@@ -13,6 +13,7 @@
 5. [Harness 接口实现](#5-harness-接口实现)
 6. [分步实施方案](#6-分步实施方案)
 7. [技术细节与挑战](#7-技术细节与挑战)
+8. [CCM 集成对框架提出的需求](#8-ccm-集成对框架提出的需求)
 
 ---
 
@@ -898,3 +899,111 @@ def create_instance_manager(settings: Settings) -> InstanceManager:
 ```
 
 这样在没有配置 Elastic-Agent 的情况下，CCM 仍然可以作为单机工具使用，保持向后兼容。
+
+---
+
+## 8. CCM 集成对框架提出的需求
+
+> 通过 CCM 这个真实 Harness 案例的分析，识别出了一批对 Elastic-Agent 框架的新需求。以下按"框架应该提供"和"Harness 自己解决"分类。
+
+### 8.1 框架必须提供的通用能力
+
+这些需求不是 CCM 特有的，任何 Harness 都会遇到。如果留给 Harness 自己实现，每个 Harness 都要重复造同一个轮子。
+
+#### (1) Worker 执行运行时
+
+CCM 的 `InstanceManager.launch()` 通过 `asyncio.create_subprocess_exec()` 在本地启动 Claude Code。改成远程后，每个 Harness 都需要"在远程机器上执行一个命令并实时拿到输出"。
+
+**框架应该内置 Worker Runtime**，部署在每个 Worker 上，提供标准 API：
+- `POST /execute` — 启动进程
+- `POST /stop` — 停止进程
+- `GET /status` — 状态上报
+- `WebSocket /logs` — 流式日志
+
+Harness 只需要告诉框架"执行什么命令"，不需要关心远程执行的传输细节。CCM 的改造量从"开发 Worker Agent Service（300-500 行）"降低为"在 `RemoteInstanceManager` 中调用框架的 Worker Runtime API"。
+
+#### (2) 实时日志流式传输
+
+CCM 的前端依赖 WebSocket 实时显示 Claude Code 的 NDJSON 输出。任何需要观察 Agent 运行过程的 Harness 都有相同需求。
+
+**框架应该提供 Worker → Manager 的标准日志传输通道：**
+
+- Worker Runtime 主动连接 Manager（反向 WebSocket），Worker 不需要开入站端口
+- Manager 汇聚后通过事件总线分发给 Harness
+- Harness 再转发给自己的前端
+
+#### (3) 有状态工作负载的亲和性路由
+
+CCM 的 `--resume session_id` 要求续接任务必须路由回同一台 Worker。这是所有有状态 Agent 的通用需求：
+
+- Claude Code 的 session 文件绑定 cwd
+- Codex 也有 session 概念
+- 任何 Agent 的本地缓存、中间结果、对话上下文
+
+**框架应该内置亲和性调度**，Harness 通过声明 `AffinityPolicy`（NONE / PREFERRED / REQUIRED）来使用，而不是自己实现路由逻辑。
+
+#### (4) 优雅缩容（Drain 机制）
+
+CCM 的任务执行可能持续 30 分钟。如果缩容时直接 terminate Worker，正在执行的任务会被中断。
+
+**框架应该内置 Drain 机制：**
+1. 标记 Worker 为 draining → 不再接受新任务
+2. 等待当前任务完成（可配置超时）
+3. 触发 Harness 的 `on_drain` 回调（可选的数据备份）
+4. 终止实例
+
+#### (5) 双层凭证管理
+
+CCM 需要两种凭证：
+- **Agent 凭证**：Claude Code 的登录态（框架已设计）
+- **应用凭证**：Git SSH key、HTTPS token、WandB API key 等
+
+框架当前只考虑了 Agent 凭证。应用凭证也是通用需求 — 几乎任何 Harness 都需要 Git 凭证。**框架应该提供安全的应用凭证传递通道**，Harness 声明需要哪些凭证，框架负责安全注入到 Worker 环境中。
+
+#### (6) 扩缩容信号接口
+
+CCM 有任务队列，队列深度是最天然的扩缩容信号。框架应该提供标准化的信号接口：
+
+```python
+class ScalingSignal:
+    pending_tasks: int      # 排队中的任务数
+    idle_workers: int       # 空闲 Worker 数
+    avg_wait_time: float    # 平均排队时间
+```
+
+Harness 上报信号，框架的规则引擎自动决策扩缩容。比让每个 Harness 自己调 `scale_out()` 更可靠。
+
+#### (7) 工作区同步
+
+CCM 的 Project 需要代码在 Worker 上可用。大部分 Agent 工作在代码仓库上，Worker 上需要有这份代码。
+
+框架应该提供标准的工作区同步能力：
+- Git clone + 执行前 pull（有 remote 的项目）
+- rsync 从 Manager 推送（纯本地项目）
+
+### 8.2 Harness 自己负责的（不属于框架）
+
+| 职责 | 原因 |
+|------|------|
+| NDJSON 解析 / StreamParser | Claude Code 特有的输出格式，其他 Agent 有不同格式 |
+| 任务优先级 / 调度策略 | 每个 Harness 有自己的调度需求（CCM 按 model 匹配） |
+| Plan 模式 / Loop 模式 | CCM 特有的任务模式 |
+| 前端 UI 具体布局 | 每个 Harness 的 UI 需求不同 |
+| `--resume` session 管理 | Claude Code 特有的会话机制（但亲和性路由由框架提供） |
+| 任务重试策略 | 每个 Harness 的重试逻辑不同（CCM 按 exit code 判断） |
+
+### 8.3 这些需求的普适性验证
+
+将 CCM 的需求与 agent-ml-research 对比，确认普适性：
+
+| 需求 | CCM 需要 | agent-ml-research 需要 | 普适性 |
+|------|---------|----------------------|--------|
+| Worker Runtime (远程执行) | ✅ | ✅（SSH + systemd） | 通用 |
+| 日志流式传输 | ✅ WebSocket | ✅ 飞书告警 | 通用 |
+| 有状态亲和性 | ✅ session resume | ✅ 项目绑定实例 | 通用 |
+| 优雅缩容 | ✅ 30min 任务 | ✅ 长时间训练 | 通用 |
+| 双层凭证 | ✅ Git key | ✅ WandB/HF/Feishu | 通用 |
+| 扩缩容信号 | ✅ 任务队列深度 | ✅ 项目数量 | 通用 |
+| 工作区同步 | ✅ Project clone | ✅ 代码部署 | 通用 |
+
+所有需求在两个不同的 Harness 中都出现了，确认应该纳入框架核心设计。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 的第 10 节"框架设计完整性审查"。

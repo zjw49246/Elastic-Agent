@@ -15,7 +15,8 @@
 7. [纯 EC2 方案的缺陷与不足](#7-纯-ec2-方案的缺陷与不足)
 8. [推荐架构方案](#8-推荐架构方案)
 9. [MVP 实现计划](#9-mvp-实现计划)
-10. [未来演进路线](#10-未来演进路线)
+10. [框架设计完整性审查](#10-框架设计完整性审查)
+11. [未来演进路线](#11-未来演进路线)
 
 ---
 
@@ -280,34 +281,49 @@ Manager 上运行的 Python asyncio 任务：
 **Elastic-Agent 是一个 AI Agent 弹性计算基座框架**，提供：
 
 1. **节点自动扩缩容** — 在 AWS / 阿里云上自动管理 Worker 节点
-2. **Agent 账号自动分发** — Claude Code / Codex 等 Agent 账号的自动登录、额度监控、智能轮换
-3. **智能分发与风控** — 账号-IP 亲和性绑定，最小化 IP 暴露
-4. **Harness 插件化** — 用户可在节点启动时部署自己的 Agent 服务代码
+2. **Worker 执行运行时** — 在 Worker 上接收命令、执行进程、实时回传日志的标准运行时
+3. **Agent 账号自动分发** — Claude Code / Codex 等 Agent 账号的自动登录、额度监控、智能轮换
+4. **双层凭证管理** — Agent 凭证（账号登录态）+ 应用凭证（Git key、API key 等）
+5. **智能分发与风控** — 账号-IP 亲和性 + 有状态工作负载的 Worker 亲和性路由
+6. **优雅生命周期** — Drain 机制（缩容时等待任务完成）、数据备份/恢复
+7. **任务感知扩缩容** — Harness 上报扩缩容信号，框架规则引擎自动决策
+8. **Harness 插件化** — 用户可在节点启动时部署自己的 Agent 服务代码
+
+> **设计原则：** 以上 1-7 是所有 Harness 都会需要的通用能力，由框架统一提供。Harness 只需要关注业务逻辑（任务调度策略、Agent 输出解析、UI 定制等），不需要重复解决基础设施问题。
 
 ### 2.2 核心架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Manager 节点                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
-│  │ 前端 UI  │  │ 后端 API │  │ 调度引擎 │  │ Router │  │
-│  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│  │ 凭证管理 │  │ 额度监控 │  │ 节点注册 │              │
-│  └──────────┘  └──────────┘  └──────────┘              │
-└─────────────────────┬───────────────────────────────────┘
-                      │ API / SSH
-    ┌─────────────────┼─────────────────┐
-    │                 │                 │
-┌───▼───┐        ┌───▼───┐        ┌───▼───┐
-│Worker1│        │Worker2│        │WorkerN│
-│EC2/ECS│        │EC2/ECS│        │EC2/ECS│
-│       │        │       │        │       │
-│Claude │        │Claude │        │Codex  │
-│ Code  │        │ Code  │        │       │
-│       │        │       │        │       │
-│Harness│        │Harness│        │Harness│  ← 用户自定义的 Agent 服务
-└───────┘        └───────┘        └───────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                         Manager 节点                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐           │
+│  │ 前端 UI  │  │ 后端 API │  │ 调度引擎 │  │ Router │           │
+│  └──────────┘  └──────────┘  └──────────┘  └────────┘           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐   │
+│  │ 凭证管理 │  │ 额度监控 │  │ 节点注册 │  │ 日志/事件汇聚  │   │
+│  └──────────┘  └──────────┘  └──────────┘  └────────────────┘   │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │ Worker Runtime Protocol
+                       │ (WebSocket 反向连接 / HTTP API)
+     ┌─────────────────┼─────────────────┐
+     │                 │                 │
+┌────▼────┐       ┌────▼────┐       ┌────▼────┐
+│Worker 1 │       │Worker 2 │       │Worker N │
+│EC2/ECS  │       │EC2/ECS  │       │EC2/ECS  │
+│         │       │         │       │         │
+│┌───────┐│       │┌───────┐│       │┌───────┐│
+││Worker ││       ││Worker ││       ││Worker ││
+││Runtime││       ││Runtime││       ││Runtime ││  ← 框架提供的标准运行时
+│└───┬───┘│       │└───┬───┘│       │└───┬───┘│
+│    │    │       │    │    │       │    │    │
+│┌───▼───┐│       │┌───▼───┐│       │┌───▼───┐│
+││Claude ││       ││Claude ││       ││Codex  ││
+││ Code  ││       ││ Code  ││       ││       ││
+│└───────┘│       │└───────┘│       │└───────┘│
+│┌───────┐│       │┌───────┐│       │┌───────┐│
+││Harness││       ││Harness││       ││Harness││  ← 用户自定义
+│└───────┘│       │└───────┘│       │└───────┘│
+└─────────┘       └─────────┘       └─────────┘
 ```
 
 ### 2.3 可插拔接口设计
@@ -315,28 +331,73 @@ Manager 上运行的 Python asyncio 任务：
 框架需要提供以下扩展点：
 
 ```
-CloudProvider 接口
+CloudProvider 接口                    ← 云资源管理
   ├── AWSProvider（EC2）
   ├── AWSContainerProvider（ECS/Fargate）
   ├── AliyunProvider（阿里云 ECS）
   └── ... 未来扩展
 
-AgentType 接口
+AgentType 接口                        ← Agent CLI 工具适配
   ├── ClaudeCodeAgent
   ├── CodexAgent
   └── ... 未来扩展
 
-BootstrapPipeline 接口
+BootstrapPipeline 接口                ← 节点初始化
   ├── 基础系统初始化
   ├── Agent 安装与配置
-  ├── Harness 代码部署        ← 用户自定义
+  ├── Harness 代码部署               ← 用户自定义
   └── 服务启动
 
-CredentialProvider 接口
+CredentialProvider 接口               ← Agent 账号管理
   ├── ClaudeOAuthProvider（171mail 登录流程）
   ├── APIKeyProvider（简单 API Key 分发）
   └── ... 未来扩展
+
+WorkerRuntime 接口（框架内置）          ← 远程执行运行时
+  ├── execute(command, env, cwd) → stream[LogEvent]
+  ├── stop(pid)
+  ├── status() → WorkerStatus
+  └── health() → HealthReport
+
+LogTransport 接口（框架内置）           ← Worker → Manager 日志通道
+  ├── WebSocket 反向连接（Worker 主动连接 Manager）
+  └── HTTP Long Polling（备选）
+
+AffinityPolicy 接口                   ← 有状态工作负载路由
+  ├── NONE — 任意 Worker
+  ├── PREFERRED — 优先同一 Worker
+  └── REQUIRED — 必须同一 Worker
+
+ScalingSignal 接口                    ← Harness 上报扩缩容信号
+  ├── pending_tasks / idle_workers
+  ├── avg_wait_time / avg_task_duration
+  └── 自定义指标
+
+ApplicationCredential 接口            ← 应用级凭证（区别于 Agent 凭证）
+  ├── Git SSH Key / HTTPS Token
+  ├── API Keys（WandB, HuggingFace, ...）
+  └── 环境变量 (.env files)
 ```
+
+### 2.4 框架 vs Harness 职责边界
+
+| 职责 | 框架提供 | Harness 实现 |
+|------|---------|-------------|
+| 节点创建/销毁/监控 | ✅ | |
+| Worker Runtime（远程执行 + 日志流） | ✅ | |
+| Agent 凭证管理（登录、额度、轮换） | ✅ | |
+| 应用凭证安全传递 | ✅ | |
+| IP 亲和性调度 | ✅ | |
+| Worker 亲和性路由 | ✅ | |
+| 优雅缩容（Drain 机制） | ✅ | |
+| 扩缩容规则引擎 | ✅ | |
+| 工作区同步（git clone/rsync） | ✅ | |
+| Bootstrap 步骤执行 | ✅ | ✅ 定义具体步骤 |
+| 扩缩容信号上报 | ✅ 接收+决策 | ✅ 产生信号 |
+| 任务调度策略 | | ✅ |
+| Agent 输出解析 | | ✅ |
+| 业务 API 和 UI | | ✅ |
+| 任务队列管理 | | ✅ |
 
 ---
 
@@ -889,33 +950,50 @@ elastic-agent/
 │   │   │   ├── claude_code.py      # Claude Code 实现
 │   │   │   └── codex.py            # Codex 实现（未来）
 │   │   ├── credentials/            # 凭证管理
-│   │   │   ├── base.py             # CredentialProvider 抽象基类
-│   │   │   ├── manager.py          # 凭证池管理器
-│   │   │   ├── claude_oauth.py     # Claude OAuth 登录
-│   │   │   └── api_key.py          # 简单 API Key 分发
+│   │   │   ├── agent_credentials.py    # Agent 凭证池（账号登录态）
+│   │   │   ├── app_credentials.py      # 应用凭证（Git key, API key 等）
+│   │   │   ├── provider.py             # CredentialProvider 抽象基类
+│   │   │   ├── claude_oauth.py         # Claude OAuth 登录
+│   │   │   └── api_key.py              # 简单 API Key 分发
+│   │   ├── runtime/                # Worker 执行运行时（框架核心）
+│   │   │   ├── worker_runtime.py   # Worker 侧运行时（接收命令、启动进程、流式日志）
+│   │   │   ├── log_transport.py    # Worker→Manager 日志传输通道
+│   │   │   └── protocol.py         # Manager↔Worker 通信协议定义
 │   │   ├── bootstrap/              # 节点初始化
 │   │   │   ├── pipeline.py         # 可插拔初始化管道
 │   │   │   └── steps/              # 各初始化步骤
 │   │   ├── scheduler/              # 扩缩容调度
 │   │   │   ├── engine.py           # 调度引擎
 │   │   │   ├── rules.py            # 规则引擎（基于规则的扩缩容）
-│   │   │   └── policies.py         # 扩缩容策略
+│   │   │   ├── signals.py          # Harness 上报的扩缩容信号
+│   │   │   └── drain.py            # 优雅缩容 Drain 机制
+│   │   ├── affinity/               # 亲和性调度
+│   │   │   ├── ip_affinity.py      # 账号-IP 亲和性
+│   │   │   └── worker_affinity.py  # 有状态工作负载的 Worker 亲和性
+│   │   ├── workspace/              # 工作区管理
+│   │   │   ├── sync.py             # 项目代码同步（git clone / rsync）
+│   │   │   └── backup.py           # 缩容时数据备份、扩容时恢复
 │   │   ├── monitor/                # 监控
 │   │   │   ├── quota.py            # 额度监控
-│   │   │   ├── health.py           # 健康检查
-│   │   │   └── metrics.py          # 指标收集
+│   │   │   ├── health.py           # Worker 应用级健康检查
+│   │   │   ├── metrics.py          # 指标收集（资源、成本、任务）
+│   │   │   └── events.py           # 事件总线（node_added, drain_start, ...）
 │   │   ├── router/                 # 请求路由
 │   │   │   └── dispatcher.py       # 请求分发到 Worker
-│   │   └── registry/               # 节点注册
-│   │       └── store.py            # 节点状态存储
+│   │   ├── registry/               # 节点注册
+│   │   │   └── store.py            # 节点状态存储
+│   │   └── security/               # 安全
+│   │       ├── auth.py             # Manager↔Worker 认证
+│   │       └── transport.py        # 传输加密
 │   ├── manager/                    # Manager 节点
 │   │   ├── api/                    # REST API
 │   │   ├── service.py              # FastAPI 应用
 │   │   └── config.py               # 配置模型
 │   ├── worker/                     # Worker 节点
-│   │   ├── agent.py                # Worker 侧 Agent 生命周期
+│   │   ├── runtime_server.py       # Worker Runtime HTTP/WS 服务
+│   │   ├── process_manager.py      # 本地进程管理（启动/停止/监控）
 │   │   ├── watchdog.py             # 额度监控看门狗
-│   │   └── reporter.py             # 状态上报
+│   │   └── reporter.py             # 状态/日志上报
 │   └── cli/                        # CLI 工具
 │       └── main.py                 # 命令行入口
 ├── dashboard/                      # 前端 UI
@@ -926,6 +1004,7 @@ elastic-agent/
 ├── infra/                          # IaC（Pulumi/CDK）
 │   └── __main__.py                 # 基础设施定义
 ├── examples/                       # 示例 Harness
+│   ├── claude-code-manager/        # CCM 的 Harness 示例
 │   └── agent-ml-research/          # agent-ml-research 的 Harness 示例
 ├── pyproject.toml
 └── README.md
@@ -934,7 +1013,8 @@ elastic-agent/
 ### 9.2 核心接口定义（草案）
 
 ```python
-# CloudProvider 接口
+# ── 云资源管理 ──
+
 class CloudProvider(ABC):
     async def create_instance(self, config: InstanceConfig) -> Instance: ...
     async def start_instance(self, instance_id: str) -> None: ...
@@ -942,33 +1022,109 @@ class CloudProvider(ABC):
     async def terminate_instance(self, instance_id: str) -> None: ...
     async def list_instances(self, filters: dict) -> list[Instance]: ...
     async def get_instance(self, instance_id: str) -> Instance: ...
-    async def execute_command(self, instance_id: str, command: str) -> CommandResult: ...
 
-# AgentType 接口
+# ── Agent 类型 ──
+
 class AgentType(ABC):
     def get_install_commands(self) -> list[str]: ...
     def get_start_commands(self) -> list[str]: ...
     def get_health_check(self) -> HealthCheck: ...
     def get_quota_check(self, credential: Credential) -> QuotaStatus: ...
 
-# CredentialProvider 接口
+# ── 凭证管理（双层） ──
+
 class CredentialProvider(ABC):
+    """Agent 凭证 — Claude Code/Codex 的账号登录态"""
     async def login(self, account: Account, instance: Instance) -> Credential: ...
     async def check_quota(self, credential: Credential) -> QuotaStatus: ...
     async def refresh(self, credential: Credential) -> Credential: ...
     async def revoke(self, credential: Credential) -> None: ...
 
-# BootstrapStep 接口
+class AppCredentialStore(ABC):
+    """应用凭证 — Git key、API key 等 Harness 业务所需"""
+    async def get(self, name: str) -> str: ...
+    async def set(self, name: str, value: str) -> None: ...
+    async def inject_to_env(self, names: list[str]) -> dict[str, str]: ...
+
+# ── Worker 执行运行时（框架核心） ──
+
+class WorkerRuntime(ABC):
+    """运行在每个 Worker 上，接收命令、执行进程、流式回传日志"""
+    async def execute(self, cmd: list[str], cwd: str, env: dict,
+                      timeout: int | None = None) -> AsyncIterator[LogEvent]: ...
+    async def stop(self, pid: int) -> None: ...
+    async def status(self) -> WorkerStatus: ...
+    async def health(self) -> HealthReport: ...
+
+class LogEvent:
+    timestamp: datetime
+    stream: Literal["stdout", "stderr"]
+    data: str               # 原始行内容
+    worker_id: str
+    task_id: str | None
+
+# ── 亲和性调度 ──
+
+class AffinityPolicy(Enum):
+    NONE = "none"           # 任意 Worker
+    PREFERRED = "preferred" # 优先同一 Worker，不可用时允许其他
+    REQUIRED = "required"   # 必须同一 Worker，不可用时等待或报错
+
+class AffinityKey:
+    """标识一个亲和性绑定"""
+    key: str                # 如 session_id、project_id
+    worker_id: str          # 绑定到的 Worker
+    policy: AffinityPolicy
+
+# ── 优雅生命周期 ──
+
+class DrainPolicy:
+    timeout: int = 1800             # 最长等待时间（秒），超时强制终止
+    backup_before_terminate: bool = True
+    notify_harness: bool = True     # 触发 Harness 的 on_drain 回调
+
+# ── 扩缩容信号 ──
+
+class ScalingSignal:
+    """Harness 上报的扩缩容信号"""
+    pending_tasks: int = 0
+    idle_workers: int = 0
+    busy_workers: int = 0
+    avg_wait_time_seconds: float = 0
+    custom_metrics: dict[str, float] = {}
+
+# ── 节点初始化 ──
+
 class BootstrapStep(ABC):
     name: str
     async def execute(self, ctx: BootstrapContext) -> StepResult: ...
     async def rollback(self, ctx: BootstrapContext) -> None: ...
 
-# Harness 接口 — 用户实现
+# ── 事件系统 ──
+
+class FrameworkEvent(Enum):
+    NODE_CREATING = "node_creating"
+    NODE_READY = "node_ready"
+    NODE_DRAIN_START = "node_drain_start"
+    NODE_TERMINATING = "node_terminating"
+    CREDENTIAL_ROTATED = "credential_rotated"
+    CREDENTIAL_EXHAUSTED = "credential_exhausted"
+    QUOTA_WARNING = "quota_warning"
+    BOOTSTRAP_FAILED = "bootstrap_failed"
+    WORKER_UNHEALTHY = "worker_unhealthy"
+
+class EventHandler(ABC):
+    async def handle(self, event: FrameworkEvent, data: dict) -> None: ...
+
+# ── Harness 接口 — 用户实现 ──
+
 class Harness(ABC):
-    def get_repo_url(self) -> str: ...
+    def get_repo_url(self) -> str | None: ...
     def get_bootstrap_steps(self) -> list[BootstrapStep]: ...
     def get_service_definitions(self) -> list[ServiceDefinition]: ...
+    def get_app_credentials(self) -> list[str]: ...         # 需要注入的应用凭证名
+    def get_scaling_signal(self) -> ScalingSignal: ...       # 上报扩缩容信号
+    def get_event_handlers(self) -> dict[FrameworkEvent, EventHandler]: ...  # 事件回调
 ```
 
 ### 9.3 智能分发与风控实现
@@ -1068,36 +1224,255 @@ status = await manager.get_cluster_status()
 
 ---
 
-## 10. 未来演进路线
+## 10. 框架设计完整性审查
+
+> 基于对 agent-ml-research 和 Claude Code Manager 两个实际项目的分析，以及框架自身架构的审视，识别出以下设计缺口。
+
+### 10.1 已识别的关键缺口
+
+#### (1) Manager 崩溃恢复与操作幂等性
+
+**问题：** 如果 Manager 在 `scale_out()` 过程中崩溃 — EC2 已创建但注册表未更新 — 会产生"孤儿实例"：云上有机器在跑，但 Manager 不知道它的存在。
+
+**影响：** 孤儿实例持续计费但无人管理。更严重的是，上面可能绑定了一个凭证，但凭证池不知道它已被使用，可能导致同一凭证分配给两台机器。
+
+**设计方案：**
+
+| 机制 | 说明 |
+|------|------|
+| 操作日志 (Operation Log) | 每次扩缩容操作写入预写日志（WAL），完成后标记 done。Manager 重启时扫描未完成的操作并恢复 |
+| 云端标签对账 (Tag Reconciliation) | 所有框架创建的实例都打 `ManagedBy=elastic-agent` 标签。Manager 启动时用 `describe_instances` 扫描，与注册表对比，发现孤儿实例后纳入管理或清理 |
+| 幂等操作 | `create_instance` 带幂等性 token，重复调用不会重复创建 |
+
+agent-ml-research 的 Poller 已经做了类似的事情（每 60 秒同步云端状态），但缺少预写日志和幂等保证。框架应该将这个提升为核心能力。
+
+#### (2) Worker 应用级健康检查
+
+**问题：** 当前设计只通过 `describe_instances()` 检查 VM 状态（running/stopped/terminated）。但"VM 在运行"不等于"Claude Code 在正常工作"。进程可能：
+- Claude Code 子进程崩溃但 Worker Runtime 还活着
+- Worker 磁盘满导致无法写入
+- OOM 但进程未被彻底 kill
+- 网络不通但实例状态仍显示 running
+
+**设计方案：** 框架的 Worker Runtime 应该内置多层健康检查：
+
+| 层级 | 检查内容 | 方式 |
+|------|---------|------|
+| L1 - 基础设施 | VM 是否在运行 | `describe_instances()`（已有） |
+| L2 - Worker Runtime | Worker Runtime 服务是否响应 | HTTP `GET /health`（框架内置） |
+| L3 - Agent 进程 | Claude Code / Codex 进程是否存活 | Worker Runtime 检查子进程状态（框架内置） |
+| L4 - 应用 | Harness 业务是否正常 | Harness 自定义健康检查（Harness 实现） |
+
+连续 N 次 L2/L3 检查失败 → 标记 Worker 为 unhealthy → 触发 `WORKER_UNHEALTHY` 事件 → 自动重启服务或重建节点。
+
+#### (3) Bootstrap 失败处理
+
+**问题：** Bootstrap 是一个 10+ 步骤的管道。如果在第 7 步失败了怎么办？当前设计有 per-step rollback，但缺少全局策略。
+
+**设计方案：**
+
+```python
+class BootstrapFailurePolicy(Enum):
+    TERMINATE_AND_RETRY = "terminate_and_retry"  # 销毁实例，重新创建（默认）
+    RETRY_FROM_FAILED = "retry_from_failed"      # 在同一实例上从失败步骤重试
+    LEAVE_FOR_DEBUG = "leave_for_debug"           # 保留实例供人工排查
+```
+
+框架应该：
+- 记录每个步骤的执行状态（成功/失败/跳过）到注册表
+- 失败时按策略处理：默认 terminate + retry（因为半初始化的实例是危险的）
+- 凭证如果已分配但 bootstrap 失败 → 自动回收凭证到池子
+- 最大重试次数限制（防止无限创建+销毁循环）
+
+#### (4) Manager ↔ Worker 安全模型
+
+**问题：** 当前设计没有明确 Manager 和 Worker 之间如何认证。Worker Runtime 暴露了 `/execute` API — 如果没有认证，任何人都可以在 Worker 上执行任意命令。
+
+**设计方案：**
+
+| 方案 | 复杂度 | 安全性 | 推荐 |
+|------|--------|--------|------|
+| 共享 Secret (Bearer Token) | 低 | 中 | MVP ✅ |
+| 每 Worker 独立 Token | 中 | 高 | Phase 2 |
+| Mutual TLS (mTLS) | 高 | 最高 | Phase 5+ |
+| IAM Role (AWS 原生) | 中 | 高 | Phase 2（AWS only） |
+
+MVP：Bootstrap 时生成随机 token 写入 Worker 配置，Manager 记录在注册表中。所有 API 调用携带 Bearer Token。
+
+此外：
+- Manager → Worker 通信走 VPC 内网（不经过公网）
+- Worker 不需要开放任何公网入站端口
+- Worker Runtime 仅监听内网 IP（`--host 10.x.x.x`）
+
+#### (5) 并发模型：每 Worker 多少任务？
+
+**问题：** 当前设计隐含"一个 Worker 一个任务"。但实际上 CCM 在单机上就跑 5 个并发 Claude Code 进程。框架需要明确每 Worker 的并发模型。
+
+**设计方案：**
+
+```python
+class WorkerCapacity:
+    max_concurrent_tasks: int = 1    # 默认单任务
+    cpu_per_task: float = 2.0        # 每任务预留 CPU
+    memory_per_task_mb: int = 4096   # 每任务预留内存
+```
+
+- 默认 1 个 Worker 1 个任务（最简单、最安全、风控最好 — 每个账号独占一台机器）
+- 可配置为 1:N（多任务共享 Worker），但 Harness 需要自己管理资源隔离
+- 框架提供资源感知：Worker Runtime 上报可用 CPU/内存，调度器据此决定是否还能分配新任务
+
+#### (6) 成本追踪
+
+**问题：** 当前设计没有成本相关的能力。Elastic-Agent 管理的是云资源，成本是用户最关心的指标之一。
+
+**设计方案：** 框架应追踪两层成本：
+
+| 层级 | 来源 | 方式 |
+|------|------|------|
+| 基础设施成本 | EC2/ECS 实例运行时间 | 框架根据 instance_type + 运行时间估算（或调用 Cost Explorer API） |
+| Agent 使用成本 | Claude Code / Codex API 调用 | Harness 上报（如 CCM 从 `result` 事件中提取 `cost_usd`） |
+
+框架提供统一的成本视图：
+- 每 Worker 的基础设施成本
+- 每 Worker 的 Agent 使用成本
+- 总成本和趋势
+- 预算告警（月度预算超 80% 时提醒）
+
+#### (7) Worker 软件更新
+
+**问题：** Claude Code CLI 会更新版本，Harness 代码也会迭代。如何在不重建整个节点的情况下更新 Worker 上的软件？
+
+**设计方案：**
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| 滚动重建 | 创建新 Worker（新版本）→ drain 旧 Worker → 终止旧 Worker | 大版本更新、AMI 变更 |
+| 热更新 | SSH/SSM 在运行中的 Worker 上执行更新命令 | 小版本更新、配置变更 |
+| Harness 代码同步 | `git pull` 拉取最新 Harness 代码 + 重启服务 | Harness 逻辑更新 |
+
+框架应该提供 `update_workers(strategy)` API，Harness 可以选择策略。
+
+#### (8) 数据面与控制面分离
+
+**问题：** 当前设计中 Manager 同时承担：
+- **控制面**：节点管理、凭证管理、扩缩容决策
+- **数据面**：日志转发、请求路由、状态汇聚
+
+如果日志量大（50 个 Worker 同时流式输出），数据面的负载可能拖垮控制面。
+
+**设计方案：** 在 MVP 阶段可以不分离（单进程足够），但架构上应该做好分离准备：
+
+```
+控制面（低频、关键）              数据面（高频、大流量）
+  ├── 节点 CRUD                    ├── 日志流式传输
+  ├── 凭证分配/轮换                ├── Worker 状态上报
+  ├── 扩缩容决策                   ├── 请求路由转发
+  └── Bootstrap 编排               └── 心跳检测
+```
+
+实现方式：
+- MVP：同一个 FastAPI 进程，不同的 Router 前缀（`/api/control/` vs `/api/data/`）
+- 后续：可以拆分为两个独立服务，控制面高可用部署，数据面水平扩展
+
+#### (9) 多 Harness 支持
+
+**问题：** 当前设计假设一个 Elastic-Agent 部署只跑一种 Harness。但实际场景中可能需要不同 Worker 跑不同的 Harness（比如一些 Worker 跑 CCM，另一些跑 agent-ml-research）。
+
+**设计方案：**
+
+- MVP：一个部署一种 Harness（足够大部分场景）
+- 后续：支持 Worker 标签（`harness=ccm` / `harness=aml`），调度器按标签路由
+- Worker 的 AMI / Docker 镜像可以不同，每种 Harness 对应一个 AMI
+
+#### (10) 可测试性
+
+**问题：** 框架涉及云资源操作（创建 EC2、SSH、凭证分发），如果每次测试都需要真实云资源，开发效率极低且费钱。
+
+**设计方案：**
+
+```python
+class LocalProvider(CloudProvider):
+    """本地模拟 Provider — 用 Docker 容器模拟 EC2 实例"""
+    async def create_instance(self, config):
+        container = docker.run("ubuntu:22.04", detach=True)
+        return Instance(id=container.id, ip=container.ip, ...)
+
+class DryRunProvider(CloudProvider):
+    """空跑 Provider — 只记录操作日志，不实际创建资源"""
+    async def create_instance(self, config):
+        self.log.append(("create", config))
+        return Instance(id=f"dry-{uuid4()}", ip="127.0.0.1", ...)
+```
+
+框架应该提供：
+- `LocalProvider` — 用 Docker 容器替代 EC2，本地快速迭代
+- `DryRunProvider` — 只验证流程不消耗资源
+- 每个模块的单元测试 mock 接口
+
+### 10.2 优先级排序
+
+| 优先级 | 缺口 | 理由 |
+|--------|------|------|
+| **P0 - MVP 必须** | Worker Runtime + 日志传输 | 没有这个框架无法执行任何远程任务 |
+| **P0 - MVP 必须** | Manager ↔ Worker 认证 | 安全底线 |
+| **P0 - MVP 必须** | 云端标签对账 | 防止孤儿实例持续烧钱 |
+| **P1 - MVP 应该** | Bootstrap 失败处理 | 否则失败后需要手动清理 |
+| **P1 - MVP 应该** | Worker 应用级健康检查 (L2+L3) | 否则 Worker 假死无法发现 |
+| **P1 - MVP 应该** | 优雅缩容 (Drain) | 否则缩容会中断正在执行的任务 |
+| **P2 - 后续迭代** | 双层凭证管理 | MVP 可先用环境变量传递 |
+| **P2 - 后续迭代** | 亲和性调度 | MVP 可先不支持 session 续接 |
+| **P2 - 后续迭代** | 扩缩容信号 + 规则引擎 | MVP 手动扩缩容 |
+| **P2 - 后续迭代** | 成本追踪 | MVP 阶段实例少，手动看 AWS 账单 |
+| **P2 - 后续迭代** | 操作幂等性 + 预写日志 | MVP 阶段实例少，出问题手动修 |
+| **P3 - 长期** | 数据面/控制面分离 | 50+ Worker 后再考虑 |
+| **P3 - 长期** | 多 Harness 支持 | 大部分用户单 Harness 足够 |
+| **P3 - 长期** | Worker 软件热更新 | MVP 阶段重建 Worker 可接受 |
+| **P3 - 长期** | 可测试性 (LocalProvider) | MVP 可以直接用真实 EC2 测试 |
+
+---
+
+## 11. 未来演进路线
 
 ### Phase 1：MVP（当前目标）
 
 - [x] 调研分析（本文档）
 - [ ] 核心抽象接口定义
-- [ ] AWS EC2 Provider 实现
+- [ ] **Worker Runtime 实现**（远程执行 + 日志流式传输）
+- [ ] **Manager ↔ Worker 认证**（共享 Secret）
+- [ ] AWS EC2 Provider 实现（boto3 SDK 直连）
 - [ ] Claude Code Agent 实现
-- [ ] 基础 Bootstrap Pipeline
+- [ ] 基础 Bootstrap Pipeline + **失败处理**
+- [ ] **云端标签对账**（防止孤儿实例）
+- [ ] **Worker 应用级健康检查**（L2 + L3）
+- [ ] **优雅缩容（Drain 机制）**
 - [ ] 简单的手动扩缩容 API
 - [ ] 基础 Web UI（节点列表、手动操作）
 - [ ] 凭证分发（API Key 方式）
 - [ ] 基础额度监控
 
-### Phase 2：智能化
+### Phase 2：智能化 + 安全增强
 
+- [ ] 双层凭证管理（Agent 凭证 + 应用凭证）
 - [ ] Claude OAuth 自动登录
 - [ ] IP 亲和性调度
-- [ ] 基于规则的自动扩缩容
+- [ ] **Worker 亲和性路由**（有状态工作负载）
+- [ ] **扩缩容信号接口 + 规则引擎**
 - [ ] 额度耗尽自动换号
 - [ ] 用完/过期账号自动回收
-- [ ] 节点健康检查和自动恢复
+- [ ] **操作幂等性 + 预写日志**
+- [ ] **成本追踪**（基础设施 + Agent 使用）
+- [ ] 每 Worker 独立 Token 认证
 
-### Phase 3：多 Agent 支持
+### Phase 3：多 Agent + Harness 生态
 
 - [ ] Codex Agent 支持
 - [ ] 通用 Agent 接口
-- [ ] Harness 插件系统
+- [ ] Harness 插件系统 + 事件回调
 - [ ] 请求路由（Router 功能）
+- [ ] **工作区同步**（git clone / rsync）
+- [ ] **Worker 软件热更新**
 - [ ] 完善的 Dashboard
+- [ ] **多 Harness 支持**（Worker 标签路由）
 
 ### Phase 4：多云
 
@@ -1117,12 +1492,15 @@ status = await manager.get_cluster_status()
 ### Phase 6：生产级
 
 - [ ] Manager 高可用（多副本 + 负载均衡）
+- [ ] **数据面/控制面分离**
 - [ ] 数据库后端（PostgreSQL）
 - [ ] 缩容时数据自动备份到 S3
 - [ ] 扩容时数据自动恢复
 - [ ] 基于 Agent 的智能扩缩容（AI 决策）
 - [ ] 成本优化建议
 - [ ] 完整可观测性（Prometheus + Grafana）
+- [ ] **可测试性**（LocalProvider + DryRunProvider）
+- [ ] Mutual TLS (mTLS) 认证
 
 ---
 
