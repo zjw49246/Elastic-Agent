@@ -615,64 +615,221 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 
 ## 8. 推荐架构方案
 
-### 8.1 MVP 方案：EC2 + Lambda 编排 + SSM
+### 8.1 MVP 方案：SDK 直连管理（最简方案）
 
-最简单可行的方案，基于纯 EC2 但利用 AWS 原生服务解决 agent-ml-research 的痛点：
+**核心思路：** 直接用云厂商 SDK（`boto3` / `alibabacloud-ecs-sdk`）管理实例，不引入 ASG、Lambda、Secrets Manager 等额外云服务。这正是 agent-ml-research 已验证可行的方案 — 一个 Python 进程 + SDK 就能跑起来。
 
 ```
-                        ┌───────────────────────────┐
-                        │     Manager EC2 实例       │
-                        │  ┌─────────┐ ┌──────────┐ │
-                        │  │FastAPI  │ │ React UI │ │
-                        │  │后端     │ │ 前端     │ │
-                        │  └────┬────┘ └──────────┘ │
-                        │       │                   │
-                        │  ┌────▼────────────────┐  │
-                        │  │ 调度引擎             │  │
-                        │  │ - ASG 管理           │  │
-                        │  │ - 凭证分发           │  │
-                        │  │ - 额度监控           │  │
-                        │  │ - IP 亲和调度        │  │
-                        │  └────┬────────────────┘  │
-                        └───────┼────────────────────┘
-                                │
-            ┌───────────────────┼───────────────────┐
-            │           SSM Run Command             │
-            │                                       │
-   ┌────────▼────────┐              ┌───────────────▼──┐
-   │   NAT GW #1     │              │   NAT GW #2      │
-   │   EIP: 1.2.3.4  │              │   EIP: 5.6.7.8   │
-   └────────┬────────┘              └───────────────┬──┘
-            │                                       │
-   ┌────────▼────────┐              ┌───────────────▼──┐
-   │ Private Subnet A│              │ Private Subnet B │
-   │                 │              │                  │
-   │ ┌─────────────┐ │              │ ┌──────────────┐ │
-   │ │ Worker EC2  │ │              │ │ Worker EC2   │ │
-   │ │ Account #1  │ │              │ │ Account #2   │ │
-   │ │ Claude Code │ │              │ │ Claude Code  │ │
-   │ │ + Harness   │ │              │ │ + Harness    │ │
-   │ └─────────────┘ │              │ └──────────────┘ │
-   └──────────────────┘              └──────────────────┘
+┌──────────────────────────────────────────────────┐
+│              Manager 节点 (EC2 / 本地机器)        │
+│                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │
+│  │ FastAPI  │  │ React UI │  │  调度引擎       │  │
+│  │ 后端 API │  │ 前端     │  │  (Python 进程) │  │
+│  └────┬─────┘  └──────────┘  └───────┬────────┘  │
+│       │                              │           │
+│  ┌────▼──────────────────────────────▼────────┐  │
+│  │              核心管理模块                   │  │
+│  │  ┌────────────┐  ┌───────────┐             │  │
+│  │  │boto3 / SDK │  │ 凭证池    │             │  │
+│  │  │直接调用    │  │ (JSON/DB) │             │  │
+│  │  └────────────┘  └───────────┘             │  │
+│  │  ┌────────────┐  ┌───────────┐             │  │
+│  │  │节点注册表  │  │ 额度监控  │             │  │
+│  │  │(YAML/DB)  │  │ (轮询)    │             │  │
+│  │  └────────────┘  └───────────┘             │  │
+│  └────────────────────────────────────────────┘  │
+└──────────────────────┬───────────────────────────┘
+                       │ SSH
+         ┌─────────────┼─────────────┐
+         │             │             │
+    ┌────▼───┐    ┌────▼───┐    ┌────▼───┐
+    │Worker 1│    │Worker 2│    │Worker N│
+    │EC2/ECS │    │EC2/ECS │    │EC2/ECS │
+    │        │    │        │    │        │
+    │Claude  │    │Claude  │    │Codex   │
+    │ Code   │    │ Code   │    │        │
+    │        │    │        │    │        │
+    │Harness │    │Harness │    │Harness │
+    └────────┘    └────────┘    └────────┘
 ```
 
-**核心组件：**
+#### 工作流程
 
-| 组件 | 实现 | 说明 |
-|------|------|------|
-| Manager | FastAPI + React | 单 EC2 实例运行，提供 Web UI 和 API |
-| Worker 管理 | boto3 + ASG | 通过 ASG 实现扩缩容，生命周期钩子触发凭证注入 |
-| 凭证存储 | Secrets Manager | $0.40/secret/月，自动轮换，审计追踪 |
-| 凭证分发 | SSM Run Command | 无需 SSH，实例启动后自动拉取凭证 |
-| IP 亲和性 | 多 NAT Gateway + DynamoDB | DynamoDB 记录 account → subnet 映射 |
-| 额度监控 | Worker 侧 watchdog + Manager 轮询 | 沿用 agent-ml-research 的 watchdog 思路 |
-| 数据备份 | EBS 快照 + S3 | ASG 缩容时生命周期钩子触发 |
-| Harness 部署 | user-data + git clone | Worker 启动时自动拉取用户的 Harness 代码 |
-| IaC | Pulumi (Python) | 多云准备，Python 生态与框架核心语言一致 |
+```
+扩容:
+  Manager API 收到请求
+    → boto3.run_instances() / aliyun SDK 创建实例
+    → 等待 running 状态
+    → SSH 连入执行 bootstrap 脚本
+        → 安装 Agent (Claude Code / Codex)
+        → SCP 分发凭证文件
+        → git clone 部署 Harness 代码
+        → systemd 启动服务
+    → 写入节点注册表
+    → 开始心跳监控
 
-### 8.2 进阶方案：ECS on EC2 + 容器化
+缩容:
+  Manager API 收到请求
+    → （可选）SSH 触发数据备份到 S3 / OSS
+    → boto3.terminate_instances() / aliyun SDK 释放实例
+    → 回收凭证到池子
+    → 从注册表中移除
 
-在 MVP 基础上将 Worker 容器化：
+额度监控:
+  Manager 后台轮询
+    → SSH / HTTP 调用每个 Worker 的 watchdog 状态
+    → 发现额度不足 → 从凭证池取新号
+    → SCP 新凭证到 Worker → 重启 Agent 服务
+    → 回收旧号到池子
+```
+
+#### 核心组件实现
+
+| 功能 | 实现方式 | 说明 |
+|------|---------|------|
+| 创建/销毁节点 | `boto3.run_instances()` / `terminate_instances()` | 直接 SDK 调用，无需 ASG |
+| | `alibabacloud_ecs.create_instance()` | 阿里云同理 |
+| 节点初始化 | SSH + bootstrap 脚本 | 装 Agent、部署代码、分发凭证 |
+| 状态监控 | 后台轮询 `describe_instances()` + Worker 心跳 | 60 秒间隔，同步 IP / 状态变化 |
+| 凭证存储 | 本地 JSON 文件（MVP）→ 数据库（后续） | 凭证池 + 账号-IP 映射 |
+| 凭证分发 | SCP 推送凭证文件到 Worker | 简单直接 |
+| 额度监控 | Worker 侧 watchdog 脚本 + Manager 轮询 | 沿用 agent-ml-research 的 watchdog |
+| 扩缩容触发 | Manager 后端 API 手动触发 | 未来加规则引擎实现自动化 |
+| Harness 部署 | SSH + `git clone` 用户 repo | Worker 启动后自动拉取 |
+| 节点注册表 | YAML 文件（MVP）→ 数据库（后续） | 记录实例 ID、IP、状态、绑定的凭证 |
+
+#### 与 AWS 原生服务方案的对比
+
+| 维度 | SDK 直连（本方案） | ASG + Lambda + SSM + Secrets Manager |
+|------|-------------------|--------------------------------------|
+| **实现复杂度** | 低 — 一个 Python 进程 + SDK | 高 — 需理解 ASG 生命周期钩子、Lambda 部署、SSM 配置 |
+| **调试便捷性** | 高 — 所有逻辑在一个进程，直接看日志 | 低 — 逻辑分散在 Lambda、CloudWatch Logs 等多处 |
+| **自定义灵活度** | 高 — IP 亲和性、智能分发直接写 Python | 中 — 需要绕 AWS 事件机制和 Lambda 限制 |
+| **多云统一性** | 高 — AWS / 阿里云各实现一个 Provider，上层逻辑共享 | 低 — ASG、Lambda、SSM 都是 AWS 专属 |
+| **额外云服务费用** | 无 — 只付 EC2 计算费用 | 有 — Secrets Manager ($0.40/secret/月)、NAT Gateway ($32/月)、DynamoDB |
+| **开发速度** | 快 — agent-ml-research 已有参考实现可复用 | 慢 — 需要学习和配置多个 AWS 服务 |
+| **高可用** | 弱 — Manager 单点故障 | 中 — Lambda 本身高可用，但整体仍需 Manager |
+| **安全性** | 中 — SSH key 共享、凭证明文传输 | 高 — SSM 无需 SSH、Secrets Manager 加密存储 |
+| **可扩展性** | 中 — 文件系统状态 50+ 实例后可能瓶颈 | 高 — DynamoDB / Secrets Manager 原生可扩展 |
+
+**结论：** MVP 阶段选 SDK 直连，**先跑起来再迭代**。Manager 单点故障、SSH key 共享、文件状态这些问题在 50 个实例以内完全可以接受。当规模增长时，再逐步引入云原生服务增强。
+
+#### SDK 直连方案的代码结构
+
+```python
+# 最简 Provider 接口 — 直接封装云厂商 SDK
+class CloudProvider(ABC):
+    """云服务商接口"""
+    async def create_instance(self, config: InstanceConfig) -> Instance: ...
+    async def start_instance(self, instance_id: str) -> None: ...
+    async def stop_instance(self, instance_id: str) -> None: ...
+    async def terminate_instance(self, instance_id: str) -> None: ...
+    async def describe_instances(self, filters: dict) -> list[Instance]: ...
+
+# AWS EC2 实现 — 直接用 boto3
+class AWSEc2Provider(CloudProvider):
+    def __init__(self, region: str, **kwargs):
+        self.ec2 = boto3.client('ec2', region_name=region)
+
+    async def create_instance(self, config):
+        resp = self.ec2.run_instances(
+            ImageId=config.ami_id,
+            InstanceType=config.instance_type,
+            MinCount=1, MaxCount=1,
+            KeyName=config.key_pair_name,
+            SecurityGroupIds=config.security_group_ids,
+            SubnetId=config.subnet_id,
+            TagSpecifications=[{
+                'ResourceType': 'instance',
+                'Tags': [
+                    {'Key': 'Name', 'Value': f'Worker-{config.name}'},
+                    {'Key': 'ManagedBy', 'Value': 'elastic-agent'},
+                ]
+            }],
+        )
+        return Instance.from_aws(resp['Instances'][0])
+
+# 阿里云 ECS 实现 — 封装 alibabacloud SDK
+class AliyunEcsProvider(CloudProvider):
+    def __init__(self, region: str, **kwargs):
+        self.client = EcsClient(config)
+
+    async def create_instance(self, config):
+        request = CreateInstanceRequest()
+        request.set_ImageId(config.image_id)
+        request.set_InstanceType(config.instance_type)
+        # ...
+        resp = self.client.do_action_with_exception(request)
+        return Instance.from_aliyun(resp)
+```
+
+```python
+# Manager 核心逻辑 — 一个 Python 进程搞定全部
+class ElasticAgentManager:
+    def __init__(self, provider: CloudProvider, credential_pool: CredentialPool):
+        self.provider = provider
+        self.credentials = credential_pool
+        self.registry = NodeRegistry()  # YAML/JSON 文件
+
+    async def scale_out(self, count: int = 1):
+        for _ in range(count):
+            # 1. SDK 直接创建实例
+            instance = await self.provider.create_instance(self.config)
+
+            # 2. 等待 running
+            await self._wait_until_running(instance.id)
+
+            # 3. 从凭证池选一个号（优先之前在这个 IP 用过的）
+            cred = self.credentials.select(prefer_ip=instance.public_ip)
+
+            # 4. SSH bootstrap: 装 agent + 分发凭证 + 部署 harness
+            await self._bootstrap(instance, cred)
+
+            # 5. 注册到本地注册表
+            self.registry.add(instance, cred)
+
+    async def scale_in(self, count: int = 1):
+        victims = self.registry.select_for_removal(count)
+        for instance in victims:
+            # 1. 回收凭证
+            self.credentials.release(instance.credential_id)
+            # 2. (可选) 备份数据
+            await self._backup_data(instance)
+            # 3. SDK 直接终止实例
+            await self.provider.terminate_instance(instance.id)
+            # 4. 从注册表移除
+            self.registry.remove(instance.id)
+```
+
+#### MVP 阶段接受的已知限制
+
+| 限制 | 影响 | 后续解决方案 |
+|------|------|-------------|
+| Manager 单点故障 | Manager 挂了无法管理节点，但 Worker 继续运行 | 后续加高可用（多副本 + 负载均衡） |
+| SSH key 共享 | 一个 key 泄露影响所有节点 | 后续引入 SSM Session Manager |
+| 凭证明文传输 | SCP 传输凭证文件有中间人风险 | 后续引入 Secrets Manager |
+| 文件系统状态 | YAML/JSON 在 50+ 实例时性能下降 | 后续引入数据库（PostgreSQL / SQLite） |
+| 手动扩缩容 | 需要通过 API/UI 手动触发 | 后续加规则引擎自动化 |
+| IP 亲和性简单实现 | 仅基于历史记录的软绑定 | 后续引入多 NAT Gateway 硬绑定 |
+
+### 8.2 进阶方案：SDK 直连 + 云原生服务增强
+
+在 MVP 基础上，针对痛点逐步引入云原生服务：
+
+| 痛点 | 引入的服务 | 说明 |
+|------|-----------|------|
+| SSH key 安全 | SSM Session Manager / Run Command | 消除 SSH，无需开放 22 端口 |
+| 凭证安全 | Secrets Manager / 阿里云凭据管家 | 加密存储 + 自动轮换 |
+| IP 硬绑定 | 多 NAT Gateway + 子网路由 | 每个账号组固定出站 IP |
+| 状态可扩展 | DynamoDB / RDS | 替代 YAML/JSON 文件 |
+| 数据备份 | EBS 快照 + S3 / OSS | 缩容时自动触发 |
+
+核心管理逻辑仍然是 SDK 直连（boto3 / aliyun SDK），只是把周边能力替换为托管服务。这样可以逐步增强而不需要推翻 MVP 的架构。
+
+### 8.3 容器化方案：ECS on EC2
+
+在进阶方案基础上将 Worker 容器化：
 
 - Worker 使用官方 `ghcr.io/anthropics/claude-code` Docker 镜像为基础
 - ECS Task Definition 中注入凭证（引用 Secrets Manager）
@@ -680,7 +837,7 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 - 底层 EC2 由 ASG 管理，支持 Spot
 - 更好的资源隔离和快速部署
 
-### 8.3 远期方案：EKS + KEDA 多云
+### 8.4 远期方案：EKS + KEDA 多云
 
 当规模增长或需要多云时：
 
@@ -690,7 +847,7 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 - 多 NodeGroup + 不同子网实现 IP 亲和性
 - Helm Chart 打包，一键部署
 
-### 8.4 路由功能设计
+### 8.5 路由功能设计
 
 Manager 作为服务入口（Router）：
 
