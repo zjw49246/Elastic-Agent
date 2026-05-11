@@ -1,6 +1,8 @@
 # Harness 应用示例：Claude Code Manager 接入 Elastic-Agent
 
-> 本文档以 [Claude Code Manager](https://github.com/zjw49246/Claude-Code-Manager)（以下简称 CCM）为例，说明一个具体项目如何作为 Harness 接入 Elastic-Agent 弹性计算框架。
+> 本文档以 [Claude Code Manager](https://github.com/zjw49246/Claude-Code-Manager)（以下简称 CCM）为例，说明一个单机应用如何作为 Harness 接入 Elastic-Agent 弹性计算框架，获得分布式扩展能力。
+>
+> 另一个 Harness 示例见 [agent-ml-research 集成文档](harness-example-agent-ml-research.md)，展示已有自建基础设施的项目如何迁移。两个案例代表了两种典型的接入模式。
 
 ---
 

@@ -1164,69 +1164,44 @@ def select_credential_for_instance(instance_id: str) -> Credential:
     return min(available, key=lambda c: (c.ip_count, -c.quota_remaining))
 ```
 
-### 9.4 外接场景示例：agent-ml-research
+### 9.4 应用示例
 
-当框架完成后，agent-ml-research 可以这样接入：
+框架设计基于两个真实项目验证，每个项目有独立的详细 Harness 集成文档：
 
-```python
-# examples/agent-ml-research/harness.py
-class AgentMLResearchHarness(Harness):
-    def get_repo_url(self):
-        return "https://github.com/caoxiaoyuyuyuyuyu/agent-ml-research.git"
+| 项目 | 接入类型 | 详细文档 |
+|------|---------|---------|
+| **agent-ml-research** | 替换自建基础设施（~2000 行 → ~300 行） | [harness-example-agent-ml-research.md](harness-example-agent-ml-research.md) |
+| **Claude Code Manager** | 从单机扩展到分布式 | [harness-example-claude-code-manager.md](harness-example-claude-code-manager.md) |
 
-    def get_bootstrap_steps(self):
-        return [
-            InstallUVStep(),
-            UVSyncStep(extras=["all"]),
-            InstallPlaywrightStep(),
-            BuildDashboardStep(),
-            SetupXvfbStep(),
-            ConfigureFeishuStep(),
-            ConfigureWandBStep(),
-        ]
+两个项目代表了两种典型的接入模式：
 
-    def get_service_definitions(self):
-        return [
-            ServiceDefinition(
-                name="agent-ml",
-                command="agent-ml server --public --dash-port 8420",
-                restart_policy="always",
-            ),
-        ]
-```
+- **agent-ml-research**：已有自建 EC2 管理 + 账号管理代码，需要**替换**为框架调用。迁移后删除 ~2000 行自建基础设施代码，同时获得 IP 亲和性、优雅缩容、健康检查等自建版本缺失的能力。
 
-原来 agent-ml-research 中的 EC2 管理代码可以完全替换为 Elastic-Agent 框架调用：
+- **Claude Code Manager**：单机单体应用，需要**新增**分布式能力。改造重点是将本地子进程执行切换为远程 Worker Runtime 调用，框架提供全部基础设施层。
+
+两个 Harness 的核心需求（Worker Runtime、日志传输、有状态亲和性、优雅缩容、双层凭证、扩缩容信号）完全一致，验证了框架核心设计的普适性。
+
+**框架调用示例：**
 
 ```python
-# 替换前：agent-ml-research 自己的 EC2 管理
-from manager.ec2.provider import Ec2Provider
-from manager.ec2.bootstrap import bootstrap_instance
-
-# 替换后：使用 Elastic-Agent 框架
-from elastic_agent import ElasticAgentManager
+from elastic_agent import ElasticAgentManager, AWSEc2Provider, CredentialPool
 
 manager = ElasticAgentManager(
-    cloud_provider=AWSEc2Provider(config),
-    agent_type=ClaudeCodeAgent(),
-    credential_provider=ClaudeOAuthProvider(email_tokens),
-    harness=AgentMLResearchHarness(),
+    provider=AWSEc2Provider(config),
+    credential_pool=CredentialPool(provider=ClaudeOAuthProvider(email_tokens)),
+    harness=AgentMLResearchHarness(app_config),  # 或 CCMHarness(app_config)
 )
 
-# 扩容
-await manager.scale_out(count=3)
-
-# 缩容
-await manager.scale_in(count=1)
-
-# 查看状态
-status = await manager.get_cluster_status()
+await manager.scale_out(count=3)            # 扩容
+await manager.scale_in(count=1)             # 缩容（自动 Drain）
+status = await manager.get_cluster_status() # 状态总览
 ```
 
 ---
 
 ## 10. 框架设计完整性审查
 
-> 基于对 agent-ml-research 和 Claude Code Manager 两个实际项目的分析，以及框架自身架构的审视，识别出以下设计缺口。
+> 基于对 [agent-ml-research](harness-example-agent-ml-research.md) 和 [Claude Code Manager](harness-example-claude-code-manager.md) 两个实际 Harness 案例的分析，以及框架自身架构的审视，识别出以下设计缺口。每项缺口都在两个案例中得到了验证。
 
 ### 10.1 已识别的关键缺口
 
@@ -1526,5 +1501,6 @@ class DryRunProvider(CloudProvider):
 - [HashiCorp Nomad](https://www.nomadproject.io/) — 简单编排器
 - [Claude Code Docker](https://github.com/anthropics/claude-code) — 官方 Docker 镜像
 
-### 参考项目
-- [agent-ml-research](https://github.com/caoxiaoyuyuyuyuyu/agent-ml-research) — 本框架的核心参考实现
+### 参考项目与 Harness 文档
+- [agent-ml-research](https://github.com/caoxiaoyuyuyuyuyu/agent-ml-research) — 已有自建基础设施的参考项目 → [Harness 集成文档](harness-example-agent-ml-research.md)
+- [Claude Code Manager](https://github.com/zjw49246/Claude-Code-Manager) — 单机 Agent 编排系统 → [Harness 集成文档](harness-example-claude-code-manager.md)
