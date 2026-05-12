@@ -16,7 +16,8 @@
 8. [推荐架构方案](#8-推荐架构方案)
 9. [MVP 实现计划](#9-mvp-实现计划)
 10. [框架设计完整性审查](#10-框架设计完整性审查)
-11. [未来演进路线](#11-未来演进路线)
+11. [Audiobook Harness 案例补充验证](#11-audiobook-harness-案例补充验证)
+12. [未来演进路线](#12-未来演进路线)
 
 ---
 
@@ -1201,7 +1202,7 @@ status = await manager.get_cluster_status() # 状态总览
 
 ## 10. 框架设计完整性审查
 
-> 基于对 [agent-ml-research](harness-example-agent-ml-research.md) 和 [Claude Code Manager](harness-example-claude-code-manager.md) 两个实际 Harness 案例的分析，以及框架自身架构的审视，识别出以下设计缺口。每项缺口都在两个案例中得到了验证。
+> 基于对 [agent-ml-research](harness-example-agent-ml-research.md)、[Claude Code Manager](harness-example-claude-code-manager.md) 和 [Audiobook Production](harness-example-audiobook-production.md) 三个实际 Harness 案例的分析，以及框架自身架构的审视，识别出以下设计缺口。每项缺口都在多个案例中得到了验证。
 
 ### 10.1 已识别的关键缺口
 
@@ -1406,7 +1407,209 @@ class DryRunProvider(CloudProvider):
 
 ---
 
-## 11. 未来演进路线
+## 11. Audiobook Harness 案例补充验证
+
+> **更新说明**：本节基于新增的第三个 Harness 案例 — [有声书稿全自动化生产系统](harness-example-audiobook-production.md)（以下简称 Audiobook）的分析结果。Audiobook 代表了第三种典型接入模式：**绿地构建**（前两个案例分别代表"替换自建基础设施"和"扩展单机应用"）。通过这个新案例，进一步验证了已有的框架核心需求，并识别出 4 项前两个案例未覆盖的新需求。
+
+### 11.1 Audiobook 项目概要
+
+Audiobook 是一个端到端有声书稿自动化生产平台：前端提交做书请求 → 后端按需启动临时 EC2 → 自动登录 Claude Code → 执行 10 Phase 做书流水线 → 实时双向聊天 → 完成后 EC2 自动销毁。
+
+关键差异点（与前两个案例相比）：
+
+| 维度 | agent-ml-research | CCM | Audiobook |
+|------|-------------------|-----|-----------|
+| Worker 生命周期 | 常驻 | 本地子进程 | **临时（用完即毁）** |
+| 通信模式 | SSH pull | 本地 stdout | **SQS push** |
+| 接入模式 | 替换 | 扩展 | **绿地构建** |
+| 任务时长 | 小时级 | 分钟级 | **1-2 小时（10 Phase）** |
+| 用户交互 | 飞书 Bot | Web 单向 | **Web 双向聊天** |
+| 崩溃恢复 | 无 | 无 | **自动检测 + S3 恢复** |
+
+详见 [harness-example-audiobook-production.md](harness-example-audiobook-production.md)。
+
+### 11.2 对已有核心需求的验证
+
+第 10 节识别的 10 个设计缺口，在 Audiobook 案例中再次得到验证：
+
+| 设计缺口 | Audiobook 中的体现 | 验证结论 |
+|----------|-------------------|---------|
+| (1) Manager 崩溃恢复 | 如果后端在 `scale_out()` 时崩溃，EC2 已启动但 DB 未更新 → 孤儿 Worker 持续烧钱 | ✅ 需要 |
+| (2) Worker 应用级健康检查 | Worker 心跳超时检测（`HealthChecker`，2 分钟阈值）是 Audiobook 崩溃恢复的基础 | ✅ **强烈需要** — Audiobook 自建了 HealthChecker 来弥补框架缺失 |
+| (3) Bootstrap 失败处理 | 7 步 Bootstrap（凭证拉取 → 登录 → 启动 Worker），登录步骤依赖外部服务（171mail + Anthropic），失败概率较高 | ✅ 需要 |
+| (4) Manager ↔ Worker 认证 | EC2 Worker 通过 SQS 通信（AWS IAM 已提供身份），但 SQS 消息体无额外认证 | ✅ 需要 |
+| (5) 并发模型 | 每台 EC2 只跑 1 个任务（1-2 个 Claude 账号），严格的 1:1 模型 | ✅ 确认默认单任务模型合理 |
+| (6) 成本追踪 | m5.xlarge $0.192/h × 2h = $0.38/本书，Spot 可降 60-70% | ✅ 需要 |
+| (7) Worker 软件更新 | AMI 预装 + Bootstrap 动态部署，双层策略 | ✅ 需要 |
+| (8) 数据面/控制面分离 | StreamHub 高频消费 SQS（每秒多次轮询），如果与 TaskManager 同进程，高负载下可能相互影响 | ✅ 需要（尤其多任务并行时） |
+| (9) 多 Harness 支持 | 单一 Harness，但验证了"不同 Harness 的 Worker 生命周期模式不同"的需求 | ✅ 间接验证 |
+| (10) 可测试性 | 做书任务 1-2 小时，真实 EC2 测试成本高 | ✅ 需要 |
+
+### 11.3 Audiobook 提出的 4 项新需求
+
+以下需求在 agent-ml-research 和 CCM 案例中未出现，由 Audiobook 首次提出：
+
+#### (11) 临时 Worker（Ephemeral Worker）模式
+
+**问题：** agent-ml-research 和 CCM 的 Worker 都是"创建后常驻、复用多个任务"。Audiobook 的 Worker 是"一个任务一台 EC2，完成后立即 terminate"。当前框架设计假设 Worker 是持久的。
+
+**影响：**
+- `NodeRegistry` 需要支持自动注销（Worker 自毁后自动移除）
+- `ScalingEngine` 的逻辑不同 — 不是"维持 N 台 Worker"，而是"每个 pending 任务启动一台"
+- 健康检查超时需要更智能 — Worker 不应该存活超过预期任务时长（做书 2 小时，超过 3 小时应告警）
+
+**设计建议：**
+
+```python
+class WorkerLifecycle(Enum):
+    PERSISTENT = "persistent"     # 常驻，接受多个任务（agent-ml-research, CCM）
+    EPHEMERAL = "ephemeral"       # 临时，一个任务一台 Worker（Audiobook）
+
+class AudiobookHarness(Harness):
+    def get_worker_lifecycle(self) -> WorkerLifecycle:
+        return WorkerLifecycle.EPHEMERAL
+```
+
+**普适性判断：** 通用。batch job 类场景（一次性数据处理、CI/CD runner、ML 训练）都需要 ephemeral 模式。与 persistent 模式互补，框架应同时支持。
+
+#### (12) 任务级元数据注入（task_metadata）
+
+**问题：** Audiobook 的 Bootstrap 步骤需要知道具体任务参数 — book_slug、SQS 下行队列 URL、S3 路径等。这些参数在 Worker 创建时才确定，Bootstrap 步骤需要访问它们。
+
+**影响：** 当前 Harness Bootstrap 步骤只能通过 `ctx.config`（全局配置）和 `ctx.app_credentials`（凭证）获取信息。缺少 per-task 的元数据注入机制。
+
+**设计建议：**
+
+```python
+# scale_out 时传入 task_metadata
+node = await elastic.scale_out(
+    count=1,
+    task_metadata={
+        "task_id": "task-20260512-001",
+        "book_slug": "sapiens",
+        "sqs_downstream_url": "https://sqs.../audiobook-down-task-20260512-001",
+        "s3_work_prefix": "s3://audiobook-production/tasks/task-20260512-001/work",
+    },
+)
+
+# Bootstrap 步骤中通过 ctx.task_metadata 访问
+class DownloadBookPDFStep(BootstrapStep):
+    async def execute(self, ctx):
+        s3_path = ctx.task_metadata["book_s3_path"]
+        await ctx.ssh.run(f"aws s3 cp {s3_path} /workspace/book.pdf")
+```
+
+**普适性判断：** 通用。任何按需启动 Worker 的 Harness 都需要告诉 Worker "为什么被启动"。agent-ml-research 通过 SSH 命令参数传递项目名，CCM 通过 HTTP `/execute` API 传递任务信息 — 本质是同一个需求。
+
+#### (13) 崩溃恢复的状态还原
+
+**问题：** Audiobook Worker 崩溃后，新 Worker 需要从 S3 恢复上一个 Worker 的工作目录（`.work/` 中的中间文件），然后用 `/continue-book` 从断点继续。当前框架只处理"新建 Worker"，不处理"恢复旧 Worker 的状态"。
+
+**影响：** Audiobook 自建了 `HealthChecker` + 恢复流程（~300 行代码），这些逻辑与业务无关，应该由框架提供。
+
+**设计建议：**
+
+```python
+class AudiobookHarness(Harness):
+    def get_state_directories(self) -> list[str]:
+        """声明需要持久化的目录（框架自动周期性快照到 S3）"""
+        return [
+            "/home/ubuntu/workspace/.work/{book_slug}/",
+        ]
+
+    def get_recovery_config(self) -> dict:
+        return {
+            "auto_recover": True,
+            "state_restore": "s3_sync",       # 从 S3 恢复工作目录
+            "resume_command": "/continue-book {book_slug}",
+            "max_recovery_count": 3,
+        }
+```
+
+框架应该：
+1. Worker Runtime 定期将声明的目录快照到 S3（与 Audiobook 的 `FileSyncer` 3s 同步类似，但由框架统一提供）
+2. 检测 Worker 异常后，自动创建新 Worker → 恢复状态 → 触发 `on_recovery` 事件
+3. Harness 在事件中决定如何"续做"（如 Audiobook 用 `/continue-book`）
+
+**普适性判断：** 通用。任何长时间运行且有中间状态的工作负载都需要崩溃恢复 — ML 训练（checkpoint 恢复）、CI/CD（重试 from 失败步骤）、数据处理（增量恢复）。
+
+#### (14) 反向消息通道（Manager → Worker）
+
+**问题：** Audiobook 需要从后端向 Worker 发送用户消息和控制命令（暂停/取消/合规决策）。当前设计中框架只有 Manager → Worker 的 Bootstrap 通道（SSH），没有持续运行时的消息通道。
+
+**影响：** Audiobook 自建了 per-task 下行 SQS 队列（`audiobook-down-{task_id}`），包括创建、注入 URL、轮询消费、任务结束后删除 — 约 100 行代码。
+
+**设计建议：**
+
+框架 Worker Runtime 已经有 Manager → Worker 的连接（Bootstrap 用的就是这个通道）。应该在运行时也保持这个通道，提供标准 API：
+
+```python
+# Manager 侧
+await elastic.send_to_worker(node_id, {
+    "type": "user_message",
+    "payload": {"text": "选 B 合规版"},
+})
+
+# Worker 侧（Worker Runtime 自动接收，转发给 Harness 注册的 handler）
+class AudiobookHarness(Harness):
+    async def on_message_from_manager(self, node_id: str, message: dict):
+        # 写入本地队列，WorkerAgent 轮询消费
+        self.message_queue.put(message)
+```
+
+**普适性判断：** 通用。agent-ml-research 通过飞书 Bot 接收用户指令并转发到 Worker（SSH 执行）；CCM 支持 Plan 模式的人工审批 — 这些都是 Manager → Worker 的反向消息需求。框架统一提供后，各 Harness 无需自建通道。
+
+### 11.4 更新后的优先级排序
+
+将 4 项新需求纳入整体优先级：
+
+| 优先级 | 缺口 | 来源 | 理由 |
+|--------|------|------|------|
+| **P0** | Worker Runtime + 日志传输 | 10.1(原) | 框架核心 |
+| **P0** | Manager ↔ Worker 认证 | 10.1(原) | 安全底线 |
+| **P0** | 云端标签对账 | 10.1(原) | 防孤儿实例 |
+| **P1** | Bootstrap 失败处理 | 10.1(原) | 否则需手动清理 |
+| **P1** | Worker 应用级健康检查 | 10.1(原) | Audiobook 已自建 HealthChecker 弥补 |
+| **P1** | 优雅缩容 (Drain) | 10.1(原) | 1-2 小时做书任务不能被中断 |
+| **P1** | **临时 Worker 模式** | **11.3(新)** | Audiobook 和 batch job 场景的基础 |
+| **P1** | **task_metadata 注入** | **11.3(新)** | 所有按需启动 Worker 的 Harness 都需要 |
+| **P2** | 双层凭证管理 | 10.1(原) | Audiobook 需要 Claude 账号 + 171mail tokens |
+| **P2** | 亲和性调度 | 10.1(原) | Audiobook 的账号-IP 亲和性 |
+| **P2** | 扩缩容信号 + 规则引擎 | 10.1(原) | Audiobook 用 pending 任务数作为信号 |
+| **P2** | **崩溃恢复状态还原** | **11.3(新)** | Audiobook 已自建 ~300 行恢复代码 |
+| **P2** | **反向消息通道** | **11.3(新)** | Audiobook 双向聊天、CCM Plan 审批都需要 |
+| **P2** | 成本追踪 | 10.1(原) | Audiobook $0.38/本，Spot 可降 60-70% |
+| **P2** | 操作幂等性 + 预写日志 | 10.1(原) | MVP 阶段实例少可手动修 |
+| **P3** | 数据面/控制面分离 | 10.1(原) | 50+ Worker 后考虑 |
+| **P3** | 多 Harness 支持 | 10.1(原) | 大部分用户单 Harness 足够 |
+| **P3** | Worker 软件热更新 | 10.1(原) | MVP 阶段重建可接受 |
+| **P3** | 可测试性 | 10.1(原) | MVP 用真实 EC2 |
+
+### 11.5 三案例交叉验证汇总
+
+三个 Harness 案例验证的框架核心能力完整度：
+
+| 框架能力 | agent-ml-research (替换) | CCM (扩展) | Audiobook (绿地) | 结论 |
+|---------|------------------------|-----------|-----------------|------|
+| Worker Runtime | ✅ 替换 SSH | ✅ 替换本地子进程 | ✅ 替换 user_data 脚本 | **框架核心** |
+| 日志流式传输 | ✅ 飞书告警 | ✅ WebSocket 前端 | ✅ SQS → WebSocket | **框架核心** |
+| 有状态亲和性 | ✅ 项目绑定实例 | ✅ session resume | ✅ 账号-IP 亲和 | **框架核心** |
+| 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 1-2h 做书 | **框架核心** |
+| 双层凭证 | ✅ WandB/HF/Feishu | ✅ Git key | ✅ Claude 账号 + 171mail | **框架核心** |
+| 扩缩容信号 | ✅ 活跃项目数 | ✅ 任务队列深度 | ✅ 待处理任务数 | **框架核心** |
+| 工作区同步 | ✅ git clone/rsync | ✅ Project clone | ✅ S3 sync（崩溃恢复） | **框架核心** |
+| Bootstrap 超时 | ✅ uv sync 600s | - | ✅ Playwright 登录 300s | 框架支持 |
+| 事件 Webhook | ✅ 飞书 | - | ✅ 钉钉/飞书告警 | 框架支持 |
+| **临时 Worker** | - | - | ✅ 用完即毁 | **新增 — 框架支持** |
+| **task_metadata** | - | - | ✅ 任务参数注入 | **新增 — 框架支持** |
+| **崩溃恢复** | - | - | ✅ S3 → 新 Worker | **新增 — 框架支持** |
+| **反向消息通道** | - | - | ✅ 用户消息下发 | **新增 — 框架支持** |
+
+**结论**：前 7 项核心能力在三个完全不同的案例中均出现，充分确认为框架必备。Audiobook 新增的 4 项需求填补了"临时 Worker"、"任务级参数"、"崩溃恢复"、"反向通信"四个之前未覆盖的维度，使框架设计更加完整。
+
+---
+
+## 12. 未来演进路线
 
 ### Phase 1：MVP（当前目标）
 
@@ -1504,3 +1707,4 @@ class DryRunProvider(CloudProvider):
 ### 参考项目与 Harness 文档
 - [agent-ml-research](https://github.com/caoxiaoyuyuyuyuyu/agent-ml-research) — 已有自建基础设施的参考项目 → [Harness 集成文档](harness-example-agent-ml-research.md)
 - [Claude Code Manager](https://github.com/zjw49246/Claude-Code-Manager) — 单机 Agent 编排系统 → [Harness 集成文档](harness-example-claude-code-manager.md)
+- [有声书稿全自动化生产系统](../SOLUTION.md) — 绿地构建的临时 EC2 做书系统 → [Harness 集成文档](harness-example-audiobook-production.md)
