@@ -1,8 +1,11 @@
 # Harness 应用示例：idea-review-agent 接入 Elastic-Agent
 
-> 本文档以 [idea-review-agent](https://github.com/your-repo/idea-review-agent)（以下简称 IRA）为例，说明一个 **手动分布式** 项目如何接入 Elastic-Agent 弹性计算框架，将人工运维自动化。
+> 本文档以 [idea-review-agent](https://github.com/your-repo/idea-review-agent)（以下简称 IRA）为例，说明一个 **token 消耗密集型** 项目如何接入 Elastic-Agent 弹性计算框架，获得弹性资源分配和自动凭证管理能力。
 >
-> 与 [CCM Harness 文档](harness-example-claude-code-manager.md) 中 CCM 从单机扩展到多机不同，也与 [agent-ml-research 文档](harness-example-agent-ml-research.md) 中替换自建基础设施不同，IRA 的特殊之处在于：**它的分布式能力完全靠人手动操作（scp、ssh、手动分配 idea、手动切账号），没有任何自建基础设施代码**。Elastic-Agent 在此场景下的价值是 **将人工运维流程代码化**。
+> IRA 的核心挑战是：**单个 idea 评审消耗大量 token（20-60 分钟持续推理），极易触发 Claude Max 的 5h 滑动窗口限流；同时 idea 数量波动大（一批可能 5 个，也可能 100 个），固定机器数既浪费又不够用**。Elastic-Agent 在此场景下的核心价值是：
+>
+> 1. **弹性机器分配**：根据 pending idea 数量自动决定开几台 EC2，处理完自动关闭
+> 2. **自动登号切号**：每台机器自动登录 Claude 账号，撞 limit 时自动切换到下一个可用账号，全程无人干预
 
 ---
 
@@ -171,83 +174,68 @@ _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 | 账号管理 | 人手动 cp 凭证文件 | 无 | 自建（Playwright + watchdog） |
 | 任务分发 | 人手动 scp JSON 文件 | 自动调度（GlobalDispatcher） | 飞书 Bot + API |
 | 监控 | Bash 脚本 + 人手动 SSH | WebSocket 实时日志 | 飞书告警 + Dashboard |
-| 迁移策略 | **自动化**手动操作流程 | **新增**分布式能力 | **替换**自建基础设施 |
-| 改造重点 | 构建完整的 Manager 编排层 | 新增 RemoteInstanceManager | 剥离 `manager/ec2/` 和 `pool/` |
+| 迁移策略 | **获得**弹性资源 + 自动凭证管理 | **新增**分布式能力 | **替换**自建基础设施 |
+| 改造重点 | 接入框架获得弹性机器分配和自动切号 | 新增 RemoteInstanceManager | 剥离 `manager/ec2/` 和 `pool/` |
 
 ---
 
-## 2. 当前运维流程的痛点
+## 2. 为什么 IRA 需要 Elastic-Agent
 
-### 2.1 完整的人工操作链
+### 2.1 核心矛盾：token 消耗密集 × idea 数量波动
 
-一次完整的批量评审（以 Batch 3 的 53 个 Opus idea 为例）需要以下人工操作：
+IRA 面临的根本问题不是"运维麻烦"，而是 **资源需求与供给的动态不匹配**：
+
+**token 消耗端**：单个 idea 评审需要 20-60 分钟持续推理（最多 24 个 CLI 子进程串/并行），一个 Claude Max 账号在 5h 滑动窗口内很容易撞 limit。实测 Batch 3 中，2 个账号交替使用仍然频繁限流。
+
+**idea 数量端**：一批可能进来 5 个 idea，也可能 100 个。固定 4 台服务器——5 个 idea 时 3 台空转浪费钱，100 个 idea 时 4 台跑不完。
+
+**当前的"解决方案"是人**：人看着哪台服务器限流了，ssh 进去手动切账号；人估算 idea 数量，决定开几台服务器。这不可扩展——idea 数量翻倍，人的操作量也翻倍。
+
+### 2.2 Elastic-Agent 解决什么
+
+| 问题 | 当前（人工） | 接入 Elastic-Agent 后 |
+|------|------------|---------------------|
+| **开几台机器？** | 固定 4 台，人拍脑袋 | 根据 pending idea 数量自动扩缩：5 个 idea 开 2 台，100 个开 10 台，跑完缩到 0 |
+| **撞 limit 怎么办？** | 人 ssh 进去 `cp` 切凭证文件，可能 2 小时才发现 | CredentialPool 实时监控 5h 窗口使用率，>85% 自动切到下一个可用账号，秒级响应 |
+| **账号怎么登录？** | 预先手动 cp 凭证到每台服务器 | Bootstrap 时自动分发凭证，新开的机器自动登录 |
+| **idea 怎么分配？** | 人决定哪些 idea 发到哪台服务器 | 框架调度引擎自动分发到空闲 Worker，动态负载均衡 |
+| **跑完了怎么关机？** | 经常忘了关，EC2 白跑 | 扩缩容引擎检测到全部空闲 → 自动缩容到 0，成本归零 |
+| **一台机器挂了？** | 4 小时后才发现，手动重启 | Worker Runtime 心跳检测，挂了自动将未完成 idea 重新调度到其他 Worker |
+
+### 2.3 典型场景对比
+
+**场景：53 个 Opus idea 进来**
 
 ```
-步骤 1: 拉取 idea
-  python tools/fetch_ideas.py -o dispatch/ideas/ --status pending
+当前（人工）:
+  1. 人拍脑袋决定 4 台服务器够不够
+  2. 人把 53 个 idea 手动分成 4 份（13/14/13/13），scp 到 4 台服务器
+  3. 4 台服务器各自跑，s2 分到最多，其他 3 台跑完空等
+  4. s2 跑到第 8 个时限流，人 2 小时后才发现，ssh 进去切号
+  5. 全部跑完后 4 台 EC2 继续开着，人忘了关
+  → 耗时：约 6 小时（含 2 小时限流空等）+ 人工操作 30 分钟
 
-步骤 2: 手动分配 idea 到 4 台服务器
-  # 人脑决定哪些 idea 发到哪台服务器
-  scp -i $KEY dispatch/ideas/idea_001*.json ubuntu@s1:~/idea_review/dispatch/ideas/
-  scp -i $KEY dispatch/ideas/idea_002*.json ubuntu@s2:~/idea_review/dispatch/ideas/
-  ...（重复 4 次）
-
-步骤 3: SSH 到每台服务器启动 pipeline
-  ssh -i $KEY ubuntu@s1
-  cd ~/idea_review
-  IDEA_DIR=dispatch/ideas OUTPUT_DIR=dispatch/results \
-    nohup python3 dispatch/run_full_pipeline.py > dispatch/run_s1.log 2>&1 &
-  ...（重复 4 次）
-
-步骤 4: 监控进度
-  bash check_remote_progress.sh          # 概览
-  ssh -i $KEY ubuntu@s1 tail -f ...      # 详细日志（按需）
-
-步骤 5: 处理账号限流
-  # 发现某台服务器 Claude 限流
-  ssh -i $KEY ubuntu@s2
-  cp ~/.claude-account-2/.credentials.json ~/.claude/.credentials.json
-  # 重启 pipeline
-
-步骤 6: 收集结果
-  scp -i $KEY -r ubuntu@s1:~/idea_review/dispatch/results/ results/s1_collected/
-  scp -i $KEY -r ubuntu@s2:~/idea_review/dispatch/results/ results/s2_collected/
-  ...（重复 4 次）
-
-步骤 7: 写回 API
-  python tools/writeback_results.py results/s1_collected/ --dry-run
-  python tools/writeback_results.py results/s1_collected/ --set-review-result
-  ...（重复 4 次）
+接入 Elastic-Agent 后:
+  1. 53 个 pending idea 被 poll_tasks() 拉取
+  2. ScalingEngine 判断需要 6 台 Worker（每台 ~9 个 idea），自动开 EC2
+  3. Bootstrap 自动部署代码 + 登录 Claude 账号
+  4. 框架动态分发 idea，谁先完成谁接下一个（不会出现 3 台等 1 台）
+  5. 某台 Worker 的账号使用率 >85% → 自动切到 account-2，不中断
+  6. 53 个全部完成 → ScalingEngine 缩容到 0 台，EC2 成本归零
+  → 耗时：约 3 小时（无限流空等）+ 零人工操作
 ```
 
-### 2.2 痛点分析
+### 2.4 附带解决的运维问题
 
-| 痛点 | 说明 | 实际案例 |
-|------|------|---------|
-| **手动分配无策略** | 人脑决定 idea 分到哪台服务器，无负载均衡 | Batch 2 中 s2 分了最多 idea，导致跑到最后 s1/s3/s4 全空闲等 s2 |
-| **账号切换靠人** | 限流时需要 SSH 进去手动 cp 凭证文件 | s2 跑到一半限流，人没及时发现，闲置 2 小时 |
-| **代码同步靠 scp** | 每次代码更新需要手动 scp 到 4 台服务器 | 修了 parsers.py 的 bug，忘了同步到 s3，s3 产出了坏结果 |
-| **结果收集靠 scp** | 4 台服务器的结果需要逐个 scp 回来 | Batch 1 中 scp 同名文件覆盖了好结果 |
-| **无自动重试** | pipeline 崩溃需要人工 SSH 检查、清理已完成 idea、重启 | s4 因内存不足崩溃，4 小时后才被发现 |
-| **无实时监控** | 只有 Bash 脚本定期检查，无告警 | s1 的 pipeline 静默失败，check_remote 只看进程在不在 |
-| **静态 4 台服务器** | 服务器数量固定，忙时不够用、闲时浪费钱 | 53 个 idea 跑完后 4 台 EC2 继续开着忘了关 |
-| **无断点续传** | 服务器崩溃后需要人工判断哪些 idea 已完成 | 靠 `ls results/result_*.json` 手动判断 |
-| **API Token 硬编码** | Manager API 的 URL 和 Token 硬编码在多个文件中 | 换 Token 时忘了改 writeback_results.py |
-| **无健康检查** | 不知道 Claude CLI 是否真的在跑、是否卡住 | CLI 进程卡在等待响应，pgrep 看着进程还在但实际无产出 |
+弹性资源分配和自动凭证管理是核心价值。以下问题因为机器由框架管理而 **附带解决**，不需要额外设计：
 
-### 2.3 与已有自建基础设施的对比
-
-| 能力 | agent-ml-research（自建） | IRA（手动） | Elastic-Agent（框架） |
-|------|--------------------------|------------|---------------------|
-| EC2 创建/销毁 | boto3 代码 | 手动 AWS Console | 框架 CloudProvider |
-| 账号登录 | Playwright 自动化 | 手动 cp 凭证文件 | 框架 CredentialPool |
-| 额度监控 | 900 行 Bash watchdog | 人眼看 CLI 报错 | 框架 QuotaMonitor |
-| 任务分发 | API 轮询 | 人手动 scp JSON | 框架调度 + Harness poll_tasks |
-| 代码部署 | git clone + rsync | 人手动 scp | 框架 Bootstrap Pipeline |
-| 健康检查 | systemd + watchdog | Bash 脚本 | 框架 Worker Runtime |
-| 结果收集 | API 直写 | 人手动 scp + writeback | Harness 事件回调 |
-
-IRA 的迁移价值不在于替换代码（它几乎没有基础设施代码），而在于 **将大约 30 分钟的人工操作自动化为零人工**。
+| 原来的人工操作 | 为什么不需要了 |
+|---|---|
+| scp 代码到服务器 | 框架 Bootstrap 自动 git clone |
+| scp 收集结果 | Harness 回调直接写 API |
+| ssh 启动 pipeline | Worker Runtime 自动执行 |
+| bash 脚本监控进度 | 框架内置健康检查 |
+| 崩溃后手动判断哪些 idea 已完成 | 框架维护任务状态，未完成的自动重新调度 |
 
 ---
 
@@ -256,23 +244,21 @@ IRA 的迁移价值不在于替换代码（它几乎没有基础设施代码）�
 ### 3.1 迁移前后对比
 
 ```
-迁移前（人手动编排）:                      迁移后（Elastic-Agent 自动编排）:
+迁移前（固定资源 + 人工管理）:              迁移后（弹性资源 + 自动凭证管理）:
 
-   你（人）                                Elastic-Agent Manager
-    │                                       │
-    ├─ fetch_ideas.py                       ├─ Harness.poll_tasks()
-    ├─ 人脑分配 idea                         ├─ 框架调度引擎
-    ├─ scp 到 4 台服务器                     ├─ 框架 Worker Runtime
-    ├─ ssh 启动 pipeline                    ├─ 框架远程执行
-    ├─ ssh 监控进度                          ├─ 框架健康检查 + 事件系统
-    ├─ ssh cp 切账号                        ├─ 框架 CredentialPool 自动轮换
-    ├─ scp 收集结果                          ├─ Harness 结果回调
-    └─ writeback_results.py                 └─ Harness 自动写回 API
-         │                                       │
-    ┌────┼────┐                             ┌────┼────┐
-    │    │    │                             │    │    │
-   s1   s2   s3  s4                    Worker1  Worker2  ...WorkerN
-   (固定 4 台)                          (按需扩缩)
+  idea 数量: 53                            idea 数量: 53
+  机器数量: 固定 4 台（人拍脑袋）            机器数量: 自动 6 台（ScalingEngine 计算）
+  账号管理: 人 ssh 进去 cp 切号             账号管理: CredentialPool 自动轮换
+  分发策略: 人手动分成 4 份                  分发策略: 动态调度，谁空闲谁接
+       │                                       │
+  ┌────┼────┐                          ┌────────┼────────┐
+  │    │    │                          │    │   │   │    │
+  s1   s2   s3  s4                   W1   W2  W3  W4  W5  W6
+  13个 14个 13个 13个                 动态分配，负载均衡
+  └─ s2 跑最久，                      └─ 谁先完成谁接下一个
+     其他 3 台空等                        无空等
+  └─ 限流靠人发现                      └─ 限流自动切号（秒级）
+  └─ 跑完忘关机                        └─ 跑完自动缩容到 0
 ```
 
 ### 3.2 保留与替换的边界
@@ -1102,18 +1088,19 @@ python main.py samples/proposal.md -o results/result.json
 
 ### 8.3 IRA 作为第三个 Harness 的独特价值
 
-IRA 代表了一类 **重要但被忽视的场景**：项目已经在"手动分布式"运行，有真实的多 Worker 经验，但完全没有基础设施代码。这类项目：
+IRA 代表了一类 **token 消耗密集型 Agent 应用**：单次任务推理时间长（20-60 分钟）、频繁撞 limit、任务量波动大。这类项目对 Elastic-Agent 的两个核心能力有刚需：
 
-1. **迁移成本最低**：不需要替换任何基础设施代码（因为根本没有），只需要新增 Harness 定义
-2. **价值最直观**：从"人工操作 30 分钟"到"零人工"，用户体感最强
-3. **验证框架完整性**：如果框架能让一个零基础设施的项目直接获得完整的分布式能力，说明框架的抽象层设计是正确的
+1. **弹性机器分配**：任务量波动大（5 个 idea vs 100 个 idea），固定机器数既浪费又不够用。框架根据 pending 任务数自动开/关 EC2，处理完缩容到 0
+2. **自动凭证轮换**：单个任务 token 消耗高，5h 窗口内必然撞 limit。框架实时监控使用率，自动切到下一个可用账号，秒级响应而非人工 2 小时后才发现
+3. **验证框架完整性**：IRA 没有任何自建基础设施代码，如果框架能让这样一个项目直接获得弹性计算和凭证管理能力，说明框架的抽象层设计是自足的
 
-三个 Harness 形成了完整的迁移光谱：
+三个 Harness 代表了三种不同的接入动机：
 
 ```
-零基础设施 ──────── 自建基础设施 ──────── 无分布式能力
-   IRA                agent-ml              CCM
-   │                     │                   │
-   新增 Harness         替换基础设施         新增分布式
-   (~410 行)           (~2000→300 行)      (~500+200 行)
+token 密集 + 无基础设施 ─── 已有自建基础设施 ─── 单机需要扩展
+        IRA                    agent-ml              CCM
+        │                        │                    │
+   需要弹性资源              需要替换自建代码        需要分布式能力
+   + 自动切号                + 获得高级功能          + 凭证管理
+   (~410 行 Harness)       (~2000→300 行)         (~500+200 行)
 ```
