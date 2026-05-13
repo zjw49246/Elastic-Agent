@@ -1,6 +1,6 @@
-# Harness 应用示例：审 idea 的 agent 接入 Elastic-Agent
+# Harness 应用示例：idea-review-agent 接入 Elastic-Agent
 
-> 本文档以 [审 idea 的 agent](https://github.com/your-repo/idea-review-agent)（以下简称 IRA）为例，说明一个 **手动分布式** 项目如何接入 Elastic-Agent 弹性计算框架，将人工运维自动化。
+> 本文档以 [idea-review-agent](https://github.com/your-repo/idea-review-agent)（以下简称 IRA）为例，说明一个 **手动分布式** 项目如何接入 Elastic-Agent 弹性计算框架，将人工运维自动化。
 >
 > 与 [CCM Harness 文档](harness-example-claude-code-manager.md) 中 CCM 从单机扩展到多机不同，也与 [agent-ml-research 文档](harness-example-agent-ml-research.md) 中替换自建基础设施不同，IRA 的特殊之处在于：**它的分布式能力完全靠人手动操作（scp、ssh、手动分配 idea、手动切账号），没有任何自建基础设施代码**。Elastic-Agent 在此场景下的价值是 **将人工运维流程代码化**。
 
@@ -8,7 +8,7 @@
 
 ## 目录
 
-1. [审 idea 的 agent 项目解析](#1-审-idea-的-agent-项目解析)
+1. [idea-review-agent 项目解析](#1-idea-review-agent-项目解析)
 2. [当前运维流程的痛点](#2-当前运维流程的痛点)
 3. [迁移架构设计](#3-迁移架构设计)
 4. [模块替换映射](#4-模块替换映射)
@@ -19,7 +19,7 @@
 
 ---
 
-## 1. 审 idea 的 agent 项目解析
+## 1. idea-review-agent 项目解析
 
 ### 1.1 项目定位
 
@@ -164,7 +164,7 @@ _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 ### 1.7 与 CCM 和 agent-ml-research 的关键差异
 
-| 维度 | IRA（审 idea） | CCM | agent-ml-research |
+| 维度 | IRA（idea-review） | CCM | agent-ml-research |
 |------|---------------|-----|-------------------|
 | 架构 | 无基础设施，纯手动分布式 | 单机单体 | 自建 Manager-Worker |
 | EC2 管理 | 人手动 SSH | 无（本地进程） | 自建（boto3 + SSH） |
@@ -532,7 +532,7 @@ from elastic_agent import (
 )
 
 class IdeaReviewHarness(Harness):
-    """审 idea 的 agent 的 Elastic-Agent Harness 实现"""
+    """idea-review-agent 的 Elastic-Agent Harness 实现"""
 
     def __init__(self, config: dict):
         self.config = config
@@ -551,7 +551,7 @@ class IdeaReviewHarness(Harness):
     def get_bootstrap_steps(self) -> list[BootstrapStep]:
         return [
             InstallPythonStep(),                # apt install python3.11 + pip
-            CloneRepoStep(),                    # git clone 审 idea 代码
+            CloneRepoStep(),                    # git clone idea-review 代码
             CreateVenvStep(),                   # python -m venv .venv
             InstallDependenciesStep(),          # pip install claude-agent-sdk
             SetupWorkspaceStep(),               # mkdir -p results/ dispatch/
@@ -1085,7 +1085,7 @@ python main.py samples/proposal.md -o results/result.json
 
 ### 8.2 与 CCM 和 agent-ml-research 需求的交叉验证
 
-| 需求 | IRA（审 idea） | CCM | agent-ml-research | 结论 |
+| 需求 | IRA（idea-review） | CCM | agent-ml-research | 结论 |
 |------|---------------|-----|-------------------|------|
 | Worker Runtime | ✅ 远程执行 pipeline | ✅ 远程 Claude Code | ✅ 替换 SSH | **框架核心** |
 | 日志流式传输 | ✅ 评审进度 | ✅ WebSocket 前端 | ✅ 飞书告警 | **框架核心** |
