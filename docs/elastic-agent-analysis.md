@@ -1672,12 +1672,12 @@ Audiobook 是一个端到端有声书稿自动化生产平台：前端提交做�
 
 | 维度 | agent-ml-research | CCM | Audiobook |
 |------|-------------------|-----|-----------|
-| Worker 生命周期 | 常驻 | 本地子进程 | **临时（用完即毁）** |
-| 通信模式 | SSH pull | 本地 stdout | **SQS push** |
+| Worker 生命周期 | 常驻 | 本地子进程 | **常驻（手动开启，多槽位）** |
+| 通信模式 | SSH pull | 本地 stdout | **Worker Runtime WS** |
 | 接入模式 | 替换 | 扩展 | **绿地构建** |
-| 任务时长 | 小时级 | 分钟级 | **1-2 小时（10 Phase）** |
-| 用户交互 | 飞书 Bot | Web 单向 | **Web 双向聊天** |
-| 崩溃恢复 | 无 | 无 | **自动检测 + S3 恢复** |
+| 任务时长 | 小时级 | 分钟级 | **生产 1-2h + 修改 分钟级** |
+| 用户交互 | 飞书 Bot | Web 单向 | **Web 双向聊天 + 后续修改** |
+| 并发模型 | 1:1 | max_concurrent=5 | **生产1 + 修改3（可配置）** |
 
 详见 [harness-example-audiobook-production.md](harness-example-audiobook-production.md)。
 
@@ -1691,7 +1691,7 @@ Audiobook 是一个端到端有声书稿自动化生产平台：前端提交做�
 | (2) Worker 应用级健康检查 | Worker 心跳超时检测（`HealthChecker`，2 分钟阈值）是 Audiobook 崩溃恢复的基础 | ✅ **强烈需要** — Audiobook 自建了 HealthChecker 来弥补框架缺失 |
 | (3) Bootstrap 失败处理 | 7 步 Bootstrap（凭证拉取 → 登录 → 启动 Worker），登录步骤依赖外部服务（171mail + Anthropic），失败概率较高 | ✅ 需要 |
 | (4) Manager ↔ Worker 认证 | EC2 Worker 通过 SQS 通信（AWS IAM 已提供身份），但 SQS 消息体无额外认证 | ✅ 需要 |
-| (5) 并发模型 | 每台 EC2 只跑 1 个任务（1-2 个 Claude 账号），严格的 1:1 模型 | ✅ 确认默认单任务模型合理 |
+| (5) 并发模型 | 每台 Worker 生产 1 本 + 同时修改 3 本，混合重/轻任务 | ✅ **需要多槽位并发模型** |
 | (6) 成本追踪 | m5.xlarge $0.192/h × 2h = $0.38/本书，Spot 可降 60-70% | ✅ 需要 |
 | (7) Worker 软件更新 | AMI 预装 + Bootstrap 动态部署，双层策略 | ✅ 需要 |
 | (8) 数据面/控制面分离 | StreamHub 高频消费 SQS（每秒多次轮询），如果与 TaskManager 同进程，高负载下可能相互影响 | ✅ 需要（尤其多任务并行时） |
@@ -1702,28 +1702,31 @@ Audiobook 是一个端到端有声书稿自动化生产平台：前端提交做�
 
 以下需求在 agent-ml-research 和 CCM 案例中未出现，由 Audiobook 首次提出：
 
-#### (11) 临时 Worker（Ephemeral Worker）模式
+#### (11) 多槽位并发模型（Multi-Slot Capacity）
 
-**问题：** agent-ml-research 和 CCM 的 Worker 都是"创建后常驻、复用多个任务"。Audiobook 的 Worker 是"一个任务一台 EC2，完成后立即 terminate"。当前框架设计假设 Worker 是持久的。
+**问题：** agent-ml-research 和 CCM 假设 Worker 上的任务类型是同质的（全部是研究任务或全部是 Claude Code 任务）。Audiobook 的 Worker 需要区分"生产"和"修改"两种不同权重的任务类型，各自有独立的并发上限。
 
 **影响：**
-- `NodeRegistry` 需要支持自动注销（Worker 自毁后自动移除）
-- `ScalingEngine` 的逻辑不同 — 不是"维持 N 台 Worker"，而是"每个 pending 任务启动一台"
-- 健康检查超时需要更智能 — Worker 不应该存活超过预期任务时长（做书 2 小时，超过 3 小时应告警）
+- 框架的 `WorkerCapacity` 需要支持多种槽位类型，不只是一个 `max_concurrent_tasks`
+- 调度器路由请求时需要检查对应类型的槽位是否有空位
+- 资源估算需要按任务类型加权（生产消耗 ~3GB，修改消耗 ~1GB）
 
 **设计建议：**
 
 ```python
-class WorkerLifecycle(Enum):
-    PERSISTENT = "persistent"     # 常驻，接受多个任务（agent-ml-research, CCM）
-    EPHEMERAL = "ephemeral"       # 临时，一个任务一台 Worker（Audiobook）
+class WorkerCapacity:
+    slots: dict[str, SlotConfig]  # 按类型定义槽位
+    # 示例: {"production": SlotConfig(max=1), "edit": SlotConfig(max=3)}
 
 class AudiobookHarness(Harness):
-    def get_worker_lifecycle(self) -> WorkerLifecycle:
-        return WorkerLifecycle.EPHEMERAL
+    def get_worker_capacity(self) -> WorkerCapacity:
+        return WorkerCapacity(slots={
+            "production": SlotConfig(max=1),  # 同时做 1 本新书
+            "edit": SlotConfig(max=3),        # 同时修改 3 本
+        })
 ```
 
-**普适性判断：** 通用。batch job 类场景（一次性数据处理、CI/CD runner、ML 训练）都需要 ephemeral 模式。与 persistent 模式互补，框架应同时支持。
+**普适性判断：** 通用。任何需要混合重/轻任务的场景：CI/CD（build 重 + lint 轻）、ML（训练重 + 推理轻）。框架应支持多槽位类型，默认提供单一的 `default` 槽位兼容简单场景。
 
 #### (12) 任务级元数据注入（task_metadata）
 
@@ -1828,7 +1831,7 @@ class AudiobookHarness(Harness):
 | **P1** | Bootstrap 失败处理 | 10.1(原) | 否则需手动清理 |
 | **P1** | Worker 应用级健康检查 | 10.1(原) | Audiobook 已自建 HealthChecker 弥补 |
 | **P1** | 优雅缩容 (Drain) | 10.1(原) | 1-2 小时做书任务不能被中断 |
-| **P1** | **临时 Worker 模式** | **11.3(新)** | Audiobook 和 batch job 场景的基础 |
+| **P1** | **多槽位并发模型** | **11.3(新)** | Audiobook 生产1+修改3 的混合负载 |
 | **P1** | **task_metadata 注入** | **11.3(新)** | 所有按需启动 Worker 的 Harness 都需要 |
 | **P2** | 双层凭证管理 | 10.1(原) | Audiobook 需要 Claude 账号 + 171mail tokens |
 | **P2** | 亲和性调度 | 10.1(原) | Audiobook 的账号-IP 亲和性 |
@@ -1857,14 +1860,14 @@ class AudiobookHarness(Harness):
 | 工作区同步 | ✅ git clone/rsync | ✅ Project clone | ✅ S3 sync（崩溃恢复） | **框架核心** |
 | Bootstrap 超时 | ✅ uv sync 600s | - | ✅ Playwright 登录 300s | 框架支持 |
 | 事件 Webhook | ✅ 飞书 | - | ✅ 钉钉/飞书告警 | 框架支持 |
-| **临时 Worker** | - | - | ✅ 用完即毁 | **新增 — 框架支持** |
+| **多槽位并发** | - | ✅ max_concurrent=5 | ✅ 生产1+修改3 | **新增 — 框架支持** |
 | **task_metadata** | - | - | ✅ 任务参数注入 | **新增 — 框架支持** |
 | **崩溃恢复** | - | - | ✅ S3 → 新 Worker | **新增 — 框架支持** |
 | **反向消息通道** | - | - | ✅ 用户消息下发 | **新增 — 框架支持** |
 | **外部服务 API（轨迹）** | ✅ 飞书告警消费 | ✅ WebSocket 前端 | ✅ SQS→WebSocket | **新增 — 框架核心** |
 | **外部服务 API（文件）** | ✅ 代码同步 | ✅ 项目文件访问 | ✅ 做书产物下载 | **新增 — 框架核心** |
 
-**结论**：前 7 项核心能力在三个完全不同的案例中均出现，充分确认为框架必备。Audiobook 新增的 4 项需求填补了"临时 Worker"、"任务级参数"、"崩溃恢复"、"反向通信"四个之前未覆盖的维度。外部服务 API（轨迹流 + 文件传输）在三个案例中都有体现，确认为框架核心能力。
+**结论**：前 7 项核心能力在三个完全不同的案例中均出现，充分确认为框架必备。Audiobook 新增的 4 项需求填补了"多槽位并发"、"任务级参数"、"崩溃恢复"、"反向通信"四个之前未覆盖的维度。外部服务 API（轨迹流 + 文件传输）在三个案例中都有体现，确认为框架核心能力。
 
 ---
 

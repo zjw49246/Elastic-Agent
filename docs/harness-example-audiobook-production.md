@@ -1,17 +1,15 @@
 # Harness 应用示例：有声书稿全自动化生产系统接入 Elastic-Agent
 
-> 本文档以有声书稿全自动化生产系统（以下简称 Audiobook）为例，说明一个 **Claude Code 插件** 如何作为 Harness 接入 Elastic-Agent 弹性计算框架，实现多书并行生产、弹性扩缩容、崩溃恢复。
+> 本文档以有声书稿全自动化生产系统（以下简称 Audiobook）为例，说明一个 **Claude Code 插件** 如何作为 Harness 接入 Elastic-Agent 弹性计算框架，实现多书并行生产、会话持久化、后续修改路由。
 >
 > 本文档基于 audiobook-nonfiction v1.1.1 的真实代码分析。
->
-> 与 [agent-ml-research](harness-example-agent-ml-research.md)（替换自建基础设施）和 [CCM](harness-example-claude-code-manager.md)（扩展单机应用）不同，Audiobook 代表第三种接入模式：**将 Claude Code 插件提升为可弹性扩展的分布式生产系统**。
 
 ---
 
 ## 目录
 
 1. [Audiobook 项目真实架构解析](#1-audiobook-项目真实架构解析)
-2. [为什么需要 Elastic-Agent](#2-为什么需要-elastic-agent)
+2. [整体业务流程](#2-整体业务流程)
 3. [基于框架的分布式架构设计](#3-基于框架的分布式架构设计)
 4. [Harness 接口实现](#4-harness-接口实现)
 5. [核心技术挑战与方案](#5-核心技术挑战与方案)
@@ -24,101 +22,26 @@
 
 ### 1.1 项目定位
 
-Audiobook 是一个 **Claude Code 插件（Skill）**，将非虚构书籍转换为 TTS-ready 的有声书讲稿（默认压缩到原文 9-17%）。它实现了一个 **10 Phase 全自动化生产流水线**，由 Main Agent 编排 22 个专用子 Agent，配合 9 个 Python 工具脚本，产出可直接录音的讲稿。
+Audiobook 是一个 **Claude Code 插件（Skill）**，将非虚构书籍转换为 TTS-ready 的有声书讲稿（默认压缩到原文 9-17%）。它实现了一个 **10 Phase 全自动化生产流水线**，由 Main Agent 编排 22 个专用子 Agent，配合 9 个 Python 工具脚本。
 
 **关键架构事实：**
-- **不是一个后端服务** — 它是 Claude Code 的 Skill 插件，运行在 Claude Code CLI 会话中
-- **不需要自建后端** — 所有编排由 Claude Code 的 Main Agent 完成
-- **状态管理是文件系统** — `.work/{book_slug}/state.json` 追踪全部状态
-- **子 Agent 是 Claude Code 子代理** — 通过 `Agent({subagent_type: "audiobook-xxx"})` 调用
-- **单会话单书** — 一个 Claude Code 会话从头到尾处理一本书
+- 它是 Claude Code 的 Skill 插件，运行在 Claude Code CLI 会话中
+- 所有编排由 Claude Code 的 Main Agent 完成，不需要自建后端
+- 状态管理基于文件系统 — `.work/{book_slug}/state.json`
+- 子 Agent 通过 `Agent({subagent_type: "audiobook-xxx"})` 调用
+- 单会话单书 — 一个 Claude Code 会话从头到尾处理一本书
+- `/continue-book {book_slug}` 支持从任意中断点恢复
+- 会话完成后，`session_id` 可用于 `--resume` 继续对话（后续修改）
 
-### 1.2 插件结构
-
-```
-audiobook-nonfiction/
-├── .claude-plugin/
-│   ├── plugin.json              # 插件元数据（v1.1.1）
-│   └── marketplace.json         # 本地 marketplace 注册
-├── agents/                      # 22 个专用子 Agent 定义
-│   ├── audiobook-text-compressor.md
-│   ├── audiobook-story-structure-analyst.md
-│   ├── audiobook-anchor-creator.md
-│   ├── audiobook-narration-framework-designer.md   # Opus
-│   ├── audiobook-draft-writer.md                   # Opus
-│   ├── audiobook-progress-analyst.md
-│   ├── audiobook-persona-fusion.md
-│   ├── audiobook-opening-closing-editor.md         # Opus
-│   ├── audiobook-book-facts-checker.md             # +WebSearch
-│   ├── audiobook-intro-generator.md
-│   ├── audiobook-auditor-fidelity.md               # 7 审核员
-│   ├── audiobook-auditor-narrative-quality.md
-│   ├── audiobook-auditor-safety.md
-│   ├── audiobook-auditor-logic.md
-│   ├── audiobook-auditor-repetition.md
-│   ├── audiobook-auditor-style.md
-│   ├── audiobook-auditor-standard.md
-│   ├── audiobook-fixer.md                          # Opus
-│   ├── audiobook-compliance-processor.md           # Opus
-│   ├── audiobook-anchor-fixer.md
-│   ├── audiobook-fidelity-prechecker.md
-│   └── audiobook-intro-generator.md
-├── skills/audiobook-nonfiction/
-│   ├── SKILL.md                 # Main Agent 系统指令
-│   ├── README.md                # 使用说明
-│   ├── shared_values.md         # 质量共识（4 维度 + 6 原则）
-│   ├── commands/
-│   │   ├── audiobook.md         # /audiobook 命令定义
-│   │   └── continue-book.md     # /continue-book 命令定义
-│   ├── phases/                  # 10 Phase 流水线定义
-│   │   ├── phase_00_init.md
-│   │   ├── phase_01_decomposition.md
-│   │   ├── phase_02_blueprint.md
-│   │   ├── phase_03_splitting.md
-│   │   ├── phase_04_production_loop.md
-│   │   ├── phase_05_persona_fusion.md
-│   │   ├── phase_06_opening_closing.md
-│   │   ├── phase_07_audit_loop.md
-│   │   ├── phase_075_final_review.md
-│   │   ├── phase_08_compliance.md
-│   │   ├── phase_085_intro.md
-│   │   └── phase_09_delivery.md
-│   ├── schemas/                 # 数据结构定义
-│   │   ├── state.md             # state.json 状态机
-│   │   ├── quality_targets.md   # 质量硬指标
-│   │   ├── audit_report.md      # 审核报告格式
-│   │   └── self_eval.md         # 子 Agent 自评格式
-│   ├── decisions/               # 6 个决策点指南
-│   │   ├── M1_blueprint_review.md
-│   │   ├── M2_section_review.md
-│   │   ├── M4_final_review.md
-│   │   ├── M5_failure_report.md
-│   │   └── M6_compliance_assessment.md
-│   ├── personas/                # 叙述人格
-│   │   └── nonfiction_default/
-│   │       ├── framework.md
-│   │       └── style.md
-│   └── scripts/                 # 9 个 Python 工具
-│       ├── doc_extractor.py     # PDF/EPUB/DOCX → 纯文本
-│       ├── chunk_splitter.py    # 固定分块（~20k 字符）
-│       ├── cjk_counter.py       # CJK 汉字计数
-│       ├── word_count_calculator.py
-│       ├── section_splitter.py  # 锚点切分
-│       ├── compression_merger.py
-│       ├── metrics_collector.py # 成本/token 追踪
-│       ├── validate_and_repair_json.py  # 4 层 JSON 修复
-│       └── audit_severity_diff.py
-```
-
-### 1.3 10 Phase 生产流水线
+### 1.2 10 Phase 生产流水线
 
 | Phase | 名称 | 关键子 Agent | 产出 | 耗时 |
 |-------|------|-------------|------|------|
 | 0 | 初始化 | — | `state.json` | <1min |
-| 1 | 书籍解构 | text-compressor(Sonnet×N), book-facts-checker(Sonnet+WebSearch) | `raw_text.md`, `compressed.md`, `book_meta.json`, `book_facts.json` | 10-20min |
-| 2 | 战略蓝图 | story-structure-analyst, anchor-creator, narration-framework-designer(**Opus**) | `blueprint.md`, `quality_targets.json`, `anchors.json` | 10-15min |
+| 1 | 书籍解构 | text-compressor(Sonnet×N), book-facts-checker | `compressed.md`, `book_meta.json` | 10-20min |
+| 2 | 战略蓝图 | narration-framework-designer(**Opus**) | `blueprint.md`, `quality_targets.json` | 10-15min |
 | 3 | 源文切片 | anchor-fixer(如需) | `sections/section_*.txt` | 2-5min |
-| 4 | 主体生产 | progress-analyst(Sonnet×N), draft-writer(**Opus**×N) | `drafts/draft_*.md` | 20-40min |
+| 4 | 主体生产 | draft-writer(**Opus**×N) | `drafts/draft_*.md` | 20-40min |
 | 5 | 人格融合 | persona-fusion(Sonnet×N) | `styled/styled_*.md` | 10-20min |
 | 6 | 开头结尾 | opening-closing-editor(**Opus**) | `manuscript_v1.md` | 5-10min |
 | 7 | 审核循环 | 7 auditors(Sonnet×7并行) + fixer(**Opus**), 最多 3 轮 | `manuscript_final.md` | 15-30min |
@@ -127,139 +50,95 @@ audiobook-nonfiction/
 | 8.5 | 简介生成 | intro-generator + 3 auditor(并行) + fixer | `intro_final.md` | 5-10min |
 | 9 | 交付打包 | — | `delivery/` | <1min |
 
-**总计：** 1-2 小时/本书，50-80 次子 Agent 调用，30-80M token，约 $1.5-4 USD
+**总计：** 1-2 小时/本书，50-80 次子 Agent 调用，30-80M token
 
-### 1.4 状态机 (`state.json`)
-
-```json
-{
-  "book_slug": "outliers",
-  "state": "AUDITING",
-  "phase": "7",
-  "phase_iter": 2,
-  "order": {
-    "book_path": "/path/to/book.pdf",
-    "target_word_count_pct": 12,
-    "target_word_count_chars": null
-  },
-  "timestamps": {
-    "INIT": "2026-04-20T10:00:00Z",
-    "COMPRESSING": "2026-04-20T10:01:30Z"
-  },
-  "decisions": [
-    {"at": "...", "decision_point": "M1", "phase": "2", "verdict": "accept"}
-  ],
-  "known_issues": [],
-  "error_history": [],
-  "rate_limit_events": [],
-  "failure": null
-}
-```
-
-**关键设计：** state.json 提供了完整的断点续做能力 — `/continue-book {book_slug}` 可以从任意中断的 Phase 恢复。
-
-### 1.5 质量保证体系
-
-**4 维度质量共识：**
-1. **忠实性** — 论点/论据/尺度/立场四层对齐
-2. **篇幅** — CJK 字数在 T × [0.70, 1.30] 硬指标内
-3. **风格** — 教养都市人自然聊天语调
-4. **合规** — PRC 法律 + 核心价值观
-
-**3 类故障分类：**
-- **Type A**：问题不可修复（≥5 次尝试），标记 Known Issue，跳过继续
-- **Type B**：全书停滞（3 轮审核无改善），生成因果报告，上报人工
-- **Type C**：不可恢复崩溃（Agent 崩溃、限频无法恢复），立即上报
-
-### 1.6 工作目录结构
+### 1.3 工作目录结构
 
 ```
 .work/{book_slug}/
-├── state.json                    # 状态机
+├── state.json                    # 状态机（Phase/决策/已知问题/时间戳）
 ├── raw_text.md                   # Phase 1 原文
-├── chunks/, compressed_chunks/   # Phase 1 分块
 ├── compressed.md                 # Phase 1 压缩版
-├── book_meta.json                # Phase 1 元数据
-├── book_facts.json               # Phase 1 事实核查
-├── blueprint.md, blueprint_summary.md  # Phase 2 蓝图
-├── quality_targets.json          # Phase 2 质量硬指标
-├── anchors.json, story_structure.md    # Phase 2
+├── book_meta.json, book_facts.json
+├── blueprint.md, quality_targets.json
 ├── sections/section_*.txt        # Phase 3 切片
 ├── drafts/draft_*.md             # Phase 4 底稿
 ├── styled/styled_*.md            # Phase 5 风格化
 ├── manuscript_v1.md              # Phase 6 初版
-├── iter_*/                       # Phase 7 审核迭代
-│   ├── audit_*.json              # 7 维度审核报告
-│   └── manuscript_v*.md          # 修复版本
+├── iter_*/audit_*.json           # Phase 7 审核迭代
 ├── manuscript_final.md           # Phase 7 终版
-├── manuscript_compliant.md       # Phase 8 合规版
+├── manuscript_compliant.md       # Phase 8 合规版（如有）
 ├── intro_final.md                # Phase 8.5 简介
 ├── delivery/                     # Phase 9 交付
-│   ├── manuscript.md
-│   ├── intro.md
-│   └── archive/
 └── metrics.json                  # 成本/token 追踪
 ```
 
-### 1.7 当前局限性
-
-| 局限 | 说明 |
-|------|------|
-| **单机单书** | 一个 Claude Code 会话只能处理一本书，无法并行 |
-| **无弹性扩展** | 需要手动启动 EC2、安装插件、启动 Claude Code |
-| **单账号** | 一个 Claude Code 会话使用一个账号，额度用完整个流水线停滞 |
-| **无崩溃恢复基础设施** | state.json 支持 `/continue-book`，但需要人工操作 |
-| **无外部监控** | 流水线进度、审核状态只能在 Claude Code 会话内查看 |
-| **无多书队列** | 多本书需要手动逐个启动 |
-| **凭证手动管理** | Claude Code 登录态需要手动设置 |
-
 ---
 
-## 2. 为什么需要 Elastic-Agent
+## 2. 整体业务流程
 
-### 2.1 核心需求
+### 2.1 用户视角的完整流程
 
 ```
-当前（单机单书）:                   目标（弹性多书并行）:
-
-┌─────────────┐                     ┌─────────────┐
-│ 单台机器     │                     │ Manager     │
-│             │                     │ 调度 + 监控  │
-│ Claude Code │                     │ + 外部 API  │
-│ 1 个会话    │                     └──────┬──────┘
-│ 1 本书      │                            │
-│ 1 个账号    │               ┌────────────┼────────────┐
-│             │               │            │            │
-│ 手动操作    │          ┌────▼───┐   ┌────▼───┐   ┌────▼───┐
-└─────────────┘          │Worker 1│   │Worker 2│   │Worker N│
-                         │阿里云  │   │阿里云  │   │阿里云  │
-                         │账号 A  │   │账号 B  │   │账号 C  │
-                         │《异类》 │   │《枪炮》 │   │《思考》 │
-                         │Phase 4 │   │Phase 7 │   │Phase 1 │
-                         └────────┘   └────────┘   └────────┘
-                         用完即毁       用完即毁       用完即毁
+用户在做书前端选书 → 提交做书请求
+        │
+        ▼
+Elastic-Agent 将请求入队 → 分发到有空闲生产槽位的 Worker
+        │
+        ▼
+Worker 上 Claude Code 执行 /audiobook（1-2 小时）
+  - 做书过程中：chat 实时流到前端，文件实时同步到 OSS/S3
+  - 前端展示：实时聊天框 + Phase 进度条 + 文件目录增量
+        │
+        ▼
+做书完成 → 会话保留在 Worker 上 → 前端展示最终讲稿
+        │
+        ▼
+用户可以随时进入任意已完成的会话，发送修改指令
+  - 修改请求 → Elastic-Agent 路由到对应 Worker → --resume 恢复会话
+  - 修改过程中：chat 继续实时流到前端
+  - 同一 Worker 上最多 3 个修改会话并行
 ```
 
-| 问题 | 单机 | Elastic-Agent |
-|------|------|---------------|
-| 并行度 | 1 本/时 | N 本并行（按需扩容） |
-| 额度 | 单账号，30-80M token/书容易触限 | 多账号分布不同 Worker，自动换号 |
-| 可用性 | Claude Code 崩溃 = 停工 | Worker 崩溃 → 新 Worker + `/continue-book` 自动恢复 |
-| 监控 | 只能在终端看 | 外部 API 实时获取 Phase 进度、审核状态、讲稿文件 |
-| 成本 | 固定开销 | 临时 Worker 用完即毁，空闲零成本 |
-| 运维 | 手动安装插件、登录账号 | Bootstrap 自动化全部 |
+### 2.2 两种工作模式
 
-### 2.2 Audiobook 特有的需求
+| 维度 | 生产模式（/audiobook） | 修改模式（--resume） |
+|------|---------------------|---------------------|
+| 触发 | 用户提交新书 | 用户在已完成的 chat 中发修改指令 |
+| 耗时 | 1-2 小时 | 数分钟到十几分钟 |
+| 资源 | 重（Opus 密集调用） | 轻（通常只用 fixer 或局部重写） |
+| 并发 | 每 Worker 最多 **1** 个 | 每 Worker 最多 **3** 个（可配置） |
+| 会话 | 新建 session | 复用已有 session_id |
+| 独占性 | 占用生产槽位 | 占用修改槽位（与生产槽位独立） |
 
-与 agent-ml-research 和 CCM 相比，Audiobook 有几个特殊需求：
+### 2.3 Worker 槽位模型
 
-| 需求 | 说明 | 其他 Harness 是否有 |
-|------|------|-------------------|
-| **临时 Worker** | 一本书一台机器，完成后销毁 | agent-ml: 常驻; CCM: 常驻 |
-| **断点续做** | Worker 崩溃后新 Worker 从 state.json 恢复 | 部分 — CCM 有 session resume |
-| **Phase 进度监控** | 外部服务需要知道当前在哪个 Phase | 部分 — CCM 有任务状态 |
-| **工作目录同步** | `.work/` 目录需要持久化到 S3/OSS 以支持崩溃恢复 | 部分 |
-| **长时间任务** | 1-2 小时/书，Drain 超时需要足够长 | agent-ml: 小时级; CCM: 分钟级 |
+```
+Worker (常驻，手动开启)
+│
+├── 生产槽位 (max_production_slots = 1)
+│   └── [占用] Claude Code: /audiobook 《异类》  ← 1-2h 重负载
+│
+├── 修改槽位 (max_edit_slots = 3)
+│   ├── [占用] Claude Code: --resume session_A "请修改第三章开头..."
+│   ├── [占用] Claude Code: --resume session_B "调整尺度表达..."
+│   └── [空闲]
+│
+└── 已完成会话池 (无上限)
+    ├── session_C (《枪炮、病菌与钢铁》) — 可随时 --resume
+    ├── session_D (《思考，快与慢》) — 可随时 --resume
+    └── ...
+```
+
+**两种槽位独立计数。** 一台 Worker 可以同时跑 1 个新书生产 + 3 个修改会话 = 4 个 Claude Code 进程。
+
+**并发参数可配置：**
+
+```yaml
+worker:
+  max_production_slots: 1    # 同时做几本新书（默认 1）
+  max_edit_slots: 3          # 同时修改几本已完成的书（默认 3）
+```
 
 ---
 
@@ -268,153 +147,245 @@ audiobook-nonfiction/
 ### 3.1 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Manager 节点                            │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │             Audiobook Dispatcher（业务层）                │   │
-│  │                                                          │   │
-│  │  ┌───────────────┐  ┌──────────┐  ┌──────────────────┐  │   │
-│  │  │ BookQueue      │  │TaskState │  │ Web UI           │  │   │
-│  │  │(做书请求队列)  │  │(全局状态)│  │ (进度/聊天/文件) │  │   │
-│  │  └───────┬───────┘  └──────────┘  └──────────────────┘  │   │
-│  └──────────┼───────────────────────────────────────────────┘   │
-│             │ 调用框架 API                                       │
-│  ┌──────────▼───────────────────────────────────────────────┐   │
-│  │             Elastic-Agent 框架层                          │   │
-│  │                                                          │   │
-│  │  AliyunEcsProvider    CredentialPool    BootstrapPipeline │   │
-│  │  NodeRegistry         HealthChecker     DrainManager      │   │
-│  │  ExternalAPI(轨迹流)  ExternalAPI(文件)  CloudReconciler  │   │
-│  └──────────────────────────┬───────────────────────────────┘   │
-└─────────────────────────────┼───────────────────────────────────┘
-                              │ Worker Runtime Protocol
-                ┌─────────────┼─────────────┐
-                │             │             │
-           ┌────▼────┐  ┌────▼────┐  ┌─────▼───┐
-           │Worker 1 │  │Worker 2 │  │Worker N │
-           │阿里云ECS│  │阿里云ECS│  │阿里云ECS│
-           │┌───────┐│  │┌───────┐│  │┌───────┐│
-           ││Worker ││  ││Worker ││  ││Worker ││
-           ││Runtime││  ││Runtime││  ││Runtime ││  ← 框架内置
-           │└───┬───┘│  │└───┬───┘│  │└───┬───┘│
-           │┌───▼───┐│  │┌───▼───┐│  │┌───▼───┐│
-           ││Claude ││  ││Claude ││  ││Claude ││
-           ││Code   ││  ││Code   ││  ││Code   ││
-           ││+ 插件 ││  ││+ 插件 ││  ││+ 插件 ││  ← audiobook-nonfiction
-           │└───────┘│  │└───────┘│  │└───────┘│
-           │  《异类》 │  │  《枪炮》 │  │  《思考》 │
-           └─────────┘  └─────────┘  └─────────┘
-           用完即毁       用完即毁       用完即毁
+┌──────────────────────────────────────────────────────────────────────┐
+│                    做书前后端（外部服务）                               │
+│  提交做书请求 · 实时聊天框 · Phase 进度 · 文件浏览 · 发修改指令         │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            │ HTTPS + WebSocket
+                            ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Elastic-Agent Manager                          │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │                    Audiobook Harness 层                        │  │
+│  │                                                                │  │
+│  │  BookQueue        SessionRegistry      ChatRelay              │  │
+│  │  做书请求队列      session→worker 映射   双向消息中继            │  │
+│  │                                                                │  │
+│  │  SlotScheduler                                                │  │
+│  │  槽位调度:                                                     │  │
+│  │    生产请求 → 找有空生产槽位的 Worker                           │  │
+│  │    修改请求 → 找 session 所在的 Worker + 检查修改槽位            │  │
+│  └────────────────────────┬───────────────────────────────────────┘  │
+│                           │                                          │
+│  ┌────────────────────────▼───────────────────────────────────────┐  │
+│  │                    Elastic-Agent 框架层                         │  │
+│  │                                                                │  │
+│  │  CloudProvider    NodeRegistry     ExternalAPI(轨迹/文件)      │  │
+│  │  CredentialPool   HealthChecker    FileSyncManager             │  │
+│  └────────────────────────┬───────────────────────────────────────┘  │
+└───────────────────────────┼──────────────────────────────────────────┘
+                            │ Worker Runtime (WebSocket)
+              ┌─────────────┼─────────────┐
+              │             │             │
+         ┌────▼────┐  ┌────▼────┐  ┌─────▼───┐
+         │Worker 1 │  │Worker 2 │  │Worker N │
+         │(常驻)   │  │(常驻)   │  │(常驻)   │
+         │         │  │         │  │         │
+         │生产[1/1]│  │生产[0/1]│  │生产[1/1]│
+         │修改[2/3]│  │修改[0/3]│  │修改[1/3]│
+         │         │  │         │  │         │
+         │sessions:│  │sessions:│  │sessions:│
+         │ A,B,C,D │  │ (空)    │  │ E,F     │
+         └─────────┘  └─────────┘  └─────────┘
+          手动开启      手动开启      手动开启
 ```
 
-### 3.2 工作流程
+### 3.2 核心数据结构
 
-#### 扩容（收到做书请求）
+#### Session Registry
+
+每个做书会话在 Elastic-Agent 中注册，用于路由修改请求到正确的 Worker。
 
 ```
-前端提交做书请求（book_path, book_slug, persona, target_pct）
+SessionRegistry (Manager 侧):
+  book_slug → {
+    worker_id:   "worker-1"
+    session_id:  "abc123-def456"       # Claude Code 的 session ID
+    status:      "producing" | "idle" | "editing"
+    cwd:         "/root/.work/outliers"
+    created_at:  "2026-05-17T10:00:00Z"
+    finished_at: "2026-05-17T11:45:00Z" | null
+  }
+```
+
+#### Worker 槽位状态
+
+```
+WorkerSlotState (per Worker, 由 Worker Runtime 上报):
+  production_slots: { used: 1, max: 1 }
+  edit_slots:       { used: 2, max: 3 }
+  active_sessions:  [
+    { book_slug: "outliers", session_id: "abc", mode: "producing", pid: 12345 },
+    { book_slug: "sapiens",  session_id: "def", mode: "editing",   pid: 12350 },
+    { book_slug: "thinking", session_id: "ghi", mode: "editing",   pid: 12355 },
+  ]
+  completed_sessions: [
+    { book_slug: "guns", session_id: "jkl", finished_at: "..." },
+    ...
+  ]
+```
+
+### 3.3 工作流程
+
+#### 新书生产
+
+```
+做书前端提交: {book_slug: "outliers", book_path: "/books/outliers.pdf", target_pct: 12}
   │
   ▼
 Manager BookQueue 入队
   │
   ▼
-Elastic-Agent scale_out(count=1, task_metadata={book_slug, book_path, ...})
+SlotScheduler 查找有空闲生产槽位的 Worker:
+  Worker 1: production_slots 1/1 ← 满
+  Worker 2: production_slots 0/1 ← 空闲 ✓
   │
   ▼
-AliyunEcsProvider 创建临时 ECS 实例
-  → 等待 running
-  → 从 CredentialPool 选择账号
-  → Bootstrap Pipeline 执行:
-      1. 安装 Node.js + Claude Code CLI
-      2. 注入 Claude Code 凭证（refresh token 写入 ~/.claude/.credentials.json）
-      3. 安装 audiobook-nonfiction 插件
-      4. 安装 Python 依赖（pypdf, ebooklib, python-docx）
-      5. 上传书籍 PDF 到 Worker
-      6. 启动 Worker Runtime
-      7. 通过 Worker Runtime 启动 Claude Code 会话:
-         claude -p "/audiobook {book_path} {persona} target_pct={N}" \
-           --dangerously-skip-permissions --output-format stream-json
-  │
-  ▼
-Worker Runtime 流式回传 Claude Code 的 NDJSON 输出到 Manager
-  → Manager 事件总线分发
-  → 外部 API 实时推送到前端（Phase 进度、Agent 轨迹、审核结果）
-  │
-  ▼
-Worker 上的 .work/{book_slug}/ 目录定期同步到 OSS（框架文件监听 + 同步）
-  → 外部服务可通过 /api/external/files/{node_id}/... 实时获取中间产物
-```
-
-#### 崩溃恢复
-
-```
-HealthChecker 检测到 Worker 心跳超时
-  │
-  ▼
-从 OSS 获取最新的 .work/{book_slug}/ 快照
-  │
-  ▼
-Elastic-Agent scale_out(count=1, task_metadata={book_slug, recovery: true})
-  │
-  ▼
-Bootstrap Pipeline:
-  ... (同上 1-6)
-  7. 从 OSS 恢复 .work/ 目录到新 Worker
-  8. 启动 Claude Code: claude -p "/continue-book {book_slug}" \
+通过 Worker 2 的 Runtime 执行:
+  1. 上传 book PDF 到 Worker
+  2. 启动 Claude Code:
+     claude -p "/audiobook /books/outliers.pdf nonfiction_default target_pct=12" \
        --dangerously-skip-permissions --output-format stream-json
   │
   ▼
-Claude Code 读取 state.json，从中断的 Phase 恢复
-```
-
-#### 任务完成 / 缩容
-
-```
-Claude Code 输出 phase=9, state=DELIVERED
+Worker Runtime 流式回传 Claude Code NDJSON 输出:
+  → Manager EventBus
+  → 外部 API → 做书前端 (实时聊天框)
   │
   ▼
-Worker Runtime 检测到进程退出 (exit_code=0)
+同时: Worker Runtime 监听 .work/outliers/ 文件变更:
+  → 新文件/修改 → 立即同步到 OSS/S3
+  → 外部 API FILE_CHANGE 事件 → 前端文件目录刷新
   │
   ▼
-Manager 收到 process_exit 事件
-  → 从 Worker 下载 delivery/ 目录最终产物
-  → 持久化到 OSS
-  → 回收 Claude Code 凭证到 CredentialPool
-  → 销毁 ECS 实例（临时 Worker 模式）
-  → 从 NodeRegistry 移除
+Claude Code 输出 phase=9, state=DELIVERED, session_id=abc123
+  → process_exit 事件
   │
   ▼
-BookQueue 标记任务完成
-前端展示：讲稿下载链接、简介、质量报告
+Manager:
+  SessionRegistry 注册: {outliers → worker-2, session_id: abc123, status: idle}
+  Worker 2 的 production_slots: 1/1 → 0/1 (释放生产槽位)
+  通知前端: 做书完成
 ```
 
-### 3.3 外部服务 API 的使用
+#### 后续修改
 
-Audiobook 的前端和监控系统通过框架外部 API 获取实时数据：
-
-| 需求 | 外部 API 端点 | 数据来源 |
-|------|-------------|---------|
-| Phase 进度 | `GET /api/external/files/{node_id}/.work/{slug}/state.json` | state.json 文件 |
-| 实时 Agent 轨迹 | `WS /api/external/traces/{node_id}/stream` | Claude Code stream-json 输出 |
-| 审核报告 | `GET /api/external/files/{node_id}/.work/{slug}/iter_*/audit_*.json` | 审核 JSON 文件 |
-| 讲稿预览 | `GET /api/external/files/{node_id}/.work/{slug}/manuscript_*.md` | 讲稿文件 |
-| 成本追踪 | `GET /api/external/files/{node_id}/.work/{slug}/metrics.json` | metrics.json |
-| 文件变更监听 | `WS /api/external/files/{node_id}/watch` | inotify 监听 .work/ |
-| 蓝图审阅 | `GET /api/external/files/{node_id}/.work/{slug}/blueprint.md` | 蓝图文件 |
-| 质量指标 | `GET /api/external/files/{node_id}/.work/{slug}/quality_targets.json` | 质量硬指标 |
-
-**前端轮询 state.json 可以构建 Phase 进度条：**
-
-```javascript
-// 前端伪代码
-const state = await fetch(`/api/external/files/${nodeId}/.work/${slug}/state.json`);
-const phaseNames = ["初始化","解构","蓝图","切片","生产","风格","开头结尾","审核","合规","简介","交付"];
-progressBar.update(state.phase, phaseNames[state.phase]);
-if (state.phase === "7") {
-  progressBar.detail(`审核第 ${state.phase_iter}/3 轮`);
-}
 ```
+用户在前端进入 "outliers" 的聊天，发送: "请修改第三章的开头，换一种更吸引人的方式"
+  │
+  ▼
+做书前端 → Elastic-Agent API:
+  POST /api/sessions/outliers/chat
+  { "message": "请修改第三章的开头，换一种更吸引人的方式" }
+  │
+  ▼
+Manager ChatRelay:
+  1. SessionRegistry 查找: outliers → worker-2, session_id=abc123
+  2. 检查 Worker 2 的 edit_slots: 2/3 → 有空位 ✓
+  3. 通过 Worker 2 的 Runtime 执行:
+     claude -p "请修改第三章的开头，换一种更吸引人的方式" \
+       --resume abc123 \
+       --dangerously-skip-permissions --output-format stream-json \
+       --cwd /root/.work/outliers
+  │
+  ▼
+Worker Runtime:
+  → 占用一个修改槽位 (edit_slots: 3/3)
+  → Claude Code 通过 --resume 恢复上下文
+  → 执行修改 (读取 manuscript_final.md → Edit → 更新文件)
+  → NDJSON 输出 → Manager → 前端 (修改过程的聊天流)
+  → 文件变更 → OSS 同步 → 前端文件更新
+  │
+  ▼
+修改完成 (process_exit):
+  → 释放修改槽位 (edit_slots: 2/3)
+  → 更新 session_id (Claude Code 每次 resume 可能产生新 session_id)
+  → SessionRegistry 更新
+  → 前端显示修改结果
+```
+
+#### 槽位满时的行为
+
+```
+场景: Worker 2 的修改槽位已满 (3/3)，用户对 Worker 2 上的另一本书发修改请求
+
+Manager ChatRelay:
+  1. 查找 session → Worker 2
+  2. 检查 edit_slots: 3/3 → 满
+  3. 返回 429: "该 Worker 修改槽位已满，请稍后重试"
+  4. 前端显示排队提示
+
+不会跨 Worker 路由:
+  session 文件绑定在特定 Worker 上，无法转移到其他 Worker 执行
+  (除非引入跨 Worker 的 session 迁移机制 — MVP 不做)
+```
+
+### 3.4 文件实时同步
+
+```
+文件同步通道（双重保障）:
+
+通道 1: Worker → OSS/S3 (持久化)
+  Worker Runtime 使用 inotify 监听 .work/ 目录
+    → 文件创建/修改 → 防抖 2s → 增量上传到 OSS/S3
+    → 路径映射: .work/{slug}/xxx → oss://bucket/{worker_id}/{slug}/xxx
+    → 用途: 持久化存储，崩溃恢复，前端文件下载
+
+通道 2: Worker → Manager → 前端 (实时通知)
+  Worker Runtime 监听 .work/ 目录
+    → FILE_CHANGE 事件 via WebSocket → Manager EventBus
+    → 外部 API → 前端 (文件目录实时更新)
+    → 用途: 前端知道有新文件，触发 UI 刷新
+    → 文件内容本身通过通道 1 (OSS/S3 链接) 或通道 2 GET 获取
+
+为什么不只用 WebSocket 传文件内容?
+  - 讲稿文件可达 50-100KB，WebSocket 传输影响聊天流延迟
+  - OSS/S3 是更适合文件下载的基础设施（CDN、断点续传）
+  - 通知与数据分离: WS 告诉前端"有新文件了"，前端从 OSS 下载
+```
+
+### 3.5 Chat 双向中继
+
+```
+做书前端 ←→ Elastic-Agent Manager ←→ Worker Claude Code
+
+上行 (Claude Code → 前端):
+  Claude Code stdout (stream-json NDJSON)
+    → Worker Runtime 逐行读取 → LOG 消息 via WS
+    → Manager EventBus → 外部 API 轨迹流
+    → 做书前端 WebSocket → 渲染为聊天气泡
+
+下行 (前端 → Claude Code):
+  目前 Claude Code -p (prompt mode) 是单次输入
+  修改模式下: 每次修改请求启动一个新的 --resume 进程
+  → 用户输入作为 -p 参数传入
+  → 不是"在运行中的进程里注入新输入"，而是"启动新进程恢复上下文"
+
+  这意味着:
+    生产模式: 不接受中途输入（10 Phase 自动跑完）
+    修改模式: 每条用户指令 = 一次 --resume 调用 = 一个短生命进程
+
+  合规决策 M6 的特殊处理:
+    Phase 8 需要用户选择（合规版 vs 原始版）
+    → state.json 中 state="NEEDS_HUMAN"
+    → 前端检测后显示选择 UI
+    → 用户选择后写入 .work/{slug}/user_decision.json
+    → /continue-book 读取该文件继续
+```
+
+### 3.6 外部服务 API 使用
+
+| 需求 | 端点 | 说明 |
+|------|------|------|
+| 新书请求 | `POST /api/books/produce` | 入队做书 |
+| 发修改指令 | `POST /api/sessions/{slug}/chat` | 路由到 Worker --resume |
+| 实时聊天流 | `WS /api/external/traces/{node_id}/stream` | Claude Code NDJSON |
+| 文件变更通知 | `WS /api/external/files/{node_id}/watch` | inotify 事件 |
+| 文件下载 | `GET /api/external/files/{node_id}/{path}` 或 OSS 直链 | 按需读取 |
+| 会话列表 | `GET /api/sessions` | 所有已注册的 session |
+| Worker 状态 | `GET /api/workers` | 各 Worker 槽位占用 |
+| Phase 进度 | `GET /api/external/files/{node_id}/.work/{slug}/state.json` | state.json |
 
 ---
 
@@ -423,340 +394,349 @@ if (state.phase === "7") {
 ### 4.1 AudiobookHarness 定义
 
 ```python
-from elastic_agent import (
-    Harness, BootstrapStep, ServiceDefinition,
-    ScalingSignal, FrameworkEvent, WorkerLifecycle,
-)
-
 class AudiobookHarness(Harness):
     """有声书稿生产系统的 Elastic-Agent Harness"""
 
     def __init__(self, config: dict):
         self.config = config
+        self.session_registry = SessionRegistry()
+        self.book_queue = BookQueue()
 
     def get_worker_lifecycle(self) -> WorkerLifecycle:
-        return WorkerLifecycle.EPHEMERAL  # 用完即毁
+        return WorkerLifecycle.PERSISTENT  # 常驻，手动开启/关闭
 
-    def get_repo_url(self) -> str | None:
-        return None  # 插件通过 Bootstrap 安装，不需要 clone 代码仓库
+    def get_worker_capacity(self) -> WorkerCapacity:
+        return WorkerCapacity(
+            max_production_slots=self.config.get("max_production_slots", 1),
+            max_edit_slots=self.config.get("max_edit_slots", 3),
+        )
 
     def get_bootstrap_steps(self) -> list[BootstrapStep]:
         return [
-            InstallNodeJSStep(),            # Node.js 20.x
-            InstallClaudeCodeStep(),         # npm install -g @anthropic-ai/claude-code
-            InjectCredentialStep(),          # 写入 ~/.claude/.credentials.json
-            InstallAudiobookPluginStep(),    # 解压插件 + claude plugin install
-            InstallPythonDepsStep(),         # pypdf, ebooklib, python-docx
-            UploadBookPDFStep(),             # SCP/OSS 上传书籍文件到 Worker
-            StartWorkerRuntimeStep(),        # 启动框架 Worker Runtime
-            LaunchClaudeCodeSessionStep(),   # 启动 Claude Code 会话执行 /audiobook
+            InstallNodeJSStep(),
+            InstallClaudeCodeStep(),
+            InjectCredentialStep(),
+            InstallAudiobookPluginStep(),
+            InstallPythonDepsStep(),
+            StartWorkerRuntimeStep(),
+            # 注意: 不在 Bootstrap 中启动 Claude Code 会话
+            # 会话由 BookQueue 调度后按需启动
         ]
 
-    def get_service_definitions(self) -> list[ServiceDefinition]:
-        return []  # 无常驻服务，Claude Code 进程由 Bootstrap 最后一步启动
-
-    def get_app_credentials(self) -> list[str]:
-        return []  # Audiobook 不需要额外的应用凭证（Git key 等）
-
-    def get_scaling_signal(self) -> ScalingSignal:
-        pending_books = self._count_pending_books()
-        active_workers = self._count_active_workers()
-        return ScalingSignal(
-            pending_tasks=pending_books,
-            idle_workers=0,  # 临时 Worker 没有空闲概念
-            busy_workers=active_workers,
+    def get_file_sync_config(self) -> FileSyncConfig:
+        return FileSyncConfig(
+            watch_paths=["/root/.work/"],
+            sync_target="oss://audiobook-production/",  # 或 s3://
+            debounce_seconds=2,
+            sync_on_change=True,  # 有变更就同步，不只是定期
         )
-
-    def get_state_directories(self) -> list[str]:
-        """声明需要持久化的目录（框架定期同步到 OSS）"""
-        return ["/home/root/.work/"]
-
-    def get_drain_timeout(self) -> int:
-        return 7200  # 2 小时（一本书最长耗时）
 
     def get_event_handlers(self) -> dict:
         return {
             FrameworkEvent.NODE_READY: self._on_node_ready,
+            FrameworkEvent.PROCESS_EXIT: self._on_process_exit,
             FrameworkEvent.WORKER_UNHEALTHY: self._on_worker_unhealthy,
-            FrameworkEvent.NODE_TERMINATING: self._on_node_terminating,
         }
 
     async def _on_node_ready(self, data: dict):
-        """Worker 就绪后更新任务状态"""
-        book_slug = data.get("task_metadata", {}).get("book_slug")
-        self.book_queue.update_status(book_slug, "running", worker_id=data["node_id"])
+        """Worker 就绪 — 开始消费做书队列"""
+        worker_id = data["node_id"]
+        await self._dispatch_pending_books(worker_id)
 
-    async def _on_worker_unhealthy(self, data: dict):
-        """Worker 异常 — 触发崩溃恢复"""
-        node_id = data["node_id"]
-        book_slug = self.book_queue.get_book_by_worker(node_id)
-        if book_slug:
-            # 标记需要恢复
-            self.book_queue.update_status(book_slug, "recovering")
-            # 框架会自动终止旧 Worker
-            # 启动新 Worker 并恢复
-            await self.manager.scale_out(
-                count=1,
-                task_metadata={
-                    "book_slug": book_slug,
-                    "recovery": True,
-                    "oss_state_path": f"oss://audiobook-state/{book_slug}/",
-                },
-            )
+    async def _on_process_exit(self, data: dict):
+        """Claude Code 进程退出 — 更新会话状态，释放槽位"""
+        task_id = data["task_id"]
+        session_info = self.session_registry.get_by_task(task_id)
+        if not session_info:
+            return
 
-    async def _on_node_terminating(self, data: dict):
-        """Worker 终止前 — 确保工作目录已同步到 OSS"""
-        # 框架的文件同步机制应该已经处理了，这里做最终确认
-        pass
+        if session_info.mode == "producing":
+            # 做书完成 → 注册会话 → 释放生产槽位 → 尝试消费队列
+            session_info.status = "idle"
+            session_info.session_id = data.get("session_id")  # 从输出中提取
+            session_info.finished_at = datetime.utcnow()
+            await self._dispatch_pending_books(session_info.worker_id)
+        elif session_info.mode == "editing":
+            # 修改完成 → 释放修改槽位
+            session_info.status = "idle"
+            # 更新 session_id（--resume 可能产生新 id）
+
+    async def _dispatch_pending_books(self, worker_id: str):
+        """尝试将队列中的书分发到有空闲生产槽位的 Worker"""
+        worker_state = await self.get_worker_slot_state(worker_id)
+        if worker_state.production_slots.used < worker_state.production_slots.max:
+            book = self.book_queue.dequeue()
+            if book:
+                await self._start_production(worker_id, book)
+
+    async def _start_production(self, worker_id: str, book: BookRequest):
+        """在指定 Worker 上启动做书"""
+        runtime = self.manager.get_runtime_client(worker_id)
+        # 上传 PDF
+        await runtime.upload_file(book.pdf_path, f"/root/books/{book.slug}.pdf")
+        # 启动 Claude Code
+        task_id = await runtime.execute(
+            command=["claude", "-p",
+                f"/audiobook /root/books/{book.slug}.pdf {book.persona} target_pct={book.target_pct}",
+                "--dangerously-skip-permissions", "--output-format", "stream-json"],
+            cwd="/root",
+        )
+        # 注册会话
+        self.session_registry.register(book.slug, worker_id, task_id, mode="producing")
+
+    async def handle_edit_request(self, book_slug: str, message: str):
+        """处理修改请求 — 路由到正确 Worker 的 --resume"""
+        session = self.session_registry.get(book_slug)
+        if not session:
+            raise NotFoundError(f"Session for {book_slug} not found")
+
+        worker_state = await self.get_worker_slot_state(session.worker_id)
+        if worker_state.edit_slots.used >= worker_state.edit_slots.max:
+            raise CapacityError(f"Worker {session.worker_id} edit slots full")
+
+        runtime = self.manager.get_runtime_client(session.worker_id)
+        task_id = await runtime.execute(
+            command=["claude", "-p", message,
+                "--resume", session.session_id,
+                "--dangerously-skip-permissions", "--output-format", "stream-json"],
+            cwd=session.cwd,
+        )
+        session.status = "editing"
+        session.mode = "editing"
+        return task_id
 ```
 
-### 4.2 Bootstrap 步骤实现
+### 4.2 Manager 侧 API 扩展
 
 ```python
-class InstallAudiobookPluginStep(BootstrapStep):
-    name = "install-audiobook-plugin"
-    timeout = 120
+# Audiobook 特有的 API（挂载在 Manager FastAPI 上）
 
-    async def execute(self, ctx):
-        # 上传插件压缩包到 Worker
-        plugin_archive = ctx.config["audiobook_plugin_path"]
-        await ctx.runtime.upload_file(plugin_archive, "/tmp/audiobook-nonfiction.tar.gz")
-        # 解压 + 安装
-        await ctx.runtime.execute(
-            ["bash", "-c",
-             "cd /opt && tar xzf /tmp/audiobook-nonfiction.tar.gz && "
-             "cd audiobook-nonfiction && "
-             "claude plugin marketplace add ./ && "
-             "claude plugin install audiobook-nonfiction@audiobook-local"],
-            timeout=60,
-        )
+@app.post("/api/books/produce")
+async def produce_book(request: ProduceBookRequest):
+    """提交做书请求"""
+    harness.book_queue.enqueue(BookRequest(
+        slug=request.book_slug,
+        pdf_path=request.book_path,
+        target_pct=request.target_pct,
+    ))
+    # 尝试立即分发（如果有空闲 Worker）
+    for worker_id in registry.list_ready_workers():
+        await harness._dispatch_pending_books(worker_id)
+    return {"status": "queued", "book_slug": request.book_slug}
 
-class InstallPythonDepsStep(BootstrapStep):
-    name = "install-python-deps"
-    timeout = 120
+@app.post("/api/sessions/{book_slug}/chat")
+async def send_edit_message(book_slug: str, request: ChatRequest):
+    """向已完成的会话发送修改指令"""
+    task_id = await harness.handle_edit_request(book_slug, request.message)
+    return {"status": "started", "task_id": task_id}
 
-    async def execute(self, ctx):
-        await ctx.runtime.execute(
-            ["pip3", "install", "pypdf", "ebooklib", "python-docx"],
-            timeout=90,
-        )
+@app.get("/api/sessions")
+async def list_sessions():
+    """列出所有注册的会话"""
+    return harness.session_registry.list_all()
 
-class UploadBookPDFStep(BootstrapStep):
-    name = "upload-book-pdf"
-    timeout = 60
-
-    async def execute(self, ctx):
-        book_path = ctx.task_metadata["book_path"]
-        remote_path = f"/home/root/books/{ctx.task_metadata['book_slug']}.pdf"
-        await ctx.runtime.upload_file(book_path, remote_path)
-        ctx.metadata["remote_book_path"] = remote_path
-
-class LaunchClaudeCodeSessionStep(BootstrapStep):
-    name = "launch-claude-code"
-    timeout = 30
-
-    async def execute(self, ctx):
-        meta = ctx.task_metadata
-        book_slug = meta["book_slug"]
-        remote_book_path = ctx.metadata.get("remote_book_path",
-            f"/home/root/books/{book_slug}.pdf")
-        persona = meta.get("persona", "nonfiction_default")
-        target = meta.get("target_word_count_pct", 13)
-
-        if meta.get("recovery"):
-            # 崩溃恢复模式 — 先从 OSS 恢复工作目录
-            oss_path = meta["oss_state_path"]
-            await ctx.runtime.execute(
-                ["bash", "-c", f"ossutil cp -r {oss_path} /home/root/.work/{book_slug}/"],
-                timeout=120,
-            )
-            prompt = f"/continue-book {book_slug}"
-        else:
-            prompt = f"/audiobook {remote_book_path} {persona} target_pct={target}"
-
-        # 启动 Claude Code 会话（非阻塞 — Worker Runtime 管理进程生命周期）
-        await ctx.runtime.execute(
-            ["claude", "-p", prompt,
-             "--dangerously-skip-permissions",
-             "--output-format", "stream-json",
-             "--verbose"],
-            cwd="/home/root",
-            timeout=None,  # 无超时 — 1-2 小时任务
-        )
-```
-
-### 4.3 Manager 侧集成
-
-```python
-from elastic_agent import ElasticAgentManager, AliyunEcsProvider, CredentialPool
-from audiobook_harness import AudiobookHarness
-
-# 阿里云优先
-provider = AliyunEcsProvider(
-    region_id="cn-hangzhou",
-    image_id="m-bp1xxxx",                 # 预装 Ubuntu + Python + Node.js
-    instance_type="ecs.c6.xlarge",         # 4C/8G（Opus 子 Agent 需要更多内存）
-    security_group_id="sg-bp1xxxx",        # Terraform output
-    vswitch_id="vsw-bp1xxxx",             # Terraform output
-    key_pair_name="elastic-agent-key",
-    spot_strategy="SpotAsPriceGo",         # 抢占式实例节省 70-85%
-)
-
-manager = ElasticAgentManager(
-    provider=provider,
-    credential_pool=CredentialPool("claude_accounts.json"),
-    harness=AudiobookHarness({
-        "audiobook_plugin_path": "/opt/audiobook-nonfiction.tar.gz",
-        "oss_bucket": "audiobook-production",
-    }),
-)
-
-# 收到做书请求时
-async def handle_book_request(book_slug: str, book_path: str, target_pct: int = 13):
-    nodes = await manager.scale_out(
-        count=1,
-        instance_config=InstanceConfig(
-            name=f"audiobook-{book_slug}",
-            spot=True,  # 抢占式实例
-        ),
-        task_metadata={
-            "book_slug": book_slug,
-            "book_path": book_path,
-            "target_word_count_pct": target_pct,
-        },
-    )
-    return nodes[0].id
-
-# 前端获取实时数据
-# WS: /api/external/traces/{node_id}/stream          → Agent 轨迹
-# GET: /api/external/files/{node_id}/.work/*/state.json → Phase 进度
-# GET: /api/external/files/{node_id}/.work/*/delivery/  → 最终产物
+@app.get("/api/workers")
+async def list_workers():
+    """列出所有 Worker 及其槽位状态"""
+    workers = []
+    for node in registry.list_all():
+        slot_state = await harness.get_worker_slot_state(node["instance_id"])
+        workers.append({**node, "slots": slot_state})
+    return workers
 ```
 
 ---
 
 ## 5. 核心技术挑战与方案
 
-### 5.1 Claude Code 插件安装自动化
+### 5.1 Session 路由
 
-**挑战：** audiobook-nonfiction 是 Claude Code 插件，需要通过 `claude plugin install` 安装。Bootstrap 必须正确处理插件的 marketplace 注册和安装。
-
-**方案：**
-1. 将插件压缩包预置在 AMI/镜像中（减少 Bootstrap 时间）
-2. 或通过 SCP/OSS 上传到 Worker 后本地安装
-3. 插件安装后需要**重启 Claude Code 会话**才能生效
-
-### 5.2 工作目录持久化与崩溃恢复
-
-**挑战：** `.work/{book_slug}/` 目录是全部中间产物的唯一存储。如果 Worker（临时 ECS 实例）崩溃或被 Spot 回收，这些文件丢失则无法恢复。
+**挑战：** 修改请求必须路由到 session 所在的 Worker。session 文件存在 Worker 本地文件系统中，无法跨 Worker 访问。
 
 **方案：**
+
 ```
-Worker 运行中:
-  框架 Worker Runtime 使用 inotify 监听 .work/ 目录
-    → 文件变更时增量同步到 OSS (aliyun) / S3 (aws)
-    → 同步间隔: 变更后 3-5 秒（防抖）
-    → 关键文件（state.json）变更立即同步
+SessionRegistry 是路由的核心:
+  1. 做书完成时注册: book_slug → (worker_id, session_id)
+  2. 修改请求到来时: 查 book_slug → 得到 worker_id → 发到该 Worker
+  3. session_id 更新: --resume 后 Claude Code 可能返回新 session_id → 更新注册表
 
-Worker 崩溃后:
-  Manager HealthChecker 检测心跳超时
-    → 创建新 Worker
-    → Bootstrap: ossutil cp -r oss://.../{book_slug}/ /home/root/.work/{book_slug}/
-    → 启动 Claude Code: /continue-book {book_slug}
-    → state.json 告诉 Claude Code 从哪个 Phase 恢复
+路由失败场景:
+  - Worker 不在线 → 返回错误"Worker 离线"（不自动迁移）
+  - Worker 修改槽位满 → 返回"请稍后重试"
+  - session 不存在 → 返回"会话未找到"
+
+MVP 不做 session 迁移:
+  session 文件(.jsonl)在 Worker 本地，迁移意味着:
+    - 停止 Worker 上的 Claude Code
+    - 拷贝 session 文件 + .work/ 目录到新 Worker
+    - 在新 Worker 上 --resume
+  复杂度高且 Claude Code session 文件路径有 hardlink 依赖
+  MVP 阶段: session 绑定 Worker，Worker 离线 = session 不可用
 ```
 
-**state.json 是恢复的核心** — 它记录了 Phase、迭代次数、决策历史、已知问题。`/continue-book` 命令读取 state.json 后跳过已完成的 Phase。
+### 5.2 从 Claude Code 输出中提取 session_id
 
-### 5.3 Claude Code 账号额度管理
-
-**挑战：** 单本书消耗 30-80M token，Claude Max 订阅有 5 小时滑动窗口限制。高并发生产时账号池必须足够大。
+**挑战：** 做书完成后需要拿到 `session_id` 用于后续 `--resume`。session_id 在 Claude Code 的 stream-json 输出的 `result` 事件中。
 
 **方案：**
-- CredentialPool 在 Bootstrap 时选择最空闲账号
-- 每个 Worker 独占一个账号（一对一绑定）
-- 如果做书过程中额度耗尽：
-  1. Claude Code 会自动等待限频恢复（rate_limit_events 记录在 state.json）
-  2. 如果等待超时 → Worker Runtime 检测到进程异常 → 触发崩溃恢复流程
-  3. 新 Worker 分配新账号 + `/continue-book` 恢复
 
-### 5.4 从 Agent 轨迹中提取 Phase 进度
+```
+Claude Code stream-json 输出格式 (NDJSON, 逐行):
+  {"type": "system", ...}
+  {"type": "assistant", "content": "开始 Phase 1...", ...}
+  {"type": "tool_use", ...}
+  ...
+  {"type": "result", "session_id": "abc123", "cost_usd": 2.34, ...}
 
-**挑战：** 外部服务需要知道当前书在哪个 Phase。Claude Code 的 stream-json 输出是原始的 NDJSON 事件，不包含 Phase 信息。
+Worker Runtime 在读取每行 stdout 时:
+  1. 正常转发为 LOG 事件（给外部 API 消费）
+  2. 如果行是 JSON 且 type="result" → 提取 session_id
+  3. 在 PROCESS_EXIT 事件中附带 session_id
 
-**方案（两个层次）：**
+Manager 收到 PROCESS_EXIT:
+  → 更新 SessionRegistry 中的 session_id
+  → 释放槽位
+```
 
-1. **文件监听 state.json**（推荐）— 框架外部 API 监听 state.json 文件变更，每次 state 更新时推送给外部：
-   ```
-   WS /api/external/files/{node_id}/watch → 监听 .work/*/state.json
-   ```
+### 5.3 文件同步的完整性保证
 
-2. **解析 Agent 轨迹流**（辅助）— 从 stream-json 中匹配 Phase 切换关键词。但这需要 Harness 自定义解析逻辑，不如直接读 state.json 可靠。
-
-### 5.5 Spot 实例中断处理
-
-**挑战：** 阿里云抢占式实例可能被回收（2 分钟通知），做书流水线 1-2 小时，中断概率不低。
-
-**方案：**
-- 抢占式实例被回收前阿里云发送中断通知
-- 框架 Worker Runtime 接收中断信号后：
-  1. 立即将当前 `.work/` 目录全量同步到 OSS
-  2. 记录中断点到 state.json
-  3. Manager 自动创建新 Worker（On-Demand 或新 Spot）+ `/continue-book` 恢复
-
-### 5.6 用户交互（合规决策 M6）
-
-**挑战：** Phase 8 有一个用户决策点 M6 — 用户需要选择使用合规版还是原始版。当前设计中这个决策在 Claude Code 会话内完成，分布式后如何让外部用户参与？
+**挑战：** 做书过程产生大量文件（raw_text.md、compressed.md、各种 draft、audit JSON 等），必须及时同步到 OSS 供前端浏览。但如果同步太频繁会产生大量小文件 IO。
 
 **方案：**
-- 框架反向消息通道（Manager → Worker）
-- 前端检测到 state.json 中 `state: "NEEDS_HUMAN"` 时显示决策 UI
-- 用户选择后通过 Manager API 发送消息到 Worker
-- Worker Runtime 将消息写入一个文件（如 `.work/{slug}/user_decision.json`）
-- Claude Code 的 `/continue-book` 读取该文件继续
+
+```
+分层同步策略:
+
+  关键文件 (state.json, metrics.json):
+    → 变更后 0.5s 内同步（几乎实时）
+    → 前端靠这些文件构建进度条
+
+  中等文件 (manuscript_*.md, audit_*.json, blueprint.md):
+    → 变更后 2s 防抖同步
+    → 前端可以点击查看
+
+  大文件 (raw_text.md, compressed.md):
+    → 变更后 5s 防抖同步
+    → 通常只在 Phase 1 生成一次
+
+  实现:
+    Worker Runtime 的 FileSyncManager:
+      - inotify 监听 .work/ 递归
+      - 按文件路径匹配 → 不同防抖等级
+      - debounce timer 到期 → 增量上传（只传变化的文件）
+      - 上传到 OSS: oss://bucket/{worker_id}/{book_slug}/...
+```
+
+### 5.4 并发控制
+
+**挑战：** 同一台 Worker 上可能有 1 个生产 + 3 个修改 = 4 个 Claude Code 进程同时运行。需要确保资源不冲突。
+
+**方案：**
+
+```
+资源隔离:
+  每个 Claude Code 进程:
+    - 独立的 cwd (.work/{book_slug}/)
+    - 独立的 session 文件
+    - 共享 Claude Code 凭证（同一个 ~/.claude/.credentials.json）
+    - 共享系统资源 (CPU/内存)
+
+  凭证冲突:
+    同一个 Claude Max 账号跑 4 个并发进程 → 额度消耗 4x
+    → Worker 应该绑定足够的额度（4 个会话同时跑时 token 消耗飙升）
+    → CredentialPool 分配时需要考虑 Worker 的总槽位数
+
+  内存/CPU:
+    生产模式 (Opus 密集): ~2-4 GB 内存
+    修改模式 (通常 Sonnet): ~1-2 GB 内存
+    推荐 Worker 实例: ecs.c6.2xlarge (8C/16G) 或以上
+    4 个并发时总内存 ~8-12 GB
+
+Worker Runtime 的槽位管理:
+  processes: dict[task_id, ProcessInfo]
+  ProcessInfo:
+    mode: "producing" | "editing"
+    book_slug: str
+    session_id: str | None
+    pid: int
+
+  收到 EXECUTE 请求时:
+    if mode == "producing" and production_count >= max_production_slots:
+      → 拒绝 (返回 CAPACITY_FULL 错误)
+    if mode == "editing" and edit_count >= max_edit_slots:
+      → 拒绝
+
+  进程退出时:
+    → 释放对应槽位
+    → 上报 PROCESS_EXIT + session_id
+```
+
+### 5.5 Worker 手动管理
+
+**挑战：** Worker 不自动创建/销毁，由运维手动 `scale_out()`。但 Worker 的 Bootstrap、凭证注入、健康检查仍需自动化。
+
+**方案：**
+
+```
+手动扩容:
+  运维 / 管理界面调用:
+    POST /api/nodes/scale-out?count=1
+  → Elastic-Agent 创建 ECS 实例 → Bootstrap → 注册
+
+不自动销毁:
+  Worker 上所有会话完成后 → 进入 idle 状态
+  → 不触发 Drain / terminate
+  → 保持运行，等待新的做书任务或修改请求
+  → 只有运维手动调用 DELETE /api/nodes/{node_id} 才会销毁
+
+手动缩容:
+  运维调用: DELETE /api/nodes/{node_id}
+  → 检查有无活跃会话 (producing/editing)
+  → 如果有 → 拒绝 (返回 409 Conflict)
+  → 如果没有 → 回收凭证 → 终止实例 → 注销所有 session
+```
 
 ---
 
 ## 6. 分步实施方案
 
-> **前置条件：** 按 [MVP 计划](mvp-plan.md) 完成 Terraform 网络部署和框架核心模块开发。
-
 ### Phase 0：基础设施准备
 
 1. Terraform 部署阿里云 VPC/安全组/密钥对
 2. 制作 AMI（预装 Ubuntu + Python 3.11 + Node.js 20 + Claude Code CLI + audiobook-nonfiction 插件）
-3. 配置 OSS Bucket（存储工作目录快照和最终交付物）
+3. 配置 OSS Bucket（存储工作目录同步文件）
 4. 准备 Claude Max 账号池
 
-### Phase 1：单书端到端验证
+### Phase 1：单 Worker 端到端
 
-1. 手动创建一台阿里云 ECS
-2. 安装插件 + 登录 Claude Code + 执行 `/audiobook`
-3. 验证全 10 Phase 流水线可以在阿里云 ECS 上完整运行
-4. 验证 `/continue-book` 可以从中断恢复
+1. 手动 `scale_out(1)` 创建一台 Worker
+2. 通过 API 提交一本书 → 验证做书全流程
+3. 验证实时聊天流（Claude Code → Manager → 外部 API）
+4. 验证文件同步（.work/ → OSS）
+5. 做书完成后验证 session 注册
 
-### Phase 2：框架集成
+### Phase 2：修改模式
 
-1. 实现 AudiobookHarness（Bootstrap 步骤、事件处理）
-2. 通过 Elastic-Agent 创建临时 Worker → 自动安装插件 → 自动执行做书
-3. 验证外部 API：通过 `/api/external/files/` 实时获取 state.json 和讲稿
-4. 验证崩溃恢复：手动 kill Worker → 新 Worker 自动恢复
+1. 对已完成的书发送修改请求
+2. 验证 session 路由 → 正确 Worker → --resume
+3. 验证修改过程的聊天流
+4. 验证并发修改（同时修改 2-3 本）
 
-### Phase 3：多书并行 + 前端
+### Phase 3：多 Worker + 队列
 
-1. 实现 BookQueue 队列管理（多本书排队/并行）
-2. 前端：提交做书请求 UI
-3. 前端：Phase 进度条（轮询 state.json）
-4. 前端：Agent 轨迹实时流（WebSocket 消费外部 API）
-5. 前端：讲稿预览/下载
+1. 手动扩容到 3 台 Worker
+2. 提交多本书 → 验证队列分发
+3. 验证跨 Worker 的 session 路由
+4. 验证槽位满时的排队/拒绝行为
 
-### Phase 4：生产化
+### Phase 4：前端集成
 
-1. 额度监控 + 自动换号
-2. Spot 实例中断处理
-3. 成本追踪仪表盘（每本书的 ECS 成本 + token 成本）
-4. 用户决策点 M6 的外部交互
-5. 批量做书支持
+1. 做书前端接入 API
+2. 实时聊天框渲染
+3. Phase 进度条（轮询 state.json）
+4. 文件浏览器（OSS 文件列表）
+5. 修改指令发送 UI
 
 ---
 
@@ -766,41 +746,36 @@ Worker 崩溃后:
 
 | 需求 | 说明 | 普适性 |
 |------|------|--------|
-| **临时 Worker 模式** | 一个任务一台 Worker，完成后销毁 | 通用 — batch job、CI runner 都需要 |
-| **task_metadata 注入** | Bootstrap 需要知道具体任务参数（book_slug、book_path） | 通用 — 任何按需启动 Worker 的场景 |
-| **工作目录持久化** | 定期同步指定目录到 OSS/S3 | 通用 — ML checkpoint、中间结果 |
-| **崩溃恢复** | 新 Worker 从 OSS 恢复状态 + 续做 | 通用 — 长时间任务的可靠性保证 |
-| **反向消息通道** | Manager → Worker 传递用户决策 | 通用 — 人工审批、交互式 Agent |
-| **Spot 中断处理** | 抢占式实例回收时优雅保存状态 | 通用 — 使用 Spot 的所有场景 |
-| **文件上传到 Worker** | Bootstrap 时上传书籍 PDF 到 Worker | 通用 — 任何需要输入文件的任务 |
+| **多槽位并发模型** | 同一 Worker 上区分"生产槽位"和"修改槽位"，各自可配置上限 | 通用 — 任何需要混合重/轻任务的场景 |
+| **Session 路由** | 修改请求路由到 session 所在的 Worker | 通用 — 有状态工作负载的亲和性路由 |
+| **Session 持久化** | 做书完成后会话不销毁，支持随时 --resume | 通用 — 任何需要多轮交互的 Agent |
+| **双向 Chat 中继** | 外部 → Manager → Worker → Claude Code (--resume) | 通用 — 人工审批、交互式 Agent |
+| **文件实时同步** | .work/ 目录变更立即同步到 OSS/S3 | 通用 — 需要外部实时查看 Agent 产物 |
+| **常驻 Worker** | 手动扩容/缩容，不自动销毁 | 通用 — 稳定工作负载场景 |
+| **文件上传到 Worker** | Bootstrap 或运行时上传 PDF 等输入文件 | 通用 — 任何需要输入文件的任务 |
 
 ### 7.2 与其他 Harness 的交叉验证
 
 | 框架能力 | agent-ml-research | CCM | Audiobook | 结论 |
 |---------|------------------|-----|-----------|------|
 | Worker Runtime | ✅ 替换 SSH | ✅ 替换本地子进程 | ✅ 启动 Claude Code 会话 | **框架核心** |
-| 日志流式传输 | ✅ 飞书告警 | ✅ WebSocket 前端 | ✅ stream-json → 外部 API | **框架核心** |
-| 外部 API（轨迹） | ✅ 飞书消费 | ✅ 前端日志 | ✅ Phase 进度 + Agent 轨迹 | **框架核心** |
-| 外部 API（文件） | ✅ 研究产物 | ✅ 项目文件 | ✅ state.json + 讲稿 + 审核报告 | **框架核心** |
-| 有状态亲和性 | ✅ 项目绑定 | ✅ session resume | ❌ 临时 Worker 不需要 | 部分通用 |
-| 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 2h 做书（Drain 7200s） | **框架核心** |
+| 外部 API（轨迹） | ✅ 飞书消费 | ✅ 前端日志 | ✅ 做书聊天流 | **框架核心** |
+| 外部 API（文件） | ✅ 研究产物 | ✅ 项目文件 | ✅ 讲稿 + 审核报告 + OSS 同步 | **框架核心** |
+| 有状态亲和性 | ✅ 项目绑定 | ✅ session resume | ✅ **session 路由到 Worker** | **框架核心** |
+| 多槽位并发 | — | ✅ max_concurrent=5 | ✅ **生产1 + 修改3** | **框架核心** |
+| 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 手动缩容需检查活跃会话 | **框架核心** |
 | 双层凭证 | ✅ WandB/HF | ✅ Git key | ✅ Claude 账号 | **框架核心** |
-| 扩缩容信号 | ✅ 项目数 | ✅ 队列深度 | ✅ 待做书数 | **框架核心** |
-| **临时 Worker** | ❌ 常驻 | ❌ 常驻 | ✅ 用完即毁 | **新增** |
-| **工作目录持久化** | ❌ | ❌ | ✅ .work/ → OSS | **新增** |
-| **崩溃恢复** | ❌ | ❌ | ✅ OSS → 新 Worker | **新增** |
-| **task_metadata** | ❌ | ❌ | ✅ book_slug/path | **新增** |
-| **反向消息** | ✅ 飞书指令 | ✅ Plan 审批 | ✅ 合规决策 M6 | **框架核心** |
-| **Terraform IaC** | ✅ | ✅ | ✅ | **框架提供模板** |
+| 双向 Chat | ✅ 飞书指令 | ✅ Plan 审批 | ✅ **修改指令 + 合规决策** | **框架核心** |
+| 文件同步到 OSS/S3 | — | — | ✅ **.work/ 实时同步** | **新增** |
+| 常驻 Worker | ✅ | ✅ | ✅ | 已有 |
 
 ### 7.3 成本估算
 
-| 资源 | 单价 | 单本书用量 | 单本书成本 |
-|------|------|----------|----------|
-| 阿里云 ecs.c6.xlarge On-Demand | ¥0.78/h | 2h | ¥1.56 |
-| 阿里云 ecs.c6.xlarge Spot | ~¥0.12/h | 2h | ¥0.24 |
-| Claude Max 订阅（已有） | — | 30-80M token | ~$1.5-4 |
-| OSS 存储 | ¥0.12/GB/月 | ~100MB | ¥0.012 |
-| **总计 (Spot)** | | | **~¥0.25 + $2.75 ≈ ¥20/本** |
+| 资源 | 单价 | 说明 |
+|------|------|------|
+| 阿里云 ecs.c6.2xlarge (8C/16G) | ¥1.56/h On-Demand | 支持 1 生产 + 3 修改并发 |
+| Claude Max 订阅 | 已有 | 30-80M token/本新书 |
+| OSS 存储 | ¥0.12/GB/月 | 每本书 ~100-200MB 工作文件 |
+| OSS 请求 | ¥0.01/万次 | 文件同步 API 调用 |
 
-使用 Spot 实例后，**基础设施成本几乎可以忽略**，主要成本是 Claude API token 消耗。
+常驻 Worker 的月成本: ¥1.56 × 24 × 30 = **¥1,123/台/月** (On-Demand)。如果夜间不需要可以手动 stop 降成本。
