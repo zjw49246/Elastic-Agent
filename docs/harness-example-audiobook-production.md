@@ -1,1101 +1,806 @@
 # Harness 应用示例：有声书稿全自动化生产系统接入 Elastic-Agent
 
-> 本文档以有声书稿全自动化生产系统（以下简称 Audiobook）为例，说明一个 **从零设计、尚未实现** 的分布式系统如何以 Elastic-Agent Harness 为基础进行架构设计。
+> 本文档以有声书稿全自动化生产系统（以下简称 Audiobook）为例，说明一个 **Claude Code 插件** 如何作为 Harness 接入 Elastic-Agent 弹性计算框架，实现多书并行生产、弹性扩缩容、崩溃恢复。
 >
-> 与 [agent-ml-research Harness 文档](harness-example-agent-ml-research.md) 中的 **替换** 已有基础设施不同，也与 [CCM Harness 文档](harness-example-claude-code-manager.md) 中的 **扩展** 单机应用不同，Audiobook 是一个绿地项目——它的基础设施层可以直接基于 Elastic-Agent 框架设计，避免先自建再迁移的浪费。
+> 本文档基于 audiobook-nonfiction v1.1.1 的真实代码分析。
 >
-> 本案例代表了第三种典型接入模式：**绿地构建**。
+> 与 [agent-ml-research](harness-example-agent-ml-research.md)（替换自建基础设施）和 [CCM](harness-example-claude-code-manager.md)（扩展单机应用）不同，Audiobook 代表第三种接入模式：**将 Claude Code 插件提升为可弹性扩展的分布式生产系统**。
 
 ---
 
 ## 目录
 
-1. [Audiobook 项目解析](#1-audiobook-项目解析)
-2. [为什么 Audiobook 需要 Elastic-Agent](#2-为什么-audiobook-需要-elastic-agent)
-3. [基于框架的架构设计](#3-基于框架的架构设计)
-4. [模块映射：自建 vs 框架](#4-模块映射自建-vs-框架)
-5. [Harness 接口实现](#5-harness-接口实现)
+1. [Audiobook 项目真实架构解析](#1-audiobook-项目真实架构解析)
+2. [为什么需要 Elastic-Agent](#2-为什么需要-elastic-agent)
+3. [基于框架的分布式架构设计](#3-基于框架的分布式架构设计)
+4. [Harness 接口实现](#4-harness-接口实现)
+5. [核心技术挑战与方案](#5-核心技术挑战与方案)
 6. [分步实施方案](#6-分步实施方案)
-7. [技术细节与挑战](#7-技术细节与挑战)
-8. [Audiobook 对框架提出的需求](#8-audiobook-对框架提出的需求)
+7. [Audiobook 对框架提出的需求](#7-audiobook-对框架提出的需求)
 
 ---
 
-## 1. Audiobook 项目解析
+## 1. Audiobook 项目真实架构解析
 
 ### 1.1 项目定位
 
-Audiobook 是一个 **端到端有声书稿自动化生产平台**，用户在前端提交一本书的 PDF，系统自动完成从解构、蓝图设计、底稿生成、风格润色、审核迭代到合规交付的全部 10 个 Phase，最终交付可用于录音的有声书稿。
+Audiobook 是一个 **Claude Code 插件（Skill）**，将非虚构书籍转换为 TTS-ready 的有声书讲稿（默认压缩到原文 9-17%）。它实现了一个 **10 Phase 全自动化生产流水线**，由 Main Agent 编排 22 个专用子 Agent，配合 9 个 Python 工具脚本，产出可直接录音的讲稿。
 
-核心能力：
-- 前端提交做书请求 → 后端按需启动 EC2 Worker → 自动登录 Claude Code → 安装做书插件 → 执行 10 Phase 做书流水线
-- 每台 EC2 上运行 1-2 个 Claude Code 账号，额度满自动切号（hardlink session + `--resume` 保持上下文）
-- **实时双向聊天**：EC2 上 Claude Code 的每条消息实时流到前端聊天框，用户可以发消息回去（如合规决策、手动干预）
-- 多任务并行：多台 EC2 同时做不同书，前端可以切换查看任意一台的聊天流
-- 中间文件实时同步到 S3，前端可随时查看
-- EC2 崩溃自动恢复：从 S3 恢复工作目录 + `/continue-book` 从断点继续
-- 任务完成后 EC2 自动销毁
+**关键架构事实：**
+- **不是一个后端服务** — 它是 Claude Code 的 Skill 插件，运行在 Claude Code CLI 会话中
+- **不需要自建后端** — 所有编排由 Claude Code 的 Main Agent 完成
+- **状态管理是文件系统** — `.work/{book_slug}/state.json` 追踪全部状态
+- **子 Agent 是 Claude Code 子代理** — 通过 `Agent({subagent_type: "audiobook-xxx"})` 调用
+- **单会话单书** — 一个 Claude Code 会话从头到尾处理一本书
 
-### 1.2 系统架构
-
-Audiobook 是 **前端 → 后端 Dispatcher → EC2 Worker** 三层架构：
+### 1.2 插件结构
 
 ```
-┌────────────────────────────────────────────────────┐
-│                  前端 (Web UI)                       │
-│  Vue/React SPA                                      │
-│  - 提交做书请求（书名、PDF、参数）                     │
-│  - 聊天框：镜像 EC2 Claude Code 对话 + 用户回复       │
-│  - 多任务切换、Phase 进度条、中间文件浏览             │
-└──────────────────────┬─────────────────────────────┘
-                       │ HTTP + WebSocket
-                       ▼
-┌────────────────────────────────────────────────────┐
-│              后端 Dispatcher (FastAPI)               │
-│  常驻服务，管理机上运行                                │
-│                                                     │
-│  ┌────────────┐ ┌────────────┐ ┌────────────────┐  │
-│  │TaskManager │ │EC2 Manager │ │ StreamHub      │  │
-│  │SQLite 任务  │ │boto3 生命期│ │SQS→WS 中继     │  │
-│  └────────────┘ └────────────┘ └────────────────┘  │
-│  ┌────────────┐ ┌────────────┐ ┌────────────────┐  │
-│  │ChatService │ │PoolMonitor │ │HealthChecker   │  │
-│  │双向聊天管理 │ │号池状态聚合│ │崩溃检测+恢复    │  │
-│  └────────────┘ └────────────┘ └────────────────┘  │
-└──────────────────────┬─────────────────────────────┘
-                       │ SQS 双向 + S3
-          ┌────────────┼────────────┐
-          │            │            │
-     ┌────▼───┐   ┌────▼───┐   ┌────▼───┐
-     │EC2 #1  │   │EC2 #2  │   │EC2 #N  │
-     │        │   │        │   │        │
-     │Worker  │   │Worker  │   │Worker  │
-     │Agent   │   │Agent   │   │Agent   │
-     │        │   │        │   │        │
-     │Claude  │   │Claude  │   │Claude  │
-     │Code    │   │Code    │   │Code    │
-     │1-2 账号 │   │1-2 账号 │   │1-2 账号 │
-     │        │   │        │   │        │
-     │watchdog│   │watchdog│   │watchdog│
-     └────────┘   └────────┘   └────────┘
-     用完即毁       用完即毁       用完即毁
+audiobook-nonfiction/
+├── .claude-plugin/
+│   ├── plugin.json              # 插件元数据（v1.1.1）
+│   └── marketplace.json         # 本地 marketplace 注册
+├── agents/                      # 22 个专用子 Agent 定义
+│   ├── audiobook-text-compressor.md
+│   ├── audiobook-story-structure-analyst.md
+│   ├── audiobook-anchor-creator.md
+│   ├── audiobook-narration-framework-designer.md   # Opus
+│   ├── audiobook-draft-writer.md                   # Opus
+│   ├── audiobook-progress-analyst.md
+│   ├── audiobook-persona-fusion.md
+│   ├── audiobook-opening-closing-editor.md         # Opus
+│   ├── audiobook-book-facts-checker.md             # +WebSearch
+│   ├── audiobook-intro-generator.md
+│   ├── audiobook-auditor-fidelity.md               # 7 审核员
+│   ├── audiobook-auditor-narrative-quality.md
+│   ├── audiobook-auditor-safety.md
+│   ├── audiobook-auditor-logic.md
+│   ├── audiobook-auditor-repetition.md
+│   ├── audiobook-auditor-style.md
+│   ├── audiobook-auditor-standard.md
+│   ├── audiobook-fixer.md                          # Opus
+│   ├── audiobook-compliance-processor.md           # Opus
+│   ├── audiobook-anchor-fixer.md
+│   ├── audiobook-fidelity-prechecker.md
+│   └── audiobook-intro-generator.md
+├── skills/audiobook-nonfiction/
+│   ├── SKILL.md                 # Main Agent 系统指令
+│   ├── README.md                # 使用说明
+│   ├── shared_values.md         # 质量共识（4 维度 + 6 原则）
+│   ├── commands/
+│   │   ├── audiobook.md         # /audiobook 命令定义
+│   │   └── continue-book.md     # /continue-book 命令定义
+│   ├── phases/                  # 10 Phase 流水线定义
+│   │   ├── phase_00_init.md
+│   │   ├── phase_01_decomposition.md
+│   │   ├── phase_02_blueprint.md
+│   │   ├── phase_03_splitting.md
+│   │   ├── phase_04_production_loop.md
+│   │   ├── phase_05_persona_fusion.md
+│   │   ├── phase_06_opening_closing.md
+│   │   ├── phase_07_audit_loop.md
+│   │   ├── phase_075_final_review.md
+│   │   ├── phase_08_compliance.md
+│   │   ├── phase_085_intro.md
+│   │   └── phase_09_delivery.md
+│   ├── schemas/                 # 数据结构定义
+│   │   ├── state.md             # state.json 状态机
+│   │   ├── quality_targets.md   # 质量硬指标
+│   │   ├── audit_report.md      # 审核报告格式
+│   │   └── self_eval.md         # 子 Agent 自评格式
+│   ├── decisions/               # 6 个决策点指南
+│   │   ├── M1_blueprint_review.md
+│   │   ├── M2_section_review.md
+│   │   ├── M4_final_review.md
+│   │   ├── M5_failure_report.md
+│   │   └── M6_compliance_assessment.md
+│   ├── personas/                # 叙述人格
+│   │   └── nonfiction_default/
+│   │       ├── framework.md
+│   │       └── style.md
+│   └── scripts/                 # 9 个 Python 工具
+│       ├── doc_extractor.py     # PDF/EPUB/DOCX → 纯文本
+│       ├── chunk_splitter.py    # 固定分块（~20k 字符）
+│       ├── cjk_counter.py       # CJK 汉字计数
+│       ├── word_count_calculator.py
+│       ├── section_splitter.py  # 锚点切分
+│       ├── compression_merger.py
+│       ├── metrics_collector.py # 成本/token 追踪
+│       ├── validate_and_repair_json.py  # 4 层 JSON 修复
+│       └── audit_severity_diff.py
 ```
 
-### 1.3 核心模块
+### 1.3 10 Phase 生产流水线
 
-#### 后端 Dispatcher
+| Phase | 名称 | 关键子 Agent | 产出 | 耗时 |
+|-------|------|-------------|------|------|
+| 0 | 初始化 | — | `state.json` | <1min |
+| 1 | 书籍解构 | text-compressor(Sonnet×N), book-facts-checker(Sonnet+WebSearch) | `raw_text.md`, `compressed.md`, `book_meta.json`, `book_facts.json` | 10-20min |
+| 2 | 战略蓝图 | story-structure-analyst, anchor-creator, narration-framework-designer(**Opus**) | `blueprint.md`, `quality_targets.json`, `anchors.json` | 10-15min |
+| 3 | 源文切片 | anchor-fixer(如需) | `sections/section_*.txt` | 2-5min |
+| 4 | 主体生产 | progress-analyst(Sonnet×N), draft-writer(**Opus**×N) | `drafts/draft_*.md` | 20-40min |
+| 5 | 人格融合 | persona-fusion(Sonnet×N) | `styled/styled_*.md` | 10-20min |
+| 6 | 开头结尾 | opening-closing-editor(**Opus**) | `manuscript_v1.md` | 5-10min |
+| 7 | 审核循环 | 7 auditors(Sonnet×7并行) + fixer(**Opus**), 最多 3 轮 | `manuscript_final.md` | 15-30min |
+| 7.5 | 终审 | Main Agent 通读全文 | 决策记录 | 5min |
+| 8 | 合规处理 | compliance-processor(**Opus**) | `manuscript_compliant.md` | 5-10min |
+| 8.5 | 简介生成 | intro-generator + 3 auditor(并行) + fixer | `intro_final.md` | 5-10min |
+| 9 | 交付打包 | — | `delivery/` | <1min |
 
-| 模块 | 职责 |
+**总计：** 1-2 小时/本书，50-80 次子 Agent 调用，30-80M token，约 $1.5-4 USD
+
+### 1.4 状态机 (`state.json`)
+
+```json
+{
+  "book_slug": "outliers",
+  "state": "AUDITING",
+  "phase": "7",
+  "phase_iter": 2,
+  "order": {
+    "book_path": "/path/to/book.pdf",
+    "target_word_count_pct": 12,
+    "target_word_count_chars": null
+  },
+  "timestamps": {
+    "INIT": "2026-04-20T10:00:00Z",
+    "COMPRESSING": "2026-04-20T10:01:30Z"
+  },
+  "decisions": [
+    {"at": "...", "decision_point": "M1", "phase": "2", "verdict": "accept"}
+  ],
+  "known_issues": [],
+  "error_history": [],
+  "rate_limit_events": [],
+  "failure": null
+}
+```
+
+**关键设计：** state.json 提供了完整的断点续做能力 — `/continue-book {book_slug}` 可以从任意中断的 Phase 恢复。
+
+### 1.5 质量保证体系
+
+**4 维度质量共识：**
+1. **忠实性** — 论点/论据/尺度/立场四层对齐
+2. **篇幅** — CJK 字数在 T × [0.70, 1.30] 硬指标内
+3. **风格** — 教养都市人自然聊天语调
+4. **合规** — PRC 法律 + 核心价值观
+
+**3 类故障分类：**
+- **Type A**：问题不可修复（≥5 次尝试），标记 Known Issue，跳过继续
+- **Type B**：全书停滞（3 轮审核无改善），生成因果报告，上报人工
+- **Type C**：不可恢复崩溃（Agent 崩溃、限频无法恢复），立即上报
+
+### 1.6 工作目录结构
+
+```
+.work/{book_slug}/
+├── state.json                    # 状态机
+├── raw_text.md                   # Phase 1 原文
+├── chunks/, compressed_chunks/   # Phase 1 分块
+├── compressed.md                 # Phase 1 压缩版
+├── book_meta.json                # Phase 1 元数据
+├── book_facts.json               # Phase 1 事实核查
+├── blueprint.md, blueprint_summary.md  # Phase 2 蓝图
+├── quality_targets.json          # Phase 2 质量硬指标
+├── anchors.json, story_structure.md    # Phase 2
+├── sections/section_*.txt        # Phase 3 切片
+├── drafts/draft_*.md             # Phase 4 底稿
+├── styled/styled_*.md            # Phase 5 风格化
+├── manuscript_v1.md              # Phase 6 初版
+├── iter_*/                       # Phase 7 审核迭代
+│   ├── audit_*.json              # 7 维度审核报告
+│   └── manuscript_v*.md          # 修复版本
+├── manuscript_final.md           # Phase 7 终版
+├── manuscript_compliant.md       # Phase 8 合规版
+├── intro_final.md                # Phase 8.5 简介
+├── delivery/                     # Phase 9 交付
+│   ├── manuscript.md
+│   ├── intro.md
+│   └── archive/
+└── metrics.json                  # 成本/token 追踪
+```
+
+### 1.7 当前局限性
+
+| 局限 | 说明 |
 |------|------|
-| `TaskManager` | 任务 CRUD、状态机管理（queued → launching → running → completed） |
-| `EC2Manager` | boto3 启动/监控/销毁 EC2，构建 user_data，管理 Launch Template |
-| `StreamHub` | 消费上行 SQS（EC2 → 后端），写 DB + 推 WebSocket |
-| `ChatService` | 管理 WebSocket 双向连接、下行消息投递（前端 → EC2） |
-| `PoolMonitorService` | 消费号池事件，聚合入 DB，告警通知 |
-| `HealthChecker` | 心跳超时检测 → EC2 崩溃恢复 |
-
-#### EC2 Worker
-
-| 模块 | 职责 |
-|------|------|
-| `WorkerAgent` | 主控进程：选号 → 启动 Claude Code → stream-json 解析 → 限流检测 → 切号 → resume |
-| `StreamReporter` | 0.5s 攒批 + 即时 flush，SQS `send_message_batch` 上报聊天消息 |
-| `FileSyncer` | 每 3s 扫描 `.work/` 目录变更，增量上传 S3 |
-| `PoolStateWatcher` | 每 30s diff watchdog 状态文件，检测账号状态转换，SQS 上报事件 |
-| `claude-pool-watchdog` | Shell 脚本（AMI 预装），每 60s 调用 Anthropic Usage API 采集额度 |
-
-### 1.4 数据流通道
-
-| 通道 | 方向 | 用途 |
-|------|------|------|
-| `audiobook-upstream` SQS | EC2 → 后端 | 聊天消息、Phase 变化、心跳、号池事件（全局共享） |
-| `audiobook-down-{task_id}` SQS | 后端 → EC2 | 用户消息、控制命令（按任务动态创建/销毁） |
-| S3 `tasks/{task_id}/work/` | EC2 → 后端 → 前端 | 中间文件实时同步 |
-| WebSocket `/ws/tasks/{id}` | 后端 ↔ 前端 | 实时聊天双向通信 |
-
-### 1.5 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| 语言 | Python 3.11+（后端 + Worker）、TypeScript（前端） |
-| 后端 | FastAPI、SQLAlchemy (async)、aiosqlite |
-| 前端 | Vue 3 + Vite + TypeScript |
-| AWS | EC2、S3、SQS（Standard）、Secrets Manager、Launch Template、AMI |
-| 浏览器自动化 | Playwright + playwright-stealth + mitmproxy（自动登录） |
-| 进程管理 | user_data 脚本、PGID 追踪、start_new_session |
-| 实时通信 | SQS + WebSocket |
-| 持久化 | SQLite（聊天消息、任务、账号状态）、S3（文件） |
-
-### 1.6 关键特性
-
-| 特性 | 实现方式 |
-|------|---------|
-| **无感账号切换** | 限流检测 → `claude-pool select` → `session_linker.py` 硬链接 `.jsonl` → `--resume` 继续 |
-| **实时聊天镜像** | tempfile tail-read → StreamReporter 0.5s 攒批 → SQS → StreamHub 1s 轮询 → WebSocket → 前端 |
-| **双向交互** | 前端 → WebSocket → ChatService → 下行 SQS → Worker `poll_user_commands()` → `--resume` + 用户消息 |
-| **多任务切换** | 前端 `useChatManager` → 切换时 REST 加载历史 + WebSocket 订阅实时流 |
-| **文件实时同步** | FileSyncer 3s 扫描 → S3 上传 → SQS 通知 → 前端文件列表刷新 |
-| **崩溃恢复** | HealthChecker 心跳超时 → 新 EC2 → S3 恢复 `.work/` → `/continue-book` 从断点继续 |
-| **三层号池监控** | watchdog 60s 采集 → PoolStateWatcher 30s diff → PoolMonitorService 入库+告警 |
-
-### 1.7 与 agent-ml-research 和 CCM 的对比
-
-| 维度 | agent-ml-research | CCM | Audiobook |
-|------|-------------------|-----|-----------|
-| 架构 | 已有 Manager-Worker | 单机单体 | 绿地三层架构 |
-| Worker 生命周期 | 常驻 EC2 | 本地子进程 | **临时 EC2，用完即毁** |
-| 通信方式 | SSH (paramiko) | 本地 stdout | **SQS 双向 + S3** |
-| 账号管理 | 完整（OAuth 自动登录 + 额度监控） | 无 | 复用 audiobook-pool（OAuth + watchdog） |
-| 接入模式 | **替换**自建基础设施 | **扩展**到分布式 | **绿地构建** |
-| 任务粒度 | 多阶段研究（小时级） | 短任务（分钟级） | **10-Phase 做书（1-2 小时）** |
-| 用户交互 | 飞书 Bot 双向 | Web UI 单向 | **Web UI 双向聊天** |
-| 崩溃恢复 | 无 | 无 | **自动检测 + S3 恢复 + /continue-book** |
+| **单机单书** | 一个 Claude Code 会话只能处理一本书，无法并行 |
+| **无弹性扩展** | 需要手动启动 EC2、安装插件、启动 Claude Code |
+| **单账号** | 一个 Claude Code 会话使用一个账号，额度用完整个流水线停滞 |
+| **无崩溃恢复基础设施** | state.json 支持 `/continue-book`，但需要人工操作 |
+| **无外部监控** | 流水线进度、审核状态只能在 Claude Code 会话内查看 |
+| **无多书队列** | 多本书需要手动逐个启动 |
+| **凭证手动管理** | Claude Code 登录态需要手动设置 |
 
 ---
 
-## 2. 为什么 Audiobook 需要 Elastic-Agent
+## 2. 为什么需要 Elastic-Agent
 
-### 2.1 自建基础设施的代价
-
-如果 Audiobook 不使用 Elastic-Agent，需要自建以下基础设施：
-
-| 需要自建的能力 | 预估代码量 | 复杂度 |
-|---------------|----------|--------|
-| EC2 生命周期管理（boto3 + 状态轮询 + 安全网） | ~400 行 | 中 |
-| Bootstrap Pipeline（user_data 生成 + 错误处理） | ~300 行 | 中 |
-| 凭证安全分发（Secrets Manager → EC2） | ~200 行 | 低 |
-| 号池管理（账号分配 + 额度监控 + 轮换） | ~500 行 | 高 |
-| 崩溃恢复（心跳检测 + 新 EC2 + S3 恢复） | ~300 行 | 高 |
-| 扩缩容逻辑（并发任务 → EC2 数量） | ~200 行 | 中 |
-| **合计** | **~1900 行** | |
-
-这 ~1900 行基础设施代码与做书的核心业务完全无关，且每个新项目都需要重复实现。
-
-### 2.2 Elastic-Agent 的价值
+### 2.1 核心需求
 
 ```
-不使用框架:                              使用框架:
-┌───────────────────────┐              ┌───────────────────────┐
-│ Audiobook 后端         │              │ Audiobook 后端         │
-│                       │              │                       │
-│ ┌─────────────────┐   │              │ ┌─────────────────┐   │
-│ │ 做书业务逻辑     │   │              │ │ 做书业务逻辑     │   │
-│ │ (TaskManager,   │   │              │ │ (TaskManager,   │   │
-│ │  StreamHub,     │   │              │ │  StreamHub,     │   │
-│ │  ChatService)   │   │              │ │  ChatService)   │   │
-│ └─────────────────┘   │              │ └─────────────────┘   │
-│ ┌─────────────────┐   │              │ ┌─────────────────┐   │
-│ │ 自建基础设施     │   │              │ │ Elastic-Agent    │   │
-│ │ (~1900 行)      │   │  ═替换为═▶   │ │ (~200 行 Harness │   │
-│ │ EC2 管理        │   │              │ │  + 框架 API 调用) │   │
-│ │ 凭证管理        │   │              │ │                  │   │
-│ │ 额度监控        │   │              │ │ + 获得:          │   │
-│ │ 崩溃恢复        │   │              │ │   IP 亲和性      │   │
-│ │ 扩缩容          │   │              │ │   优雅缩容       │   │
-│ └─────────────────┘   │              │ │   健康检查       │   │
-│                       │              │ │   自动扩缩容     │   │
-└───────────────────────┘              │ └─────────────────┘   │
-                                       └───────────────────────┘
+当前（单机单书）:                   目标（弹性多书并行）:
+
+┌─────────────┐                     ┌─────────────┐
+│ 单台机器     │                     │ Manager     │
+│             │                     │ 调度 + 监控  │
+│ Claude Code │                     │ + 外部 API  │
+│ 1 个会话    │                     └──────┬──────┘
+│ 1 本书      │                            │
+│ 1 个账号    │               ┌────────────┼────────────┐
+│             │               │            │            │
+│ 手动操作    │          ┌────▼───┐   ┌────▼───┐   ┌────▼───┐
+└─────────────┘          │Worker 1│   │Worker 2│   │Worker N│
+                         │阿里云  │   │阿里云  │   │阿里云  │
+                         │账号 A  │   │账号 B  │   │账号 C  │
+                         │《异类》 │   │《枪炮》 │   │《思考》 │
+                         │Phase 4 │   │Phase 7 │   │Phase 1 │
+                         └────────┘   └────────┘   └────────┘
+                         用完即毁       用完即毁       用完即毁
 ```
 
-| 问题 | 自建 | Elastic-Agent |
+| 问题 | 单机 | Elastic-Agent |
 |------|------|---------------|
-| EC2 管理 | 手写 boto3 + 状态轮询 + 安全网 | 框架 CloudProvider 标准接口 |
-| 凭证安全 | 手写 Secrets Manager 集成 | 框架 CredentialPool + 安全传递通道 |
-| 额度监控 | 三层自建（watchdog → watcher → monitor） | 框架内置 QuotaMonitor |
-| 崩溃恢复 | 手写心跳检测 + 恢复流程 | 框架 Worker Runtime 内置 L2/L3 健康检查 |
-| 扩缩容 | 手写规则 | 框架 ScalingEngine + ScalingSignal |
-| IP 亲和 | 无 | 框架内置，减少账号风控风险 |
-| 优雅缩容 | 无（直接 terminate，做书中途被杀） | 框架 Drain 机制 |
-| 代码量 | ~1900 行基础设施 | ~200 行 Harness 定义 |
+| 并行度 | 1 本/时 | N 本并行（按需扩容） |
+| 额度 | 单账号，30-80M token/书容易触限 | 多账号分布不同 Worker，自动换号 |
+| 可用性 | Claude Code 崩溃 = 停工 | Worker 崩溃 → 新 Worker + `/continue-book` 自动恢复 |
+| 监控 | 只能在终端看 | 外部 API 实时获取 Phase 进度、审核状态、讲稿文件 |
+| 成本 | 固定开销 | 临时 Worker 用完即毁，空闲零成本 |
+| 运维 | 手动安装插件、登录账号 | Bootstrap 自动化全部 |
+
+### 2.2 Audiobook 特有的需求
+
+与 agent-ml-research 和 CCM 相比，Audiobook 有几个特殊需求：
+
+| 需求 | 说明 | 其他 Harness 是否有 |
+|------|------|-------------------|
+| **临时 Worker** | 一本书一台机器，完成后销毁 | agent-ml: 常驻; CCM: 常驻 |
+| **断点续做** | Worker 崩溃后新 Worker 从 state.json 恢复 | 部分 — CCM 有 session resume |
+| **Phase 进度监控** | 外部服务需要知道当前在哪个 Phase | 部分 — CCM 有任务状态 |
+| **工作目录同步** | `.work/` 目录需要持久化到 S3/OSS 以支持崩溃恢复 | 部分 |
+| **长时间任务** | 1-2 小时/书，Drain 超时需要足够长 | agent-ml: 小时级; CCM: 分钟级 |
 
 ---
 
-## 3. 基于框架的架构设计
+## 3. 基于框架的分布式架构设计
 
-### 3.1 使用框架前后对比
-
-```
-使用框架前 (SOLUTION.md 的设计):          使用框架后:
-┌─────────────────────┐                 ┌─────────────────────┐
-│ 后端 Dispatcher      │                 │ 后端 Dispatcher      │
-│                     │                 │                     │
-│ TaskManager         │                 │ TaskManager         │
-│ StreamHub           │                 │ StreamHub           │
-│ ChatService         │                 │ ChatService         │
-│ EC2Manager (自建)   │  ══替换══▶      │                     │
-│ HealthChecker (自建)│                 │ Elastic-Agent       │
-│ PoolMonitor (自建)  │                 │ Framework           │
-│                     │                 │ (CloudProvider +    │
-│ user_data 脚本生成  │                 │  CredentialPool +   │
-│ 心跳超时检测        │                 │  QuotaMonitor +     │
-│ 恢复流程编排        │                 │  BootstrapPipeline) │
-└─────────┬───────────┘                 └─────────┬───────────┘
-          │ SQS + SSH                             │ Worker Runtime
-     ┌────▼────┐                             ┌────▼────┐
-     │EC2      │                             │Worker   │
-     │         │                             │┌──────┐ │
-     │user_data│                             ││W.R.  │ │  ← 框架 Runtime
-     │脚本启动  │                             │└──┬───┘ │
-     │         │                             │   │     │
-     │Worker   │                             │Worker   │
-     │Agent    │                             │Agent    │  ← 业务代码
-     └─────────┘                             └─────────┘
-```
-
-### 3.2 保留与替换的边界
-
-| 模块 | 操作 | 理由 |
-|------|------|------|
-| `EC2Manager` | **替换** → `elastic_agent.CloudProvider` | 框架标准 EC2 管理 |
-| `user_data.py` 脚本生成 | **替换** → Harness Bootstrap Pipeline | 框架有失败处理 + 回滚 |
-| `HealthChecker` | **替换** → 框架 Worker Runtime 健康检查 | 框架内置 L2/L3 |
-| `PoolMonitorService` | **替换** → 框架 QuotaMonitor | 框架统一监控 |
-| 安全网 (EventBridge) | **替换** → 框架孤儿实例检测 | 框架内置 |
-| `StreamHub` | **保留** | 做书特有的聊天中继逻辑 |
-| `ChatService` | **保留** | 双向聊天是业务特有 |
-| `TaskManager` | **保留** | 做书任务管理是业务特有 |
-| `WorkerAgent` | **保留** | 做书核心编排（stream-json 解析、Phase 检测、账号切换） |
-| `StreamReporter` | **保留** | 0.5s 攒批 SQS 上报是业务优化 |
-| `FileSyncer` | **保留** | 3s 文件同步是业务需求 |
-| `PoolStateWatcher` | **适配** | 保留事件检测逻辑，上报方式适配框架 Worker Runtime |
-| `claude-pool-watchdog` | **保留** | AMI 预装的 Shell 脚本，本地采集不变 |
-| 前端聊天系统 | **保留** | 做书特有的 UI |
-
-### 3.3 框架化后的架构
+### 3.1 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Manager 节点（后端服务器）                 │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │            Audiobook 业务层（保留）                      │  │
-│  │  TaskManager · StreamHub · ChatService · Vue 前端      │  │
-│  │  SQS 消息协议 · WebSocket 双向聊天 · S3 文件同步       │  │
-│  └───────────────────────┬───────────────────────────────┘  │
-│                          │ 调用框架 API                      │
-│  ┌───────────────────────▼───────────────────────────────┐  │
-│  │             Elastic-Agent 框架层                        │  │
-│  │                                                       │  │
-│  │  CloudProvider  CredentialPool   QuotaMonitor          │  │
-│  │  (boto3 EC2)    (Claude 账号池)   (额度监控)           │  │
-│  │                                                       │  │
-│  │  NodeRegistry   BootstrapPipeline  WorkerRuntime       │  │
-│  │  (节点注册)     (初始化管道)       (远程执行+日志)     │  │
-│  │                                                       │  │
-│  │  IPAffinity     DrainPolicy       ScalingEngine        │  │
-│  │  (IP 亲和)      (优雅缩容)        (扩缩容规则)        │  │
-│  └───────────────────────┬───────────────────────────────┘  │
-└──────────────────────────┼──────────────────────────────────┘
-                           │ Worker Runtime Protocol
-             ┌─────────────┼─────────────┐
-             │             │             │
-        ┌────▼────┐   ┌────▼────┐   ┌────▼────┐
-        │Worker 1 │   │Worker 2 │   │Worker N │
-        │┌───────┐│   │┌───────┐│   │┌───────┐│
-        ││Worker ││   ││Worker ││   ││Worker ││
-        ││Runtime││   ││Runtime││   ││Runtime││  ← 框架提供
-        │└───┬───┘│   │└───┬───┘│   │└───┬───┘│
-        │┌───▼───┐│   │┌───▼───┐│   │┌───▼───┐│
-        ││Worker ││   ││Worker ││   ││Worker ││
-        ││Agent  ││   ││Agent  ││   ││Agent  ││  ← 做书业务代码
-        │└───────┘│   │└───────┘│   │└───────┘│
-        │┌───────┐│   │┌───────┐│   │┌───────┐│
-        ││Claude ││   ││Claude ││   ││Claude ││
-        ││Code   ││   ││Code   ││   ││Code   ││
-        │└───────┘│   │└───────┘│   │└───────┘│
-        └─────────┘   └─────────┘   └─────────┘
-        用完即毁        用完即毁        用完即毁
+┌─────────────────────────────────────────────────────────────────┐
+│                         Manager 节点                            │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │             Audiobook Dispatcher（业务层）                │   │
+│  │                                                          │   │
+│  │  ┌───────────────┐  ┌──────────┐  ┌──────────────────┐  │   │
+│  │  │ BookQueue      │  │TaskState │  │ Web UI           │  │   │
+│  │  │(做书请求队列)  │  │(全局状态)│  │ (进度/聊天/文件) │  │   │
+│  │  └───────┬───────┘  └──────────┘  └──────────────────┘  │   │
+│  └──────────┼───────────────────────────────────────────────┘   │
+│             │ 调用框架 API                                       │
+│  ┌──────────▼───────────────────────────────────────────────┐   │
+│  │             Elastic-Agent 框架层                          │   │
+│  │                                                          │   │
+│  │  AliyunEcsProvider    CredentialPool    BootstrapPipeline │   │
+│  │  NodeRegistry         HealthChecker     DrainManager      │   │
+│  │  ExternalAPI(轨迹流)  ExternalAPI(文件)  CloudReconciler  │   │
+│  └──────────────────────────┬───────────────────────────────┘   │
+└─────────────────────────────┼───────────────────────────────────┘
+                              │ Worker Runtime Protocol
+                ┌─────────────┼─────────────┐
+                │             │             │
+           ┌────▼────┐  ┌────▼────┐  ┌─────▼───┐
+           │Worker 1 │  │Worker 2 │  │Worker N │
+           │阿里云ECS│  │阿里云ECS│  │阿里云ECS│
+           │┌───────┐│  │┌───────┐│  │┌───────┐│
+           ││Worker ││  ││Worker ││  ││Worker ││
+           ││Runtime││  ││Runtime││  ││Runtime ││  ← 框架内置
+           │└───┬───┘│  │└───┬───┘│  │└───┬───┘│
+           │┌───▼───┐│  │┌───▼───┐│  │┌───▼───┐│
+           ││Claude ││  ││Claude ││  ││Claude ││
+           ││Code   ││  ││Code   ││  ││Code   ││
+           ││+ 插件 ││  ││+ 插件 ││  ││+ 插件 ││  ← audiobook-nonfiction
+           │└───────┘│  │└───────┘│  │└───────┘│
+           │  《异类》 │  │  《枪炮》 │  │  《思考》 │
+           └─────────┘  └─────────┘  └─────────┘
+           用完即毁       用完即毁       用完即毁
 ```
 
----
+### 3.2 工作流程
 
-## 4. 模块映射：自建 vs 框架
+#### 扩容（收到做书请求）
 
-### 4.1 EC2 生命周期管理
-
-```python
-# ── 自建方案（SOLUTION.md 中的设计） ──
-
-# backend/services/ec2_manager.py
-class EC2Manager:
-    async def launch_worker(self, task: Task) -> str:
-        # 手动构建 user_data
-        user_data = build_user_data(task, downstream_url=downstream_url)
-        resp = self.ec2.run_instances(
-            LaunchTemplate={"LaunchTemplateName": "audiobook-worker-template"},
-            UserData=base64.b64encode(user_data.encode()).decode(),
-            # ...
-        )
-        return resp['Instances'][0]['InstanceId']
-
-    async def poll_workers(self):
-        # 手动每 30 秒轮询 EC2 状态
-        ...
-
-# ── 使用框架后 ──
-
-from elastic_agent import AWSEc2Provider, InstanceConfig
-
-provider = AWSEc2Provider(
-    region="us-east-1",
-    ami_id="ami-audiobook-worker-v1",
-    default_instance_type="m5.xlarge",
-    key_pair_name="audiobook-workers",
-    security_group_ids=["sg-xxxxx"],
-    subnet_id="subnet-xxxxx",
-    instance_initiated_shutdown="terminate",
-)
-
-# 框架自动处理：状态轮询、孤儿检测、安全网
-instance = await provider.create_instance(InstanceConfig(
-    name=f"audiobook-{task.id}",
-    tags={"TaskId": task.id, "Project": "audiobook"},
-))
+```
+前端提交做书请求（book_path, book_slug, persona, target_pct）
+  │
+  ▼
+Manager BookQueue 入队
+  │
+  ▼
+Elastic-Agent scale_out(count=1, task_metadata={book_slug, book_path, ...})
+  │
+  ▼
+AliyunEcsProvider 创建临时 ECS 实例
+  → 等待 running
+  → 从 CredentialPool 选择账号
+  → Bootstrap Pipeline 执行:
+      1. 安装 Node.js + Claude Code CLI
+      2. 注入 Claude Code 凭证（refresh token 写入 ~/.claude/.credentials.json）
+      3. 安装 audiobook-nonfiction 插件
+      4. 安装 Python 依赖（pypdf, ebooklib, python-docx）
+      5. 上传书籍 PDF 到 Worker
+      6. 启动 Worker Runtime
+      7. 通过 Worker Runtime 启动 Claude Code 会话:
+         claude -p "/audiobook {book_path} {persona} target_pct={N}" \
+           --dangerously-skip-permissions --output-format stream-json
+  │
+  ▼
+Worker Runtime 流式回传 Claude Code 的 NDJSON 输出到 Manager
+  → Manager 事件总线分发
+  → 外部 API 实时推送到前端（Phase 进度、Agent 轨迹、审核结果）
+  │
+  ▼
+Worker 上的 .work/{book_slug}/ 目录定期同步到 OSS（框架文件监听 + 同步）
+  → 外部服务可通过 /api/external/files/{node_id}/... 实时获取中间产物
 ```
 
-### 4.2 Bootstrap Pipeline
+#### 崩溃恢复
 
-```python
-# ── 自建方案：一个巨大的 user_data bash 脚本 ──
-
-# 约 150 行 bash，包含 6 个阶段：
-# 阶段 1: 拉取凭证 (Secrets Manager)
-# 阶段 2: 自动登录所有账号 (Playwright)
-# 阶段 3: 启动 Watchdog
-# 阶段 4: 下载 PDF + 准备环境
-# 阶段 5: 启动 Worker Agent
-# 阶段 6: 上传产物 + 自毁
-# 无失败回滚，某步失败整个脚本中断
-
-# ── 使用框架后：Harness Bootstrap 步骤（见第 5 节） ──
-# 每步有 execute + rollback，框架处理失败恢复
+```
+HealthChecker 检测到 Worker 心跳超时
+  │
+  ▼
+从 OSS 获取最新的 .work/{book_slug}/ 快照
+  │
+  ▼
+Elastic-Agent scale_out(count=1, task_metadata={book_slug, recovery: true})
+  │
+  ▼
+Bootstrap Pipeline:
+  ... (同上 1-6)
+  7. 从 OSS 恢复 .work/ 目录到新 Worker
+  8. 启动 Claude Code: claude -p "/continue-book {book_slug}" \
+       --dangerously-skip-permissions --output-format stream-json
+  │
+  ▼
+Claude Code 读取 state.json，从中断的 Phase 恢复
 ```
 
-### 4.3 凭证与号池管理
+#### 任务完成 / 缩容
 
-```python
-# ── 自建方案 ──
-
-# 1. user_data 中从 Secrets Manager 手动拉取
-ACCOUNTS_JSON=$(aws secretsmanager get-secret-value ...)
-# 2. 手动调用 account_login.py 登录每个账号
-# 3. watchdog shell 脚本本地监控
-# 4. PoolStateWatcher Python 协程 SQS 上报
-# 5. PoolMonitorService 后端消费入库告警
-# 三层架构，~500 行代码
-
-# ── 使用框架后 ──
-
-from elastic_agent import CredentialPool, ClaudeOAuthProvider
-
-pool = CredentialPool(
-    provider=ClaudeOAuthProvider(
-        email_tokens=load_email_tokens(),
-        # Playwright 登录逻辑从 account_login.py 适配而来
-    ),
-    affinity_policy="prefer_same_ip",
-    quota_threshold=0.85,
-    rotation_strategy="least_used_first",
-)
-
-# 框架自动处理：
-# - 安全凭证传递到 Worker
-# - 额度监控（内置 watchdog 等价功能）
-# - 告警阈值触发事件
+```
+Claude Code 输出 phase=9, state=DELIVERED
+  │
+  ▼
+Worker Runtime 检测到进程退出 (exit_code=0)
+  │
+  ▼
+Manager 收到 process_exit 事件
+  → 从 Worker 下载 delivery/ 目录最终产物
+  → 持久化到 OSS
+  → 回收 Claude Code 凭证到 CredentialPool
+  → 销毁 ECS 实例（临时 Worker 模式）
+  → 从 NodeRegistry 移除
+  │
+  ▼
+BookQueue 标记任务完成
+前端展示：讲稿下载链接、简介、质量报告
 ```
 
-### 4.4 崩溃恢复
+### 3.3 外部服务 API 的使用
 
-```python
-# ── 自建方案 ──
+Audiobook 的前端和监控系统通过框架外部 API 获取实时数据：
 
-# backend/services/health_checker.py
-class HealthChecker:
-    HEARTBEAT_TIMEOUT = 120  # 2 分钟
-    async def check_loop(self):
-        # 每 30 秒检查心跳超时
-        # 二次确认 EC2 状态
-        # 手动编排恢复流程：
-        #   terminate 旧 EC2 → 删旧 SQS → 启新 EC2(recovery_mode) → 更新 DB
-    async def recover_task(self, task):
-        # ~50 行恢复编排代码
+| 需求 | 外部 API 端点 | 数据来源 |
+|------|-------------|---------|
+| Phase 进度 | `GET /api/external/files/{node_id}/.work/{slug}/state.json` | state.json 文件 |
+| 实时 Agent 轨迹 | `WS /api/external/traces/{node_id}/stream` | Claude Code stream-json 输出 |
+| 审核报告 | `GET /api/external/files/{node_id}/.work/{slug}/iter_*/audit_*.json` | 审核 JSON 文件 |
+| 讲稿预览 | `GET /api/external/files/{node_id}/.work/{slug}/manuscript_*.md` | 讲稿文件 |
+| 成本追踪 | `GET /api/external/files/{node_id}/.work/{slug}/metrics.json` | metrics.json |
+| 文件变更监听 | `WS /api/external/files/{node_id}/watch` | inotify 监听 .work/ |
+| 蓝图审阅 | `GET /api/external/files/{node_id}/.work/{slug}/blueprint.md` | 蓝图文件 |
+| 质量指标 | `GET /api/external/files/{node_id}/.work/{slug}/quality_targets.json` | 质量硬指标 |
 
-# ── 使用框架后 ──
+**前端轮询 state.json 可以构建 Phase 进度条：**
 
-# 框架 Worker Runtime 内置：
-# - L2 健康检查：进程存活
-# - L3 健康检查：业务心跳（Worker Agent 上报）
-# - 自动重启/重建流程
-# Harness 只需实现 on_node_unhealthy 事件处理器
+```javascript
+// 前端伪代码
+const state = await fetch(`/api/external/files/${nodeId}/.work/${slug}/state.json`);
+const phaseNames = ["初始化","解构","蓝图","切片","生产","风格","开头结尾","审核","合规","简介","交付"];
+progressBar.update(state.phase, phaseNames[state.phase]);
+if (state.phase === "7") {
+  progressBar.detail(`审核第 ${state.phase_iter}/3 轮`);
+}
 ```
 
 ---
 
-## 5. Harness 接口实现
+## 4. Harness 接口实现
 
-### 5.1 AudiobookHarness 定义
+### 4.1 AudiobookHarness 定义
 
 ```python
 from elastic_agent import (
     Harness, BootstrapStep, ServiceDefinition,
-    ScalingSignal, FrameworkEvent, EventHandler,
+    ScalingSignal, FrameworkEvent, WorkerLifecycle,
 )
 
 class AudiobookHarness(Harness):
-    """有声书稿全自动化生产系统的 Elastic-Agent Harness 实现"""
+    """有声书稿生产系统的 Elastic-Agent Harness"""
 
     def __init__(self, config: dict):
         self.config = config
 
+    def get_worker_lifecycle(self) -> WorkerLifecycle:
+        return WorkerLifecycle.EPHEMERAL  # 用完即毁
+
     def get_repo_url(self) -> str | None:
-        # Worker Agent 代码已在 AMI 中预装，无需 clone
-        # 如需动态部署最新版本可返回 repo URL
-        return None
+        return None  # 插件通过 Bootstrap 安装，不需要 clone 代码仓库
 
     def get_bootstrap_steps(self) -> list[BootstrapStep]:
         return [
-            FetchCredentialsStep(),         # 从 Secrets Manager 拉取账号凭证
-            SetupAccountConfigDirsStep(),   # 为每个账号创建 config 目录
-            AutoLoginAccountsStep(),        # Playwright 自动登录所有账号
-            StartWatchdogStep(),            # 启动 claude-pool-watchdog
-            DownloadBookPDFStep(),          # 从 S3 下载书稿 PDF
-            PrepareWorkspaceStep(),         # 准备工作目录 + 确认插件可用
-            StartWorkerAgentStep(),         # 启动 worker_agent.py（systemd）
+            InstallNodeJSStep(),            # Node.js 20.x
+            InstallClaudeCodeStep(),         # npm install -g @anthropic-ai/claude-code
+            InjectCredentialStep(),          # 写入 ~/.claude/.credentials.json
+            InstallAudiobookPluginStep(),    # 解压插件 + claude plugin install
+            InstallPythonDepsStep(),         # pypdf, ebooklib, python-docx
+            UploadBookPDFStep(),             # SCP/OSS 上传书籍文件到 Worker
+            StartWorkerRuntimeStep(),        # 启动框架 Worker Runtime
+            LaunchClaudeCodeSessionStep(),   # 启动 Claude Code 会话执行 /audiobook
         ]
 
     def get_service_definitions(self) -> list[ServiceDefinition]:
-        return [
-            ServiceDefinition(
-                name="claude-pool-watchdog",
-                command="claude-pool-watchdog -l /tmp/watchdog.log",
-                restart_policy="always",
-            ),
-            ServiceDefinition(
-                name="audiobook-worker",
-                command=(
-                    "python3 /home/ubuntu/worker/worker_agent.py "
-                    "--task-id {task_id} "
-                    "--book-path /home/ubuntu/workspace/book.pdf "
-                    "--book-slug {book_slug} "
-                    "--book-title '{book_title}' "
-                    "--sqs-upstream-url {sqs_upstream_url} "
-                    "--sqs-downstream-url {sqs_downstream_url} "
-                    "--s3-work-prefix {s3_work_prefix} "
-                    "--s3-result-prefix {s3_result_prefix}"
-                ),
-                restart_policy="on-failure",
-                env={
-                    "TASK_ID": "{task_id}",
-                    "BOOK_SLUG": "{book_slug}",
-                },
-                working_directory="/home/ubuntu/workspace",
-            ),
-        ]
+        return []  # 无常驻服务，Claude Code 进程由 Bootstrap 最后一步启动
 
     def get_app_credentials(self) -> list[str]:
-        return [
-            "audiobook_pool_accounts",    # Claude 账号配置 JSON
-            "audiobook_pool_email_tokens", # 171mail API tokens
-        ]
-
-    def get_health_check(self) -> dict:
-        return {
-            "type": "heartbeat",
-            "source": "sqs",                  # Worker 通过 SQS 上报心跳
-            "interval": 30,
-            "timeout": 120,                   # 2 分钟无心跳判定异常
-        }
+        return []  # Audiobook 不需要额外的应用凭证（Git key 等）
 
     def get_scaling_signal(self) -> ScalingSignal:
-        pending = self._count_pending_tasks()
-        running = self._count_running_workers()
+        pending_books = self._count_pending_books()
+        active_workers = self._count_active_workers()
         return ScalingSignal(
-            pending_tasks=pending,
-            idle_workers=0,            # Audiobook Worker 用完即毁，无空闲
-            busy_workers=running,
+            pending_tasks=pending_books,
+            idle_workers=0,  # 临时 Worker 没有空闲概念
+            busy_workers=active_workers,
         )
 
-    def get_drain_policy(self) -> dict:
-        return {
-            "grace_period": 7200,      # 做书任务最长 2 小时
-            "save_state": True,        # 缩容前上传工作目录到 S3
-        }
+    def get_state_directories(self) -> list[str]:
+        """声明需要持久化的目录（框架定期同步到 OSS）"""
+        return ["/home/root/.work/"]
+
+    def get_drain_timeout(self) -> int:
+        return 7200  # 2 小时（一本书最长耗时）
 
     def get_event_handlers(self) -> dict:
         return {
             FrameworkEvent.NODE_READY: self._on_node_ready,
-            FrameworkEvent.NODE_UNHEALTHY: self._on_node_unhealthy,
-            FrameworkEvent.NODE_DRAIN_START: self._on_drain_start,
-            FrameworkEvent.CREDENTIAL_EXHAUSTED: self._on_credential_exhausted,
-            FrameworkEvent.QUOTA_WARNING: self._on_quota_warning,
-            FrameworkEvent.WORKER_COMPLETED: self._on_worker_completed,
+            FrameworkEvent.WORKER_UNHEALTHY: self._on_worker_unhealthy,
+            FrameworkEvent.NODE_TERMINATING: self._on_node_terminating,
         }
-
-    # ── 事件处理器 ──
 
     async def _on_node_ready(self, data: dict):
-        """Worker 就绪后，更新任务状态"""
-        task_id = data.get("task_metadata", {}).get("task_id")
-        if task_id:
-            await self.db.execute(
-                "UPDATE tasks SET status='running', instance_ip=? WHERE id=?",
-                [data["private_ip"], task_id],
+        """Worker 就绪后更新任务状态"""
+        book_slug = data.get("task_metadata", {}).get("book_slug")
+        self.book_queue.update_status(book_slug, "running", worker_id=data["node_id"])
+
+    async def _on_worker_unhealthy(self, data: dict):
+        """Worker 异常 — 触发崩溃恢复"""
+        node_id = data["node_id"]
+        book_slug = self.book_queue.get_book_by_worker(node_id)
+        if book_slug:
+            # 标记需要恢复
+            self.book_queue.update_status(book_slug, "recovering")
+            # 框架会自动终止旧 Worker
+            # 启动新 Worker 并恢复
+            await self.manager.scale_out(
+                count=1,
+                task_metadata={
+                    "book_slug": book_slug,
+                    "recovery": True,
+                    "oss_state_path": f"oss://audiobook-state/{book_slug}/",
+                },
             )
 
-    async def _on_node_unhealthy(self, data: dict):
-        """Worker 异常，触发恢复流程"""
-        task_id = data.get("task_metadata", {}).get("task_id")
-        if not task_id:
-            return
-
-        # 通知前端
-        await self.stream_hub.broadcast(task_id, {
-            "msg_type": "system",
-            "content": {"text": "EC2 实例异常，正在自动恢复..."},
-        })
-
-        # 框架自动处理：terminate 旧实例 → 启新实例 → 重新 Bootstrap
-        # Harness 只需告诉框架如何恢复业务状态：
-        return {
-            "recovery_action": "restart_with_state",
-            "state_restore": {
-                "s3_prefix": f"s3://audiobook-production/tasks/{task_id}/work/",
-                "target_path": f"/home/ubuntu/workspace/.work/{data.get('book_slug', '')}/",
-            },
-            "resume_command": f"/continue-book {data.get('book_slug', '')}",
-        }
-
-    async def _on_drain_start(self, data: dict):
-        """优雅缩容：通知 Worker 保存进度"""
-        task_id = data.get("task_metadata", {}).get("task_id")
-        if task_id:
-            # 通过下行 SQS 发送 pause 命令
-            await self.sqs_send_downstream(task_id, {
-                "command": "pause",
-                "payload": {"reason": "scaling_in"},
-            })
-
-    async def _on_credential_exhausted(self, data: dict):
-        """所有账号额度耗尽"""
-        await self.alert_sender.send({
-            "title": "号池告警：所有账号额度已耗尽",
-            "detail": data,
-        })
-
-    async def _on_quota_warning(self, data: dict):
-        """额度告警"""
-        account_id = data.get("account_id", "")
-        pct = data.get("five_hour_pct", 0)
-        await self.alert_sender.send({
-            "title": f"号池告警: {account_id} 额度 {pct:.0f}%",
-            "detail": data,
-        })
-
-    async def _on_worker_completed(self, data: dict):
-        """Worker 正常完成，清理资源"""
-        task_id = data.get("task_metadata", {}).get("task_id")
-        if task_id:
-            await self.db.execute(
-                "UPDATE tasks SET status='completed', completed_at=? WHERE id=?",
-                [datetime.utcnow(), task_id],
-            )
-            # 删除 per-task 下行 SQS 队列
-            downstream_url = await self.db.fetchval(
-                "SELECT downstream_queue_url FROM tasks WHERE id=?", [task_id]
-            )
-            if downstream_url:
-                self.sqs.delete_queue(QueueUrl=downstream_url)
-
-    # ── 辅助方法 ──
-
-    def _count_pending_tasks(self) -> int:
-        return self.db.fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'queued'"
-        ) or 0
-
-    def _count_running_workers(self) -> int:
-        return self.db.fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE status IN ('running', 'switching')"
-        ) or 0
-```
-
-### 5.2 各 Bootstrap 步骤实现
-
-```python
-class FetchCredentialsStep(BootstrapStep):
-    name = "fetch-credentials"
-
-    async def execute(self, ctx):
-        """从 Secrets Manager 拉取账号凭证到 Worker"""
-        accounts_json = await ctx.secrets.get("audiobook_pool_accounts")
-        email_tokens = await ctx.secrets.get("audiobook_pool_email_tokens")
-
-        await ctx.ssh.run("mkdir -p ~/.claude-pool && chmod 700 ~/.claude-pool")
-        await ctx.ssh.write_file("~/.claude-pool/accounts.json", accounts_json)
-        await ctx.ssh.write_file("~/.claude-pool/email_tokens.json", email_tokens)
-        await ctx.ssh.run("chmod 600 ~/.claude-pool/email_tokens.json")
-
-    async def rollback(self, ctx):
-        await ctx.ssh.run("rm -rf ~/.claude-pool")
-
-
-class SetupAccountConfigDirsStep(BootstrapStep):
-    name = "setup-account-config-dirs"
-
-    async def execute(self, ctx):
-        """为每个账号创建 CLAUDE_CONFIG_DIR"""
-        await ctx.ssh.run("""
-            python3 -c "
-import json, os, pathlib
-with open(os.path.expanduser('~/.claude-pool/accounts.json')) as f:
-    cfg = json.load(f)
-for acc in cfg['accounts']:
-    d = os.path.expandvars(acc['config_dir'])
-    pathlib.Path(d).mkdir(parents=True, exist_ok=True)
-"
-        """)
-
-
-class AutoLoginAccountsStep(BootstrapStep):
-    name = "auto-login-accounts"
-
-    async def execute(self, ctx):
-        """Playwright 自动登录所有 Claude Code 账号"""
-        result = await ctx.ssh.run(
-            "python3 /home/ubuntu/.claude-pool/lib/batch_login.py "
-            "--accounts ~/.claude-pool/accounts.json "
-            "--tokens ~/.claude-pool/email_tokens.json",
-            timeout=300,  # 登录可能需要较长时间
-        )
-        if result.returncode != 0:
-            ctx.log(f"部分账号登录失败: {result.stderr}")
-            # 不中断 — 只要有一个账号登录成功就行
-
-    async def rollback(self, ctx):
-        # 登录失败时无需回滚，凭证已在上一步被清理
+    async def _on_node_terminating(self, data: dict):
+        """Worker 终止前 — 确保工作目录已同步到 OSS"""
+        # 框架的文件同步机制应该已经处理了，这里做最终确认
         pass
+```
 
+### 4.2 Bootstrap 步骤实现
 
-class StartWatchdogStep(BootstrapStep):
-    name = "start-watchdog"
+```python
+class InstallAudiobookPluginStep(BootstrapStep):
+    name = "install-audiobook-plugin"
+    timeout = 120
 
     async def execute(self, ctx):
-        """启动 claude-pool-watchdog 额度监控"""
-        await ctx.ssh.run("nohup claude-pool-watchdog -l /tmp/watchdog.log &")
-        # 等待 watchdog 首次写出状态文件
-        await ctx.ssh.run(
-            "for i in $(seq 1 10); do "
-            "  [ -f /tmp/claude_pool_status.json ] && break; "
-            "  sleep 1; "
-            "done"
+        # 上传插件压缩包到 Worker
+        plugin_archive = ctx.config["audiobook_plugin_path"]
+        await ctx.runtime.upload_file(plugin_archive, "/tmp/audiobook-nonfiction.tar.gz")
+        # 解压 + 安装
+        await ctx.runtime.execute(
+            ["bash", "-c",
+             "cd /opt && tar xzf /tmp/audiobook-nonfiction.tar.gz && "
+             "cd audiobook-nonfiction && "
+             "claude plugin marketplace add ./ && "
+             "claude plugin install audiobook-nonfiction@audiobook-local"],
+            timeout=60,
         )
 
-
-class DownloadBookPDFStep(BootstrapStep):
-    name = "download-book-pdf"
+class InstallPythonDepsStep(BootstrapStep):
+    name = "install-python-deps"
+    timeout = 120
 
     async def execute(self, ctx):
-        """从 S3 下载书稿 PDF"""
-        book_s3_path = ctx.task_metadata["book_s3_path"]
-        await ctx.ssh.run(f"mkdir -p /home/ubuntu/workspace")
-        await ctx.ssh.run(
-            f"aws s3 cp {book_s3_path} /home/ubuntu/workspace/book.pdf",
-            timeout=120,
+        await ctx.runtime.execute(
+            ["pip3", "install", "pypdf", "ebooklib", "python-docx"],
+            timeout=90,
         )
 
-    async def rollback(self, ctx):
-        await ctx.ssh.run("rm -f /home/ubuntu/workspace/book.pdf")
-
-
-class PrepareWorkspaceStep(BootstrapStep):
-    name = "prepare-workspace"
+class UploadBookPDFStep(BootstrapStep):
+    name = "upload-book-pdf"
+    timeout = 60
 
     async def execute(self, ctx):
-        """准备工作目录，确认做书插件可用"""
-        book_slug = ctx.task_metadata["book_slug"]
+        book_path = ctx.task_metadata["book_path"]
+        remote_path = f"/home/root/books/{ctx.task_metadata['book_slug']}.pdf"
+        await ctx.runtime.upload_file(book_path, remote_path)
+        ctx.metadata["remote_book_path"] = remote_path
 
-        # 确认 audiobook-nonfiction 插件已安装
-        result = await ctx.ssh.run(
-            "ls /home/ubuntu/audiobook-nonfiction/skills/audiobook-nonfiction/SKILL.md"
-        )
-        if result.returncode != 0:
-            raise RuntimeError("audiobook-nonfiction 插件未安装，AMI 可能有问题")
-
-        # 如果是恢复模式，从 S3 恢复工作目录
-        if ctx.task_metadata.get("recovery_mode"):
-            s3_work_prefix = ctx.task_metadata["s3_work_prefix"]
-            await ctx.ssh.run(
-                f"mkdir -p /home/ubuntu/workspace/.work/{book_slug} && "
-                f"aws s3 sync {s3_work_prefix}/ "
-                f"/home/ubuntu/workspace/.work/{book_slug}/ --quiet",
-                timeout=300,
-            )
-
-
-class StartWorkerAgentStep(BootstrapStep):
-    name = "start-worker-agent"
+class LaunchClaudeCodeSessionStep(BootstrapStep):
+    name = "launch-claude-code"
+    timeout = 30
 
     async def execute(self, ctx):
-        """启动 Worker Agent 主控进程"""
         meta = ctx.task_metadata
-        cmd = (
-            f"python3 /home/ubuntu/worker/worker_agent.py "
-            f"--task-id {meta['task_id']} "
-            f"--book-path /home/ubuntu/workspace/book.pdf "
-            f"--book-slug {meta['book_slug']} "
-            f"--book-title '{meta['book_title']}' "
-            f"--sqs-upstream-url {meta['sqs_upstream_url']} "
-            f"--sqs-downstream-url {meta['sqs_downstream_url']} "
-            f"--s3-work-prefix {meta['s3_work_prefix']} "
-            f"--s3-result-prefix {meta['s3_result_prefix']}"
-        )
+        book_slug = meta["book_slug"]
+        remote_book_path = ctx.metadata.get("remote_book_path",
+            f"/home/root/books/{book_slug}.pdf")
+        persona = meta.get("persona", "nonfiction_default")
+        target = meta.get("target_word_count_pct", 13)
 
-        if meta.get("target_word_count_pct"):
-            cmd += f" --target-word-count-pct {meta['target_word_count_pct']}"
-        if meta.get("persona", "nonfiction_default") != "nonfiction_default":
-            cmd += f" --persona {meta['persona']}"
+        if meta.get("recovery"):
+            # 崩溃恢复模式 — 先从 OSS 恢复工作目录
+            oss_path = meta["oss_state_path"]
+            await ctx.runtime.execute(
+                ["bash", "-c", f"ossutil cp -r {oss_path} /home/root/.work/{book_slug}/"],
+                timeout=120,
+            )
+            prompt = f"/continue-book {book_slug}"
+        else:
+            prompt = f"/audiobook {remote_book_path} {persona} target_pct={target}"
 
-        # 用 systemd 启动（框架 ServiceDefinition 也可以处理这个）
-        unit = f"""
-[Unit]
-Description=Audiobook Worker Agent
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/workspace
-ExecStart={cmd}
-Restart=on-failure
-RestartSec=5
-Environment=DISPLAY=
-
-[Install]
-WantedBy=multi-user.target
-"""
-        await ctx.ssh.write_file(
-            "/etc/systemd/system/audiobook-worker.service", unit
-        )
-        await ctx.ssh.run(
-            "sudo systemctl daemon-reload && sudo systemctl enable --now audiobook-worker"
+        # 启动 Claude Code 会话（非阻塞 — Worker Runtime 管理进程生命周期）
+        await ctx.runtime.execute(
+            ["claude", "-p", prompt,
+             "--dangerously-skip-permissions",
+             "--output-format", "stream-json",
+             "--verbose"],
+            cwd="/home/root",
+            timeout=None,  # 无超时 — 1-2 小时任务
         )
 ```
 
-### 5.3 Manager 侧集成
+### 4.3 Manager 侧集成
 
 ```python
-# backend/main.py — 初始化 Elastic-Agent
-
-from elastic_agent import ElasticAgentManager, AWSEc2Provider, CredentialPool
+from elastic_agent import ElasticAgentManager, AliyunEcsProvider, CredentialPool
 from audiobook_harness import AudiobookHarness
 
-elastic = ElasticAgentManager(
-    provider=AWSEc2Provider(
-        region="us-east-1",
-        ami_id="ami-audiobook-worker-v1",
-        instance_type="m5.xlarge",
-        key_pair_name="audiobook-workers",
-        security_group_ids=["sg-xxxxx"],
-        subnet_id="subnet-xxxxx",
-        iam_instance_profile="audiobook-worker-role",
-        instance_initiated_shutdown="terminate",
-    ),
-    credential_pool=CredentialPool(
-        provider=ClaudeOAuthProvider(email_tokens=load_email_tokens()),
-        affinity_policy="prefer_same_ip",
-        quota_threshold=0.85,
-    ),
-    harness=AudiobookHarness(config),
+# 阿里云优先
+provider = AliyunEcsProvider(
+    region_id="cn-hangzhou",
+    image_id="m-bp1xxxx",                 # 预装 Ubuntu + Python + Node.js
+    instance_type="ecs.c6.xlarge",         # 4C/8G（Opus 子 Agent 需要更多内存）
+    security_group_id="sg-bp1xxxx",        # Terraform output
+    vswitch_id="vsw-bp1xxxx",             # Terraform output
+    key_pair_name="elastic-agent-key",
+    spot_strategy="SpotAsPriceGo",         # 抢占式实例节省 70-85%
 )
 
-# 任务 API（业务逻辑不变，只是 EC2 管理委托给框架）
+manager = ElasticAgentManager(
+    provider=provider,
+    credential_pool=CredentialPool("claude_accounts.json"),
+    harness=AudiobookHarness({
+        "audiobook_plugin_path": "/opt/audiobook-nonfiction.tar.gz",
+        "oss_bucket": "audiobook-production",
+    }),
+)
 
-@app.post("/api/tasks")
-async def create_task(req: TaskCreateRequest):
-    # 1. 上传 PDF 到 S3
-    # 2. 写 DB
-    # 3. 创建 per-task 下行 SQS 队列
-    downstream_url = sqs.create_queue(
-        QueueName=f"audiobook-down-{task.id}",
-        Attributes={"MessageRetentionPeriod": "3600"},
-    )["QueueUrl"]
-    
-    # 4. 通过框架启动 Worker（替换原来的 ec2_manager.launch_worker）
-    node = await elastic.scale_out(
+# 收到做书请求时
+async def handle_book_request(book_slug: str, book_path: str, target_pct: int = 13):
+    nodes = await manager.scale_out(
         count=1,
+        instance_config=InstanceConfig(
+            name=f"audiobook-{book_slug}",
+            spot=True,  # 抢占式实例
+        ),
         task_metadata={
-            "task_id": task.id,
-            "book_slug": req.book_slug,
-            "book_title": req.book_title,
-            "book_s3_path": s3_path,
-            "sqs_upstream_url": UPSTREAM_SQS_URL,
-            "sqs_downstream_url": downstream_url,
-            "s3_work_prefix": f"s3://audiobook-production/tasks/{task.id}/work",
-            "s3_result_prefix": f"s3://audiobook-production/tasks/{task.id}/result",
-            "target_word_count_pct": req.target_word_count_pct,
-            "persona": req.persona,
+            "book_slug": book_slug,
+            "book_path": book_path,
+            "target_word_count_pct": target_pct,
         },
     )
-    
-    # 5. 更新 DB
-    await db.execute(
-        "UPDATE tasks SET status='launching', instance_id=?, downstream_queue_url=? WHERE id=?",
-        [node[0].id, downstream_url, task.id],
-    )
-    return {"task_id": task.id}
+    return nodes[0].id
+
+# 前端获取实时数据
+# WS: /api/external/traces/{node_id}/stream          → Agent 轨迹
+# GET: /api/external/files/{node_id}/.work/*/state.json → Phase 进度
+# GET: /api/external/files/{node_id}/.work/*/delivery/  → 最终产物
 ```
+
+---
+
+## 5. 核心技术挑战与方案
+
+### 5.1 Claude Code 插件安装自动化
+
+**挑战：** audiobook-nonfiction 是 Claude Code 插件，需要通过 `claude plugin install` 安装。Bootstrap 必须正确处理插件的 marketplace 注册和安装。
+
+**方案：**
+1. 将插件压缩包预置在 AMI/镜像中（减少 Bootstrap 时间）
+2. 或通过 SCP/OSS 上传到 Worker 后本地安装
+3. 插件安装后需要**重启 Claude Code 会话**才能生效
+
+### 5.2 工作目录持久化与崩溃恢复
+
+**挑战：** `.work/{book_slug}/` 目录是全部中间产物的唯一存储。如果 Worker（临时 ECS 实例）崩溃或被 Spot 回收，这些文件丢失则无法恢复。
+
+**方案：**
+```
+Worker 运行中:
+  框架 Worker Runtime 使用 inotify 监听 .work/ 目录
+    → 文件变更时增量同步到 OSS (aliyun) / S3 (aws)
+    → 同步间隔: 变更后 3-5 秒（防抖）
+    → 关键文件（state.json）变更立即同步
+
+Worker 崩溃后:
+  Manager HealthChecker 检测心跳超时
+    → 创建新 Worker
+    → Bootstrap: ossutil cp -r oss://.../{book_slug}/ /home/root/.work/{book_slug}/
+    → 启动 Claude Code: /continue-book {book_slug}
+    → state.json 告诉 Claude Code 从哪个 Phase 恢复
+```
+
+**state.json 是恢复的核心** — 它记录了 Phase、迭代次数、决策历史、已知问题。`/continue-book` 命令读取 state.json 后跳过已完成的 Phase。
+
+### 5.3 Claude Code 账号额度管理
+
+**挑战：** 单本书消耗 30-80M token，Claude Max 订阅有 5 小时滑动窗口限制。高并发生产时账号池必须足够大。
+
+**方案：**
+- CredentialPool 在 Bootstrap 时选择最空闲账号
+- 每个 Worker 独占一个账号（一对一绑定）
+- 如果做书过程中额度耗尽：
+  1. Claude Code 会自动等待限频恢复（rate_limit_events 记录在 state.json）
+  2. 如果等待超时 → Worker Runtime 检测到进程异常 → 触发崩溃恢复流程
+  3. 新 Worker 分配新账号 + `/continue-book` 恢复
+
+### 5.4 从 Agent 轨迹中提取 Phase 进度
+
+**挑战：** 外部服务需要知道当前书在哪个 Phase。Claude Code 的 stream-json 输出是原始的 NDJSON 事件，不包含 Phase 信息。
+
+**方案（两个层次）：**
+
+1. **文件监听 state.json**（推荐）— 框架外部 API 监听 state.json 文件变更，每次 state 更新时推送给外部：
+   ```
+   WS /api/external/files/{node_id}/watch → 监听 .work/*/state.json
+   ```
+
+2. **解析 Agent 轨迹流**（辅助）— 从 stream-json 中匹配 Phase 切换关键词。但这需要 Harness 自定义解析逻辑，不如直接读 state.json 可靠。
+
+### 5.5 Spot 实例中断处理
+
+**挑战：** 阿里云抢占式实例可能被回收（2 分钟通知），做书流水线 1-2 小时，中断概率不低。
+
+**方案：**
+- 抢占式实例被回收前阿里云发送中断通知
+- 框架 Worker Runtime 接收中断信号后：
+  1. 立即将当前 `.work/` 目录全量同步到 OSS
+  2. 记录中断点到 state.json
+  3. Manager 自动创建新 Worker（On-Demand 或新 Spot）+ `/continue-book` 恢复
+
+### 5.6 用户交互（合规决策 M6）
+
+**挑战：** Phase 8 有一个用户决策点 M6 — 用户需要选择使用合规版还是原始版。当前设计中这个决策在 Claude Code 会话内完成，分布式后如何让外部用户参与？
+
+**方案：**
+- 框架反向消息通道（Manager → Worker）
+- 前端检测到 state.json 中 `state: "NEEDS_HUMAN"` 时显示决策 UI
+- 用户选择后通过 Manager API 发送消息到 Worker
+- Worker Runtime 将消息写入一个文件（如 `.work/{slug}/user_decision.json`）
+- Claude Code 的 `/continue-book` 读取该文件继续
 
 ---
 
 ## 6. 分步实施方案
 
-### Phase 0：环境准备（1-2 天）
+> **前置条件：** 按 [MVP 计划](mvp-plan.md) 完成 Terraform 网络部署和框架核心模块开发。
 
-1. 制作 AMI：预装 Claude Code + Playwright + mitmproxy + audiobook-pool + audiobook-nonfiction
-2. 创建 AWS 资源：S3 Bucket、SQS 上行队列、Secrets Manager、IAM Role、Security Group
-3. 在 Elastic-Agent 框架中实现 `AudiobookHarness` 基本骨架
-4. 手动测试：通过框架创建一台 EC2，验证 AMI 和 Bootstrap 步骤
+### Phase 0：基础设施准备
 
-### Phase 1：Worker Agent 核心（3-5 天）
+1. Terraform 部署阿里云 VPC/安全组/密钥对
+2. 制作 AMI（预装 Ubuntu + Python 3.11 + Node.js 20 + Claude Code CLI + audiobook-nonfiction 插件）
+3. 配置 OSS Bucket（存储工作目录快照和最终交付物）
+4. 准备 Claude Max 账号池
 
-1. 实现 `WorkerAgent`（Claude 子进程管理 + stream-json 解析 + Phase 检测）
-2. 实现 `StreamReporter`（0.5s 攒批 SQS 上报）
-3. 实现 `FileSyncer`（3s 扫描 + S3 上传）
-4. 实现账号切换逻辑（rate limit 检测 + hardlink + resume）
-5. 端到端测试：手动启动 EC2 → 跑通一本书 → 实时消息可在 SQS 看到
+### Phase 1：单书端到端验证
 
-### Phase 2：后端 Dispatcher（3-5 天）
+1. 手动创建一台阿里云 ECS
+2. 安装插件 + 登录 Claude Code + 执行 `/audiobook`
+3. 验证全 10 Phase 流水线可以在阿里云 ECS 上完整运行
+4. 验证 `/continue-book` 可以从中断恢复
 
-1. FastAPI 框架 + SQLite 数据库 + 数据模型
-2. 任务 CRUD API + Elastic-Agent 集成
-3. `StreamHub`（消费上行 SQS → 写 DB → WebSocket 推送）
-4. `ChatService`（WebSocket 双向连接 + 下行 SQS 投递）
-5. per-task 下行 SQS 队列创建/销毁
-6. 端到端测试：通过 API 创建任务 → Worker 自动启动 → 消息实时到达后端
+### Phase 2：框架集成
 
-### Phase 3：前端 UI（2-3 天）
+1. 实现 AudiobookHarness（Bootstrap 步骤、事件处理）
+2. 通过 Elastic-Agent 创建临时 Worker → 自动安装插件 → 自动执行做书
+3. 验证外部 API：通过 `/api/external/files/` 实时获取 state.json 和讲稿
+4. 验证崩溃恢复：手动 kill Worker → 新 Worker 自动恢复
 
-1. 任务提交页面
-2. `useChatManager`：多任务切换 + WebSocket 实时聊天
-3. `ChatStream.vue`：聊天气泡渲染（文本 + 工具卡片 + 系统消息）
-4. `PhaseProgress.vue`：10 Phase 进度条
-5. `FileExplorer.vue`：中间文件浏览器
-6. 用户消息发送功能
+### Phase 3：多书并行 + 前端
 
-### Phase 4：高级功能（2-3 天）
+1. 实现 BookQueue 队列管理（多本书排队/并行）
+2. 前端：提交做书请求 UI
+3. 前端：Phase 进度条（轮询 state.json）
+4. 前端：Agent 轨迹实时流（WebSocket 消费外部 API）
+5. 前端：讲稿预览/下载
 
-1. 崩溃恢复：框架 `NODE_UNHEALTHY` → 新 EC2 → S3 恢复 → `/continue-book`
-2. 三层号池监控：watchdog → PoolStateWatcher → PoolMonitorService
-3. 扩缩容规则：pending 任务数 > 0 → 扩容，任务完成 → 自动销毁
-4. IP 亲和性：同一账号优先分配到之前使用过的 IP
-5. 前端号池面板
+### Phase 4：生产化
 
-### Phase 5：集成测试与优化（2-3 天）
-
-1. 端到端全流程：前端提交 → EC2 做书 → 实时聊天 → 完成
-2. 测试账号切换（模拟限流）
-3. 测试崩溃恢复（kill EC2）
-4. 测试用户双向交互（Phase 8 合规决策）
-5. 延迟优化验证（目标：Claude 输出 → 前端气泡 ≤1.7 秒）
-
-**总计：约 12-18 天**（与自建方案 11-18 天相近，但获得了 IP 亲和、优雅缩容、标准健康检查等额外能力）
+1. 额度监控 + 自动换号
+2. Spot 实例中断处理
+3. 成本追踪仪表盘（每本书的 ECS 成本 + token 成本）
+4. 用户决策点 M6 的外部交互
+5. 批量做书支持
 
 ---
 
-## 7. 技术细节与挑战
+## 7. Audiobook 对框架提出的需求
 
-### 7.1 双向聊天与 Claude Code `--print` 模式的矛盾
+### 7.1 Audiobook 特有但普适的需求
 
-**挑战**：Claude Code `--print` 模式是单次执行，不接受运行中注入输入。用户在前端发的消息无法"中断"正在运行的 Claude。
+| 需求 | 说明 | 普适性 |
+|------|------|--------|
+| **临时 Worker 模式** | 一个任务一台 Worker，完成后销毁 | 通用 — batch job、CI runner 都需要 |
+| **task_metadata 注入** | Bootstrap 需要知道具体任务参数（book_slug、book_path） | 通用 — 任何按需启动 Worker 的场景 |
+| **工作目录持久化** | 定期同步指定目录到 OSS/S3 | 通用 — ML checkpoint、中间结果 |
+| **崩溃恢复** | 新 Worker 从 OSS 恢复状态 + 续做 | 通用 — 长时间任务的可靠性保证 |
+| **反向消息通道** | Manager → Worker 传递用户决策 | 通用 — 人工审批、交互式 Agent |
+| **Spot 中断处理** | 抢占式实例回收时优雅保存状态 | 通用 — 使用 Spot 的所有场景 |
+| **文件上传到 Worker** | Bootstrap 时上传书籍 PDF 到 Worker | 通用 — 任何需要输入文件的任务 |
 
-**解决方案**：Worker 在每次 Claude Code 运行结束后，检查下行 SQS 是否有用户消息。有的话用 `--resume` + 用户消息作为新 prompt 启动新一轮。
+### 7.2 与其他 Harness 的交叉验证
 
-```python
-# WorkerAgent 主循环伪代码
-while True:
-    exit_code, session_id = run_claude_with_streaming(prompt)
-    
-    if is_rate_limited():
-        switch_account()
-        prompt = "/continue-book {slug}"
-        continue
-    
-    user_commands = poll_downstream_sqs()
-    if user_commands:
-        prompt = user_commands[-1]["text"]
-        continue  # --resume + 用户消息
-    
-    if is_waiting_for_user():
-        msg = wait_for_user_message(timeout=300)
-        if msg:
-            prompt = msg
-            continue
-    
-    break  # 正常完成
-```
+| 框架能力 | agent-ml-research | CCM | Audiobook | 结论 |
+|---------|------------------|-----|-----------|------|
+| Worker Runtime | ✅ 替换 SSH | ✅ 替换本地子进程 | ✅ 启动 Claude Code 会话 | **框架核心** |
+| 日志流式传输 | ✅ 飞书告警 | ✅ WebSocket 前端 | ✅ stream-json → 外部 API | **框架核心** |
+| 外部 API（轨迹） | ✅ 飞书消费 | ✅ 前端日志 | ✅ Phase 进度 + Agent 轨迹 | **框架核心** |
+| 外部 API（文件） | ✅ 研究产物 | ✅ 项目文件 | ✅ state.json + 讲稿 + 审核报告 | **框架核心** |
+| 有状态亲和性 | ✅ 项目绑定 | ✅ session resume | ❌ 临时 Worker 不需要 | 部分通用 |
+| 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 2h 做书（Drain 7200s） | **框架核心** |
+| 双层凭证 | ✅ WandB/HF | ✅ Git key | ✅ Claude 账号 | **框架核心** |
+| 扩缩容信号 | ✅ 项目数 | ✅ 队列深度 | ✅ 待做书数 | **框架核心** |
+| **临时 Worker** | ❌ 常驻 | ❌ 常驻 | ✅ 用完即毁 | **新增** |
+| **工作目录持久化** | ❌ | ❌ | ✅ .work/ → OSS | **新增** |
+| **崩溃恢复** | ❌ | ❌ | ✅ OSS → 新 Worker | **新增** |
+| **task_metadata** | ❌ | ❌ | ✅ book_slug/path | **新增** |
+| **反向消息** | ✅ 飞书指令 | ✅ Plan 审批 | ✅ 合规决策 M6 | **框架核心** |
+| **Terraform IaC** | ✅ | ✅ | ✅ | **框架提供模板** |
 
-**延迟分析**：
-- Claude 已停下等用户：~1-3 秒（SQS 传输 + Worker 轮询）
-- Claude 还在运行中：等当前轮次结束（前端可看到 Claude 在忙，用户有预期）
+### 7.3 成本估算
 
-**框架可提供的帮助**：Worker Runtime 如果支持"信号注入"接口（不杀进程，只是标记有新消息），Worker Agent 可以在 Claude 自然停顿点（如工具调用之间）检查消息，减少等待时间。
+| 资源 | 单价 | 单本书用量 | 单本书成本 |
+|------|------|----------|----------|
+| 阿里云 ecs.c6.xlarge On-Demand | ¥0.78/h | 2h | ¥1.56 |
+| 阿里云 ecs.c6.xlarge Spot | ~¥0.12/h | 2h | ¥0.24 |
+| Claude Max 订阅（已有） | — | 30-80M token | ~$1.5-4 |
+| OSS 存储 | ¥0.12/GB/月 | ~100MB | ¥0.012 |
+| **总计 (Spot)** | | | **~¥0.25 + $2.75 ≈ ¥20/本** |
 
-### 7.2 SQS 消息排序
-
-**挑战**：SQS Standard Queue 不保证消息顺序。聊天气泡乱序会导致前端显示混乱。
-
-**解决方案**：Worker 端维护 `seq` 单调递增计数器，前端按 `seq` 排序。成本比 SQS FIFO 低得多（FIFO 限制 300 TPS 且贵 2x）。
-
-**框架可提供的帮助**：框架的日志传输通道如果内置序号机制，Harness 无需自己维护 `seq`。
-
-### 7.3 临时 EC2 的通信挑战
-
-**挑战**：与 agent-ml-research 的常驻 EC2 不同，Audiobook Worker 是临时的（用完即毁）。无法用 SSH 轮询状态，无法部署常驻 HTTP 服务。
-
-**解决方案**：全部用 SQS 推送模式。Worker 主动上报，后端被动消费。
-
-**与 agent-ml-research 的关键区别**：
-- agent-ml-research：Manager 主动 SSH 拉取状态（pull）
-- Audiobook：Worker 通过 SQS 主动推送（push）
-- 框架 Worker Runtime 可以统一抽象这两种模式
-
-### 7.4 跨 EC2 崩溃恢复的限制
-
-**挑战**：新 EC2 没有旧 EC2 的 session.jsonl 文件，`--resume` 无法恢复完整对话上下文。
-
-**解决方案**：接受限制，用 `/continue-book` 从 `state.json` + 中间文件恢复。Claude 需要重新理解上下文（约浪费 5-10 分钟），但比从头重做（1-2 小时）好得多。
-
-**三层恢复保障**：
-1. **S3 文件**：FileSyncer 每 3 秒同步，最多丢 3 秒内的文件变更
-2. **state.json**：做书 Skill 自己维护的断点信息
-3. **session_id**：存在 DB 中，但跨 EC2 时 .jsonl 文件丢失
-
-**框架可提供的帮助**：如果框架支持 Worker 状态持久化到 S3（包括 session.jsonl），跨 EC2 恢复时可以完整恢复对话上下文。
-
-### 7.5 AMI 依赖复杂度
-
-**挑战**：AMI 需要预装大量依赖——Claude Code CLI + Playwright + Chromium + mitmproxy + audiobook-pool + audiobook-nonfiction 插件。AMI 更新频繁（插件版本变化、Claude Code 升级）。
-
-**解决方案**：
-- 基础 AMI：系统依赖 + Playwright + Chromium（变化少）
-- Bootstrap 时：动态安装最新 Claude Code + 动态部署最新 Worker 代码
-- 做书插件通过 git pull 获取最新版本
-
-**框架可提供的帮助**：Bootstrap Pipeline 的分层缓存——基础 AMI 只装系统依赖，框架在 Bootstrap 时安装应用依赖，支持缓存到 AMI snapshot 加速后续启动。
-
-### 7.6 低延迟实时聊天的攒批策略
-
-**挑战**：逐条发 SQS 延迟低但成本高（每条 ~50ms × 高频消息 = 大量请求）；全量攒批延迟高但便宜。
-
-**解决方案**：StreamReporter 混合策略：
-- 普通消息：0.5s 攒批窗口，`send_message_batch` 最多 10 条/次
-- 高优先级消息（phase_change / account_switch / error / user_input）：立即 flush
-
-端到端延迟：Claude 输出 → 前端气泡 **0.7-1.7 秒**（0.1s tail-read + 0.5s 攒批 + 0.05s SQS + 1s 后端轮询 + 0.01s WebSocket）。
-
-### 7.7 改造量评估
-
-| 模块 | 工作量 | 说明 |
-|------|--------|------|
-| `AudiobookHarness` | 新开发 ~300 行 | 7 个 Bootstrap 步骤 + 事件处理器 |
-| `WorkerAgent` | 新开发 ~500 行 | 核心做书编排，不依赖框架 |
-| `StreamReporter` | 新开发 ~100 行 | SQS 攒批上报 |
-| `FileSyncer` | 新开发 ~80 行 | S3 文件同步 |
-| `StreamHub` | 新开发 ~150 行 | SQS → DB → WebSocket |
-| `ChatService` | 新开发 ~120 行 | 双向聊天管理 |
-| `TaskManager` | 新开发 ~100 行 | 任务 CRUD |
-| 前端 | 新开发 ~500 行 | 聊天框 + 进度 + 文件浏览 |
-| **EC2Manager** | **不需要** | 框架 CloudProvider 替代 |
-| **HealthChecker** | **不需要** | 框架 Worker Runtime 替代 |
-| **PoolMonitorService** | **不需要** | 框架 QuotaMonitor 替代 |
-| **安全网脚本** | **不需要** | 框架孤儿检测替代 |
-| **总计** | ~1850 行业务代码 | 省去 ~1900 行基础设施代码 |
-
----
-
-## 8. Audiobook 对框架提出的需求
-
-### 8.1 Audiobook 特有但值得框架支持的
-
-| 需求 | 说明 | 普适性判断 |
-|------|------|-----------|
-| **task_metadata 传递** | Bootstrap 步骤需要知道具体任务参数（book_slug、SQS URL 等） | 通用 — 任何按需启动的 Worker 都需要知道"为什么被启动" |
-| **per-task 资源创建** | 每个任务需要专属下行 SQS 队列 | 部分通用 — 需要反向通信通道的 Harness 都会遇到 |
-| **崩溃恢复的状态还原** | 新 Worker 需要从 S3 恢复上一个 Worker 的工作目录 | 通用 — 任何有状态工作负载的崩溃恢复都需要 |
-| **用完即毁的 Worker 模式** | Worker 完成一个任务后立即 terminate，不是常驻服务 | 通用 — batch job 模式 vs long-running 模式 |
-| **SQS 推送模式** | 临时 Worker 无法被 Manager pull，只能主动 push | 通用 — 与常驻 SSH/HTTP 的互补模式 |
-
-### 8.2 与 agent-ml-research 和 CCM 的需求交叉验证
-
-| 需求 | agent-ml-research | CCM | Audiobook | 结论 |
-|------|-------------------|-----|-----------|------|
-| Worker Runtime | ✅ 替换 SSH | ✅ 替换本地子进程 | ✅ 替换 user_data 脚本 | **框架核心** |
-| 日志流式传输 | ✅ 飞书告警 | ✅ WebSocket 前端 | ✅ SQS → WebSocket | **框架核心** |
-| 有状态亲和性 | ✅ 项目绑定实例 | ✅ session resume | ✅ 账号-IP 亲和 | **框架核心** |
-| 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 1-2h 做书 | **框架核心** |
-| 双层凭证 | ✅ WandB/HF/Feishu | ✅ Git key | ✅ Claude 账号 + 171mail tokens | **框架核心** |
-| 扩缩容信号 | ✅ 活跃项目数 | ✅ 任务队列深度 | ✅ 待处理任务数 | **框架核心** |
-| 工作区同步 | ✅ git clone/rsync | ✅ Project clone | ✅ S3 sync（崩溃恢复） | **框架核心** |
-| Bootstrap 超时 | ✅ uv sync 600s | - | ✅ Playwright 登录 300s | 框架支持 |
-| 事件 Webhook | ✅ 飞书 | - | ✅ 钉钉/飞书告警 | 框架支持 |
-| task_metadata | - | - | ✅ 任务参数注入 Worker | 框架支持 |
-| 用完即毁模式 | - | - | ✅ 临时 Worker | 框架支持 |
-| 崩溃状态恢复 | - | - | ✅ S3 → 新 Worker | 框架支持 |
-
-### 8.3 Audiobook 提出的新需求（前两个案例未覆盖）
-
-#### (1) 临时 Worker（Ephemeral Worker）模式
-
-agent-ml-research 和 CCM 的 Worker 都是"创建后常驻、复用多个任务"。Audiobook 的 Worker 是"一个任务一台 EC2，完成后自动销毁"。
-
-**框架应该支持两种 Worker 生命周期模式：**
-- `persistent`：创建后常驻，接受多个任务分发
-- `ephemeral`：按任务创建，完成后自动销毁
-
-Ephemeral 模式对框架的影响：
-- NodeRegistry 需要支持自动注销
-- ScalingEngine 的逻辑不同（不是"扩容到 N 台"，而是"每个任务一台"）
-- 健康检查的超时阈值更短（Worker 不应该存活超过预期任务时长）
-
-#### (2) 任务级元数据注入
-
-Bootstrap 步骤需要知道具体的任务参数（book_slug、SQS URL、S3 路径等），这些参数在 Worker 创建时才确定。
-
-**框架应该支持 `task_metadata` 传递**：Harness 在调用 `scale_out()` 时传入 metadata dict，框架在 Bootstrap 时通过 `ctx.task_metadata` 暴露给每个步骤。
-
-#### (3) 崩溃恢复的状态还原
-
-Worker 崩溃后，新 Worker 需要从外部存储（S3）恢复前一个 Worker 的工作状态。
-
-**框架应该提供标准的状态快照/恢复接口：**
-- Worker Runtime 定期快照指定目录到 S3
-- 崩溃恢复时自动还原到新 Worker
-- Harness 通过 `get_state_directories()` 声明需要持久化的目录
-
-```python
-def get_state_directories(self) -> list[str]:
-    return [
-        "/home/ubuntu/workspace/.work/{book_slug}/",  # 做书中间文件
-    ]
-```
-
-#### (4) 反向消息通道（Manager → Worker）
-
-Audiobook 需要从后端向 Worker 发送用户消息和控制命令。当前设计用 per-task SQS 队列实现。
-
-**框架应该内置 Manager → Worker 的消息通道**，而不是让每个 Harness 自己建 SQS 队列。Worker Runtime 已经有 Manager → Worker 的连接（Bootstrap 用的就是这个），可以复用。
-
-### 8.4 三个案例验证的框架核心需求完整度
-
-通过 agent-ml-research（替换）、CCM（扩展）、Audiobook（绿地构建）三个不同接入模式的案例，确认以下 7 项能力是 Elastic-Agent 框架的核心需求：
-
-1. **Worker Runtime**（远程执行 + 日志传输）
-2. **日志流式传输**（Worker → Manager → 前端）
-3. **有状态亲和性**（session / 项目 / IP 绑定）
-4. **优雅缩容**（Drain 机制，不中断长时间任务）
-5. **双层凭证管理**（Agent 凭证 + 应用凭证）
-6. **扩缩容信号接口**（Harness 上报，框架决策）
-7. **工作区同步**（git clone / rsync / S3 sync）
-
-Audiobook 额外提出的 4 项新需求（临时 Worker、task_metadata、崩溃恢复状态还原、反向消息通道）进一步完善了框架设计。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 的框架设计完整性审查。
+使用 Spot 实例后，**基础设施成本几乎可以忽略**，主要成本是 Claude API token 消耗。
