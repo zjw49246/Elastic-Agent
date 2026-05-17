@@ -255,7 +255,7 @@ agent-ml-research 虽然已经有了分布式架构，但自建基础设施存�
 
 ## 4. 模块替换映射
 
-### 4.1 EC2 Provider 替换
+### 4.1 EC2/ECS Provider 替换
 
 ```python
 # ── 替换前：agent-ml-research 自建 ──
@@ -274,22 +274,32 @@ class Ec2Provider:
         )
         return resp['Instances'][0]
 
-# ── 替换后：使用 Elastic-Agent 框架 ──
+# ── 替换后：使用 Elastic-Agent 框架（阿里云优先） ──
 
-from elastic_agent import AWSEc2Provider, InstanceConfig
+from elastic_agent import AliyunEcsProvider, AWSEc2Provider, InstanceConfig
 
-provider = AWSEc2Provider(
-    region="ap-northeast-1",
-    ami_id="ami-xxxxx",
-    default_instance_type="t3.large",
-    key_pair_name="auto-research-ec2-key-pair",
-    security_group_ids=["sg-xxxxx"],
-    subnet_id="subnet-xxxxx",
+# 阿里云（MVP 首选）— VPC/安全组/密钥对由 Terraform 创建
+provider = AliyunEcsProvider(
+    region_id="cn-hangzhou",
+    image_id="m-bp1xxxx",                      # 自定义镜像
+    instance_type="ecs.c6.large",
+    security_group_id="sg-bp1xxxx",            # Terraform output
+    vswitch_id="vsw-bp1xxxx",                  # Terraform output
+    key_pair_name="elastic-agent-key",         # Terraform output
 )
+
+# 或 AWS — 接口完全一致
+# provider = AWSEc2Provider(
+#     region="ap-northeast-1",
+#     ami_id="ami-xxxxx",
+#     default_instance_type="t3.large",
+#     security_group_ids=["sg-xxxxx"],
+#     subnet_id="subnet-xxxxx",
+# )
 
 instance = await provider.create_instance(InstanceConfig(
     name=f"Prod-{project}",
-    tags={"Project": project, "ManagedBy": "elastic-agent"},
+    tags={"Project": project},
 ))
 ```
 
@@ -359,6 +369,12 @@ pool = CredentialPool(
 ---
 
 ## 5. Harness 接口实现
+
+> **MVP 变更说明：** 根据 [MVP 计划](mvp-plan.md) 的更新，本 Harness 需要适配以下变化：
+> 1. **阿里云优先** — Provider 默认使用 `AliyunEcsProvider`（也可配置为 AWS）
+> 2. **外部服务 API** — 飞书告警可通过框架的外部轨迹流 API 统一接入，减少自建代码
+> 3. **Terraform 基础网络** — VPC/安全组等基础资源通过 Terraform 管理
+> 4. **文件实时传输** — 研究产物（论文、实验结果）可通过框架文件传输 API 暴露给外部服务
 
 ### 5.1 AgentMLResearchHarness 定义
 
@@ -595,7 +611,7 @@ class RegisterAsBackendStep(BootstrapStep):
 ```python
 # manager/service.py 中替换自建基础设施为框架调用
 
-from elastic_agent import ElasticAgentManager, AWSEc2Provider, CredentialPool
+from elastic_agent import ElasticAgentManager, AliyunEcsProvider, AWSEc2Provider, CredentialPool
 from aml_harness import AgentMLResearchHarness
 
 # 替换前:
@@ -604,9 +620,12 @@ from aml_harness import AgentMLResearchHarness
 # from manager.ec2.registry import Ec2Registry
 # from manager.ec2.poller import start_poll_loop
 
-# 替换后:
+# 替换后（阿里云优先）:
+provider = AliyunEcsProvider(aliyun_config)    # MVP 首选
+# provider = AWSEc2Provider(aws_config)        # 或 AWS
+
 elastic = ElasticAgentManager(
-    provider=AWSEc2Provider(config),
+    provider=provider,
     credential_pool=CredentialPool(provider=ClaudeOAuthProvider(email_tokens)),
     harness=AgentMLResearchHarness(config),
 )
@@ -616,47 +635,63 @@ elastic = ElasticAgentManager(
 # POST /api/ec2/instances/{project}/terminate → elastic.remove_node()
 # GET /api/ec2/instances → elastic.list_nodes()
 # GET /api/ec2/status → elastic.get_cluster_status()
+
+# 外部服务（如飞书 Bot）可通过框架 API 获取实时轨迹
+# WebSocket: ws://manager:8000/api/external/traces/{node_id}/stream?api_key=xxx
+# 替代原来的 quota_watchdog.py 轮询 + 飞书告警
 ```
 
 ---
 
 ## 6. 分步迁移方案
 
-### Phase 0：并行运行（零风险验证）
+> **前置条件：** 按 [MVP 计划](mvp-plan.md) 完成 Terraform 基础网络部署和框架核心模块开发。
+
+### Phase 0：基础设施准备
+
+1. 执行 Terraform 部署：`cd infra/environments/aliyun-cn-hangzhou && terraform apply`
+2. 获取 Terraform 输出（VPC ID、VSwitch ID、安全组 ID、密钥对名）填入 Manager 配置
+3. 创建阿里云自定义镜像（预装 Ubuntu + Python + Node.js + 基础工具）
+4. 配置阿里云 AccessKey（建议使用 RAM 子账号，仅授予 ECS 权限）
+
+### Phase 1：并行运行（零风险验证）
 
 1. 在 agent-ml-research 中引入 Elastic-Agent 作为依赖
 2. 新增 `/api/elastic/` 路由，与原有 `/api/ec2/` 并行
-3. 通过 Elastic-Agent 创建一台测试 EC2，验证 Bootstrap 全流程
+3. 通过 Elastic-Agent 创建一台阿里云 ECS 测试实例（或 AWS EC2），验证 Bootstrap 全流程
 4. 对比自建版本和框架版本的行为差异
+5. 验证外部服务 API：通过 `/api/external/traces/{node_id}/stream` 获取实时轨迹
 
 **关键：** 不改动原有代码，新旧共存。
 
-### Phase 1：替换 EC2 管理
+### Phase 2：替换 EC2 管理
 
-1. 将 `manager/ec2/provider.py` 替换为 `AWSEc2Provider`
+1. 将 `manager/ec2/provider.py` 替换为 `AliyunEcsProvider`（或 `AWSEc2Provider`）
 2. 将 `manager/ec2/bootstrap.py` 替换为 Harness Bootstrap Pipeline
 3. 将 `manager/ec2/registry.py` 替换为框架 `NodeRegistry`
 4. 将 `manager/ec2/poller.py` 替换为框架云端对账 + 健康检查
 5. 保留原有的 API 路由签名，内部实现替换为框架调用
 6. 端到端测试：通过 Dashboard 创建/停止/终止实例
+7. 验证飞书告警通过框架外部 API 轨迹流触发（替代原 `quota_watchdog.py` 轮询）
 
-### Phase 2：替换账号管理
+### Phase 3：替换账号管理
 
 1. 将 `manager/pool/` 替换为框架 `CredentialPool`
 2. 将 `core/tools/account_login.py` 适配为 `ClaudeOAuthProvider`
 3. 将 `scripts/claude-pool-watchdog.sh` 替换为框架额度监控
-4. 将 `manager/quota_watchdog.py` 替换为框架 Manager 级告警
+4. 将 `manager/quota_watchdog.py` 替换为框架 Manager 级告警 + 外部 API
 5. 适配 `core/claude_client.py` 的 `pool_select()` 逻辑
 6. 端到端测试：额度耗尽 → 自动换号 → 飞书告警
 
-### Phase 3：接入高级功能
+### Phase 4：接入高级功能
 
 1. 启用 IP 亲和性调度
 2. 启用优雅缩容（Drain 机制）
 3. 配置 ScalingSignal + 规则引擎实现自动扩缩容
 4. 接入框架事件系统（NODE_READY → 注册后端，QUOTA_WARNING → 飞书通知）
+5. 将研究产物（论文 PDF、实验数据）通过框架文件传输 API 暴露给外部服务
 
-### Phase 4：清理
+### Phase 5：清理
 
 1. 删除 `manager/ec2/` 目录
 2. 删除 `manager/pool/` 目录
@@ -769,8 +804,12 @@ agent-ml-research 的 `core/claude_client.py` 使用 session 硬链接技术 —
 | 双层凭证 | ✅ WandB/HF/Feishu | ✅ Git key | **框架核心** |
 | 扩缩容信号 | ✅ 活跃项目数 | ✅ 任务队列深度 | **框架核心** |
 | 工作区同步 | ✅ git clone/rsync | ✅ Project clone | **框架核心** |
+| **外部服务 API（轨迹）** | ✅ 飞书消费轨迹 | ✅ WebSocket 前端 | **框架核心** |
+| **外部服务 API（文件）** | ✅ 研究产物下载 | ✅ 项目文件访问 | **框架核心** |
+| **多云 Provider** | ✅ 阿里云/AWS | ✅ 阿里云/AWS | **框架核心** |
 | Bootstrap 超时 | ✅ | - | 框架支持 |
 | Bootstrap 备选路径 | ✅ | - | 框架支持 |
 | 事件 Webhook | ✅ 飞书 | - | 框架支持 |
+| **Terraform IaC** | ✅ 基础网络 | ✅ 基础网络 | **框架提供模板** |
 
-两个 Harness 的核心需求完全一致，进一步确认框架设计的完整性。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 第 10 节。
+两个 Harness 的核心需求完全一致，进一步确认框架设计的完整性。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 第 10 节和 [MVP 计划](mvp-plan.md)。

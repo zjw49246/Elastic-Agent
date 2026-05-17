@@ -518,11 +518,138 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 | S3 | OSS（对象存储） | 备份和数据持久化 |
 | CloudFormation | ROS（资源编排） | 声明式资源管理 |
 
-### 4.2 关键考虑
+### 4.2 阿里云 ECS SDK 直连方案（MVP 首选）
 
-- 阿里云在中国大陆地区是首选，如果需要国内节点部署则必须使用
-- 双云策略（AWS 全球 + 阿里云国内）时，Terraform 或 Pulumi 提供抽象层
+> **阿里云是 MVP 阶段的优先实现目标。** 项目的首要部署环境是中国大陆，阿里云是必选项。
+
+#### SDK 选择
+
+阿里云 ECS 的 Python SDK 已升级为 V2.0 版本（`alibabacloud_ecs20140526`），相比旧版 `aliyunsdkecs`：
+
+| 维度 | 旧版 SDK | 新版 SDK V2.0 |
+|------|---------|--------------|
+| 包名 | `aliyunsdkecs` | `alibabacloud_ecs20140526` |
+| 认证 | AccessKey 硬编码 | 支持 STS Token、ECS RAM Role、OIDC 等多种方式 |
+| 异步 | 不支持 | 原生支持 `async/await` |
+| 类型提示 | 无 | 完整的 Type Hints |
+| 维护状态 | 仅 bugfix | 活跃开发 |
+
+#### 核心 API 映射
+
+| Elastic-Agent 操作 | 阿里云 API | 说明 |
+|-------------------|-----------|------|
+| `create_instance()` | `RunInstances` | 创建 ECS 实例，支持 InstanceName、Tags、SecurityGroupId |
+| `start_instance()` | `StartInstance` | 启动已停止实例 |
+| `stop_instance()` | `StopInstance` | 停止实例（`ForceStop=True` 强制停止） |
+| `terminate_instance()` | `DeleteInstance` | 释放实例（`Force=True` 强制释放） |
+| `describe_instances()` | `DescribeInstances` | 查询实例列表，支持 Tag 过滤 |
+| IP 管理 | `AllocateEipAddress` + `AssociateEipAddress` | 弹性公网 IP 分配与绑定 |
+| 安全组 | `AuthorizeSecurityGroup` | 入站规则管理 |
+
+#### 阿里云 ECS 配置模型
+
+```python
+class AliyunEcsConfig(BaseModel):
+    region_id: str = "cn-hangzhou"
+    image_id: str = ""                          # 自定义镜像 ID
+    instance_type: str = "ecs.c6.large"         # 2 vCPU / 4 GiB
+    security_group_id: str = ""
+    vswitch_id: str = ""                        # VPC 子网
+    key_pair_name: str = "elastic-agent-key"
+    ssh_key_path: str = "~/.ssh/elastic-agent.pem"
+    ssh_user: str = "root"                      # 阿里云 ECS 默认 root
+    max_instances: int = 30
+    internet_charge_type: str = "PayByTraffic"  # 按流量计费
+    internet_max_bandwidth_out: int = 100       # Mbps
+    system_disk_category: str = "cloud_essd"    # ESSD 云盘
+    system_disk_size: int = 40                  # GB
+    spot_strategy: str = "NoSpot"               # NoSpot / SpotAsPriceGo / SpotWithPriceLimit
+    spot_price_limit: float = 0.0               # 抢占式实例最高价
+```
+
+#### 阿里云 vs AWS 关键差异
+
+| 维度 | AWS EC2 | 阿里云 ECS | 对 Provider 实现的影响 |
+|------|---------|-----------|----------------------|
+| 默认用户 | `ubuntu` | `root`（自定义镜像可改） | `ssh_user` 配置项 |
+| 公网 IP | 创建时分配或绑 EIP | 创建时分配或绑 EIP | API 路径不同，逻辑一致 |
+| 安全组 | 支持入站/出站规则 | 同上，但默认规则不同 | 需要在 Bootstrap 前确认规则 |
+| 标签 | `Tags` 在 `run_instances` 中 | `Tag` 在 `RunInstances` 中 | 字段名和结构略有不同 |
+| 实例回收 | terminate 立即释放 | `DeleteInstance` 需要先 stop | Provider 封装处理 |
+| Spot 实例 | 通过 `SpotInstanceType` | 通过 `SpotStrategy` | 参数映射不同 |
+| SSH 密钥 | Key Pair（PEM） | Key Pair（PEM），也支持密码 | 一致 |
+| 镜像 | AMI（区分 region） | 自定义镜像（区分 region） | 一致 |
+| 内网 DNS | VPC 内自动解析 | VPC 内自动解析 | 一致 |
+
+#### 实例类型推荐
+
+| 用途 | 阿里云实例类型 | 规格 | 按量价格（cn-hangzhou） | 适用场景 |
+|------|-------------|------|----------------------|---------|
+| 轻量 Agent | ecs.c6.large | 2C / 4G | ~¥0.39/h | 单 Claude Code 进程 |
+| 标准 Agent | ecs.c6.xlarge | 4C / 8G | ~¥0.78/h | 多任务并发 |
+| 高性能 Agent | ecs.c6.2xlarge | 8C / 16G | ~¥1.56/h | ML 研究等重负载 |
+| 抢占式（推荐） | ecs.c6.large (Spot) | 2C / 4G | ~¥0.06-0.12/h | 可中断场景，节省 70-85% |
+
+### 4.3 Infrastructure as Code (IaC) 策略
+
+> **结论：MVP 阶段引入 Terraform 管理基础网络资源（VPC/安全组/密钥对），实例生命周期仍用 SDK 直连。**
+
+#### 为什么需要 IaC
+
+SDK 直连管理 **实例生命周期**（创建/启动/停止/销毁）非常合适，但 **基础网络资源**（VPC、子网、安全组、NAT Gateway、密钥对）是一次性创建、长期存在的，手动管理容易出错且不可重现。
+
+| 资源类型 | 管理方式 | 理由 |
+|---------|---------|------|
+| VPC、子网 (VSwitch)、路由表 | **Terraform** | 一次性创建，环境间一致性要求高 |
+| 安全组及规则 | **Terraform** | 安全策略需要版本控制和审计 |
+| 密钥对 | **Terraform** | 一次性创建 |
+| NAT Gateway（IP 亲和性） | **Terraform** | 多 NAT 场景拓扑复杂 |
+| ECS 实例 (Worker) | **SDK 直连** | 动态生命周期，按需创建/销毁 |
+| EIP（弹性 IP） | **SDK 直连** | 跟随实例动态分配/回收 |
+
+#### Terraform 方案（阿里云 + AWS 统一）
+
+Terraform 是唯一能同时管理阿里云和 AWS 的成熟 IaC 工具：
+
+```
+infra/
+├── modules/
+│   ├── networking/          # VPC、子网、安全组（云厂商无关的逻辑抽象）
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── base/                # 密钥对、IAM/RAM 角色
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+├── environments/
+│   ├── aliyun-cn-hangzhou/  # 阿里云杭州环境
+│   │   ├── main.tf          # provider "alicloud" { region = "cn-hangzhou" }
+│   │   ├── terraform.tfvars
+│   │   └── backend.tf       # OSS remote state
+│   └── aws-ap-northeast-1/  # AWS 东京环境
+│       ├── main.tf          # provider "aws" { region = "ap-northeast-1" }
+│       ├── terraform.tfvars
+│       └── backend.tf       # S3 remote state
+└── README.md
+```
+
+#### AWS CDK 的定位
+
+AWS CDK 仅适用于 AWS 环境。如果团队已有 CDK 经验且只使用 AWS，可以用 CDK 替代 Terraform 管理 AWS 侧基础资源。但考虑到阿里云优先的策略，**MVP 阶段统一使用 Terraform**。
+
+| 工具 | 阿里云 | AWS | MVP 推荐 |
+|------|--------|-----|---------|
+| Terraform | ✅ alicloud provider | ✅ aws provider | ✅ 统一工具 |
+| AWS CDK | ❌ 不支持 | ✅ 原生最佳 | 后续 AWS 深度优化时可选 |
+| Pulumi | ✅ alicloud provider | ✅ aws provider | 备选（Python 生态更好） |
+
+### 4.4 关键考虑
+
+- **阿里云是 MVP 首选**：项目的首要部署环境是中国大陆，阿里云是必须优先实现的云厂商
+- 双云策略（阿里云国内 + AWS 全球）时，Terraform 提供统一的 IaC 抽象层
 - 阿里云 ESS 直接支持生命周期钩子，可触发自定义操作
+- 阿里云云助手（类似 SSM）可在后续替代 SSH，MVP 阶段先用 SSH
 
 ---
 
@@ -679,7 +806,9 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 
 ### 8.1 MVP 方案：SDK 直连管理（最简方案）
 
-**核心思路：** 直接用云厂商 SDK（`boto3` / `alibabacloud-ecs-sdk`）管理实例，不引入 ASG、Lambda、Secrets Manager 等额外云服务。这正是 agent-ml-research 已验证可行的方案 — 一个 Python 进程 + SDK 就能跑起来。
+**核心思路：** 直接用云厂商 SDK（阿里云 `alibabacloud_ecs20140526` / AWS `boto3`）管理实例，不引入 ASG、Lambda、Secrets Manager 等额外云服务。这正是 agent-ml-research 已验证可行的方案 — 一个 Python 进程 + SDK 就能跑起来。
+
+**阿里云优先：** MVP 阶段优先实现阿里云 ECS Provider，AWS EC2 Provider 同步实现但作为第二优先级。基础网络资源（VPC、安全组等）通过 Terraform 管理。
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -693,21 +822,25 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 │  ┌────▼──────────────────────────────▼────────┐  │
 │  │              核心管理模块                   │  │
 │  │  ┌────────────┐  ┌───────────┐             │  │
-│  │  │boto3 / SDK │  │ 凭证池    │             │  │
-│  │  │直接调用    │  │ (JSON/DB) │             │  │
+│  │  │阿里云SDK / │  │ 凭证池    │             │  │
+│  │  │boto3 直连  │  │ (JSON/DB) │             │  │
 │  │  └────────────┘  └───────────┘             │  │
 │  │  ┌────────────┐  ┌───────────┐             │  │
 │  │  │节点注册表  │  │ 额度监控  │             │  │
 │  │  │(YAML/DB)  │  │ (轮询)    │             │  │
 │  │  └────────────┘  └───────────┘             │  │
+│  │  ┌────────────┐  ┌───────────┐             │  │
+│  │  │外部服务API │  │ Terraform │             │  │
+│  │  │(轨迹/文件)│  │ (基础资源)│             │  │
+│  │  └────────────┘  └───────────┘             │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────┬───────────────────────────┘
-                       │ SSH
+                       │ SSH / Worker Runtime
          ┌─────────────┼─────────────┐
          │             │             │
     ┌────▼───┐    ┌────▼───┐    ┌────▼───┐
     │Worker 1│    │Worker 2│    │Worker N│
-    │EC2/ECS │    │EC2/ECS │    │EC2/ECS │
+    │阿里云  │    │阿里云  │    │AWS EC2 │
     │        │    │        │    │        │
     │Claude  │    │Claude  │    │Codex   │
     │ Code   │    │ Code   │    │        │
@@ -721,7 +854,7 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 ```
 扩容:
   Manager API 收到请求
-    → boto3.run_instances() / aliyun SDK 创建实例
+    → aliyun SDK RunInstances() / boto3.run_instances() 创建实例
     → 等待 running 状态
     → SSH 连入执行 bootstrap 脚本
         → 安装 Agent (Claude Code / Codex)
@@ -734,7 +867,7 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 缩容:
   Manager API 收到请求
     → （可选）SSH 触发数据备份到 S3 / OSS
-    → boto3.terminate_instances() / aliyun SDK 释放实例
+    → aliyun SDK DeleteInstance() / boto3.terminate_instances() 释放实例
     → 回收凭证到池子
     → 从注册表中移除
 
@@ -750,8 +883,8 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 
 | 功能 | 实现方式 | 说明 |
 |------|---------|------|
-| 创建/销毁节点 | `boto3.run_instances()` / `terminate_instances()` | 直接 SDK 调用，无需 ASG |
-| | `alibabacloud_ecs.create_instance()` | 阿里云同理 |
+| 创建/销毁节点 | `alibabacloud_ecs.RunInstances()` / `DeleteInstance()` | **阿里云优先** |
+| | `boto3.run_instances()` / `terminate_instances()` | AWS 同步实现 |
 | 节点初始化 | SSH + bootstrap 脚本 | 装 Agent、部署代码、分发凭证 |
 | 状态监控 | 后台轮询 `describe_instances()` + Worker 心跳 | 60 秒间隔，同步 IP / 状态变化 |
 | 凭证存储 | 本地 JSON 文件（MVP）→ 数据库（后续） | 凭证池 + 账号-IP 映射 |
@@ -768,9 +901,10 @@ Lambda 非常适合作为 Manager 节点的"大脑"：
 | **实现复杂度** | 低 — 一个 Python 进程 + SDK | 高 — 需理解 ASG 生命周期钩子、Lambda 部署、SSM 配置 |
 | **调试便捷性** | 高 — 所有逻辑在一个进程，直接看日志 | 低 — 逻辑分散在 Lambda、CloudWatch Logs 等多处 |
 | **自定义灵活度** | 高 — IP 亲和性、智能分发直接写 Python | 中 — 需要绕 AWS 事件机制和 Lambda 限制 |
-| **多云统一性** | 高 — AWS / 阿里云各实现一个 Provider，上层逻辑共享 | 低 — ASG、Lambda、SSM 都是 AWS 专属 |
-| **额外云服务费用** | 无 — 只付 EC2 计算费用 | 有 — Secrets Manager ($0.40/secret/月)、NAT Gateway ($32/月)、DynamoDB |
+| **多云统一性** | 高 — 阿里云 / AWS 各实现一个 Provider，上层逻辑共享 | 低 — ASG、Lambda、SSM 都是 AWS 专属 |
+| **额外云服务费用** | 无 — 只付 ECS/EC2 计算费用 | 有 — Secrets Manager ($0.40/secret/月)、NAT Gateway ($32/月)、DynamoDB |
 | **开发速度** | 快 — agent-ml-research 已有参考实现可复用 | 慢 — 需要学习和配置多个 AWS 服务 |
+| **IaC 集成** | Terraform 管理基础网络，SDK 管理实例 | 全托管但灵活度低 |
 | **高可用** | 弱 — Manager 单点故障 | 中 — Lambda 本身高可用，但整体仍需 Manager |
 | **安全性** | 中 — SSH key 共享、凭证明文传输 | 高 — SSM 无需 SSH、Secrets Manager 加密存储 |
 | **可扩展性** | 中 — 文件系统状态 50+ 实例后可能瓶颈 | 高 — DynamoDB / Secrets Manager 原生可扩展 |
@@ -944,8 +1078,8 @@ elastic-agent/
 │   ├── core/                       # 核心抽象
 │   │   ├── providers/              # 云服务商接口
 │   │   │   ├── base.py             # CloudProvider 抽象基类
-│   │   │   ├── aws_ec2.py          # AWS EC2 实现
-│   │   │   └── aliyun_ecs.py       # 阿里云 ECS 实现（未来）
+│   │   │   ├── aliyun_ecs.py       # 阿里云 ECS 实现（MVP 首选）
+│   │   │   └── aws_ec2.py          # AWS EC2 实现
 │   │   ├── agents/                 # Agent 类型接口
 │   │   │   ├── base.py             # AgentType 抽象基类
 │   │   │   ├── claude_code.py      # Claude Code 实现
@@ -983,6 +1117,10 @@ elastic-agent/
 │   │   │   └── dispatcher.py       # 请求分发到 Worker
 │   │   ├── registry/               # 节点注册
 │   │   │   └── store.py            # 节点状态存储
+│   │   ├── external_api/           # 外部服务 API（轨迹/文件传输）
+│   │   │   ├── traces.py           # Agent 轨迹/chat 记录实时流
+│   │   │   ├── files.py            # Worker 文件实时传输
+│   │   │   └── auth.py             # 外部 API 认证（API Key / OAuth）
 │   │   └── security/               # 安全
 │   │       ├── auth.py             # Manager↔Worker 认证
 │   │       └── transport.py        # 传输加密
@@ -1002,8 +1140,13 @@ elastic-agent/
 ├── scripts/                        # 部署脚本
 │   ├── watchdog.sh                 # Worker 侧 watchdog
 │   └── bootstrap.sh                # Worker 初始化脚本
-├── infra/                          # IaC（Pulumi/CDK）
-│   └── __main__.py                 # 基础设施定义
+├── infra/                          # IaC（Terraform）
+│   ├── modules/                    # 可复用 Terraform 模块
+│   │   ├── networking/             # VPC、子网、安全组
+│   │   └── base/                   # 密钥对、IAM/RAM 角色
+│   └── environments/               # 各云各区域环境
+│       ├── aliyun-cn-hangzhou/     # 阿里云杭州（MVP 首选）
+│       └── aws-ap-northeast-1/     # AWS 东京
 ├── examples/                       # 示例 Harness
 │   ├── claude-code-manager/        # CCM 的 Harness 示例
 │   └── agent-ml-research/          # agent-ml-research 的 Harness 示例
@@ -1117,6 +1260,32 @@ class FrameworkEvent(Enum):
 class EventHandler(ABC):
     async def handle(self, event: FrameworkEvent, data: dict) -> None: ...
 
+# ── 外部服务 API（框架内置） ──
+
+class TraceEvent:
+    """Agent 轨迹事件（一条 stream-json 输出行）"""
+    timestamp: datetime
+    worker_id: str
+    task_id: str | None
+    session_id: str | None
+    event_type: str             # "assistant", "tool_use", "tool_result", "result", ...
+    content: dict               # 原始事件内容
+    metadata: dict              # 扩展字段
+
+class ExternalAPI(ABC):
+    """框架向外部服务暴露的标准 API"""
+    async def stream_traces(self, node_id: str) -> AsyncIterator[TraceEvent]: ...
+    async def get_traces(self, node_id: str, since: datetime, limit: int) -> list[TraceEvent]: ...
+    async def read_file(self, node_id: str, path: str) -> bytes: ...
+    async def watch_files(self, node_id: str, paths: list[str]) -> AsyncIterator[FileChange]: ...
+
+class FileChange:
+    path: str
+    event: Literal["modified", "created", "deleted"]
+    content: str | None         # 文本文件内容，二进制文件为 None
+    timestamp: datetime
+    worker_id: str
+
 # ── Harness 接口 — 用户实现 ──
 
 class Harness(ABC):
@@ -1185,10 +1354,11 @@ def select_credential_for_instance(instance_id: str) -> Credential:
 **框架调用示例：**
 
 ```python
-from elastic_agent import ElasticAgentManager, AWSEc2Provider, CredentialPool
+from elastic_agent import ElasticAgentManager, AliyunEcsProvider, CredentialPool
 
+# 阿里云优先
 manager = ElasticAgentManager(
-    provider=AWSEc2Provider(config),
+    provider=AliyunEcsProvider(config),  # 或 AWSEc2Provider(config)
     credential_pool=CredentialPool(provider=ClaudeOAuthProvider(email_tokens)),
     harness=AgentMLResearchHarness(app_config),  # 或 CCMHarness(app_config)
 )
@@ -1196,6 +1366,11 @@ manager = ElasticAgentManager(
 await manager.scale_out(count=3)            # 扩容
 await manager.scale_in(count=1)             # 缩容（自动 Drain）
 status = await manager.get_cluster_status() # 状态总览
+
+# 外部服务可通过 API 获取实时数据
+traces = await manager.external_api.get_traces(node_id="worker-1")
+async for event in manager.external_api.stream_traces(node_id="worker-1"):
+    print(event)  # 实时 Agent 轨迹
 ```
 
 ---
@@ -1385,25 +1560,114 @@ class DryRunProvider(CloudProvider):
 - `DryRunProvider` — 只验证流程不消耗资源
 - 每个模块的单元测试 mock 接口
 
+#### (11) 外部服务 API — 实时轨迹/Chat 记录 + 文件传输
+
+**问题：** 外部服务（如前端 Dashboard、监控系统、第三方集成）需要通过 Manager 获取：
+1. **实时的 Agent 轨迹/Chat 记录** — Claude Code 的 stream-json 输出、工具调用记录、对话历史
+2. **Worker 上本地文本文件的实时传输** — Agent 执行过程中产生的日志文件、代码文件、配置文件等
+
+当前设计中，Worker → Manager 的日志传输是内部通道，没有对外暴露标准化 API。外部服务无法接入。
+
+**影响：** 每个 Harness 如果需要对外提供实时数据，都需要自建 API 层（CCM 自建了 WebSocket 广播，Audiobook 自建了 SQS→WebSocket 桥接），这部分工作应该由框架统一提供。
+
+**设计方案：**
+
+```python
+# ── 外部服务 API 接口 ──
+
+# 1. 实时轨迹流（WebSocket / SSE）
+@app.websocket("/api/external/traces/{node_id}/stream")
+async def stream_traces(ws: WebSocket, node_id: str, api_key: str):
+    """实时推送指定 Worker 的 Agent 轨迹"""
+    # 认证
+    verify_external_api_key(api_key)
+    # 从内部事件总线订阅该 Worker 的日志事件
+    async for event in event_bus.subscribe(node_id):
+        await ws.send_json({
+            "timestamp": event.timestamp.isoformat(),
+            "type": event.type,           # "assistant", "tool_use", "tool_result", "result"
+            "content": event.content,
+            "metadata": {
+                "worker_id": node_id,
+                "task_id": event.task_id,
+                "session_id": event.session_id,
+            }
+        })
+
+# 2. 历史轨迹查询（REST）
+@app.get("/api/external/traces/{node_id}")
+async def get_traces(node_id: str, since: datetime = None, limit: int = 100):
+    """查询指定 Worker 的历史轨迹记录"""
+    return trace_store.query(node_id=node_id, since=since, limit=limit)
+
+# 3. 文件实时传输（REST + WebSocket）
+@app.get("/api/external/files/{node_id}/{file_path:path}")
+async def get_file(node_id: str, file_path: str):
+    """通过 Manager 从 Worker 下载指定文件"""
+    content = await worker_runtime.read_file(node_id, file_path)
+    return StreamingResponse(content)
+
+@app.websocket("/api/external/files/{node_id}/watch")
+async def watch_files(ws: WebSocket, node_id: str, paths: list[str]):
+    """监听 Worker 上指定文件的变化，实时推送更新内容"""
+    async for change in worker_runtime.watch_files(node_id, paths):
+        await ws.send_json({
+            "path": change.path,
+            "event": change.event,        # "modified", "created", "deleted"
+            "content": change.content,     # 文件内容（文本文件）或 None
+            "timestamp": change.timestamp.isoformat(),
+        })
+
+# 4. 集群级实时流（全部 Worker 的轨迹聚合）
+@app.websocket("/api/external/traces/all/stream")
+async def stream_all_traces(ws: WebSocket, api_key: str):
+    """推送所有 Worker 的 Agent 轨迹（用于全局监控）"""
+    ...
+```
+
+**Worker Runtime 侧需要支持的能力：**
+
+| 能力 | 说明 | 实现方式 |
+|------|------|---------|
+| 轨迹缓存 | Worker Runtime 缓存最近 N 条轨迹记录 | 内存环形缓冲 + 可选持久化 |
+| 文件读取 | Manager 可远程读取 Worker 上的任意文件 | Worker Runtime `/files/read` API |
+| 文件监听 | Manager 可订阅 Worker 上指定文件的变化 | Worker Runtime 用 `inotify`/`watchdog` 监听 + WebSocket 推送 |
+| 增量传输 | 大文件只传输变化部分 | tail-follow 模式（适用于日志文件） |
+
+**外部 API 认证：**
+
+| 方案 | 复杂度 | 安全性 | 推荐 |
+|------|--------|--------|------|
+| API Key (Bearer Token) | 低 | 中 | MVP ✅ |
+| OAuth 2.0 Client Credentials | 中 | 高 | Phase 2 |
+| JWT + RBAC | 高 | 最高 | Phase 3+ |
+
+**普适性判断：** 通用。CCM 需要 WebSocket 实时日志给前端、agent-ml-research 需要飞书告警、Audiobook 需要 SQS→WebSocket 桥接 — 这些本质上都是"外部服务消费 Agent 轨迹"。文件传输需求同样普遍 — Agent 在 Worker 上生成的代码、报告、日志都需要被外部访问。
+
 ### 10.2 优先级排序
 
 | 优先级 | 缺口 | 理由 |
 |--------|------|------|
+| **P0 - MVP 必须** | **阿里云 ECS Provider** | **项目首要部署环境是中国大陆** |
+| **P0 - MVP 必须** | AWS EC2 Provider | 同步实现，验证多云抽象 |
 | **P0 - MVP 必须** | Worker Runtime + 日志传输 | 没有这个框架无法执行任何远程任务 |
 | **P0 - MVP 必须** | Manager ↔ Worker 认证 | 安全底线 |
 | **P0 - MVP 必须** | 云端标签对账 | 防止孤儿实例持续烧钱 |
+| **P0 - MVP 必须** | **外部服务 API — 轨迹流** | 外部服务需实时获取 Agent 轨迹/chat 记录 |
+| **P0 - MVP 必须** | **外部服务 API — 文件传输** | 外部服务需实时获取 Worker 上的文件 |
+| **P0 - MVP 必须** | **Terraform 基础网络模块** | VPC/安全组/密钥对需要 IaC 管理 |
 | **P1 - MVP 应该** | Bootstrap 失败处理 | 否则失败后需要手动清理 |
 | **P1 - MVP 应该** | Worker 应用级健康检查 (L2+L3) | 否则 Worker 假死无法发现 |
 | **P1 - MVP 应该** | 优雅缩容 (Drain) | 否则缩容会中断正在执行的任务 |
 | **P2 - 后续迭代** | 双层凭证管理 | MVP 可先用环境变量传递 |
 | **P2 - 后续迭代** | 亲和性调度 | MVP 可先不支持 session 续接 |
 | **P2 - 后续迭代** | 扩缩容信号 + 规则引擎 | MVP 手动扩缩容 |
-| **P2 - 后续迭代** | 成本追踪 | MVP 阶段实例少，手动看 AWS 账单 |
+| **P2 - 后续迭代** | 成本追踪 | MVP 阶段实例少，手动看账单 |
 | **P2 - 后续迭代** | 操作幂等性 + 预写日志 | MVP 阶段实例少，出问题手动修 |
 | **P3 - 长期** | 数据面/控制面分离 | 50+ Worker 后再考虑 |
 | **P3 - 长期** | 多 Harness 支持 | 大部分用户单 Harness 足够 |
 | **P3 - 长期** | Worker 软件热更新 | MVP 阶段重建 Worker 可接受 |
-| **P3 - 长期** | 可测试性 (LocalProvider) | MVP 可以直接用真实 EC2 测试 |
+| **P3 - 长期** | 可测试性 (LocalProvider) | MVP 可以直接用真实 ECS/EC2 测试 |
 
 ---
 
@@ -1565,9 +1829,13 @@ class AudiobookHarness(Harness):
 
 | 优先级 | 缺口 | 来源 | 理由 |
 |--------|------|------|------|
+| **P0** | **阿里云 ECS Provider** | 新增 | 项目首要部署环境是中国大陆 |
+| **P0** | AWS EC2 Provider | 10.1(原) | 同步实现，验证多云抽象 |
 | **P0** | Worker Runtime + 日志传输 | 10.1(原) | 框架核心 |
 | **P0** | Manager ↔ Worker 认证 | 10.1(原) | 安全底线 |
 | **P0** | 云端标签对账 | 10.1(原) | 防孤儿实例 |
+| **P0** | **外部服务 API（轨迹/文件）** | **10.1(新)** | 外部服务需实时获取 Agent 数据 |
+| **P0** | **Terraform 基础网络** | 新增 | VPC/安全组需 IaC 管理 |
 | **P1** | Bootstrap 失败处理 | 10.1(原) | 否则需手动清理 |
 | **P1** | Worker 应用级健康检查 | 10.1(原) | Audiobook 已自建 HealthChecker 弥补 |
 | **P1** | 优雅缩容 (Drain) | 10.1(原) | 1-2 小时做书任务不能被中断 |
@@ -1604,8 +1872,10 @@ class AudiobookHarness(Harness):
 | **task_metadata** | - | - | ✅ 任务参数注入 | **新增 — 框架支持** |
 | **崩溃恢复** | - | - | ✅ S3 → 新 Worker | **新增 — 框架支持** |
 | **反向消息通道** | - | - | ✅ 用户消息下发 | **新增 — 框架支持** |
+| **外部服务 API（轨迹）** | ✅ 飞书告警消费 | ✅ WebSocket 前端 | ✅ SQS→WebSocket | **新增 — 框架核心** |
+| **外部服务 API（文件）** | ✅ 代码同步 | ✅ 项目文件访问 | ✅ 做书产物下载 | **新增 — 框架核心** |
 
-**结论**：前 7 项核心能力在三个完全不同的案例中均出现，充分确认为框架必备。Audiobook 新增的 4 项需求填补了"临时 Worker"、"任务级参数"、"崩溃恢复"、"反向通信"四个之前未覆盖的维度，使框架设计更加完整。
+**结论**：前 7 项核心能力在三个完全不同的案例中均出现，充分确认为框架必备。Audiobook 新增的 4 项需求填补了"临时 Worker"、"任务级参数"、"崩溃恢复"、"反向通信"四个之前未覆盖的维度。外部服务 API（轨迹流 + 文件传输）在三个案例中都有体现，确认为框架核心能力。
 
 ---
 
@@ -1613,11 +1883,17 @@ class AudiobookHarness(Harness):
 
 ### Phase 1：MVP（当前目标）
 
+> **详细 MVP 实现计划见独立文档 [mvp-plan.md](mvp-plan.md)**
+
 - [x] 调研分析（本文档）
 - [ ] 核心抽象接口定义
+- [ ] **阿里云 ECS Provider 实现**（alibabacloud SDK 直连，**MVP 首选**）
+- [ ] AWS EC2 Provider 实现（boto3 SDK 直连，同步实现）
+- [ ] **Terraform 基础网络模块**（VPC/安全组/密钥对，阿里云 + AWS）
 - [ ] **Worker Runtime 实现**（远程执行 + 日志流式传输）
 - [ ] **Manager ↔ Worker 认证**（共享 Secret）
-- [ ] AWS EC2 Provider 实现（boto3 SDK 直连）
+- [ ] **外部服务 API — 实时轨迹流**（WebSocket/SSE 推送 Agent 轨迹/chat 记录）
+- [ ] **外部服务 API — 文件传输**（Worker 文件实时读取/监听）
 - [ ] Claude Code Agent 实现
 - [ ] 基础 Bootstrap Pipeline + **失败处理**
 - [ ] **云端标签对账**（防止孤儿实例）
@@ -1640,6 +1916,7 @@ class AudiobookHarness(Harness):
 - [ ] **操作幂等性 + 预写日志**
 - [ ] **成本追踪**（基础设施 + Agent 使用）
 - [ ] 每 Worker 独立 Token 认证
+- [ ] 外部 API OAuth 2.0 认证
 
 ### Phase 3：多 Agent + Harness 生态
 
@@ -1652,18 +1929,11 @@ class AudiobookHarness(Harness):
 - [ ] 完善的 Dashboard
 - [ ] **多 Harness 支持**（Worker 标签路由）
 
-### Phase 4：多云
+### Phase 4：容器化
 
-- [ ] 阿里云 ECS Provider
-- [ ] Pulumi IaC 模板
-- [ ] 跨云统一管理 UI
-- [ ] 跨云凭证同步
-
-### Phase 5：容器化
-
-- [ ] ECS/Fargate 支持
+- [ ] 阿里云 ECI / AWS ECS Fargate 支持
 - [ ] Docker 镜像构建流水线
-- [ ] Kubernetes (EKS/ACK) 支持
+- [ ] Kubernetes (ACK/EKS) 支持
 - [ ] KEDA 事件驱动扩展
 - [ ] Helm Chart 打包
 

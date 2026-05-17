@@ -426,9 +426,11 @@ CCM 的核心逻辑（任务队列、优先级调度、UI、API）**不需要改
 
 关键原则：**CCM 的任务管理、调度逻辑、前端 UI 保持不变，只替换底层的执行通道。**
 
-### 4.2 新增 Worker Agent Service
+### 4.2 ~~新增 Worker Agent Service~~ → 使用框架内置 Worker Runtime
 
-需要在每个 Worker 节点上部署一个轻量服务，承担原来 InstanceManager 在本地做的事情：
+> **MVP 更新：** 原计划自建 Worker Agent Service（~300-500 行），现在由框架内置的 Worker Runtime 替代。CCM 只需通过框架 API 调用远程执行，不需要自己开发 Worker 侧服务。
+
+以下是框架 Worker Runtime 提供的等价能力（CCM 不需要实现这些代码，仅作参考）：
 
 ```python
 # Worker Agent Service — 运行在每个 Worker 节点上
@@ -518,6 +520,12 @@ def _dispatch_task(self, task: Task):
 ---
 
 ## 5. Harness 接口实现
+
+> **MVP 变更说明：** 根据 [MVP 计划](mvp-plan.md) 的更新，CCM 的 Harness 实现需要适配以下变化：
+> 1. **阿里云优先** — Provider 默认使用 `AliyunEcsProvider`，AWS 作为备选
+> 2. **外部服务 API** — CCM 前端的 WebSocket 实时日志可通过框架外部 API 统一获取，减少自建桥接代码
+> 3. **Terraform 基础网络** — VPC/安全组等基础资源通过 Terraform 管理，安全组规则版本化
+> 4. **文件实时传输** — Worker 上的项目文件可通过框架文件传输 API 实时访问
 
 ### 5.1 CCM 的 Elastic-Agent Harness 定义
 
@@ -640,19 +648,32 @@ WantedBy=multi-user.target
 
 ```python
 # backend/main.py 中增加 Elastic-Agent 集成
-from elastic_agent import ElasticAgentManager, AWSEc2Provider, CredentialPool
+from elastic_agent import ElasticAgentManager, AliyunEcsProvider, AWSEc2Provider, CredentialPool
 from ccm_harness import CCMHarness
 
-# 初始化 Elastic-Agent
+# 初始化 Elastic-Agent（阿里云优先）
+# VPC/安全组/密钥对等基础资源由 Terraform 创建，ID 从 terraform output 获取
+
+provider = AliyunEcsProvider(
+    region_id="cn-hangzhou",
+    image_id="m-bp1xxxx",              # 预装 Ubuntu 的自定义镜像
+    instance_type="ecs.c6.large",
+    security_group_id="sg-bp1xxxx",    # Terraform output
+    vswitch_id="vsw-bp1xxxx",          # Terraform output
+    key_pair_name="elastic-agent-key", # Terraform output
+)
+
+# 或使用 AWS（接口完全一致）
+# provider = AWSEc2Provider(
+#     region="ap-northeast-1",
+#     ami_id="ami-xxxxx",
+#     default_instance_type="t3.large",
+#     security_group_ids=["sg-xxxxx"],  # Terraform output
+#     subnet_id="subnet-xxxxx",         # Terraform output
+# )
+
 elastic = ElasticAgentManager(
-    provider=AWSEc2Provider(
-        region="ap-northeast-1",
-        ami_id="ami-xxxxx",           # 预装 Ubuntu 的 AMI
-        instance_type="t3.large",
-        key_pair_name="ccm-workers",
-        security_group_ids=["sg-xxxxx"],
-        subnet_id="subnet-xxxxx",
-    ),
+    provider=provider,
     credential_pool=CredentialPool("credentials.json"),
     harness=CCMHarness({
         "manager_url": "http://manager-private-ip:8000",
@@ -699,27 +720,31 @@ async def get_quota():
 
 ## 6. 分步实施方案
 
-### Phase 0：准备（不改 CCM 代码）
+> **前置条件：** 按 [MVP 计划](mvp-plan.md) 完成 Terraform 基础网络部署和框架核心模块开发。
 
-1. 在 Elastic-Agent 框架中实现基础的 `AWSEc2Provider`
-2. 实现 `CredentialPool`（JSON 文件存储账号和 OAuth tokens）
-3. 实现 `BootstrapPipeline`（SSH 连接 + 命令执行）
-4. 手动测试：用 Elastic-Agent 创建一台 EC2，SSH 进去装好 Claude Code，手动验证可用
+### Phase 0：基础设施准备（不改 CCM 代码）
 
-### Phase 1：Worker Agent Service
+1. 执行 Terraform 部署基础网络：`cd infra/environments/aliyun-cn-hangzhou && terraform apply`
+2. 获取 Terraform 输出（VPC ID、VSwitch ID、安全组 ID、密钥对名）
+3. 在 Elastic-Agent 框架中实现 `AliyunEcsProvider`（MVP 首选）和 `AWSEc2Provider`
+4. 实现 `CredentialPool`（JSON 文件存储账号和 OAuth tokens）
+5. 实现 `BootstrapPipeline`（SSH 连接 + 命令执行）
+6. 手动测试：用 Elastic-Agent 创建一台阿里云 ECS（或 AWS EC2），SSH 进去装好 Claude Code，手动验证可用
 
-1. 开发独立的 Worker Agent Service（轻量 FastAPI）
-   - `/execute` — 启动 Claude Code 子进程
-   - `/stop` — 停止进程
-   - `/status` — 上报状态
-   - `/ws/logs/{task_id}` — 流式日志
-2. 实现 CCMHarness Bootstrap 步骤
-3. 端到端测试：Elastic-Agent 创建 EC2 → Bootstrap 部署 Worker Agent → 手动调用 API 执行一个 Claude Code 任务
+### Phase 1：Worker Runtime + 外部 API
+
+1. 框架内置 Worker Runtime 部署到 Worker（替代自建 Worker Agent Service）：
+   - 执行命令、流式日志、文件读取/监听 — 全部由框架 Worker Runtime 提供
+2. 配置外部服务 API：
+   - CCM 前端通过 `/api/external/traces/{node_id}/stream` 获取实时日志（替代原 WebSocket 自建桥接）
+   - 通过 `/api/external/files/{node_id}/{path}` 读取 Worker 上的项目文件
+3. 实现 CCMHarness Bootstrap 步骤
+4. 端到端测试：Elastic-Agent 创建阿里云 ECS → Bootstrap 部署 Worker Runtime → 通过外部 API 获取轨迹
 
 ### Phase 2：CCM 后端改造
 
-1. `Instance` 模型增加 `worker_node_id`、`worker_ip` 字段
-2. `InstanceManager` 新增 `RemoteInstanceManager`，实现通过 HTTP 调用远程 Worker
+1. `Instance` 模型增加 `worker_node_id`、`worker_ip`、`provider` 字段
+2. `InstanceManager` 新增 `RemoteInstanceManager`，通过框架 Worker Runtime 远程执行
 3. `GlobalDispatcher` 增加对远程 Instance 的支持
 4. 增加节点管理 API（`/api/elastic/`）
 5. 端到端测试：通过 CCM Web UI 创建任务 → 自动分发到远程 Worker → 实时看到日志流
@@ -727,10 +752,11 @@ async def get_quota():
 ### Phase 3：前端扩展
 
 1. 新增"节点管理"面板：
-   - 查看所有 Worker 节点的状态（IP、账号、额度、CPU/内存）
+   - 查看所有 Worker 节点的状态（IP、账号、额度、CPU/内存、云厂商）
    - 手动增减 Worker 数量
    - 查看每个 Worker 上运行的任务
-2. Instance 列表增加 Worker 信息列（哪台机器、什么 IP）
+   - 通过框架文件 API 在线查看 Worker 上的文件
+2. Instance 列表增加 Worker 信息列（哪台机器、什么 IP、阿里云/AWS）
 3. 额度监控面板：每个账号的 5h/7d 使用率可视化
 
 ### Phase 4：智能化
@@ -750,27 +776,31 @@ async def get_quota():
 
 CCM 当前直接读本地子进程的 stdout。改为远程后，需要一个可靠的实时日志传输通道。
 
-**推荐方案：Worker → Manager WebSocket 反向连接**
+**推荐方案：框架 Worker Runtime → Manager → 外部服务 API**
 
 ```
-Worker Agent Service                     Manager (CCM 后端)
+Worker Runtime (框架内置)                Manager (CCM 后端 + Elastic-Agent)
        │                                        │
-       │  WebSocket 连接 (Worker 主动连接)        │
+       │  WebSocket 反向连接 (Worker 主动连接)    │
        ├───────────────────────────────────────▶│
        │                                        │
-       │  Claude Code stdout (NDJSON 逐行转发)   │
-       │◀──(本地读取)──Claude CLI                │
-       ├───────────────────────────────────────▶│
-       │                                        │
-       │                          存入 log_entries
-       │                          WebSocket 广播到前端
+       │  Claude Code stdout (NDJSON 逐行转发)   │         外部服务/前端
+       │◀──(本地读取)──Claude CLI                │              │
+       ├───────────────────────────────────────▶│              │
+       │                                        │  外部 API    │
+       │                          事件总线 ──────┼─────────────▶│
+       │                          存入 trace_store             │
+       │                                        │  WebSocket/SSE
+       │                                        │  /api/external/traces/{node_id}/stream
 ```
 
-Worker 主动连接 Manager 的好处：
-- Worker 在私有子网内，Manager 不需要知道 Worker 的 IP
-- 不需要在 Worker 上开入站端口
-- 连接断开后 Worker 自动重连
-- 复用 CCM 已有的 WebSocket 广播机制
+**框架统一提供的好处：**
+- Worker Runtime 由框架内置，不需要 CCM 自建 Worker Agent Service
+- 日志传输通过框架事件总线 → 外部服务 API 自动暴露给前端
+- CCM 前端直接连接 `/api/external/traces/{node_id}/stream` 获取实时日志
+- 不需要 CCM 自建 WebSocket 桥接代码
+- Worker 在私有子网内，不需要开入站端口
+- 文件变更也通过同一通道实时传输（`/api/external/files/{node_id}/watch`）
 
 ### 7.2 Git 凭证传递
 
@@ -875,11 +905,14 @@ EOF
 | CCM 后端 `InstanceManager` | 中 | 新增 `RemoteInstanceManager`，原有 `LocalInstanceManager` 保留用于单机模式 |
 | CCM 后端 `GlobalDispatcher` | 小 | 增加 session 亲和性调度逻辑 |
 | CCM 后端 API | 小 | 新增 `/api/elastic/` 节点管理路由 |
-| CCM 后端 数据模型 | 小 | Instance 表增加 2 个字段 |
-| CCM 前端 | 中 | 新增 Nodes 页面和账号池面板 |
-| Worker Agent Service | 新开发 | 约 300-500 行 Python，轻量 FastAPI |
+| CCM 后端 数据模型 | 小 | Instance 表增加 3 个字段（worker_node_id, worker_ip, provider） |
+| CCM 前端 | 中 | 新增 Nodes 页面和账号池面板，日志流改为消费框架外部 API |
+| ~~Worker Agent Service~~ | ~~新开发~~ | ~~约 300-500 行~~ → **不需要**，框架内置 Worker Runtime |
 | CCM Harness | 新开发 | 约 200 行 Python，Bootstrap 步骤定义 |
-| Elastic-Agent 核心 | 独立开发 | Provider + CredentialPool + Bootstrap + Monitor |
+| Terraform 部署 | 一次性 | `terraform apply` 创建 VPC/安全组/密钥对 |
+| Elastic-Agent 核心 | 独立开发 | Provider（阿里云 + AWS）+ CredentialPool + Bootstrap + Monitor + 外部 API |
+
+**相比原方案的改动减少：** 由于框架内置 Worker Runtime 和外部服务 API，CCM 不需要自建 Worker Agent Service（~300-500 行）和 WebSocket 日志桥接代码。前端直接消费框架外部 API。
 
 ### 7.7 兼容性：保留单机模式
 
@@ -1007,5 +1040,9 @@ CCM 的 Project 需要代码在 Worker 上可用。大部分 Agent 工作在代�
 | 双层凭证 | ✅ Git key | ✅ WandB/HF/Feishu | 通用 |
 | 扩缩容信号 | ✅ 任务队列深度 | ✅ 项目数量 | 通用 |
 | 工作区同步 | ✅ Project clone | ✅ 代码部署 | 通用 |
+| **外部服务 API（轨迹）** | ✅ 前端日志流 | ✅ 飞书告警 | **通用** |
+| **外部服务 API（文件）** | ✅ 项目文件访问 | ✅ 研究产物下载 | **通用** |
+| **多云 Provider** | ✅ 阿里云/AWS | ✅ 阿里云/AWS | **通用** |
+| **Terraform IaC** | ✅ 基础网络 | ✅ 基础网络 | **通用** |
 
-所有需求在两个不同的 Harness 中都出现了，确认应该纳入框架核心设计。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 的第 10 节"框架设计完整性审查"。
+所有需求在两个不同的 Harness 中都出现了，确认应该纳入框架核心设计。详见主文档 [elastic-agent-analysis.md](elastic-agent-analysis.md) 的第 10 节"框架设计完整性审查"和 [MVP 计划](mvp-plan.md)。
