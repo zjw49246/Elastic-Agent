@@ -1,1680 +1,996 @@
 # Elastic-Agent MVP 详细实现计划
 
-> 本文档是 [elastic-agent-analysis.md](elastic-agent-analysis.md) 中 MVP 方案的详细展开，包含完整的 TODO 清单、模块实现细节、测试计划。
+> 本文档是 [elastic-agent-analysis.md](elastic-agent-analysis.md) 中 MVP 方案的详细展开。
 >
-> **核心策略：** 阿里云优先、SDK 直连管理实例、Terraform 管理基础网络、外部服务 API 暴露实时数据。
+> **核心策略：** 阿里云优先、SDK 直连管理实例、IaC 管理基础网络（阿里云 Terraform / AWS CDK）、外部服务 API 暴露实时数据。
 
 ---
 
 ## TODO 清单
 
-### P0 — 必须完成（框架无法运行的前置条件）
+### P0 — 必须完成
 
 - [ ] **T-001** 项目脚手架搭建（pyproject.toml、目录结构、CI 基础）
-- [ ] **T-002** CloudProvider 抽象基类 + Instance 数据模型
-- [ ] **T-003** 阿里云 ECS Provider 实现（alibabacloud SDK 直连）
-- [ ] **T-004** AWS EC2 Provider 实现（boto3 SDK 直连）
-- [ ] **T-005** Terraform 基础网络模块 — 阿里云（VPC/VSwitch/安全组/密钥对）
-- [ ] **T-006** Terraform 基础网络模块 — AWS（VPC/Subnet/Security Group/Key Pair）
-- [ ] **T-007** Worker Runtime 服务（Worker 侧：接收命令、执行进程、流式日志）
-- [ ] **T-008** Worker Runtime 客户端（Manager 侧：远程调用 Worker Runtime）
-- [ ] **T-009** Manager ↔ Worker 通信协议定义（WebSocket 反向连接）
-- [ ] **T-010** Manager ↔ Worker 认证（共享 Secret Bearer Token）
-- [ ] **T-011** 节点注册表（NodeRegistry，JSON/YAML 文件存储）
-- [ ] **T-012** 云端标签对账（启动时 + 定期扫描 ManagedBy 标签，清理孤儿实例）
-- [ ] **T-013** 外部服务 API — 实时轨迹流（WebSocket/SSE 推送 Agent 轨迹/chat 记录）
-- [ ] **T-014** 外部服务 API — 文件传输（Worker 文件读取 + 文件变更监听）
+- [ ] **T-002** CloudProvider 抽象基类 + Instance/InstanceConfig 数据模型
+- [ ] **T-003** 阿里云 ECS Provider（alibabacloud SDK V2.0 直连）
+- [ ] **T-004** AWS EC2 Provider（boto3 SDK 直连）
+- [ ] **T-005** IaC — 阿里云基础网络（Terraform: VPC/VSwitch/安全组/密钥对/NAT）
+- [ ] **T-006** IaC — AWS 基础网络（CDK Python: VPC/Subnet/SG/KeyPair/NAT）
+- [ ] **T-007** Worker Runtime 服务端（Worker 侧：进程执行、日志流、文件操作）
+- [ ] **T-008** Worker Runtime 客户端（Manager 侧：远程调用抽象）
+- [ ] **T-009** Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）
+- [ ] **T-010** Manager ↔ Worker 认证（per-Worker Bearer Token）
+- [ ] **T-011** NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）
+- [ ] **T-012** 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）
+- [ ] **T-013** 外部服务 API — 实时轨迹流（WebSocket + SSE 双通道）
+- [ ] **T-014** 外部服务 API — 文件传输（按需读取 + inotify 变更监听）
 - [ ] **T-015** 外部服务 API — 认证（API Key Bearer Token）
 - [ ] **T-016** Manager FastAPI 服务骨架 + 节点管理 REST API
-- [ ] **T-017** Claude Code AgentType 实现（安装/启动/健康检查命令）
+- [ ] **T-017** Claude Code AgentType（安装命令、启动命令、健康检查探针）
 
-### P1 — 应该完成（MVP 可用性和稳定性）
+### P1 — 应该完成
 
-- [ ] **T-018** Bootstrap Pipeline 框架（可插拔步骤、超时控制、失败策略）
-- [ ] **T-019** Bootstrap 步骤：系统基础初始化（Node.js、Python、uv）
-- [ ] **T-020** Bootstrap 步骤：Claude Code 安装与凭证注入
-- [ ] **T-021** Bootstrap 步骤：Worker Runtime 部署与启动
-- [ ] **T-022** Bootstrap 步骤：Harness 代码部署（git clone）
-- [ ] **T-023** Bootstrap 失败处理（terminate + retry / retry from failed / leave for debug）
-- [ ] **T-024** Worker 应用级健康检查（L2 Worker Runtime + L3 Agent 进程）
-- [ ] **T-025** 优雅缩容 Drain 机制（标记 draining → 等待任务完成 → 终止）
-- [ ] **T-026** 凭证分发（API Key 方式，通过 Bootstrap 注入环境变量）
-- [ ] **T-027** 基础额度监控（轮询 Worker 上报的 quota 状态）
+- [ ] **T-018** Bootstrap Pipeline（可插拔步骤、per-step 超时、失败策略枚举）
+- [ ] **T-019 ~ T-022** 内置 Bootstrap 步骤（系统初始化 / Agent 安装 / Runtime 部署 / Harness 代码）
+- [ ] **T-023** Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）
+- [ ] **T-024** Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）
+- [ ] **T-025** 优雅缩容 Drain（draining 标记 → 等待完成 → 回收凭证 → 终止）
+- [ ] **T-026** 凭证分发（API Key 方式，Bootstrap 注入环境变量 / .credentials.json）
+- [ ] **T-027** 基础额度监控（轮询 Worker 侧 quota 状态，阈值告警）
 - [ ] **T-028** 手动扩缩容 API（scale_out / scale_in / remove_node）
-- [ ] **T-029** 基础 Web UI（节点列表、状态、手动操作按钮）
+- [ ] **T-029** 基础 Web UI（节点列表、状态卡片、手动操作）
 
 ### 测试
 
-- [ ] **T-100** 单元测试：CloudProvider 抽象 + Mock Provider
-- [ ] **T-101** 单元测试：阿里云 ECS Provider（mock SDK responses）
-- [ ] **T-102** 单元测试：AWS EC2 Provider（mock boto3 responses）
-- [ ] **T-103** 单元测试：NodeRegistry CRUD 操作
-- [ ] **T-104** 单元测试：Worker Runtime 协议消息序列化/反序列化
-- [ ] **T-105** 单元测试：Bootstrap Pipeline 步骤执行 + 失败回滚
-- [ ] **T-106** 单元测试：Drain 机制状态机
-- [ ] **T-107** 单元测试：云端标签对账逻辑
-- [ ] **T-108** 单元测试：外部服务 API 轨迹流过滤/推送
-- [ ] **T-109** 单元测试：外部服务 API 文件读取/监听
-- [ ] **T-110** 集成测试：Manager ↔ Worker Runtime WebSocket 通信
-- [ ] **T-111** 集成测试：阿里云 ECS 实例创建/启动/停止/释放全流程
-- [ ] **T-112** 集成测试：AWS EC2 实例创建/启动/停止/终止全流程
-- [ ] **T-113** 集成测试：Bootstrap Pipeline 端到端（阿里云 ECS 实例）
-- [ ] **T-114** 集成测试：外部服务 API 端到端（轨迹流 + 文件传输）
-- [ ] **T-115** 集成测试：扩容 → Bootstrap → 执行任务 → 缩容 全链路
-- [ ] **T-116** Terraform 测试：阿里云网络模块 plan + apply + destroy
-- [ ] **T-117** Terraform 测试：AWS 网络模块 plan + apply + destroy
-- [ ] **T-118** DryRunProvider 空跑测试（验证流程不消耗资源）
+- [ ] **T-100 ~ T-109** 单元测试（Provider mock / Registry CRUD / Protocol 序列化 / Bootstrap 状态机 / Drain 状态机 / 对账逻辑 / 轨迹流过滤 / 文件监听）
+- [ ] **T-110 ~ T-115** 集成测试（Manager↔Worker WS 通信 / 阿里云全生命周期 / AWS 全生命周期 / Bootstrap E2E / 外部 API E2E / 扩容→执行→缩容全链路）
+- [ ] **T-116** IaC 测试 — 阿里云 Terraform plan+apply+destroy
+- [ ] **T-117** IaC 测试 — AWS CDK synth+deploy+destroy
+- [ ] **T-118** DryRunProvider 空跑验证
 
 ---
 
-## 1. 项目结构
+## 1. 设计原则与约束
+
+### 1.1 核心原则
+
+| 原则 | 说明 | 对设计的影响 |
+|------|------|-------------|
+| **SDK 直连** | 实例生命周期由 Python 代码通过云 SDK 管理，不引入 ASG/Lambda 等额外云服务 | 所有编排逻辑集中在 Manager 进程内，调试路径短 |
+| **控制面单进程** | MVP 阶段 Manager 是单个 FastAPI 进程 | 不需要分布式协调，但需要考虑崩溃恢复（操作日志 + 标签对账） |
+| **数据面随动** | 日志/文件传输通道复用 Worker Runtime 的 WebSocket 连接 | 不引入消息队列（SQS/RabbitMQ），减少外部依赖 |
+| **Harness 无感** | 框架提供完整的 Worker Runtime 和外部 API，Harness 只定义 Bootstrap 步骤和事件回调 | Harness 不需要自建 Worker 侧服务 |
+| **故障收敛** | 任何中间状态都能通过「标签对账 + 注册表重建」恢复到一致 | 不需要分布式事务 |
+
+### 1.2 MVP 接受的已知限制
+
+| 限制 | 影响范围 | 何时解决 |
+|------|---------|---------|
+| Manager 单点 | Manager 挂了无法创建/销毁 Worker，但已有 Worker 继续运行 | Phase 6（高可用） |
+| SSH 密钥共享 | 所有 Worker 共用一个密钥对 | Phase 2（SSM/云助手） |
+| 文件系统状态 | 注册表 JSON 文件在 50+ 实例时可能瓶颈 | Phase 6（PostgreSQL） |
+| 手动扩缩容 | 需要通过 API/UI 触发 | Phase 2（规则引擎） |
+| 无 mTLS | Manager↔Worker 通信靠 Token 而非证书 | Phase 6 |
+
+---
+
+## 2. 系统架构
+
+### 2.1 运行时拓扑
+
+```
+                     ┌─────────── 外部服务 / 前端 ──────────┐
+                     │  WS /api/external/traces/stream      │
+                     │  GET /api/external/files/{path}       │
+                     │  GET /api/external/cluster/status     │
+                     └───────────────┬───────────────────────┘
+                                     │ HTTPS (API Key 认证)
+                                     ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                        Manager 节点                                │
+│                                                                    │
+│  ┌─ FastAPI 进程 ─────────────────────────────────────────────┐   │
+│  │                                                             │   │
+│  │  ┌───────────────┐    ┌───────────────┐   ┌─────────────┐  │   │
+│  │  │ 节点管理 API   │    │ 外部服务 API  │   │ Harness     │  │   │
+│  │  │ /api/nodes/*  │    │ /api/external │   │ 回调        │  │   │
+│  │  └───────┬───────┘    └───────┬───────┘   └──────┬──────┘  │   │
+│  │          │                    │                   │         │   │
+│  │  ┌───────▼────────────────────▼───────────────────▼──────┐  │   │
+│  │  │                    事件总线 (EventBus)                  │  │   │
+│  │  │  NODE_READY · WORKER_UNHEALTHY · CREDENTIAL_ROTATED   │  │   │
+│  │  │  LOG · FILE_CHANGE · PROCESS_EXIT · HEARTBEAT         │  │   │
+│  │  └───────┬────────────────────────────────────────────────┘  │   │
+│  │          │                                                   │   │
+│  │  ┌───────▼───────────────────────────────────────────────┐   │   │
+│  │  │              ElasticAgentManager                       │   │   │
+│  │  │                                                       │   │   │
+│  │  │  CloudProvider   NodeRegistry    BootstrapPipeline     │   │   │
+│  │  │  (SDK 直连)      (JSON 文件)     (可插拔步骤)          │   │   │
+│  │  │                                                       │   │   │
+│  │  │  CredentialPool  HealthChecker   DrainManager          │   │   │
+│  │  │  (账号池)        (多层探针)      (优雅缩容)            │   │   │
+│  │  │                                                       │   │   │
+│  │  │  CloudReconciler                                      │   │   │
+│  │  │  (标签对账)                                            │   │   │
+│  │  └───────┬───────────────────────────────────────────────┘   │   │
+│  └──────────┼──────────────────────────────────────────────────┘   │
+└─────────────┼─────────────────────────────────────────────────────┘
+              │
+              │ WebSocket 反向连接（Worker 主动连 Manager）
+              │ 每条连接承载：命令下发 + 日志回传 + 文件操作 + 心跳
+              │
+    ┌─────────┼──────────┬──────────────────┐
+    │         │          │                  │
+┌───▼───┐ ┌──▼────┐ ┌───▼───┐         ┌───▼───┐
+│Worker │ │Worker │ │Worker │  ...     │Worker │
+│  #1   │ │  #2   │ │  #3   │         │  #N   │
+│       │ │       │ │       │         │       │
+│ WR ◄──┤ │ WR    │ │ WR    │         │ WR    │  WR = Worker Runtime
+│ ┌───┐ │ │       │ │       │         │       │
+│ │CC │ │ │       │ │       │         │       │  CC = Claude Code
+│ └───┘ │ │       │ │       │         │       │      (或其他 Agent)
+│ ┌───┐ │ │       │ │       │         │       │
+│ │H  │ │ │       │ │       │         │       │  H  = Harness 代码
+│ └───┘ │ │       │ │       │         │       │
+└───────┘ └───────┘ └───────┘         └───────┘
+ 阿里云ECS   阿里云ECS   AWS EC2          ...
+```
+
+### 2.2 数据流
+
+系统中有四条主要数据流，全部复用同一条 WebSocket 连接：
+
+```
+数据流 ①：命令下发（低频，关键路径）
+  Manager → Worker
+  Execute / Stop / ReadFile / WatchFiles / HealthCheck
+
+数据流 ②：日志回传（高频，大流量）
+  Worker → Manager → EventBus → 外部 API (WebSocket/SSE) → 前端
+  每行 Claude Code stdout (NDJSON) 产生一个 LogEvent
+
+数据流 ③：文件操作（按需，中等流量）
+  外部请求 → Manager → Worker Runtime (ReadFile) → Manager → 外部响应
+  外部订阅 → Manager → Worker Runtime (WatchFiles) → 文件变更事件流 → 外部
+
+数据流 ④：心跳与状态（低频，关键路径）
+  Worker → Manager: Heartbeat（30s 间隔）
+  Manager → Worker: HealthCheck（主动探测）
+  Manager ← 云 SDK: DescribeInstances（60s 间隔，标签对账用）
+```
+
+**为什么不用消息队列（SQS/RabbitMQ）？** MVP 阶段 Worker 数量 <50，单条 WebSocket 连接的吞吐足够。消息队列引入外部依赖和运维成本，且 WebSocket 的延迟远低于 SQS（毫秒 vs 百毫秒）。当 Worker 超过 50 台时，再考虑引入 NATS/Redis Stream 做数据面分离。
+
+### 2.3 组件交互时序
+
+#### 扩容全流程
+
+```
+  Harness/API          Manager              CloudProvider       Worker Runtime
+      │                    │                      │                    │
+      │  scale_out(N=1)    │                      │                    │
+      ├───────────────────▶│                      │                    │
+      │                    │  create_instance()   │                    │
+      │                    ├─────────────────────▶│                    │
+      │                    │  instance_id         │                    │
+      │                    │◀─────────────────────┤                    │
+      │                    │                      │                    │
+      │                    │  wait_until_running() │                    │
+      │                    ├─────────────────────▶│ (轮询 5s 间隔)     │
+      │                    │  Instance(RUNNING)   │                    │
+      │                    │◀─────────────────────┤                    │
+      │                    │                      │                    │
+      │                    │── SSH Bootstrap ──────────────────────────▶│
+      │                    │   1. 系统初始化                            │
+      │                    │   2. Agent 安装                           │
+      │                    │   3. 凭证注入                             │
+      │                    │   4. Worker Runtime 启动                  │
+      │                    │                      │                    │
+      │                    │◀═══ WS 反向连接（Worker 主动）═════════════╡
+      │                    │   认证: {token: "per-worker-secret"}     │
+      │                    │                      │                    │
+      │                    │── NodeRegistry.add() │                    │
+      │                    │── EventBus.emit(NODE_READY)               │
+      │  [nodes]           │                      │                    │
+      │◀───────────────────┤                      │                    │
+```
+
+#### 崩溃恢复流程
+
+```
+  HealthChecker         Manager              CloudProvider       New Worker
+      │                    │                      │                    │
+      │ 连续 3 次心跳超时   │                      │                    │
+      ├───────────────────▶│                      │                    │
+      │                    │── emit(WORKER_UNHEALTHY)                  │
+      │                    │                      │                    │
+      │                    │── 回收凭证到池子      │                    │
+      │                    │── Registry.update(unhealthy)              │
+      │                    │── terminate_instance()│                    │
+      │                    ├─────────────────────▶│                    │
+      │                    │                      │                    │
+      │                    │── Harness._on_worker_unhealthy()          │
+      │                    │   → 决定是否需要替换   │                    │
+      │                    │                      │                    │
+      │                    │── scale_out(1, recovery=True)             │
+      │                    ├─────────────────────▶│  (新实例)          │
+      │                    │                      │───────────────────▶│
+      │                    │                      │                    │
+      │                    │── Bootstrap (恢复工作目录 + /continue-book)│
+```
+
+---
+
+## 3. 核心子系统设计
+
+### 3.1 多云资源管理层
+
+**设计目标：** 一个 `CloudProvider` 接口抹平阿里云 / AWS 的差异，上层代码完全不感知云厂商。
+
+**接口契约：**
+
+```python
+class CloudProvider(ABC):
+    async def create_instance(config: InstanceConfig) -> Instance
+    async def start_instance(instance_id: str) -> None
+    async def stop_instance(instance_id: str) -> None
+    async def terminate_instance(instance_id: str) -> None
+    async def list_instances(filters: dict | None) -> list[Instance]
+    async def get_instance(instance_id: str) -> Instance
+    async def wait_until_running(instance_id: str, timeout: int) -> Instance
+```
+
+**关键设计决策：**
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 同步 vs 异步 SDK | 同步 SDK 包在 `asyncio.to_thread()` 中 | 阿里云 SDK V2 的 async 支持不稳定，boto3 完全同步；包一层比引入两套 client 简单 |
+| 实例标识 | 云厂商原生 ID（`i-bp1xxx` / `i-0xxx`） | 不引入自定义 UUID，减少映射层 |
+| 标签约定 | 所有框架实例必须打 `ManagedBy=elastic-agent` | 对账的基础；不可省略 |
+| Spot/抢占式 | `InstanceConfig.spot: bool` 统一字段 | 阿里云 SpotStrategy / AWS SpotInstanceType 在 Provider 内部映射 |
+| 错误重试 | Provider 内部不重试，由 Manager 层决定重试策略 | Provider 是纯粹的 SDK 封装，策略逻辑上推 |
+
+**阿里云 vs AWS 实现差异（Provider 内部封装）：**
+
+| 操作 | 阿里云 ECS | AWS EC2 | Provider 如何抹平 |
+|------|-----------|---------|------------------|
+| 创建实例 | `RunInstances` | `run_instances` | 统一返回 `Instance` |
+| 销毁实例 | 需先 Stop 再 `DeleteInstance(Force=True)` | `terminate_instances` 直接释放 | Provider 内部处理两步 |
+| 公网 IP | `PublicIpAddress` 或 `EipAddress` 两个位置 | `PublicIpAddress` | `_to_instance()` 统一提取 |
+| 默认用户 | `root` | `ubuntu` | 配置项 `ssh_user` |
+| Spot | `SpotStrategy: SpotAsPriceGo` | `InstanceMarketOptions.MarketType: spot` | `config.spot` 布尔值 |
+
+### 3.2 Worker Runtime 通信层
+
+**这是框架最核心的子系统。** 它定义了 Manager 和 Worker 之间的所有交互方式。
+
+#### 连接模型：Worker 主动连接 Manager
+
+```
+启动时序:
+  1. Manager 监听 WS 端点 ws://0.0.0.0:8000/ws/runtime
+  2. Bootstrap 最后一步在 Worker 上启动 Runtime 服务
+  3. Worker Runtime 主动连接 Manager（反向连接）
+  4. 发送认证消息 {"type": "auth", "token": "per-worker-secret"}
+  5. Manager 验证 token → 绑定连接到 NodeRegistry 中的节点
+  6. 进入双向消息循环
+
+为什么 Worker 主动连 Manager（而不是 Manager 连 Worker）？
+  - Worker 在 VPC 私有子网内，不需要开入站端口 → 安全
+  - Manager IP 固定（或域名），Worker IP 动态 → 连接方向自然
+  - 断线重连逻辑在 Worker 侧，更简单（Manager 不需要维护重连队列）
+```
+
+#### 消息类型体系
+
+```
+Manager → Worker (命令):
+  EXECUTE      启动子进程         {task_id, command[], cwd, env{}, timeout?}
+  STOP         停止子进程         {task_id, signal?}
+  READ_FILE    读取文件           {request_id, path, encoding?}
+  WATCH_FILES  监听文件变化       {request_id, paths[], events[]}
+  UNWATCH      取消监听           {request_id}
+  HEALTH_CHECK 主动探测           {}
+  UPLOAD_FILE  上传文件到 Worker  {path, content_base64, mode?}
+  MESSAGE      反向消息（用户→Agent） {task_id, payload}
+
+Worker → Manager (事件):
+  LOG          日志行             {task_id, stream, data, timestamp}
+  PROCESS_EXIT 进程退出           {task_id, exit_code, timestamp}
+  FILE_CONTENT 文件内容响应       {request_id, path, content}
+  FILE_CHANGE  文件变更事件       {path, event, content?, timestamp}
+  STATUS       状态上报           {cpu%, mem%, disk%, active_processes[]}
+  HEARTBEAT    心跳               {uptime_seconds}
+  ERROR        错误上报           {error_type, message, recoverable}
+```
+
+#### 连接生命周期与断线恢复
+
+```
+状态机:
+  CONNECTING → AUTHENTICATING → CONNECTED → DISCONNECTED
+                                    ↑              │
+                                    └── (自动重连) ──┘
+
+断线恢复策略:
+  Worker 侧:
+    - 指数退避重连: 1s → 2s → 4s → 8s → ... → 60s (上限)
+    - 重连期间缓冲日志到本地文件（防止丢失）
+    - 重连成功后回放缓冲日志
+
+  Manager 侧:
+    - 连接断开 → 标记节点为 "disconnected"
+    - 超过 3 × 心跳间隔(90s) 仍未重连 → 标记 "unhealthy"
+    - 连续 3 次 unhealthy → 触发 WORKER_UNHEALTHY 事件
+```
+
+#### 进程管理模型
+
+```
+Worker Runtime 管理的进程:
+  ┌────────────────────────────────────────┐
+  │ Worker Runtime (FastAPI + WS client)   │
+  │                                        │
+  │  processes: dict[task_id, Process]      │
+  │                                        │
+  │  每个进程:                              │
+  │    ├── asyncio.create_subprocess_exec   │
+  │    ├── stdout → 逐行读取 → LOG 事件     │
+  │    ├── stderr → 逐行读取 → LOG 事件     │
+  │    └── 退出 → PROCESS_EXIT 事件         │
+  │                                        │
+  │  文件监听:                              │
+  │    ├── watchdog Observer (inotify)      │
+  │    └── 变更 → FILE_CHANGE 事件          │
+  └────────────────────────────────────────┘
+
+停止进程的信号序列:
+  SIGINT → 等待 10s → SIGTERM → 等待 5s → SIGKILL
+  (与 Claude Code CLI 的优雅退出协议一致)
+```
+
+### 3.3 外部服务 API 层
+
+**设计目标：** 外部服务（前端 UI、监控系统、第三方集成）通过 Manager 获取实时 Agent 轨迹和 Worker 文件，不需要直接访问 Worker。
+
+#### 数据流路径
+
+```
+实时轨迹流:
+  Worker Claude Code stdout
+    → Worker Runtime 逐行读取
+    → LOG 消息 via WS
+    → Manager EventBus
+    → 外部 API 轨迹流端点 (WebSocket / SSE)
+    → 外部消费者
+
+文件访问:
+  外部请求 GET /api/external/files/{node_id}/{path}
+    → Manager 查找 node_id 对应的 WS 连接
+    → 发送 READ_FILE 命令到 Worker
+    → Worker 读取本地文件
+    → FILE_CONTENT 响应 via WS
+    → Manager 返回给外部
+
+文件变更监听:
+  外部订阅 WS /api/external/files/{node_id}/watch
+    → Manager 转发 WATCH_FILES 命令到 Worker
+    → Worker inotify 监听
+    → FILE_CHANGE 事件 via WS
+    → Manager 转发到外部 WebSocket
+```
+
+#### 轨迹缓存策略
+
+```
+                  ┌─────────────────────────┐
+                  │     轨迹缓存 (内存)       │
+                  │                         │
+  LOG 事件 ──────▶│  环形缓冲 (per-worker)  │──────▶ 实时订阅者 (WebSocket/SSE)
+                  │  容量: 10000 条/worker   │
+                  │                         │
+                  │  查询接口:               │──────▶ 历史查询 (REST GET)
+                  │  by node_id             │
+                  │  by task_id             │
+                  │  by time range          │
+                  └─────────────────────────┘
+
+MVP 不持久化轨迹到数据库。理由:
+  - 轨迹的主要消费场景是实时流（前端看 Agent 在做什么）
+  - 历史查询在 MVP 阶段频率极低
+  - 内存环形缓冲足够（10000 条 × 50 Worker × ~200B/条 ≈ 100MB）
+  - 后续 Phase 2 引入 ClickHouse/PostgreSQL 做轨迹持久化
+```
+
+#### 认证模型
+
+```
+外部 API 认证 (MVP):
+  所有外部 API 请求必须携带 API Key:
+    - URL 参数: ?api_key=xxx
+    - 或 Header: Authorization: Bearer xxx
+
+  API Key 在 Manager 配置文件中定义:
+    external_api:
+      api_keys:
+        - "key-for-frontend"
+        - "key-for-monitoring"
+
+  WebSocket 连接在首条消息中认证:
+    {"type": "auth", "api_key": "xxx"}
+
+后续演进:
+  Phase 2: OAuth 2.0 Client Credentials（支持 scope 控制）
+  Phase 6: JWT + RBAC（细粒度权限）
+```
+
+### 3.4 节点生命周期管理
+
+#### 节点状态机
+
+```
+                create_instance()
+                      │
+                      ▼
+  ┌──────────┐   ┌──────────┐   Bootstrap 成功   ┌──────────┐
+  │          │   │          ├───────────────────▶│          │
+  │ CREATING ├──▶│BOOTSTRAP-│                    │  READY   │
+  │          │   │   ING    │   Bootstrap 失败   │  (idle)  │
+  └──────────┘   │          ├───────┐            │          │
+                 └──────────┘       │            └────┬─────┘
+                                    ▼                 │
+                              ┌──────────┐      分配任务
+                              │  FAILED  │           │
+                              │(待清理)   │           ▼
+                              └──────────┘      ┌──────────┐
+                                                │  BUSY    │
+                                                │(执行中)   │
+                                                └────┬─────┘
+                                                     │
+                                               任务完成/失败
+                                                     │
+                             ┌───────────────────────┤
+                             │                       │
+                             ▼                       ▼
+                       ┌──────────┐           ┌──────────┐
+                       │  READY   │           │ DRAINING │
+                       │ (再次空闲)│           │(等待完成) │
+                       └──────────┘           └────┬─────┘
+                                                   │
+                                              超时或完成
+                                                   │
+                                                   ▼
+                                             ┌──────────┐
+                                             │TERMINATED│
+                                             └──────────┘
+
+异常路径:
+  任意状态 → 心跳超时 → UNHEALTHY → (Harness 决定) → TERMINATED 或替换
+  任意状态 → 云端对账发现已消失 → 从注册表移除
+```
+
+#### 云端标签对账
+
+```
+对账解决的核心问题:
+  Manager 在 scale_out() 执行到一半崩溃 → EC2 已创建但注册表未写入 → 孤儿实例
+
+对账触发时机:
+  1. Manager 启动时（必须）
+  2. 每 5 分钟周期性（兜底）
+
+对账算法:
+  cloud_instances = provider.list_instances(ManagedBy=elastic-agent)
+  registered_ids = registry.list_all_ids()
+
+  孤儿 = cloud_instances - registered_ids
+    → 策略: 纳入管理（add to registry）或清理（terminate）
+    → MVP 默认: 纳入管理，等人工确认后清理
+
+  幽灵 = registered_ids - cloud_instances
+    → 直接从注册表移除（云端已经不存在了）
+
+  状态不一致 = 两侧都有但状态不同
+    → 以云端为准（cloud is source of truth）
+```
+
+#### Bootstrap 失败处理
+
+```
+失败策略枚举:
+  TERMINATE_AND_RETRY  销毁实例 → 重新创建 → 重新 Bootstrap (默认)
+  RETRY_FROM_FAILED    在同一实例上从失败步骤重试
+  LEAVE_FOR_DEBUG      保留实例供人工排查（仅开发环境）
+
+凭证安全:
+  Bootstrap 失败时，如果凭证已注入 Worker → 必须回收凭证到池子
+  否则凭证"被锁定"在一台不可用的 Worker 上
+
+最大重试次数: 2
+  超过后 → 标记 FAILED + 发送告警 + 不再自动重试
+  防止: 云资源持续创建-销毁循环（烧钱）
+```
+
+### 3.5 凭证与安全
+
+#### 两层凭证模型
+
+```
+Layer 1: Agent 凭证（框架管理）
+  Claude Code 的登录态（OAuth refresh token）
+  存储: credentials.json（Manager 本地）
+  分发: Bootstrap 时写入 Worker 的 ~/.claude/.credentials.json
+  回收: 节点终止或 Drain 时回收到池子
+  轮换: 额度耗尽时自动换号（Phase 2 实现）
+
+Layer 2: 应用凭证（Harness 声明，框架传递）
+  Git SSH key、WandB API key、HuggingFace token 等
+  Harness 通过 get_app_credentials() 声明需要哪些
+  Bootstrap 时从 Manager 安全传递到 Worker（环境变量或文件）
+```
+
+#### Manager ↔ Worker 认证
+
+```
+Bootstrap 时:
+  1. Manager 生成 per-Worker 随机 token: secrets.token_urlsafe(32)
+  2. 通过 SSH 写入 Worker 的配置文件
+  3. 同时写入 NodeRegistry
+
+运行时:
+  Worker Runtime 连接 Manager WS 端点时:
+    → 首条消息: {"type": "auth", "token": "<per-worker-token>"}
+    → Manager 在 NodeRegistry 中查找匹配的 token
+    → 匹配 → 绑定连接; 不匹配 → 关闭连接
+
+安全边界:
+  - Manager ↔ Worker 走 VPC 内网（不经过公网）
+  - Worker Runtime 只监听内网 IP
+  - Worker 不开放任何入站端口（WS 是 Worker → Manager 方向）
+```
+
+### 3.6 事件系统
+
+```
+事件系统是 Manager 内部的核心通信机制:
+
+EventBus
+  ├── 生产者: Worker Runtime 连接 (LOG, HEARTBEAT, PROCESS_EXIT, ...)
+  ├── 生产者: HealthChecker (WORKER_UNHEALTHY)
+  ├── 生产者: ElasticAgentManager (NODE_CREATING, NODE_READY, ...)
+  ├── 生产者: CredentialPool (CREDENTIAL_ROTATED, CREDENTIAL_EXHAUSTED)
+  │
+  ├── 消费者: 外部 API traces 端点 (订阅 LOG 事件)
+  ├── 消费者: 外部 API files 端点 (订阅 FILE_CHANGE 事件)
+  ├── 消费者: Harness 事件回调 (订阅框架事件)
+  ├── 消费者: HealthChecker (订阅 HEARTBEAT 超时)
+  └── 消费者: 轨迹缓存 (订阅 LOG 事件 → 写入环形缓冲)
+
+实现:
+  MVP 用 asyncio.Queue 的 fan-out 模式:
+    - EventBus 维护 subscribers: dict[event_type, list[asyncio.Queue]]
+    - emit() → 复制事件到所有匹配的 Queue
+    - subscribe() → 返回 AsyncIterator 从 Queue 读取
+
+  不使用 Redis Pub/Sub 或 Kafka:
+    - MVP 是单进程，内存 Queue 足够
+    - 延迟更低（纳秒 vs 毫秒）
+    - 无外部依赖
+```
+
+---
+
+## 4. IaC 策略
+
+### 4.1 双工具策略
+
+| 云 | IaC 工具 | 理由 |
+|---|---------|------|
+| **阿里云** | **Terraform** (alicloud provider) | 阿里云没有 CDK 等价物，Terraform 是唯一成熟选择 |
+| **AWS** | **CDK Python** | 项目全栈 Python，CDK 与主代码共享类型系统；后续 ASG/Lambda/SSM 集成 CDK 远优于 Terraform |
+
+### 4.2 IaC 管什么、不管什么
+
+| 资源类型 | 管理方式 | 理由 |
+|---------|---------|------|
+| VPC / 子网 / 路由表 | IaC (Terraform / CDK) | 一次性创建，环境间一致性要求高 |
+| 安全组及规则 | IaC | 安全策略需要版本控制和审计 |
+| 密钥对 | IaC | 一次性创建 |
+| NAT Gateway + EIP | IaC | 出站 IP 固定是 IP 亲和性的基础 |
+| IAM/RAM 角色 | IaC | 最小权限原则，需要审计 |
+| **ECS/EC2 实例 (Worker)** | **SDK 直连** | 动态生命周期，按需创建/销毁 |
+| **EIP（弹性 IP）** | **SDK 直连** | 跟随实例动态分配/回收 |
+
+### 4.3 项目结构
+
+```
+infra/
+├── aliyun/                        # Terraform (HCL)
+│   ├── modules/
+│   │   └── networking/
+│   │       ├── main.tf            # VPC, VSwitch, 安全组, NAT, 密钥对
+│   │       ├── variables.tf
+│   │       └── outputs.tf         # → vpc_id, vswitch_ids, sg_id, key_name
+│   └── environments/
+│       └── cn-hangzhou/
+│           ├── main.tf            # provider "alicloud" + module 调用
+│           ├── terraform.tfvars   # region, cidr, 实例化参数
+│           └── backend.tf         # OSS remote state
+│
+└── aws/                           # CDK Python
+    ├── app.py                     # CDK App 入口
+    ├── stacks/
+    │   └── networking_stack.py    # VPC, Subnet, SG, NAT, KeyPair
+    ├── cdk.json
+    └── requirements.txt
+```
+
+### 4.4 CDK Python 设计要点
+
+```python
+# infra/aws/stacks/networking_stack.py
+
+from aws_cdk import Stack, CfnOutput
+from aws_cdk import aws_ec2 as ec2
+from constructs import Construct
+
+class ElasticAgentNetworkingStack(Stack):
+    def __init__(self, scope: Construct, id: str, **kwargs):
+        super().__init__(scope, id, **kwargs)
+
+        # CDK L2 Construct — 一行创建 VPC + 公私有子网 + NAT + 路由表
+        self.vpc = ec2.Vpc(self, "ElasticAgentVpc",
+            max_azs=2,
+            nat_gateways=1,
+            subnet_configuration=[
+                ec2.SubnetConfiguration(name="worker-private",
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+                ec2.SubnetConfiguration(name="public",
+                    subnet_type=ec2.SubnetType.PUBLIC),
+            ],
+        )
+        # 对比 Terraform: 需要分别定义 VPC + 2 Subnet + IGW + NAT + 4 RouteTable + 4 RouteTableAssociation
+
+        self.worker_sg = ec2.SecurityGroup(self, "WorkerSG",
+            vpc=self.vpc,
+            description="Elastic-Agent Workers",
+            allow_all_outbound=True,
+        )
+        self.worker_sg.add_ingress_rule(
+            ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            ec2.Port.tcp(8080),
+            "Worker Runtime from VPC",
+        )
+
+        # 输出供 Manager 配置使用
+        CfnOutput(self, "VpcId", value=self.vpc.vpc_id)
+        CfnOutput(self, "PrivateSubnetIds",
+            value=",".join([s.subnet_id for s in self.vpc.private_subnets]))
+        CfnOutput(self, "SecurityGroupId", value=self.worker_sg.security_group_id)
+```
+
+**CDK vs Terraform 对比（AWS 侧）：**
+
+| 维度 | CDK Python | Terraform HCL |
+|------|-----------|---------------|
+| VPC + NAT + 路由 | 1 个 `ec2.Vpc()` 调用 | ~15 个 resource block |
+| 类型安全 | Python 类型检查，IDE 补全 | HCL 无类型，靠 `terraform validate` |
+| 测试 | `pytest` + `assertions` 模块 | `terraform plan` 输出解析 |
+| 与主代码集成 | 共享 Pydantic 模型、常量 | 完全隔离 |
+| 后续扩展 | Lambda/SSM/ASG 用 L2 construct 很自然 | 需要大量 resource block |
+
+---
+
+## 5. 错误处理与恢复策略
+
+### 5.1 故障分类
+
+| 层级 | 故障 | 检测方式 | 恢复策略 |
+|------|------|---------|---------|
+| **云基础设施** | 实例意外终止 / Spot 回收 | 云端对账 + 心跳超时 | 标签对账清理 + Harness 决定是否替换 |
+| **网络** | WS 连接断开 | 心跳超时 | Worker 自动重连（指数退避） |
+| **Worker Runtime** | Runtime 进程崩溃 | 心跳消失 | Manager 标记 unhealthy → Harness 回调 |
+| **Agent 进程** | Claude Code 崩溃 | PROCESS_EXIT(非零) | Harness 决定：重启 / 恢复 / 放弃 |
+| **Manager** | Manager 进程崩溃 | 无（单点） | 重启后标签对账 + 注册表重建 |
+| **Bootstrap** | 初始化步骤失败 | 步骤返回错误 | 按失败策略处理（见 3.4） |
+
+### 5.2 Manager 崩溃恢复
+
+```
+Manager 崩溃后重启:
+  1. 读取 NodeRegistry (JSON 文件，崩溃前最后一次写入)
+  2. 云端标签对账:
+     - 发现孤儿实例 → 纳入管理
+     - 发现幽灵节点 → 从注册表移除
+  3. 等待 Worker Runtime 重连:
+     - Worker 侧有指数退避重连逻辑
+     - 所有活跃 Worker 会在 1-60s 内重连
+  4. 重建内存状态:
+     - EventBus 重新初始化
+     - HealthChecker 重新启动（从 0 开始计数）
+
+不需要 WAL/预写日志:
+  标签对账是最终一致性保证
+  最坏情况: 孤儿实例运行到下一个对账周期 (5 分钟) 被发现
+  经济影响: 5 分钟 × 1 台 ecs.c6.large ≈ ¥0.065 — 可接受
+```
+
+### 5.3 操作幂等性
+
+```
+create_instance:
+  阿里云 RunInstances API 不支持 ClientToken 幂等 → 可能重复创建
+  保障: 标签对账兜底
+
+terminate_instance:
+  阿里云 DeleteInstance(Force=True) 幂等 — 已终止的实例再次调用不报错
+  AWS terminate_instances 同理
+
+Bootstrap:
+  非幂等 — 部分步骤重复执行会出错（如重复 git clone）
+  保障: 失败策略默认 TERMINATE_AND_RETRY（销毁重来）
+```
+
+---
+
+## 6. 部署拓扑
+
+### 6.1 最小部署（MVP）
+
+```
+┌───────────────────────────────────────┐
+│  Manager 机器（本地 Mac / 云服务器）    │
+│                                       │
+│  uvicorn elastic_agent.manager:app    │
+│  监听: 0.0.0.0:8000                  │
+│                                       │
+│  ~/.elastic-agent/                    │
+│    ├── config.yaml                    │
+│    ├── registry.json                  │
+│    ├── credentials.json               │
+│    └── ssh keys                       │
+└───────────────┬───────────────────────┘
+                │
+     VPC 内网 (阿里云) 或公网 (本地 Mac)
+                │
+        ┌───────┼───────┐
+   Worker #1  Worker #2  ...
+```
+
+### 6.2 Manager 部署选项
+
+| 方案 | 适用场景 | 优缺点 |
+|------|---------|--------|
+| 本地 Mac/PC | 开发调试 | 方便但 Manager 关机 Worker 断联 |
+| 同区域云服务器 | 生产 | Manager 与 Worker 同 VPC，延迟低、安全 |
+| Cloudflare Tunnel | 本地 + 远程 Worker | Manager 在本地但可被 Worker 连接 |
+
+---
+
+## 7. 实现顺序与依赖
+
+### 7.1 分阶段路线
+
+```
+Phase A (Week 1-2): 能创建和销毁云实例
+  T-002 数据模型
+  T-003 阿里云 Provider
+  T-004 AWS Provider
+  T-005 Terraform 阿里云网络
+  T-006 CDK AWS 网络
+  T-011 NodeRegistry
+  T-012 云端对账
+  ── 里程碑: 能通过 Python 代码创建/销毁阿里云 ECS + AWS EC2 ──
+
+Phase B (Week 2-3): Manager 能控制 Worker
+  T-009 通信协议
+  T-007 Worker Runtime 服务端
+  T-008 Worker Runtime 客户端
+  T-010 认证
+  T-016 Manager FastAPI 服务
+  ── 里程碑: Manager 能通过 WS 在 Worker 上远程执行命令并看到输出 ──
+
+Phase C (Week 3-4): 外部可以消费数据
+  T-013 外部 API 轨迹流
+  T-014 外部 API 文件传输
+  T-015 外部 API 认证
+  ── 里程碑: 前端能通过 WS 看到 Worker 上 Agent 的实时输出 ──
+
+Phase D (Week 4-5): Bootstrap 自动化
+  T-017 Claude Code AgentType
+  T-018 Bootstrap Pipeline
+  T-019~T-022 内置步骤
+  T-023 失败处理
+  T-026 凭证分发
+  ── 里程碑: scale_out() 一个调用完成从创建到就绪的全流程 ──
+
+Phase E (Week 5-6): 稳定性
+  T-024 健康检查
+  T-025 Drain 机制
+  T-027 额度监控
+  T-028 手动扩缩容 API
+  T-029 基础 Web UI
+  ── 里程碑: MVP 可用 ──
+
+Phase F (Week 6-7): 测试
+  T-100~T-118 全部测试
+  ── 里程碑: 测试覆盖，可交付 ──
+```
+
+### 7.2 关键依赖链
+
+```
+T-002 (数据模型) ──→ T-003/T-004 (Provider) ──→ T-011 (Registry) ──→ T-012 (对账)
+                                                                           │
+T-009 (协议) ──→ T-007/T-008 (Runtime) ──→ T-010 (认证) ──→ T-016 (Manager)
+                       │                                          │
+                       └──→ T-013/T-014 (外部 API)                │
+                                                                   │
+T-017 (AgentType) ──→ T-018 (Bootstrap) ──→ T-019~T-022 (步骤) ──→ T-028 (扩缩容 API)
+                                                │
+                                                └──→ T-025 (Drain)
+```
+
+---
+
+## 8. 测试策略
+
+### 8.1 测试金字塔
+
+```
+                    ┌─────────────┐
+                    │  E2E 全链路  │  1-2 个: 扩容→执行→缩容
+                    │  (真实云)    │  跑一次 ~10min, ¥2
+                    ├─────────────┤
+                 ┌──┤  集成测试    │  5-6 个: WS 通信, 云生命周期, Bootstrap
+                 │  │  (真实云)    │  各 ~3min
+                 │  ├─────────────┤
+              ┌──┤  │  单元测试    │  30+ 个: Provider mock, 状态机, 协议解析
+              │  │  │  (纯内存)    │  全部 <5s
+              └──┴──┴─────────────┘
+```
+
+### 8.2 测试隔离策略
+
+| 层 | 如何隔离外部依赖 |
+|---|-----------------|
+| 单元测试 | Mock 云 SDK 响应 + DryRunProvider + 内存 EventBus |
+| 集成测试 | 真实云（env var 控制跳过）+ 测试后 cleanup |
+| E2E | 真实云 + 真实 Worker Runtime + 真实 Claude Code (可选 mock) |
+
+### 8.3 DryRunProvider
+
+不消耗任何云资源的 Provider 实现，记录所有操作到内存列表。用于：
+- 验证 Manager 编排逻辑（scale_out/scale_in 流程）
+- CI 中不需要云凭证的快速验证
+- Harness 开发时的本地调试
+
+---
+
+## 9. 项目结构
 
 ```
 elastic-agent/
-├── src/
-│   ├── elastic_agent/              # Python 包
-│   │   ├── __init__.py             # 公开 API（ElasticAgentManager, Providers, ...）
-│   │   ├── core/
-│   │   │   ├── providers/
-│   │   │   │   ├── base.py         # CloudProvider ABC + Instance 模型
-│   │   │   │   ├── aliyun_ecs.py   # 阿里云 ECS Provider（MVP 首选）
-│   │   │   │   ├── aws_ec2.py      # AWS EC2 Provider
-│   │   │   │   └── dry_run.py      # DryRun Provider（测试用）
-│   │   │   ├── agents/
-│   │   │   │   ├── base.py         # AgentType ABC
-│   │   │   │   └── claude_code.py  # Claude Code 实现
-│   │   │   ├── credentials/
-│   │   │   │   ├── pool.py         # CredentialPool（账号池）
-│   │   │   │   ├── provider.py     # CredentialProvider ABC
-│   │   │   │   └── api_key.py      # API Key 分发（MVP）
-│   │   │   ├── runtime/
-│   │   │   │   ├── protocol.py     # Manager↔Worker 通信协议
-│   │   │   │   ├── client.py       # Manager 侧 — 远程调用 Worker
-│   │   │   │   └── server.py       # Worker 侧 — 接收命令、执行进程
-│   │   │   ├── bootstrap/
-│   │   │   │   ├── pipeline.py     # 可插拔初始化管道
-│   │   │   │   ├── policy.py       # 失败处理策略
-│   │   │   │   └── steps/          # 内置步骤（系统初始化、Agent 安装等）
-│   │   │   ├── registry/
-│   │   │   │   └── store.py        # NodeRegistry（JSON 文件存储）
-│   │   │   ├── monitor/
-│   │   │   │   ├── health.py       # L2/L3 健康检查
-│   │   │   │   ├── quota.py        # 额度监控
-│   │   │   │   ├── reconciler.py   # 云端标签对账
-│   │   │   │   └── events.py       # 事件总线
-│   │   │   ├── scheduler/
-│   │   │   │   └── drain.py        # 优雅缩容 Drain 机制
-│   │   │   ├── external_api/
-│   │   │   │   ├── traces.py       # 实时轨迹流（WebSocket/SSE）
-│   │   │   │   ├── files.py        # 文件传输（读取 + 监听）
-│   │   │   │   ├── auth.py         # 外部 API 认证
-│   │   │   │   └── router.py       # FastAPI Router 挂载点
-│   │   │   └── security/
-│   │   │       └── auth.py         # Manager↔Worker Bearer Token 认证
-│   │   ├── manager/
-│   │   │   ├── api/
-│   │   │   │   ├── nodes.py        # 节点管理 API
-│   │   │   │   ├── credentials.py  # 凭证管理 API
-│   │   │   │   └── status.py       # 集群状态 API
-│   │   │   ├── service.py          # ElasticAgentManager 主类
-│   │   │   └── config.py           # Pydantic 配置模型
-│   │   ├── worker/
-│   │   │   ├── runtime_server.py   # Worker Runtime HTTP/WS 服务入口
-│   │   │   ├── process_manager.py  # 本地进程管理
-│   │   │   ├── file_watcher.py     # 文件变更监听（inotify）
-│   │   │   └── reporter.py         # 状态/日志上报
-│   │   └── cli/
-│   │       └── main.py             # 命令行入口
-├── dashboard/                      # 前端 UI（React + Vite + Ant Design）
-├── infra/                          # Terraform IaC
-│   ├── modules/
-│   │   ├── networking/
-│   │   │   ├── main.tf             # VPC、子网、路由表、NAT
-│   │   │   ├── security_groups.tf  # 安全组规则
-│   │   │   ├── variables.tf
-│   │   │   └── outputs.tf          # vpc_id, subnet_ids, sg_ids
-│   │   └── base/
-│   │       ├── main.tf             # 密钥对、IAM/RAM 角色
-│   │       ├── variables.tf
-│   │       └── outputs.tf
-│   └── environments/
-│       ├── aliyun-cn-hangzhou/     # 阿里云杭州（MVP 首选）
-│       │   ├── main.tf
-│       │   ├── terraform.tfvars
-│       │   └── backend.tf          # OSS remote state
-│       └── aws-ap-northeast-1/     # AWS 东京
-│           ├── main.tf
-│           ├── terraform.tfvars
-│           └── backend.tf          # S3 remote state
+├── src/elastic_agent/
+│   ├── core/
+│   │   ├── providers/          # CloudProvider 抽象 + 阿里云/AWS/DryRun 实现
+│   │   ├── agents/             # AgentType 抽象 + Claude Code 实现
+│   │   ├── credentials/        # CredentialPool + Provider 接口
+│   │   ├── runtime/            # 通信协议 + Worker 客户端/服务端
+│   │   ├── bootstrap/          # Pipeline + 失败策略 + 内置步骤
+│   │   ├── registry/           # NodeRegistry (JSON 存储)
+│   │   ├── monitor/            # 健康检查 + 额度监控 + 云端对账 + 事件总线
+│   │   ├── scheduler/          # Drain 机制
+│   │   ├── external_api/       # 轨迹流 + 文件传输 + 认证 + FastAPI Router
+│   │   └── security/           # Manager↔Worker 认证
+│   ├── manager/                # FastAPI 应用 + ElasticAgentManager + 配置模型
+│   ├── worker/                 # Runtime 服务入口 + 进程管理 + 文件监听
+│   └── cli/                    # 命令行入口
+├── dashboard/                  # React + Vite + Ant Design 前端
+├── infra/
+│   ├── aliyun/                 # Terraform (HCL)
+│   └── aws/                    # CDK (Python)
 ├── tests/
 │   ├── unit/
-│   │   ├── test_providers.py
-│   │   ├── test_registry.py
-│   │   ├── test_protocol.py
-│   │   ├── test_bootstrap.py
-│   │   ├── test_drain.py
-│   │   ├── test_reconciler.py
-│   │   ├── test_external_traces.py
-│   │   └── test_external_files.py
 │   └── integration/
-│       ├── test_aliyun_e2e.py
-│       ├── test_aws_e2e.py
-│       ├── test_runtime_ws.py
-│       ├── test_external_api_e2e.py
-│       └── test_full_lifecycle.py
-├── scripts/
-│   ├── bootstrap.sh                # Worker 初始化脚本
-│   └── watchdog.sh                 # Worker 侧 watchdog
-├── examples/
-│   ├── claude-code-manager/
-│   └── agent-ml-research/
+├── examples/                   # Harness 示例
 ├── pyproject.toml
-├── CLAUDE.md
 └── README.md
 ```
 
 ---
 
-## 2. 模块实现详解
+## 10. 配置管理
 
-### 2.1 CloudProvider 抽象 + 数据模型 (T-002)
-
-```python
-# src/elastic_agent/core/providers/base.py
-
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any
-
-class InstanceStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-    TERMINATING = "terminating"
-    TERMINATED = "terminated"
-
-@dataclass
-class InstanceConfig:
-    name: str
-    instance_type: str | None = None    # 不指定则用 Provider 默认值
-    image_id: str | None = None         # 不指定则用 Provider 默认值
-    tags: dict[str, str] = field(default_factory=dict)
-    subnet_id: str | None = None       # VSwitch ID (阿里云) / Subnet ID (AWS)
-    security_group_ids: list[str] = field(default_factory=list)
-    key_pair_name: str | None = None
-    user_data: str | None = None        # cloud-init 脚本
-    spot: bool = False                  # 是否使用抢占式/Spot 实例
-
-@dataclass
-class Instance:
-    id: str                             # 实例 ID（阿里云 i-xxx / AWS i-xxx）
-    name: str
-    status: InstanceStatus
-    public_ip: str | None = None
-    private_ip: str | None = None
-    instance_type: str = ""
-    region: str = ""
-    zone: str = ""
-    created_at: datetime | None = None
-    tags: dict[str, str] = field(default_factory=dict)
-    provider: str = ""                  # "aliyun" / "aws"
-    raw: dict[str, Any] = field(default_factory=dict)  # 云厂商原始响应
-
-class CloudProvider(ABC):
-    """云服务商接口 — 管理实例生命周期"""
-
-    @abstractmethod
-    async def create_instance(self, config: InstanceConfig) -> Instance: ...
-
-    @abstractmethod
-    async def start_instance(self, instance_id: str) -> None: ...
-
-    @abstractmethod
-    async def stop_instance(self, instance_id: str) -> None: ...
-
-    @abstractmethod
-    async def terminate_instance(self, instance_id: str) -> None: ...
-
-    @abstractmethod
-    async def list_instances(self, filters: dict | None = None) -> list[Instance]: ...
-
-    @abstractmethod
-    async def get_instance(self, instance_id: str) -> Instance: ...
-
-    @abstractmethod
-    async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance: ...
-```
-
-### 2.2 阿里云 ECS Provider (T-003)
-
-**MVP 首选实现。** 基于 alibabacloud_ecs20140526 SDK V2.0。
-
-```python
-# src/elastic_agent/core/providers/aliyun_ecs.py
-
-from alibabacloud_ecs20140526.client import Client as EcsClient
-from alibabacloud_ecs20140526 import models as ecs_models
-from alibabacloud_tea_openapi import models as open_api_models
-
-class AliyunEcsProvider(CloudProvider):
-    def __init__(self, config: AliyunEcsConfig):
-        self.config = config
-        api_config = open_api_models.Config(
-            access_key_id=config.access_key_id,
-            access_key_secret=config.access_key_secret,
-            region_id=config.region_id,
-        )
-        self.client = EcsClient(api_config)
-
-    async def create_instance(self, config: InstanceConfig) -> Instance:
-        # 构建 Tag 列表（必须包含 ManagedBy=elastic-agent）
-        tags = [
-            ecs_models.RunInstancesRequestTag(
-                key="ManagedBy", value="elastic-agent"
-            ),
-            ecs_models.RunInstancesRequestTag(
-                key="Name", value=f"Worker-{config.name}"
-            ),
-        ]
-        for k, v in config.tags.items():
-            tags.append(ecs_models.RunInstancesRequestTag(key=k, value=v))
-
-        request = ecs_models.RunInstancesRequest(
-            region_id=self.config.region_id,
-            image_id=config.image_id or self.config.image_id,
-            instance_type=config.instance_type or self.config.instance_type,
-            security_group_id=self.config.security_group_id,
-            v_switch_id=config.subnet_id or self.config.vswitch_id,
-            key_pair_name=config.key_pair_name or self.config.key_pair_name,
-            internet_charge_type=self.config.internet_charge_type,
-            internet_max_bandwidth_out=self.config.internet_max_bandwidth_out,
-            system_disk=ecs_models.RunInstancesRequestSystemDisk(
-                category=self.config.system_disk_category,
-                size=self.config.system_disk_size,
-            ),
-            amount=1,
-            tag=tags,
-            # 抢占式实例配置
-            spot_strategy="SpotAsPriceGo" if config.spot else "NoSpot",
-            instance_name=f"Worker-{config.name}",
-        )
-
-        response = self.client.run_instances(request)
-        instance_id = response.body.instance_id_sets.instance_id_set[0]
-        return await self.get_instance(instance_id)
-
-    async def terminate_instance(self, instance_id: str) -> None:
-        # 阿里云需要先停止再释放（或 Force=True）
-        request = ecs_models.DeleteInstanceRequest(
-            instance_id=instance_id,
-            force=True,
-        )
-        self.client.delete_instance(request)
-
-    async def list_instances(self, filters: dict | None = None) -> list[Instance]:
-        # 默认过滤 ManagedBy=elastic-agent 的实例
-        tag = [ecs_models.DescribeInstancesRequestTag(
-            key="ManagedBy", value="elastic-agent"
-        )]
-        request = ecs_models.DescribeInstancesRequest(
-            region_id=self.config.region_id,
-            tag=tag,
-            page_size=100,
-        )
-        response = self.client.describe_instances(request)
-        return [self._to_instance(i) for i in response.body.instances.instance]
-
-    async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:
-        import asyncio
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            inst = await self.get_instance(instance_id)
-            if inst.status == InstanceStatus.RUNNING and inst.public_ip:
-                return inst
-            await asyncio.sleep(5)
-        raise TimeoutError(f"Instance {instance_id} not running after {timeout}s")
-
-    def _to_instance(self, raw) -> Instance:
-        """将阿里云 API 响应转换为统一 Instance 模型"""
-        public_ip = None
-        if raw.public_ip_address and raw.public_ip_address.ip_address:
-            public_ip = raw.public_ip_address.ip_address[0]
-        elif raw.eip_address and raw.eip_address.ip_address:
-            public_ip = raw.eip_address.ip_address
-
-        status_map = {
-            "Pending": InstanceStatus.PENDING,
-            "Running": InstanceStatus.RUNNING,
-            "Stopping": InstanceStatus.STOPPING,
-            "Stopped": InstanceStatus.STOPPED,
-        }
-
-        return Instance(
-            id=raw.instance_id,
-            name=raw.instance_name or "",
-            status=status_map.get(raw.status, InstanceStatus.PENDING),
-            public_ip=public_ip,
-            private_ip=raw.vpc_attributes.private_ip_address.ip_address[0]
-                if raw.vpc_attributes and raw.vpc_attributes.private_ip_address
-                else None,
-            instance_type=raw.instance_type,
-            region=raw.region_id,
-            zone=raw.zone_id,
-            created_at=raw.creation_time,
-            provider="aliyun",
-            raw=raw.__dict__ if hasattr(raw, '__dict__') else {},
-        )
-```
-
-#### 阿里云配置模型
-
-```python
-class AliyunEcsConfig(BaseModel):
-    access_key_id: str
-    access_key_secret: str
-    region_id: str = "cn-hangzhou"
-    image_id: str = ""                          # 自定义镜像（预装 Ubuntu + 基础工具）
-    instance_type: str = "ecs.c6.large"         # 2 vCPU / 4 GiB
-    security_group_id: str = ""                 # 从 Terraform 输出获取
-    vswitch_id: str = ""                        # 从 Terraform 输出获取
-    key_pair_name: str = "elastic-agent-key"    # 从 Terraform 创建
-    ssh_key_path: str = "~/.ssh/elastic-agent.pem"
-    ssh_user: str = "root"
-    max_instances: int = 30
-    internet_charge_type: str = "PayByTraffic"
-    internet_max_bandwidth_out: int = 100
-    system_disk_category: str = "cloud_essd"
-    system_disk_size: int = 40
-    spot_strategy: str = "NoSpot"
-```
-
-### 2.3 AWS EC2 Provider (T-004)
-
-同步实现，验证 CloudProvider 抽象的正确性。
-
-```python
-# src/elastic_agent/core/providers/aws_ec2.py
-
-import boto3
-
-class AWSEc2Provider(CloudProvider):
-    def __init__(self, config: AWSEc2Config):
-        self.config = config
-        self.ec2 = boto3.client('ec2', region_name=config.region)
-
-    async def create_instance(self, config: InstanceConfig) -> Instance:
-        tags = [
-            {"Key": "ManagedBy", "Value": "elastic-agent"},
-            {"Key": "Name", "Value": f"Worker-{config.name}"},
-        ]
-        for k, v in config.tags.items():
-            tags.append({"Key": k, "Value": v})
-
-        resp = self.ec2.run_instances(
-            ImageId=config.image_id or self.config.ami_id,
-            InstanceType=config.instance_type or self.config.default_instance_type,
-            MinCount=1, MaxCount=1,
-            KeyName=config.key_pair_name or self.config.key_pair_name,
-            SecurityGroupIds=config.security_group_ids or self.config.security_group_ids,
-            SubnetId=config.subnet_id or self.config.subnet_id,
-            TagSpecifications=[{
-                "ResourceType": "instance",
-                "Tags": tags,
-            }],
-            InstanceMarketOptions={
-                "MarketType": "spot",
-                "SpotOptions": {"SpotInstanceType": "one-time"},
-            } if config.spot else {},
-        )
-        return self._to_instance(resp["Instances"][0])
-
-    async def terminate_instance(self, instance_id: str) -> None:
-        self.ec2.terminate_instances(InstanceIds=[instance_id])
-
-    async def list_instances(self, filters: dict | None = None) -> list[Instance]:
-        resp = self.ec2.describe_instances(Filters=[
-            {"Name": "tag:ManagedBy", "Values": ["elastic-agent"]},
-            {"Name": "instance-state-name", "Values": [
-                "pending", "running", "stopping", "stopped"
-            ]},
-        ])
-        instances = []
-        for reservation in resp["Reservations"]:
-            for inst in reservation["Instances"]:
-                instances.append(self._to_instance(inst))
-        return instances
-```
-
-### 2.4 Terraform 基础网络模块 (T-005, T-006)
-
-#### 阿里云网络模块
-
-```hcl
-# infra/modules/networking/main.tf (阿里云版本通过 provider 切换)
-
-# infra/environments/aliyun-cn-hangzhou/main.tf
-terraform {
-  required_providers {
-    alicloud = {
-      source  = "aliyun/alicloud"
-      version = "~> 1.220"
-    }
-  }
-}
-
-provider "alicloud" {
-  region = var.region_id
-}
-
-# VPC
-resource "alicloud_vpc" "elastic_agent" {
-  vpc_name   = "elastic-agent-vpc"
-  cidr_block = var.vpc_cidr  # 默认 "172.16.0.0/16"
-}
-
-# VSwitch（子网）— 至少 2 个用于高可用
-resource "alicloud_vswitch" "worker_a" {
-  vpc_id       = alicloud_vpc.elastic_agent.id
-  cidr_block   = "172.16.1.0/24"
-  zone_id      = "${var.region_id}-a"
-  vswitch_name = "elastic-agent-worker-a"
-}
-
-resource "alicloud_vswitch" "worker_b" {
-  vpc_id       = alicloud_vpc.elastic_agent.id
-  cidr_block   = "172.16.2.0/24"
-  zone_id      = "${var.region_id}-b"
-  vswitch_name = "elastic-agent-worker-b"
-}
-
-# 安全组
-resource "alicloud_security_group" "worker" {
-  name        = "elastic-agent-worker-sg"
-  vpc_id      = alicloud_vpc.elastic_agent.id
-  description = "Security group for Elastic-Agent workers"
-}
-
-# 安全组规则 — SSH（仅 Manager IP）
-resource "alicloud_security_group_rule" "ssh" {
-  type              = "ingress"
-  ip_protocol       = "tcp"
-  port_range        = "22/22"
-  security_group_id = alicloud_security_group.worker.id
-  cidr_ip           = var.manager_cidr  # Manager 所在的 CIDR
-}
-
-# 安全组规则 — Worker Runtime（VPC 内部）
-resource "alicloud_security_group_rule" "worker_runtime" {
-  type              = "ingress"
-  ip_protocol       = "tcp"
-  port_range        = "8080/8080"
-  security_group_id = alicloud_security_group.worker.id
-  cidr_ip           = var.vpc_cidr
-}
-
-# 安全组规则 — 出站全放行
-resource "alicloud_security_group_rule" "egress" {
-  type              = "egress"
-  ip_protocol       = "all"
-  port_range        = "-1/-1"
-  security_group_id = alicloud_security_group.worker.id
-  cidr_ip           = "0.0.0.0/0"
-}
-
-# 密钥对
-resource "alicloud_ecs_key_pair" "worker" {
-  key_pair_name = "elastic-agent-key"
-  # public_key 从变量传入，或让阿里云生成
-}
-
-# NAT Gateway（Worker 出站 IP 固定）— IP 亲和性基础
-resource "alicloud_nat_gateway" "main" {
-  vpc_id           = alicloud_vpc.elastic_agent.id
-  nat_gateway_name = "elastic-agent-nat"
-  payment_type     = "PayAsYouGo"
-  vswitch_id       = alicloud_vswitch.worker_a.id
-  nat_type         = "Enhanced"
-}
-
-resource "alicloud_eip_address" "nat" {
-  address_name         = "elastic-agent-nat-eip"
-  bandwidth            = 100
-  internet_charge_type = "PayByTraffic"
-}
-
-resource "alicloud_eip_association" "nat" {
-  allocation_id = alicloud_eip_address.nat.id
-  instance_id   = alicloud_nat_gateway.main.id
-  instance_type = "Nat"
-}
-
-resource "alicloud_snat_entry" "worker_a" {
-  snat_table_id     = alicloud_nat_gateway.main.snat_table_ids
-  source_vswitch_id = alicloud_vswitch.worker_a.id
-  snat_ip           = alicloud_eip_address.nat.ip_address
-}
-
-# Outputs — Provider 代码从这里读取
-output "vpc_id" { value = alicloud_vpc.elastic_agent.id }
-output "vswitch_ids" { value = [alicloud_vswitch.worker_a.id, alicloud_vswitch.worker_b.id] }
-output "security_group_id" { value = alicloud_security_group.worker.id }
-output "key_pair_name" { value = alicloud_ecs_key_pair.worker.key_pair_name }
-output "nat_eip" { value = alicloud_eip_address.nat.ip_address }
-```
-
-#### AWS 网络模块（结构一致，provider 不同）
-
-```hcl
-# infra/environments/aws-ap-northeast-1/main.tf
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.region
-}
-
-resource "aws_vpc" "elastic_agent" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  tags = { Name = "elastic-agent-vpc" }
-}
-
-resource "aws_subnet" "worker_a" {
-  vpc_id            = aws_vpc.elastic_agent.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "${var.region}a"
-  tags = { Name = "elastic-agent-worker-a" }
-}
-
-resource "aws_security_group" "worker" {
-  name        = "elastic-agent-worker-sg"
-  vpc_id      = aws_vpc.elastic_agent.id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.manager_cidr]
-  }
-
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_key_pair" "worker" {
-  key_name   = "elastic-agent-key"
-  public_key = var.ssh_public_key
-}
-
-# NAT Gateway
-resource "aws_eip" "nat" { domain = "vpc" }
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public.id
-}
-
-output "vpc_id" { value = aws_vpc.elastic_agent.id }
-output "subnet_ids" { value = [aws_subnet.worker_a.id] }
-output "security_group_id" { value = aws_security_group.worker.id }
-output "key_pair_name" { value = aws_key_pair.worker.key_name }
-```
-
-### 2.5 Worker Runtime (T-007, T-008, T-009)
-
-Worker Runtime 是框架的核心 — 运行在每个 Worker 上，接收 Manager 的命令，执行进程，流式回传日志。
-
-#### 通信协议 (T-009)
-
-```python
-# src/elastic_agent/core/runtime/protocol.py
-
-from enum import Enum
-from pydantic import BaseModel
-
-class MessageType(str, Enum):
-    # Manager → Worker
-    EXECUTE = "execute"          # 执行命令
-    STOP = "stop"                # 停止进程
-    READ_FILE = "read_file"      # 读取文件
-    WATCH_FILES = "watch_files"  # 监听文件变化
-    HEALTH_CHECK = "health_check"
-
-    # Worker → Manager
-    LOG = "log"                  # 日志事件
-    STATUS = "status"            # 状态上报
-    FILE_CONTENT = "file_content"  # 文件内容
-    FILE_CHANGE = "file_change"  # 文件变更事件
-    PROCESS_EXIT = "process_exit"  # 进程退出
-    HEARTBEAT = "heartbeat"      # 心跳
-
-class ExecuteRequest(BaseModel):
-    task_id: str
-    command: list[str]
-    cwd: str = "/workspace"
-    env: dict[str, str] = {}
-    timeout: int | None = None
-
-class LogEvent(BaseModel):
-    timestamp: str
-    task_id: str
-    stream: str  # "stdout" / "stderr"
-    data: str
-    worker_id: str
-
-class FileReadRequest(BaseModel):
-    path: str
-    encoding: str = "utf-8"
-
-class FileWatchRequest(BaseModel):
-    paths: list[str]
-    events: list[str] = ["modified", "created", "deleted"]
-
-class FileChangeEvent(BaseModel):
-    path: str
-    event: str
-    content: str | None = None
-    timestamp: str
-    worker_id: str
-```
-
-#### Worker 侧服务 (T-007)
-
-```python
-# src/elastic_agent/worker/runtime_server.py
-
-from fastapi import FastAPI, WebSocket
-import asyncio
-
-app = FastAPI()
-processes: dict[str, asyncio.subprocess.Process] = {}
-
-@app.websocket("/ws/runtime")
-async def runtime_websocket(ws: WebSocket):
-    """主 WebSocket 通道 — Worker 主动连接 Manager"""
-    await ws.accept()
-    # 验证 Bearer Token
-    auth = await ws.receive_json()
-    if not verify_token(auth.get("token")):
-        await ws.close(code=4001)
-        return
-
-    # 双向消息循环
-    while True:
-        msg = await ws.receive_json()
-        msg_type = msg["type"]
-
-        if msg_type == "execute":
-            req = ExecuteRequest(**msg["payload"])
-            asyncio.create_task(execute_and_stream(ws, req))
-
-        elif msg_type == "stop":
-            task_id = msg["payload"]["task_id"]
-            await stop_process(task_id)
-
-        elif msg_type == "read_file":
-            req = FileReadRequest(**msg["payload"])
-            content = await read_local_file(req.path, req.encoding)
-            await ws.send_json({
-                "type": "file_content",
-                "payload": {"path": req.path, "content": content}
-            })
-
-        elif msg_type == "watch_files":
-            req = FileWatchRequest(**msg["payload"])
-            asyncio.create_task(watch_and_stream(ws, req))
-
-        elif msg_type == "health_check":
-            await ws.send_json({
-                "type": "status",
-                "payload": get_worker_status()
-            })
-
-async def execute_and_stream(ws: WebSocket, req: ExecuteRequest):
-    """启动子进程并流式回传 stdout/stderr"""
-    proc = await asyncio.create_subprocess_exec(
-        *req.command,
-        cwd=req.cwd,
-        env={**os.environ, **req.env},
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    processes[req.task_id] = proc
-
-    async def stream_pipe(pipe, stream_name):
-        async for line in pipe:
-            await ws.send_json({
-                "type": "log",
-                "payload": {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "task_id": req.task_id,
-                    "stream": stream_name,
-                    "data": line.decode("utf-8", errors="replace"),
-                    "worker_id": WORKER_ID,
-                }
-            })
-
-    await asyncio.gather(
-        stream_pipe(proc.stdout, "stdout"),
-        stream_pipe(proc.stderr, "stderr"),
-    )
-
-    exit_code = await proc.wait()
-    del processes[req.task_id]
-    await ws.send_json({
-        "type": "process_exit",
-        "payload": {
-            "task_id": req.task_id,
-            "exit_code": exit_code,
-            "worker_id": WORKER_ID,
-        }
-    })
-
-async def watch_and_stream(ws: WebSocket, req: FileWatchRequest):
-    """使用 inotify 监听文件变化并流式推送"""
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-
-    class Handler(FileSystemEventHandler):
-        def on_any_event(self, event):
-            if event.is_directory:
-                return
-            content = None
-            if event.event_type in ("modified", "created"):
-                try:
-                    with open(event.src_path, "r") as f:
-                        content = f.read()
-                except (OSError, UnicodeDecodeError):
-                    pass
-            asyncio.run_coroutine_threadsafe(
-                ws.send_json({
-                    "type": "file_change",
-                    "payload": {
-                        "path": event.src_path,
-                        "event": event.event_type,
-                        "content": content,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "worker_id": WORKER_ID,
-                    }
-                }),
-                loop,
-            )
-
-    observer = Observer()
-    for path in req.paths:
-        observer.schedule(Handler(), path=os.path.dirname(path), recursive=False)
-    observer.start()
-```
-
-#### Manager 侧客户端 (T-008)
-
-```python
-# src/elastic_agent/core/runtime/client.py
-
-import websockets
-from typing import AsyncIterator
-
-class WorkerRuntimeClient:
-    """Manager 侧 — 与 Worker Runtime 的通信客户端"""
-
-    def __init__(self, worker_url: str, auth_token: str):
-        self.url = worker_url
-        self.token = auth_token
-        self.ws = None
-        self._subscribers: dict[str, list[asyncio.Queue]] = {}
-
-    async def connect(self):
-        self.ws = await websockets.connect(self.url)
-        await self.ws.send(json.dumps({"token": self.token}))
-        asyncio.create_task(self._message_loop())
-
-    async def execute(self, task_id: str, command: list[str],
-                      cwd: str = "/workspace", env: dict = None) -> AsyncIterator[LogEvent]:
-        """在 Worker 上执行命令，返回日志流"""
-        queue = asyncio.Queue()
-        self._subscribers.setdefault(task_id, []).append(queue)
-
-        await self.ws.send(json.dumps({
-            "type": "execute",
-            "payload": {
-                "task_id": task_id,
-                "command": command,
-                "cwd": cwd,
-                "env": env or {},
-            }
-        }))
-
-        while True:
-            event = await queue.get()
-            if event["type"] == "process_exit":
-                yield event
-                break
-            yield event
-
-    async def read_file(self, path: str) -> str:
-        """从 Worker 读取文件内容"""
-        await self.ws.send(json.dumps({
-            "type": "read_file",
-            "payload": {"path": path}
-        }))
-        # 等待响应（通过 _message_loop 分发）
-        ...
-
-    async def watch_files(self, paths: list[str]) -> AsyncIterator[FileChangeEvent]:
-        """监听 Worker 上的文件变化"""
-        await self.ws.send(json.dumps({
-            "type": "watch_files",
-            "payload": {"paths": paths}
-        }))
-        queue = asyncio.Queue()
-        self._file_watchers.append(queue)
-        while True:
-            event = await queue.get()
-            yield FileChangeEvent(**event["payload"])
-```
-
-### 2.6 外部服务 API (T-013, T-014, T-015)
-
-外部服务通过 Manager 暴露的 API 获取实时的 Agent 轨迹和文件。
-
-```python
-# src/elastic_agent/core/external_api/router.py
-
-from fastapi import APIRouter, WebSocket, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
-
-external_router = APIRouter(prefix="/api/external", tags=["external"])
-
-# ── 认证中间件 ──
-
-async def verify_api_key(api_key: str = Query(..., alias="api_key")):
-    if api_key not in VALID_API_KEYS:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
-# ── 实时轨迹流 ──
-
-@external_router.websocket("/traces/{node_id}/stream")
-async def stream_node_traces(ws: WebSocket, node_id: str):
-    """WebSocket：实时推送指定 Worker 的 Agent 轨迹/chat 记录"""
-    await ws.accept()
-    # 认证
-    init_msg = await ws.receive_json()
-    if not verify_api_key_sync(init_msg.get("api_key")):
-        await ws.close(code=4001)
-        return
-    # 订阅该 Worker 的事件
-    async for event in event_bus.subscribe(node_id=node_id, event_types=["log"]):
-        await ws.send_json({
-            "timestamp": event.timestamp,
-            "type": event.payload.get("stream", "stdout"),
-            "content": event.payload.get("data", ""),
-            "task_id": event.payload.get("task_id"),
-            "worker_id": node_id,
-        })
-
-@external_router.get("/traces/{node_id}/stream/sse")
-async def stream_node_traces_sse(node_id: str, api_key: str = Depends(verify_api_key)):
-    """SSE：实时推送（备选方案，浏览器原生支持）"""
-    async def event_generator():
-        async for event in event_bus.subscribe(node_id=node_id, event_types=["log"]):
-            yield f"data: {json.dumps(event.payload)}\n\n"
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-@external_router.websocket("/traces/all/stream")
-async def stream_all_traces(ws: WebSocket):
-    """WebSocket：推送所有 Worker 的 Agent 轨迹（全局监控）"""
-    await ws.accept()
-    init_msg = await ws.receive_json()
-    if not verify_api_key_sync(init_msg.get("api_key")):
-        await ws.close(code=4001)
-        return
-    async for event in event_bus.subscribe(event_types=["log"]):
-        await ws.send_json(event.payload)
-
-# ── 历史轨迹查询 ──
-
-@external_router.get("/traces/{node_id}")
-async def get_node_traces(
-    node_id: str,
-    since: datetime | None = None,
-    until: datetime | None = None,
-    limit: int = 100,
-    task_id: str | None = None,
-    api_key: str = Depends(verify_api_key),
-):
-    """REST：查询指定 Worker 的历史轨迹记录"""
-    return trace_store.query(
-        node_id=node_id, since=since, until=until,
-        limit=limit, task_id=task_id,
-    )
-
-# ── 文件传输 ──
-
-@external_router.get("/files/{node_id}/{file_path:path}")
-async def get_worker_file(
-    node_id: str,
-    file_path: str,
-    api_key: str = Depends(verify_api_key),
-):
-    """REST：通过 Manager 从 Worker 下载指定文件"""
-    runtime_client = get_runtime_client(node_id)
-    content = await runtime_client.read_file(f"/{file_path}")
-    return {"path": file_path, "content": content, "worker_id": node_id}
-
-@external_router.websocket("/files/{node_id}/watch")
-async def watch_worker_files(ws: WebSocket, node_id: str):
-    """WebSocket：监听 Worker 上指定文件的变化"""
-    await ws.accept()
-    init_msg = await ws.receive_json()
-    if not verify_api_key_sync(init_msg.get("api_key")):
-        await ws.close(code=4001)
-        return
-
-    paths = init_msg.get("paths", [])
-    runtime_client = get_runtime_client(node_id)
-    async for change in runtime_client.watch_files(paths):
-        await ws.send_json({
-            "path": change.path,
-            "event": change.event,
-            "content": change.content,
-            "timestamp": change.timestamp,
-            "worker_id": node_id,
-        })
-
-# ── 集群状态 ──
-
-@external_router.get("/cluster/status")
-async def get_cluster_status(api_key: str = Depends(verify_api_key)):
-    """REST：获取集群整体状态"""
-    nodes = await manager.list_nodes()
-    return {
-        "total_nodes": len(nodes),
-        "running": sum(1 for n in nodes if n.status == "running"),
-        "idle": sum(1 for n in nodes if n.status == "idle"),
-        "nodes": [
-            {
-                "id": n.id,
-                "status": n.status,
-                "ip": n.public_ip,
-                "provider": n.provider,
-                "tasks": n.active_tasks,
-            }
-            for n in nodes
-        ],
-    }
-```
-
-### 2.7 Manager ↔ Worker 认证 (T-010)
-
-```python
-# src/elastic_agent/core/security/auth.py
-
-import secrets
-
-def generate_worker_token() -> str:
-    """在 Bootstrap 时为每个 Worker 生成唯一 token"""
-    return secrets.token_urlsafe(32)
-
-class WorkerAuthMiddleware:
-    """验证 Worker Runtime WebSocket 连接的 token"""
-
-    def __init__(self, registry: NodeRegistry):
-        self.registry = registry
-
-    async def verify(self, token: str) -> str | None:
-        """验证 token，返回 worker_id 或 None"""
-        node = self.registry.get_by_token(token)
-        return node.id if node else None
-```
-
-### 2.8 节点注册表 (T-011) + 云端对账 (T-012)
-
-```python
-# src/elastic_agent/core/registry/store.py
-
-import json
-from pathlib import Path
-from threading import Lock
-
-class NodeRegistry:
-    def __init__(self, path: str = "~/.elastic-agent/registry.json"):
-        self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
-        self._data: dict[str, dict] = self._load()
-
-    def add(self, instance: Instance, credential_id: str | None = None,
-            auth_token: str = "") -> None:
-        with self._lock:
-            self._data[instance.id] = {
-                "instance_id": instance.id,
-                "name": instance.name,
-                "status": instance.status.value,
-                "public_ip": instance.public_ip,
-                "private_ip": instance.private_ip,
-                "provider": instance.provider,
-                "credential_id": credential_id,
-                "auth_token": auth_token,
-                "created_at": instance.created_at.isoformat() if instance.created_at else None,
-                "last_seen": datetime.utcnow().isoformat(),
-            }
-            self._save()
-
-    def remove(self, instance_id: str) -> None:
-        with self._lock:
-            self._data.pop(instance_id, None)
-            self._save()
-
-    def get_by_token(self, token: str) -> dict | None:
-        for node in self._data.values():
-            if node.get("auth_token") == token:
-                return node
-        return None
-
-    def list_all(self) -> list[dict]:
-        return list(self._data.values())
-```
-
-```python
-# src/elastic_agent/core/monitor/reconciler.py
-
-class CloudReconciler:
-    """云端标签对账 — 防止孤儿实例"""
-
-    def __init__(self, provider: CloudProvider, registry: NodeRegistry):
-        self.provider = provider
-        self.registry = registry
-
-    async def reconcile(self):
-        """对比云端实例和本地注册表，处理不一致"""
-        cloud_instances = await self.provider.list_instances()
-        registered_ids = {n["instance_id"] for n in self.registry.list_all()}
-        cloud_ids = {i.id for i in cloud_instances}
-
-        # 孤儿实例：云上有但注册表没有
-        orphans = cloud_ids - registered_ids
-        for orphan_id in orphans:
-            inst = next(i for i in cloud_instances if i.id == orphan_id)
-            logger.warning(f"Orphan instance found: {orphan_id} ({inst.public_ip})")
-            # 策略：纳入管理 或 清理
-            if self.config.auto_cleanup_orphans:
-                await self.provider.terminate_instance(orphan_id)
-                logger.info(f"Orphan instance terminated: {orphan_id}")
-            else:
-                self.registry.add(inst)  # 纳入管理
-
-        # 幽灵节点：注册表有但云上已消失
-        ghosts = registered_ids - cloud_ids
-        for ghost_id in ghosts:
-            logger.warning(f"Ghost node found: {ghost_id}")
-            self.registry.remove(ghost_id)
-```
-
-### 2.9 Bootstrap Pipeline (T-018 ~ T-023)
-
-```python
-# src/elastic_agent/core/bootstrap/pipeline.py
-
-from enum import Enum
-
-class BootstrapFailurePolicy(Enum):
-    TERMINATE_AND_RETRY = "terminate_and_retry"
-    RETRY_FROM_FAILED = "retry_from_failed"
-    LEAVE_FOR_DEBUG = "leave_for_debug"
-
-class BootstrapPipeline:
-    def __init__(self, steps: list[BootstrapStep],
-                 failure_policy: BootstrapFailurePolicy = BootstrapFailurePolicy.TERMINATE_AND_RETRY,
-                 max_retries: int = 2):
-        self.steps = steps
-        self.failure_policy = failure_policy
-        self.max_retries = max_retries
-
-    async def execute(self, ctx: BootstrapContext) -> bool:
-        completed_steps = []
-        for step in self.steps:
-            try:
-                logger.info(f"Bootstrap step [{step.name}] starting...")
-                await asyncio.wait_for(
-                    step.execute(ctx),
-                    timeout=step.timeout if hasattr(step, 'timeout') else 600,
-                )
-                completed_steps.append(step.name)
-                logger.info(f"Bootstrap step [{step.name}] completed")
-            except Exception as e:
-                logger.error(f"Bootstrap step [{step.name}] failed: {e}")
-                ctx.failed_step = step.name
-                ctx.error = str(e)
-                return False
-        return True
-```
-
-### 2.10 健康检查 (T-024)
-
-```python
-# src/elastic_agent/core/monitor/health.py
-
-class HealthChecker:
-    """多层健康检查"""
-
-    async def check_node(self, node: dict, runtime_client: WorkerRuntimeClient) -> HealthReport:
-        report = HealthReport(node_id=node["instance_id"])
-
-        # L1: 基础设施 — VM 是否在运行
-        try:
-            instance = await self.provider.get_instance(node["instance_id"])
-            report.l1_infra = instance.status == InstanceStatus.RUNNING
-        except Exception:
-            report.l1_infra = False
-            return report
-
-        # L2: Worker Runtime — 服务是否响应
-        try:
-            status = await asyncio.wait_for(
-                runtime_client.health_check(), timeout=10
-            )
-            report.l2_runtime = True
-            report.runtime_status = status
-        except Exception:
-            report.l2_runtime = False
-            return report
-
-        # L3: Agent 进程 — Claude Code 是否存活
-        report.l3_agent = status.get("active_processes", 0) >= 0
-        report.l3_details = status.get("processes", [])
-
-        return report
-```
-
-### 2.11 优雅缩容 Drain (T-025)
-
-```python
-# src/elastic_agent/core/scheduler/drain.py
-
-class DrainManager:
-    async def drain_node(self, node_id: str, policy: DrainPolicy) -> bool:
-        """优雅缩容一个节点"""
-        node = self.registry.get(node_id)
-
-        # 1. 标记为 draining — 不再分配新任务
-        self.registry.update_status(node_id, "draining")
-
-        # 2. 通知 Harness
-        if policy.notify_harness:
-            await self.event_bus.emit(FrameworkEvent.NODE_DRAIN_START, {
-                "node_id": node_id,
-            })
-
-        # 3. 等待当前任务完成
-        runtime = self.get_runtime_client(node_id)
-        try:
-            await asyncio.wait_for(
-                self._wait_tasks_complete(runtime),
-                timeout=policy.timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Drain timeout for {node_id}, force terminating")
-
-        # 4. 备份数据
-        if policy.backup_before_terminate:
-            await self._backup_workspace(node_id)
-
-        # 5. 回收凭证
-        cred_id = node.get("credential_id")
-        if cred_id:
-            self.credential_pool.release(cred_id)
-
-        # 6. 终止实例
-        await self.provider.terminate_instance(node_id)
-        self.registry.remove(node_id)
-        return True
-```
-
-### 2.12 ElasticAgentManager 主类 (T-016)
-
-```python
-# src/elastic_agent/manager/service.py
-
-class ElasticAgentManager:
-    """Elastic-Agent 框架入口 — 管理整个集群"""
-
-    def __init__(
-        self,
-        provider: CloudProvider,
-        credential_pool: CredentialPool | None = None,
-        harness: Harness | None = None,
-        config: ManagerConfig | None = None,
-    ):
-        self.provider = provider
-        self.credentials = credential_pool
-        self.harness = harness
-        self.config = config or ManagerConfig()
-        self.registry = NodeRegistry(self.config.registry_path)
-        self.event_bus = EventBus()
-        self.reconciler = CloudReconciler(provider, self.registry)
-        self.health_checker = HealthChecker(provider)
-        self.drain_manager = DrainManager(provider, self.registry, self.event_bus)
-        self.external_api = ExternalAPIManager(self.event_bus, self.registry)
-
-    async def start(self):
-        """启动后台任务"""
-        await self.reconciler.reconcile()  # 启动时对账
-        asyncio.create_task(self._health_check_loop())
-        asyncio.create_task(self._reconcile_loop())
-
-    async def scale_out(self, count: int = 1,
-                        instance_config: InstanceConfig | None = None) -> list[Instance]:
-        """扩容 — 创建新 Worker 并初始化"""
-        nodes = []
-        for _ in range(count):
-            config = instance_config or InstanceConfig(
-                name=f"worker-{secrets.token_hex(4)}",
-            )
-            # 1. 创建实例
-            instance = await self.provider.create_instance(config)
-            await self.event_bus.emit(FrameworkEvent.NODE_CREATING, {"instance": instance})
-
-            # 2. 等待运行
-            instance = await self.provider.wait_until_running(instance.id)
-
-            # 3. 选择凭证
-            cred = None
-            if self.credentials:
-                cred = self.credentials.select(prefer_ip=instance.public_ip)
-
-            # 4. 生成 Worker token
-            worker_token = generate_worker_token()
-
-            # 5. Bootstrap
-            bootstrap = BootstrapPipeline(
-                steps=self._get_bootstrap_steps(cred),
-            )
-            ctx = BootstrapContext(
-                instance=instance,
-                credential=cred,
-                harness=self.harness,
-                worker_token=worker_token,
-                config=self.config,
-            )
-            success = await bootstrap.execute(ctx)
-            if not success:
-                await self.provider.terminate_instance(instance.id)
-                if cred:
-                    self.credentials.release(cred.id)
-                continue
-
-            # 6. 注册
-            self.registry.add(instance, credential_id=cred.id if cred else None,
-                              auth_token=worker_token)
-            await self.event_bus.emit(FrameworkEvent.NODE_READY, {
-                "node_id": instance.id,
-                "private_ip": instance.private_ip,
-                "public_ip": instance.public_ip,
-            })
-            nodes.append(instance)
-        return nodes
-
-    async def scale_in(self, count: int = 1) -> list[str]:
-        """缩容 — 优雅地移除 Worker"""
-        # 选择空闲的 Worker
-        all_nodes = self.registry.list_all()
-        idle_nodes = [n for n in all_nodes if n.get("status") == "idle"]
-        victims = idle_nodes[:count]
-
-        removed = []
-        for node in victims:
-            success = await self.drain_manager.drain_node(
-                node["instance_id"],
-                DrainPolicy(),
-            )
-            if success:
-                removed.append(node["instance_id"])
-        return removed
-
-    async def list_nodes(self) -> list[dict]:
-        return self.registry.list_all()
-
-    async def get_cluster_status(self) -> dict:
-        nodes = self.registry.list_all()
-        return {
-            "total": len(nodes),
-            "running": sum(1 for n in nodes if n.get("status") == "running"),
-            "draining": sum(1 for n in nodes if n.get("status") == "draining"),
-            "provider": self.provider.__class__.__name__,
-        }
-```
-
----
-
-## 3. 实现顺序与依赖关系
+### 10.1 配置层级
 
 ```
-Week 1-2: 基础层
-  T-001 项目脚手架
-    ├── T-002 CloudProvider 抽象
-    │   ├── T-003 阿里云 ECS Provider  ← 首选
-    │   └── T-004 AWS EC2 Provider
-    ├── T-005 Terraform 阿里云网络  ← 与 Provider 并行
-    └── T-006 Terraform AWS 网络
+优先级从高到低:
+  环境变量    ELASTIC_AGENT_PROVIDER_TYPE=aliyun
+  配置文件    config.yaml
+  代码默认值  ManagerConfig() Pydantic defaults
 
-Week 2-3: 通信层
-  T-009 通信协议
-    ├── T-007 Worker Runtime 服务
-    ├── T-008 Worker Runtime 客户端
-    └── T-010 认证
-
-Week 3-4: 管理层
-  T-011 节点注册表
-  T-012 云端标签对账
-  T-016 Manager FastAPI 服务
-  T-017 Claude Code AgentType
-
-Week 4-5: 外部 API + Bootstrap
-  T-013 外部 API 轨迹流
-  T-014 外部 API 文件传输
-  T-015 外部 API 认证
-  T-018 ~ T-023 Bootstrap Pipeline
-
-Week 5-6: 稳定性 + UI
-  T-024 健康检查
-  T-025 Drain 机制
-  T-026 凭证分发
-  T-027 额度监控
-  T-028 手动扩缩容 API
-  T-029 基础 Web UI
-
-Week 6-7: 测试
-  T-100 ~ T-118 全部测试
+敏感值（AccessKey、API Key）只通过环境变量传入，不写入配置文件。
 ```
 
-### 关键依赖链
-
-```
-T-002 → T-003/T-004 → T-011 → T-012
-                                  ↓
-T-009 → T-007/T-008 → T-010 → T-016 → T-028
-                         ↓
-                      T-013/T-014 (外部 API 依赖 Worker Runtime 通道)
-                         ↓
-T-018 → T-019~T-022 → T-023 → T-025 (Drain 依赖 Bootstrap 完成)
-```
-
----
-
-## 4. 配置管理
-
-### 4.1 Manager 配置文件
+### 10.2 配置文件结构
 
 ```yaml
-# config.yaml — Manager 主配置
-
-# 云服务商配置
+# config.yaml
 provider:
   type: "aliyun"  # "aliyun" | "aws"
-
   aliyun:
-    access_key_id: "${ALICLOUD_ACCESS_KEY_ID}"
-    access_key_secret: "${ALICLOUD_ACCESS_KEY_SECRET}"
     region_id: "cn-hangzhou"
-    image_id: "m-bp1xxxx"       # 自定义镜像
+    image_id: "m-bp1xxxx"
     instance_type: "ecs.c6.large"
-    security_group_id: ""       # 从 terraform output 填入
-    vswitch_id: ""              # 从 terraform output 填入
+    security_group_id: ""          # 从 terraform output 填入
+    vswitch_id: ""                 # 从 terraform output 填入
     key_pair_name: "elastic-agent-key"
     ssh_key_path: "~/.ssh/elastic-agent.pem"
     max_instances: 30
-
   aws:
     region: "ap-northeast-1"
     ami_id: "ami-xxxxx"
     default_instance_type: "t3.large"
-    security_group_ids: []      # 从 terraform output 填入
-    subnet_id: ""               # 从 terraform output 填入
-    key_pair_name: "elastic-agent-key"
-    ssh_key_path: "~/.ssh/elastic-agent.pem"
-    max_instances: 30
+    security_group_ids: []         # 从 cdk deploy 输出填入
+    subnet_id: ""                  # 从 cdk deploy 输出填入
 
-# Worker 配置
 worker:
-  ssh_user: "root"              # 阿里云默认 root，AWS 默认 ubuntu
+  ssh_user: "root"                 # 阿里云 root, AWS ubuntu
   runtime_port: 8080
+  heartbeat_interval: 30           # 秒
+  unhealthy_threshold: 3           # 连续 N 次心跳超时
 
-# 凭证池
 credentials:
   pool_file: "credentials.json"
   quota_threshold: 0.85
 
-# 外部服务 API
 external_api:
   enabled: true
-  api_keys:
-    - "${EXTERNAL_API_KEY}"
-  trace_buffer_size: 10000      # 内存中缓存的轨迹条数
-  trace_persist: false          # MVP 不持久化，后续加数据库
+  trace_buffer_size: 10000
 
-# 监控
 monitor:
-  health_check_interval: 30     # 秒
-  reconcile_interval: 300       # 秒
-  quota_check_interval: 60      # 秒
+  health_check_interval: 30
+  reconcile_interval: 300
 
-# 注册表
 registry:
   path: "~/.elastic-agent/registry.json"
 ```
 
-### 4.2 Terraform 输出集成
-
-Manager 配置中的 `security_group_id`、`vswitch_id` 等字段从 Terraform 输出获取：
+### 10.3 IaC 输出集成
 
 ```bash
-# 部署流程
-cd infra/environments/aliyun-cn-hangzhou
-terraform init
+# 阿里云: Terraform 输出 → 配置
+cd infra/aliyun/environments/cn-hangzhou
 terraform apply
+export SECURITY_GROUP_ID=$(terraform output -raw security_group_id)
+export VSWITCH_ID=$(terraform output -raw vswitch_ids | jq -r '.[0]')
 
-# 提取输出写入配置
-SECURITY_GROUP_ID=$(terraform output -raw security_group_id)
-VSWITCH_ID=$(terraform output -raw vswitch_ids | jq -r '.[0]')
-KEY_PAIR_NAME=$(terraform output -raw key_pair_name)
-
-# 更新 config.yaml 或通过环境变量传入
+# AWS: CDK 输出 → 配置
+cd infra/aws
+cdk deploy
+export SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
+  --stack-name ElasticAgentNetworking \
+  --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
+  --output text)
 ```
 
 ---
 
-## 5. 测试策略
-
-### 5.1 单元测试
-
-使用 `pytest` + `pytest-asyncio`。所有云 SDK 调用通过 mock 隔离。
-
-```python
-# tests/unit/test_providers.py
-
-@pytest.mark.asyncio
-async def test_aliyun_create_instance():
-    """验证阿里云 Provider 正确调用 SDK 并转换响应"""
-    mock_client = Mock()
-    mock_client.run_instances.return_value = Mock(
-        body=Mock(instance_id_sets=Mock(
-            instance_id_set=["i-bp1xxxx"]
-        ))
-    )
-    provider = AliyunEcsProvider.__new__(AliyunEcsProvider)
-    provider.client = mock_client
-    provider.config = AliyunEcsConfig(...)
-
-    instance = await provider.create_instance(InstanceConfig(name="test"))
-    assert instance.id == "i-bp1xxxx"
-    assert instance.provider == "aliyun"
-
-@pytest.mark.asyncio
-async def test_aws_create_instance():
-    """验证 AWS Provider 正确调用 boto3"""
-    # 类似结构
-    ...
-```
-
-```python
-# tests/unit/test_external_traces.py
-
-@pytest.mark.asyncio
-async def test_trace_stream_filters_by_node():
-    """验证轨迹流只推送指定 Worker 的事件"""
-    event_bus = EventBus()
-    # 发送两个不同 Worker 的事件
-    await event_bus.emit("log", {"worker_id": "w1", "data": "hello"})
-    await event_bus.emit("log", {"worker_id": "w2", "data": "world"})
-    # 订阅 w1 只收到 w1 的事件
-    events = [e async for e in event_bus.subscribe(node_id="w1", limit=1)]
-    assert len(events) == 1
-    assert events[0].payload["worker_id"] == "w1"
-```
-
-### 5.2 集成测试
-
-需要真实云资源。通过环境变量 `ELASTIC_AGENT_TEST_PROVIDER=aliyun` 控制。
-
-```python
-# tests/integration/test_aliyun_e2e.py
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.getenv("ELASTIC_AGENT_TEST_PROVIDER") != "aliyun",
-    reason="需要阿里云环境变量"
-)
-@pytest.mark.asyncio
-async def test_aliyun_full_lifecycle():
-    """阿里云 ECS 实例完整生命周期测试"""
-    provider = AliyunEcsProvider(AliyunEcsConfig(
-        access_key_id=os.environ["ALICLOUD_ACCESS_KEY_ID"],
-        access_key_secret=os.environ["ALICLOUD_ACCESS_KEY_SECRET"],
-        ...
-    ))
-
-    # 创建
-    instance = await provider.create_instance(InstanceConfig(
-        name="test-lifecycle",
-        tags={"Test": "true"},
-    ))
-    assert instance.status == InstanceStatus.PENDING
-
-    # 等待运行
-    instance = await provider.wait_until_running(instance.id, timeout=120)
-    assert instance.status == InstanceStatus.RUNNING
-    assert instance.public_ip is not None
-
-    # 停止
-    await provider.stop_instance(instance.id)
-    # ... wait
-
-    # 释放
-    await provider.terminate_instance(instance.id)
-```
-
-### 5.3 DryRun 测试
-
-验证流程逻辑不消耗云资源。
-
-```python
-# tests/unit/test_dry_run.py
-
-@pytest.mark.asyncio
-async def test_scale_out_dry_run():
-    """DryRunProvider 验证扩容流程"""
-    provider = DryRunProvider()
-    manager = ElasticAgentManager(provider=provider)
-    nodes = await manager.scale_out(count=3)
-    assert len(nodes) == 3
-    assert len(provider.operations) == 3
-    assert all(op[0] == "create" for op in provider.operations)
-```
-
-### 5.4 Terraform 测试
-
-```bash
-# 验证 Terraform 配置语法和计划
-cd infra/environments/aliyun-cn-hangzhou
-terraform init
-terraform validate
-terraform plan -out=tfplan
-
-# 集成测试（创建真实资源后销毁）
-terraform apply -auto-approve
-terraform output  # 验证输出
-terraform destroy -auto-approve
-```
-
----
-
-## 6. 与 Harness 的集成点
-
-MVP 完成后，Harness（如 CCM、agent-ml-research）通过以下方式接入：
-
-```python
-# Harness 接入示例
-
-from elastic_agent import ElasticAgentManager, AliyunEcsProvider
-
-# 1. 选择 Provider（阿里云优先）
-provider = AliyunEcsProvider(config)
-# 或 AWSEc2Provider(config) — 接口一致
-
-# 2. 初始化 Manager
-manager = ElasticAgentManager(
-    provider=provider,
-    harness=MyHarness(app_config),
-)
-
-# 3. 启动服务
-await manager.start()
-
-# 4. 扩缩容
-await manager.scale_out(count=2)
-await manager.scale_in(count=1)
-
-# 5. 外部服务消费数据
-# WebSocket: ws://manager:8000/api/external/traces/{node_id}/stream?api_key=xxx
-# REST: GET /api/external/traces/{node_id}?api_key=xxx
-# 文件: GET /api/external/files/{node_id}/workspace/output.log?api_key=xxx
-```
-
----
-
-## 附录：技术选型确认
+## 11. 技术选型
 
 | 技术 | 选择 | 理由 |
 |------|------|------|
-| 语言 | Python 3.11+ | 与两个 Harness 统一，async 生态成熟 |
-| 后端框架 | FastAPI | 原生 async + WebSocket + OpenAPI |
-| 阿里云 SDK | alibabacloud_ecs20140526 | V2.0 新版，类型提示完整 |
-| AWS SDK | boto3 | 标准选择 |
-| IaC | Terraform | 唯一同时支持阿里云 + AWS 的成熟工具 |
+| 语言 | Python 3.11+ | 与三个 Harness 统一，async 生态成熟 |
+| 后端 | FastAPI | 原生 async + WebSocket + OpenAPI 文档 |
+| 阿里云 SDK | alibabacloud_ecs20140526 (V2) | 类型提示，async 友好 |
+| AWS SDK | boto3 | 标准，无替代 |
+| IaC (阿里云) | **Terraform** | 阿里云唯一成熟 IaC 选择 |
+| IaC (AWS) | **CDK Python** | 与项目同语言，L2 construct 高效，后续 Lambda/SSM 集成优势大 |
 | 前端 | React + Vite + Ant Design | 与 CCM 前端统一 |
-| 测试 | pytest + pytest-asyncio | Python 异步测试标准 |
-| 包管理 | uv | 快速依赖安装 |
-| SSH | asyncssh | 原生 async SSH |
-| WebSocket | websockets / FastAPI native | 标准选择 |
-| 文件监听 | watchdog | 跨平台文件系统事件监听 |
-| 配置 | Pydantic + YAML | 类型安全 + 可读性 |
+| 测试 | pytest + pytest-asyncio | 标准 |
+| SSH | asyncssh | 原生 async |
+| WebSocket | FastAPI native + websockets | 标准 |
+| 文件监听 | watchdog | 跨平台 inotify/kqueue 封装 |
+| 包管理 | uv | 快速安装，锁文件可靠 |

@@ -607,42 +607,31 @@ SDK 直连管理 **实例生命周期**（创建/启动/停止/销毁）非常�
 | ECS 实例 (Worker) | **SDK 直连** | 动态生命周期，按需创建/销毁 |
 | EIP（弹性 IP） | **SDK 直连** | 跟随实例动态分配/回收 |
 
-#### Terraform 方案（阿里云 + AWS 统一）
-
-Terraform 是唯一能同时管理阿里云和 AWS 的成熟 IaC 工具：
+#### 双工具方案：阿里云 Terraform + AWS CDK Python
 
 ```
 infra/
-├── modules/
-│   ├── networking/          # VPC、子网、安全组（云厂商无关的逻辑抽象）
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── base/                # 密钥对、IAM/RAM 角色
-│       ├── main.tf
-│       ├── variables.tf
-│       └── outputs.tf
-├── environments/
-│   ├── aliyun-cn-hangzhou/  # 阿里云杭州环境
-│   │   ├── main.tf          # provider "alicloud" { region = "cn-hangzhou" }
-│   │   ├── terraform.tfvars
-│   │   └── backend.tf       # OSS remote state
-│   └── aws-ap-northeast-1/  # AWS 东京环境
-│       ├── main.tf          # provider "aws" { region = "ap-northeast-1" }
-│       ├── terraform.tfvars
-│       └── backend.tf       # S3 remote state
-└── README.md
+├── aliyun/                         # Terraform (HCL) — 阿里云没有 CDK 等价物
+│   ├── modules/networking/         # VPC, VSwitch, 安全组, NAT, 密钥对
+│   └── environments/cn-hangzhou/   # provider "alicloud", terraform.tfvars, backend(OSS)
+│
+└── aws/                            # CDK Python — 与项目同语言，L2 Construct 高效
+    ├── app.py                      # CDK App 入口
+    ├── stacks/networking_stack.py  # VPC + NAT + SG 一个 ec2.Vpc() 调用搞定
+    └── cdk.json
 ```
+
+**为什么 AWS 不用 Terraform？** CDK Python 的 `ec2.Vpc(max_azs=2, nat_gateways=1)` 一行代码等价于 Terraform 的 ~15 个 resource block。项目全栈 Python，CDK 与主代码共享类型系统。后续 Phase 需要 Lambda/SSM/ASG 时 CDK 的 L2 Construct 优势更大。
 
 #### AWS CDK 的定位
 
-AWS CDK 仅适用于 AWS 环境。如果团队已有 CDK 经验且只使用 AWS，可以用 CDK 替代 Terraform 管理 AWS 侧基础资源。但考虑到阿里云优先的策略，**MVP 阶段统一使用 Terraform**。
+AWS CDK Python 与项目全栈 Python 一致，L2 Construct 的抽象层级远高于 Terraform（VPC + NAT + 路由表一个调用 vs 15 个 resource block），且后续 Lambda/SSM/ASG 集成 CDK 有碾压性优势。阿里云没有 CDK 等价物，因此采用 **双工具策略：阿里云 Terraform + AWS CDK Python**。
 
 | 工具 | 阿里云 | AWS | MVP 推荐 |
 |------|--------|-----|---------|
-| Terraform | ✅ alicloud provider | ✅ aws provider | ✅ 统一工具 |
-| AWS CDK | ❌ 不支持 | ✅ 原生最佳 | 后续 AWS 深度优化时可选 |
-| Pulumi | ✅ alicloud provider | ✅ aws provider | 备选（Python 生态更好） |
+| Terraform | ✅ alicloud provider | ✅ aws provider | ✅ **阿里云侧使用** |
+| AWS CDK Python | ❌ 不支持 | ✅ 原生最佳 | ✅ **AWS 侧使用** |
+| Pulumi | ✅ alicloud provider | ✅ aws provider | 备选 |
 
 ### 4.4 关键考虑
 
@@ -1140,13 +1129,13 @@ elastic-agent/
 ├── scripts/                        # 部署脚本
 │   ├── watchdog.sh                 # Worker 侧 watchdog
 │   └── bootstrap.sh                # Worker 初始化脚本
-├── infra/                          # IaC（Terraform）
-│   ├── modules/                    # 可复用 Terraform 模块
-│   │   ├── networking/             # VPC、子网、安全组
-│   │   └── base/                   # 密钥对、IAM/RAM 角色
-│   └── environments/               # 各云各区域环境
-│       ├── aliyun-cn-hangzhou/     # 阿里云杭州（MVP 首选）
-│       └── aws-ap-northeast-1/     # AWS 东京
+├── infra/                          # IaC
+│   ├── aliyun/                     # Terraform（阿里云）
+│   │   ├── modules/networking/     # VPC、子网、安全组
+│   │   └── environments/cn-hangzhou/
+│   └── aws/                        # CDK Python（AWS）
+│       ├── stacks/networking_stack.py
+│       └── app.py
 ├── examples/                       # 示例 Harness
 │   ├── claude-code-manager/        # CCM 的 Harness 示例
 │   └── agent-ml-research/          # agent-ml-research 的 Harness 示例
@@ -1655,7 +1644,7 @@ async def stream_all_traces(ws: WebSocket, api_key: str):
 | **P0 - MVP 必须** | 云端标签对账 | 防止孤儿实例持续烧钱 |
 | **P0 - MVP 必须** | **外部服务 API — 轨迹流** | 外部服务需实时获取 Agent 轨迹/chat 记录 |
 | **P0 - MVP 必须** | **外部服务 API — 文件传输** | 外部服务需实时获取 Worker 上的文件 |
-| **P0 - MVP 必须** | **Terraform 基础网络模块** | VPC/安全组/密钥对需要 IaC 管理 |
+| **P0 - MVP 必须** | **IaC 基础网络（Terraform + CDK）** | 阿里云 Terraform + AWS CDK Python |
 | **P1 - MVP 应该** | Bootstrap 失败处理 | 否则失败后需要手动清理 |
 | **P1 - MVP 应该** | Worker 应用级健康检查 (L2+L3) | 否则 Worker 假死无法发现 |
 | **P1 - MVP 应该** | 优雅缩容 (Drain) | 否则缩容会中断正在执行的任务 |
@@ -1889,7 +1878,7 @@ class AudiobookHarness(Harness):
 - [ ] 核心抽象接口定义
 - [ ] **阿里云 ECS Provider 实现**（alibabacloud SDK 直连，**MVP 首选**）
 - [ ] AWS EC2 Provider 实现（boto3 SDK 直连，同步实现）
-- [ ] **Terraform 基础网络模块**（VPC/安全组/密钥对，阿里云 + AWS）
+- [ ] **IaC 基础网络（Terraform + CDK）**（阿里云 Terraform / AWS CDK Python）
 - [ ] **Worker Runtime 实现**（远程执行 + 日志流式传输）
 - [ ] **Manager ↔ Worker 认证**（共享 Secret）
 - [ ] **外部服务 API — 实时轨迹流**（WebSocket/SSE 推送 Agent 轨迹/chat 记录）
