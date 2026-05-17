@@ -254,7 +254,7 @@ class CloudProvider(ABC):
 | 决策 | 选择 | 理由 |
 |------|------|------|
 | 同步 vs 异步 SDK | 同步 SDK 包在 `asyncio.to_thread()` 中 | 阿里云 SDK V2 的 async 支持不稳定，boto3 完全同步；包一层比引入两套 client 简单 |
-| 实例标识 | 云厂商原生 ID（`i-bp1xxx` / `i-0xxx`） | 不引入自定义 UUID，减少映射层 |
+| 实例标识 | `{platform}:{native_id}`（如 `aliyun:i-bp1xxx`、`aws:i-0abc`） | 平台前缀避免跨云 ID 碰撞，同时保留原生 ID 的可调试性（云控制台可直接搜索） |
 | 标签约定 | 所有框架实例必须打 `ManagedBy=elastic-agent` | 对账的基础；不可省略 |
 | Spot/抢占式 | `InstanceConfig.spot: bool` 统一字段 | 阿里云 SpotStrategy / AWS SpotInstanceType 在 Provider 内部映射 |
 | 错误重试 | Provider 内部不重试，由 Manager 层决定重试策略 | Provider 是纯粹的 SDK 封装，策略逻辑上推 |

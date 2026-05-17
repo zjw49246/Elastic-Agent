@@ -317,9 +317,8 @@ Manager ChatRelay:
   3. 返回 429: "该 Worker 修改槽位已满，请稍后重试"
   4. 前端显示排队提示
 
-不会跨 Worker 路由:
-  session 文件绑定在特定 Worker 上，无法转移到其他 Worker 执行
-  (除非引入跨 Worker 的 session 迁移机制 — MVP 不做)
+不会跨 Worker 路由（MVP）:
+  session 文件绑定在特定 Worker 上，MVP 阶段不支持跨 Worker 迁移（见 3.4 节说明）
 ```
 
 ### 3.4 备份范围与云存储结构
@@ -416,52 +415,81 @@ Worker Runtime 的 FileSyncManager:
 | 需要知道 book→worker 映射 | 只需要 task_id |
 | Worker Runtime WS 通道拥挤 | CDN 加速，大文件友好 |
 
-**一致性保证：**
+**新鲜度保证机制：**
 
-OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一问题是"最新版本是否已经上传"。解决方案：
-
-1. **_sync_manifest.json** 记录每个文件的最后同步时间和 MD5
-2. 外部查询 API 返回 `synced_at` 时间戳，调用者知道数据的新鲜度
-3. 如果需要确认最新：对比 manifest 中该文件的 `synced_at` 与当前时间的差值
-4. 防抖窗口内的写入可能尚未上传 — API 响应中标注 `may_be_stale_within_seconds: 5`
+从 OSS 读文件需要回答两个问题：**读到的是完整的吗？** 和 **读到的是最新的吗？**
 
 ```
-查询流程:
-  GET /api/tasks/{task_id}/files/workspace/manuscript_final.md
-    │
-    ▼
-  Manager 读取 oss://bucket/tasks/{task_id}/_sync_manifest.json
-    → 确认文件存在 + 获取 OSS 路径
-    │
-    ▼
-  生成 OSS 预签名 URL（有效期 5 分钟）或直接代理读取
-    → 返回给外部服务
-    │
-    ▼
-  响应头包含:
-    X-Synced-At: 2026-05-17T14:30:00Z
-    X-Sync-Lag-Max: 5  (秒，防抖窗口)
+问题 1：完整性 — OSS PutObject 是原子操作
+  文件要么不存在（未上传），要么是完整的（上传完成）
+  不存在"读到上传了一半的文件"的情况
+  → 只要文件在 OSS 上存在，内容就是完整的 ✓
+
+问题 2：最新性 — 通过事件通知 + 同步清单解决
+
+  时间线:
+    T=0s   Claude Code 写入 manuscript_final.md (Worker 本地)
+    T=0s   inotify 触发，FileSyncManager 启动防抖计时器 (2s)
+    T=2s   防抖到期，开始 PutObject 上传
+    T=3s   上传完成，更新 _sync_manifest.json
+    T=3s   发送 FILE_SYNCED 事件 → Manager → 外部 WebSocket
+
+  在 T=0~3s 之间查询 OSS → 拿到的是旧版本（或文件不存在）
+  在 T=3s 之后查询 OSS → 拿到的是最新版本
+
+  外部服务如何知道"现在 OSS 上是最新的"？
+
+  方式 A（推荐）：订阅事件
+    WS /api/tasks/{task_id}/files/watch → 收到 FILE_SYNCED 事件
+    事件包含 {path, synced_at} → 此时去 OSS 读该文件，保证是最新的
+    适用于: 前端实时展示（收到通知才刷新 UI）
+
+  方式 B：直接查询 + 接受延迟
+    GET /api/tasks/{task_id}/files/{path}
+    响应包含 synced_at 时间戳 → 调用者知道这个版本是什么时候同步的
+    最大延迟 = 防抖窗口(0.5~5s) + 上传时间(~1s) ≈ 1.5~6s
+    适用于: 一次性查询（不需要精确到秒的最新性）
+
+  方式 C：强制刷新
+    GET /api/tasks/{task_id}/files/{path}?force_sync=true
+    → Manager 通知 Worker 立即上传该文件（跳过防抖）→ 等上传完成 → 返回
+    延迟增加 ~1-3s，但保证返回的是 Worker 上此刻的最新内容
+    适用于: 需要确认最新的关键操作（如审核确认）
 ```
 
-#### Session 备份启用跨 Worker 迁移
-
-有了 session 备份到 OSS，之前"MVP 不做"的跨 Worker 迁移变得可行：
+**_sync_manifest.json 的作用：**
 
 ```
-场景: Worker 2 离线，用户要修改 Worker 2 上的 "outliers"
+每次同步批次完成后更新（先上传文件，最后上传 manifest）:
+{
+  "last_sync_at": "2026-05-17T14:30:03Z",
+  "worker_id": "aliyun:i-bp1xxx",
+  "files": {
+    "workspace/state.json":        {"md5": "abc...", "size": 1234, "synced_at": "14:30:01"},
+    "workspace/manuscript_final.md": {"md5": "def...", "size": 58201, "synced_at": "14:30:03"},
+    ...
+  }
+}
 
-迁移流程:
-  1. 从 OSS 下载: tasks/{task_id}/workspace/ + tasks/{task_id}/session/
-  2. 选择有空闲修改槽位的 Worker 3
-  3. 上传到 Worker 3: .work/outliers/ + ~/.claude/projects/.../
-  4. 在 Worker 3 上 --resume → 成功恢复
-  5. 更新 SessionRegistry: task_id → worker-3
-  6. 后续修改请求路由到 Worker 3
-
-限制:
-  需要确认 Claude Code session .jsonl 中没有绑定绝对路径
-  如果有 → 需要 sed 替换路径（或确保两台 Worker 的 cwd 一致）
+用途:
+  - 列出某个 task 的全部可用文件: 读 manifest 即可，不需要 ListObjects
+  - 判断文件是否存在: manifest 里有就存在
+  - 判断文件新鲜度: 对比 synced_at 与当前时间
+  - 崩溃恢复时: 根据 manifest 恢复完整的文件集
 ```
+
+#### Session 备份与跨 Worker 迁移
+
+Session 文件备份到 OSS 后，理论上可以在另一台 Worker 上恢复并 `--resume`。
+
+> **⚠ MVP 不做跨 Worker Session 迁移。** Session 绑定创建它的 Worker，Worker 离线则该 session 不可用。
+>
+> 理由：
+> 1. Claude Code session .jsonl 可能包含绝对路径引用，跨机器需要路径修补，可靠性未验证
+> 2. MVP 阶段 Worker 是手动管理的常驻实例，离线是低频异常事件
+> 3. 迁移涉及下载+上传+路径校验+SessionRegistry 更新，链路复杂度高
+>
+> 数据基础已具备（session 已备份到 OSS），后续 Phase 需要时可启用迁移功能。
 
 ### 3.5 Chat 双向中继
 
@@ -834,13 +862,9 @@ SessionRegistry 是路由的核心:
   - Worker 修改槽位满 → 返回"请稍后重试"
   - session 不存在 → 返回"会话未找到"
 
-MVP 不做 session 迁移:
-  session 文件(.jsonl)在 Worker 本地，迁移意味着:
-    - 停止 Worker 上的 Claude Code
-    - 拷贝 session 文件 + .work/ 目录到新 Worker
-    - 在新 Worker 上 --resume
-  复杂度高且 Claude Code session 文件路径有 hardlink 依赖
-  MVP 阶段: session 绑定 Worker，Worker 离线 = session 不可用
+⚠ MVP 不做跨 Worker session 迁移（详见 3.4 节）:
+  session 绑定 Worker，Worker 离线 = 该 session 不可用
+  数据基础已备（session 备份到 OSS），后续可启用迁移
 ```
 
 ### 5.2 从 Claude Code 输出中提取 session_id
@@ -869,38 +893,15 @@ Manager 收到 PROCESS_EXIT:
 
 ### 5.3 文件查询一致性
 
-**挑战：** 外部服务从 OSS 读取文件内容时，如何确保读到的是最新的、已上传完成的版本？
+**挑战：** 外部服务从 OSS 读取文件时，如何确保读到的是最新版本？
 
-**问题场景：**
-- Claude Code 在 Worker 上修改了 manuscript_final.md
-- FileSyncManager 的防抖窗口还没到期，尚未上传
-- 此时外部服务查询 → 拿到的是旧版本
+**方案：** 详见 3.4 节「内容查询：统一从云存储读取」中的新鲜度保证机制。核心要点：
 
-**方案：三层保证**
-
-```
-1. 单文件原子性:
-   OSS PutObject / S3 PutObject 是原子操作
-   → 一旦能读到，就是完整的文件（不存在"读到半个文件"）
-   → 不需要额外的锁或临时文件
-
-2. 版本新鲜度标注:
-   每次同步批次完成后更新 _sync_manifest.json:
-     { "last_sync_at": "...", "files": { "path": {"synced_at": "...", "md5": "..."} } }
-   API 响应包含 synced_at 和 sync_lag_max_seconds
-   → 外部服务知道数据可能滞后几秒
-
-3. 强制刷新（可选）:
-   GET /api/tasks/{task_id}/files/{path}?force_sync=true
-   → Manager 通知 Worker Runtime 立即上传该文件（跳过防抖）
-   → 等待上传完成后返回最新内容
-   → 延迟增加 ~1-3s，但保证最新
-
-实际影响:
-  防抖窗口最大 5s → 外部查询最多滞后 5 秒
-  对于 Phase 进度（state.json，0.5s 防抖）→ 几乎实时
-  对于讲稿预览（2s 防抖）→ 用户感知不到延迟
-```
+- **完整性**由 OSS PutObject 原子性保证 — 能读到就是完整的
+- **最新性**通过三种方式获取：
+  - **事件驱动**（推荐）：订阅 FILE_SYNCED 事件，收到通知后读 OSS，保证是最新的
+  - **直接查询**：接受最大 ~6s 延迟，响应包含 `synced_at` 标注版本时间
+  - **强制刷新**：`?force_sync=true`，等 Worker 立即上传后返回，保证当前最新
 
 ### 5.4 并发控制
 
@@ -1030,7 +1031,7 @@ Worker Runtime 的槽位管理:
 | **任务重试/续跑** | 从指定 Phase 重新开始 或 断点续跑失败任务 | 通用 — 长时间任务的容错 |
 | **常驻 Worker** | 手动扩容/缩容，不自动销毁 | 通用 — 稳定工作负载场景 |
 | **文件写入到 Worker** | 运行时将原始文本等输入写入 Worker 文件系统 | 通用 — 任何需要输入数据的任务 |
-| **跨 Worker Session 迁移** | session + workspace 备份到 OSS 后可在新 Worker 恢复 | 通用 — Worker 故障恢复 |
+| **跨 Worker Session 迁移** | session + workspace 备份到 OSS 后可在新 Worker 恢复 | 通用 — **MVP 不做**，数据基础已备 |
 
 ### 7.2 与其他 Harness 的交叉验证
 
@@ -1048,7 +1049,7 @@ Worker Runtime 的槽位管理:
 | 云存储统一读取 | — | — | ✅ **内容查询走 OSS** | **新增** |
 | Webhook 通知 | ✅ 飞书 | — | ✅ **完成/失败/Phase 通知** | **新增** |
 | 任务重试/续跑 | — | ✅ 重试 | ✅ **from_phase + continue** | **新增** |
-| 跨 Worker 迁移 | — | — | ✅ **OSS → 新 Worker** | **新增** |
+| 跨 Worker 迁移 | — | — | ⬚ 数据基础已备，**MVP 不做** | 后续 |
 | 常驻 Worker | ✅ | ✅ | ✅ | 已有 |
 
 ### 7.3 成本估算
