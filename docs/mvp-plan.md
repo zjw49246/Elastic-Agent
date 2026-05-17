@@ -23,8 +23,12 @@
 - [ ] **T-011** NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）
 - [ ] **T-012** 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）
 - [ ] **T-013** 外部服务 API — 实时轨迹流（WebSocket + SSE 双通道）
-- [ ] **T-014** 外部服务 API — 文件传输（按需读取 + inotify 变更监听）
+- [ ] **T-014** 外部服务 API — 文件变更通知（inotify → WebSocket 事件推送）
 - [ ] **T-015** 外部服务 API — 认证（API Key Bearer Token）
+- [ ] **T-030** FileSyncManager — Worker 侧文件主动同步到 OSS/S3（inotify 监听 + 分层防抖 + 同步清单）
+- [ ] **T-031** FileSyncManager — Harness 配置接口（`get_file_sync_config()`: 监听路径、同步目标、防抖策略）
+- [ ] **T-032** FileSyncManager — Worker 侧云存储凭证注入（Bootstrap 时配置 OSS/S3 access）
+- [ ] **T-033** 外部服务 API — 文件内容从云存储读取（代理 OSS/S3 或返回预签名 URL，附带 synced_at 元数据）
 - [ ] **T-016** Manager FastAPI 服务骨架 + 节点管理 REST API
 - [ ] **T-017** Claude Code AgentType（安装命令、启动命令、健康检查探针）
 
@@ -47,6 +51,8 @@
 - [ ] **T-116** IaC 测试 — 阿里云 Terraform plan+apply+destroy
 - [ ] **T-117** IaC 测试 — AWS CDK synth+deploy+destroy
 - [ ] **T-118** DryRunProvider 空跑验证
+- [ ] **T-119** 单元测试：FileSyncManager 防抖逻辑 + 同步清单生成
+- [ ] **T-120** 集成测试：Worker 文件变更 → OSS/S3 同步 → 外部 API 读取一致性
 
 ---
 
@@ -150,9 +156,11 @@
   Worker → Manager → EventBus → 外部 API (WebSocket/SSE) → 前端
   每行 Claude Code stdout (NDJSON) 产生一个 LogEvent
 
-数据流 ③：文件操作（按需，中等流量）
-  外部请求 → Manager → Worker Runtime (ReadFile) → Manager → 外部响应
-  外部订阅 → Manager → Worker Runtime (WatchFiles) → 文件变更事件流 → 外部
+数据流 ③：文件同步（持续，中等流量）
+  Worker FileSyncManager: inotify → 分层防抖 → 增量上传 OSS/S3
+  Worker → Manager: FILE_CHANGE 事件 (通知前端有新文件)
+  外部读取: 直接从 OSS/S3 读取（不走 Worker）
+  外部订阅: Manager → FILE_CHANGE 事件流 → 前端刷新文件列表
 
 数据流 ④：心跳与状态（低频，关键路径）
   Worker → Manager: Heartbeat（30s 间隔）
@@ -425,7 +433,42 @@ MVP 不持久化轨迹到数据库。理由:
   Phase 6: JWT + RBAC（细粒度权限）
 ```
 
-### 3.4 节点生命周期管理
+### 3.4 FileSyncManager — Worker 文件主动同步
+
+**为什么需要这个组件：** MVP 的原始设计是"外部按需从 Worker 读文件"。但 Audiobook Harness 的架构要求所有文件内容查询走云存储（OSS/S3），不走 Worker。这意味着文件必须**主动**从 Worker 同步到云存储，而不是被动等外部来拉。崩溃恢复（从 OSS 恢复 workspace）和跨 Worker session 迁移也依赖这个机制。
+
+```
+FileSyncManager 运行在每个 Worker 上（Worker Runtime 的子组件）:
+
+  输入:
+    Harness 通过 get_file_sync_config() 声明:
+      watch_paths:    ["/root/.work/", "~/.claude/projects/"]
+      sync_target:    "oss://bucket/tasks/{task_id}/"
+      debounce_tiers: {"state.json": 0.5, "manuscript_*": 2, "*": 5}
+
+  行为:
+    1. inotify 递归监听 watch_paths 下所有文件
+    2. 文件变更 → 匹配防抖等级 → 计时器
+    3. 计时器到期 → PutObject 上传到 OSS/S3（原子操作）
+    4. 上传完成 → 更新 _sync_manifest.json（文件清单 + MD5 + synced_at）
+    5. 同时发送 FILE_CHANGE 事件到 Manager（通知前端"有新文件"）
+
+  外部读取路径:
+    外部 API GET /api/tasks/{task_id}/files/{path}
+      → Manager 从 OSS/S3 读取（不走 Worker）
+      → 响应包含 synced_at（调用者知道数据新鲜度）
+
+  云存储凭证:
+    Bootstrap 时注入 OSS AccessKey 或 AWS IAM Role
+    Worker Runtime 用这些凭证调用 PutObject
+
+  与原有 external_api/files 的关系:
+    T-014（文件变更通知）: Worker → Manager WS 事件 → 前端（只传事件，不传内容）
+    T-033（文件内容读取）: 外部 → Manager → OSS/S3 → 返回内容（不走 Worker）
+    FileSyncManager 是两者的上游 — 它保证云存储里的文件是最新的
+```
+
+### 3.5 节点生命周期管理
 
 #### 节点状态机
 
@@ -512,7 +555,7 @@ MVP 不持久化轨迹到数据库。理由:
   防止: 云资源持续创建-销毁循环（烧钱）
 ```
 
-### 3.5 凭证与安全
+### 3.6 凭证与安全
 
 #### 两层凭证模型
 
@@ -550,7 +593,7 @@ Bootstrap 时:
   - Worker 不开放任何入站端口（WS 是 Worker → Manager 方向）
 ```
 
-### 3.6 事件系统
+### 3.7 事件系统
 
 ```
 事件系统是 Manager 内部的核心通信机制:
@@ -791,11 +834,15 @@ Phase B (Week 2-3): Manager 能控制 Worker
   T-016 Manager FastAPI 服务
   ── 里程碑: Manager 能通过 WS 在 Worker 上远程执行命令并看到输出 ──
 
-Phase C (Week 3-4): 外部可以消费数据
+Phase C (Week 3-4): 文件同步 + 外部 API
+  T-030 FileSyncManager (Worker → OSS/S3 主动同步)
+  T-031 Harness file sync config 接口
+  T-032 Worker 云存储凭证注入
   T-013 外部 API 轨迹流
-  T-014 外部 API 文件传输
+  T-014 外部 API 文件变更通知
+  T-033 外部 API 文件内容从云存储读取
   T-015 外部 API 认证
-  ── 里程碑: 前端能通过 WS 看到 Worker 上 Agent 的实时输出 ──
+  ── 里程碑: Worker 文件自动同步到 OSS; 前端从 OSS 读文件 + 通过 WS 看实时输出 ──
 
 Phase D (Week 4-5): Bootstrap 自动化
   T-017 Claude Code AgentType
@@ -814,7 +861,7 @@ Phase E (Week 5-6): 稳定性
   ── 里程碑: MVP 可用 ──
 
 Phase F (Week 6-7): 测试
-  T-100~T-118 全部测试
+  T-100~T-120 全部测试
   ── 里程碑: 测试覆盖，可交付 ──
 ```
 
@@ -825,10 +872,11 @@ T-002 (数据模型) ──→ T-003/T-004 (Provider) ──→ T-011 (Registry)
                                                                            │
 T-009 (协议) ──→ T-007/T-008 (Runtime) ──→ T-010 (认证) ──→ T-016 (Manager)
                        │                                          │
-                       └──→ T-013/T-014 (外部 API)                │
+                       ├──→ T-030/T-031 (FileSyncManager) ──→ T-033 (云存储文件读取)
+                       └──→ T-013/T-014 (外部 API 轨迹/通知)      │
                                                                    │
 T-017 (AgentType) ──→ T-018 (Bootstrap) ──→ T-019~T-022 (步骤) ──→ T-028 (扩缩容 API)
-                                                │
+                                   │                │
                                                 └──→ T-025 (Drain)
 ```
 
@@ -885,7 +933,7 @@ elastic-agent/
 │   │   ├── external_api/       # 轨迹流 + 文件传输 + 认证 + FastAPI Router
 │   │   └── security/           # Manager↔Worker 认证
 │   ├── manager/                # FastAPI 应用 + ElasticAgentManager + 配置模型
-│   ├── worker/                 # Runtime 服务入口 + 进程管理 + 文件监听
+│   ├── worker/                 # Runtime 服务入口 + 进程管理 + FileSyncManager
 │   └── cli/                    # 命令行入口
 ├── dashboard/                  # React + Vite + Ant Design 前端
 ├── infra/

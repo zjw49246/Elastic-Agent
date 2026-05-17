@@ -199,9 +199,10 @@ worker:
 
 ```
 SessionRegistry (Manager 侧):
-  book_slug → {
+  task_id → {
     worker_id:   "worker-1"
     session_id:  "abc123-def456"       # Claude Code 的 session ID
+    book_slug:   "outliers"            # 插件内部使用的 slug（.work/{book_slug}/）
     status:      "producing" | "idle" | "editing"
     cwd:         "/root/.work/outliers"
     created_at:  "2026-05-17T10:00:00Z"
@@ -216,12 +217,12 @@ WorkerSlotState (per Worker, 由 Worker Runtime 上报):
   production_slots: { used: 1, max: 1 }
   edit_slots:       { used: 2, max: 3 }
   active_sessions:  [
-    { book_slug: "outliers", session_id: "abc", mode: "producing", pid: 12345 },
-    { book_slug: "sapiens",  session_id: "def", mode: "editing",   pid: 12350 },
-    { book_slug: "thinking", session_id: "ghi", mode: "editing",   pid: 12355 },
+    { task_id: "task-001", book_slug: "outliers", session_id: "abc", mode: "producing", pid: 12345 },
+    { task_id: "task-002", book_slug: "sapiens",  session_id: "def", mode: "editing",   pid: 12350 },
+    { task_id: "task-003", book_slug: "thinking", session_id: "ghi", mode: "editing",   pid: 12355 },
   ]
   completed_sessions: [
-    { book_slug: "guns", session_id: "jkl", finished_at: "..." },
+    { task_id: "task-004", book_slug: "guns", session_id: "jkl", finished_at: "..." },
     ...
   ]
 ```
@@ -231,7 +232,7 @@ WorkerSlotState (per Worker, 由 Worker Runtime 上报):
 #### 新书生产
 
 ```
-做书前端提交: {book_slug: "outliers", raw_text: "...(原始文本)...", target_pct: 12, book_name?: "异类", author?: "马尔科姆·格拉德威尔"}
+做书前端提交: {task_id: "task-001", book_slug: "outliers", raw_text: "...(原始文本)...", target_pct: 12, book_name?: "异类", author?: "马尔科姆·格拉德威尔"}
   │
   ▼
 Manager BookQueue 入队
@@ -264,7 +265,7 @@ Claude Code 输出 phase=9, state=DELIVERED, session_id=abc123
   │
   ▼
 Manager:
-  SessionRegistry 注册: {outliers → worker-2, session_id: abc123, status: idle}
+  SessionRegistry 注册: {task-001 → worker-2, book_slug: outliers, session_id: abc123, status: idle}
   Worker 2 的 production_slots: 1/1 → 0/1 (释放生产槽位)
   通知前端: 做书完成
 ```
@@ -276,12 +277,12 @@ Manager:
   │
   ▼
 做书前端 → Elastic-Agent API:
-  POST /api/sessions/outliers/chat
+  POST /api/tasks/{task_id}/chat
   { "message": "请修改第三章的开头，换一种更吸引人的方式" }
   │
   ▼
 Manager ChatRelay:
-  1. SessionRegistry 查找: outliers → worker-2, session_id=abc123
+  1. SessionRegistry 查找: task_id → worker-2, book_slug=outliers, session_id=abc123
   2. 检查 Worker 2 的 edit_slots: 2/3 → 有空位 ✓
   3. 通过 Worker 2 的 Runtime 执行:
      claude -p "请修改第三章的开头，换一种更吸引人的方式" \
@@ -340,12 +341,12 @@ Manager ChatRelay:
 
 ```
 oss://audiobook-production/
-├── books/
-│   ├── outliers/                           # 每本书一个独立目录
+├── tasks/
+│   ├── {task_id}/                          # 每个任务一个独立目录（task_id 由外部服务提供）
 │   │   ├── source/
 │   │   │   ├── raw_text.md                 # 原始文本（提交时即存一份）
 │   │   │   └── metadata.json               # 书名、作者等元数据（可选字段，后续扩展）
-│   │   ├── workspace/                      # .work/outliers/ 的镜像
+│   │   ├── workspace/                      # .work/{book_slug}/ 的镜像
 │   │   │   ├── state.json
 │   │   │   ├── compressed.md
 │   │   │   ├── blueprint.md
@@ -358,13 +359,13 @@ oss://audiobook-production/
 │   │   │   ├── session.jsonl               # 主对话历史
 │   │   │   └── .claude.json                # 项目配置
 │   │   └── _sync_manifest.json             # 同步元数据（见下方）
-│   ├── sapiens/
+│   ├── {task_id_2}/
 │   │   └── ...
-│   └── thinking-fast-and-slow/
+│   └── {task_id_3}/
 │       └── ...
 ```
 
-**关键设计：以 book_slug 为 key，不以 worker_id 为 key。** 原因：一本书的 session 可能因为 Worker 故障而迁移到新 Worker，如果按 worker_id 组织，迁移后路径就变了。
+**关键设计：以 task_id 为 key，不以 worker_id 或 book_slug 为 key。** task_id 由外部做书服务提供，是全局唯一的任务标识。同一本书可以有多个 task_id（例如不同参数的重试）。原因：一个任务的 session 可能因为 Worker 故障而迁移到新 Worker，如果按 worker_id 组织，迁移后路径就变了；而 book_slug 是插件内部概念，不适合作为外部 API 的主键。
 
 #### 同步机制
 
@@ -372,9 +373,9 @@ oss://audiobook-production/
 Worker Runtime 的 FileSyncManager:
 
   监听范围:
-    /root/.work/{book_slug}/           → oss://bucket/books/{slug}/workspace/
-    ~/.claude/projects/{path-hash}/    → oss://bucket/books/{slug}/session/
-    /root/books/{slug}/raw_text.md     → oss://bucket/books/{slug}/source/
+    /root/.work/{book_slug}/           → oss://bucket/tasks/{task_id}/workspace/
+    ~/.claude/projects/{path-hash}/    → oss://bucket/tasks/{task_id}/session/
+    /root/books/{slug}/raw_text.md     → oss://bucket/tasks/{task_id}/source/
 
   触发策略:
     inotify 监听 → 文件变更 → 按优先级分层防抖:
@@ -412,7 +413,7 @@ Worker Runtime 的 FileSyncManager:
 |-------------|-----------|
 | Worker 离线 = 读不到 | 永远可用 |
 | 增加 Worker 负担 | Worker 零开销 |
-| 需要知道 book→worker 映射 | 只需要 book_slug |
+| 需要知道 book→worker 映射 | 只需要 task_id |
 | Worker Runtime WS 通道拥挤 | CDN 加速，大文件友好 |
 
 **一致性保证：**
@@ -426,10 +427,10 @@ OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一
 
 ```
 查询流程:
-  GET /api/books/{slug}/files/workspace/manuscript_final.md
+  GET /api/tasks/{task_id}/files/workspace/manuscript_final.md
     │
     ▼
-  Manager 读取 oss://bucket/books/{slug}/_sync_manifest.json
+  Manager 读取 oss://bucket/tasks/{task_id}/_sync_manifest.json
     → 确认文件存在 + 获取 OSS 路径
     │
     ▼
@@ -450,11 +451,11 @@ OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一
 场景: Worker 2 离线，用户要修改 Worker 2 上的 "outliers"
 
 迁移流程:
-  1. 从 OSS 下载: books/outliers/workspace/ + books/outliers/session/
+  1. 从 OSS 下载: tasks/{task_id}/workspace/ + tasks/{task_id}/session/
   2. 选择有空闲修改槽位的 Worker 3
   3. 上传到 Worker 3: .work/outliers/ + ~/.claude/projects/.../
   4. 在 Worker 3 上 --resume → 成功恢复
-  5. 更新 SessionRegistry: outliers → worker-3
+  5. 更新 SessionRegistry: task_id → worker-3
   6. 后续修改请求路由到 Worker 3
 
 限制:
@@ -499,17 +500,17 @@ OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/books/produce` | `POST` | 提交一本或多本做书请求（入队），请求体包含原始文本 + 可选元数据 |
-| `/api/books/{slug}/retry` | `POST` | 重试：`{from_phase: 3}` 从指定 Phase 重新开始，或 `{from_phase: 0}` 全部重来 |
-| `/api/books/{slug}/continue` | `POST` | 断点续跑失败的任务（等价于 /continue-book） |
-| `/api/books/{slug}/cancel` | `POST` | 取消正在进行的做书（发 SIGINT 给 Claude Code） |
-| `/api/books/{slug}/status` | `GET` | 返回当前 Phase、state、进度百分比、Worker ID |
-| `/api/books/queue` | `GET` | 查看做书队列（排队中 + 进行中 + 已完成 + 失败） |
+| `/api/tasks/produce` | `POST` | 提交一本或多本做书请求（入队），请求体包含原始文本 + 可选元数据 |
+| `/api/tasks/{task_id}/retry` | `POST` | 重试：`{from_phase: 3}` 从指定 Phase 重新开始，或 `{from_phase: 0}` 全部重来 |
+| `/api/tasks/{task_id}/continue` | `POST` | 断点续跑失败的任务（等价于 /continue-book） |
+| `/api/tasks/{task_id}/cancel` | `POST` | 取消正在进行的做书（发 SIGINT 给 Claude Code） |
+| `/api/tasks/{task_id}/status` | `GET` | 返回当前 Phase、state、进度百分比、Worker ID |
+| `/api/tasks/queue` | `GET` | 查看做书队列（排队中 + 进行中 + 已完成 + 失败） |
 
 **重试的设计要点：**
 
 ```
-POST /api/books/outliers/retry
+POST /api/tasks/{task_id}/retry
   Body: { "from_phase": 3 }
 
 处理流程:
@@ -527,14 +528,14 @@ POST /api/books/outliers/retry
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/books/{slug}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
-| `/api/books/{slug}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
-| `/api/books/{slug}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 session .jsonl 解析） |
+| `/api/tasks/{task_id}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
+| `/api/tasks/{task_id}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
+| `/api/tasks/{task_id}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 session .jsonl 解析） |
 
 **Chat stream 的统一设计：**
 
 ```
-WS /api/books/outliers/chat/stream
+WS /api/tasks/{task_id}/chat/stream
 
   连接后推送该书的所有 Claude Code 输出:
     - 如果正在生产 → 推送生产过程的 NDJSON
@@ -543,19 +544,19 @@ WS /api/books/outliers/chat/stream
 
   注意: 外部服务不需要知道 node_id 或 worker_id
   路由由 Manager 内部完成:
-    book_slug → SessionRegistry → worker_id → Worker Runtime WS → 转发
+    task_id → SessionRegistry → worker_id → Worker Runtime WS → 转发
 ```
 
 #### 内容查询（统一从 OSS 读取）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/books/{slug}/files` | `GET` | 列出该书的全部文件（从 _sync_manifest.json） |
-| `/api/books/{slug}/files/{path}` | `GET` | 读取指定文件内容（从 OSS 代理或返回预签名 URL） |
-| `/api/books/{slug}/files/{path}/url` | `GET` | 返回 OSS 预签名 URL（大文件直接下载） |
-| `/api/books/{slug}/state` | `GET` | 快捷方式：读取 state.json（等价于 files/workspace/state.json） |
-| `/api/books/{slug}/manuscript` | `GET` | 快捷方式：读取最终讲稿（自动选择 compliant 或 final 版本） |
-| `/api/books/{slug}/export` | `GET` | 打包下载：delivery/ 目录 + intro + state.json → zip |
+| `/api/tasks/{task_id}/files` | `GET` | 列出该书的全部文件（从 _sync_manifest.json） |
+| `/api/tasks/{task_id}/files/{path}` | `GET` | 读取指定文件内容（从 OSS 代理或返回预签名 URL） |
+| `/api/tasks/{task_id}/files/{path}/url` | `GET` | 返回 OSS 预签名 URL（大文件直接下载） |
+| `/api/tasks/{task_id}/state` | `GET` | 快捷方式：读取 state.json（等价于 files/workspace/state.json） |
+| `/api/tasks/{task_id}/manuscript` | `GET` | 快捷方式：读取最终讲稿（自动选择 compliant 或 final 版本） |
+| `/api/tasks/{task_id}/export` | `GET` | 打包下载：delivery/ 目录 + intro + state.json → zip |
 
 **所有内容都从 OSS 读取**，响应包含同步时间信息：
 
@@ -571,7 +572,7 @@ WS /api/books/outliers/chat/stream
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/books/{slug}/files/watch` | `WS` | 订阅该书的文件变更事件 |
+| `/api/tasks/{task_id}/files/watch` | `WS` | 订阅该书的文件变更事件 |
 
 ```
 事件格式:
@@ -607,11 +608,11 @@ WS /api/books/outliers/chat/stream
 
 ```
 Webhook 事件类型:
-  book.production.started    做书开始（分配到 Worker）
-  book.production.phase      Phase 切换（附带 phase 编号）
-  book.production.completed  做书完成（附带 delivery 路径）
-  book.production.failed     做书失败（附带 failure type + report 路径）
-  book.edit.completed        修改完成
+  task.production.started    做书开始（分配到 Worker）
+  task.production.phase      Phase 切换（附带 phase 编号）
+  task.production.completed  做书完成（附带 delivery 路径）
+  task.production.failed     做书失败（附带 failure type + report 路径）
+  task.edit.completed        修改完成
   worker.unhealthy           Worker 异常
   worker.added               新 Worker 上线
 ```
@@ -623,11 +624,11 @@ Webhook 事件类型:
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/dashboard` | `GET` | 总览：队列长度、进行中/已完成/失败数、Worker 数、总成本 |
-| `/api/books` | `GET` | 所有书的列表 + 状态摘要（支持分页、过滤） |
+| `/api/tasks` | `GET` | 所有任务的列表 + 状态摘要（支持分页、过滤） |
 
 #### API 设计原则
 
-1. **以 book_slug 为主键**，不暴露 worker_id 和 node_id 给外部。路由是 Manager 内部事务。
+1. **以 task_id 为主键**，不暴露 worker_id、node_id 和 book_slug 给外部。路由是 Manager 内部事务。
 2. **读操作走 OSS**，写操作（做书/修改/重试）走 Worker。
 3. **实时流用 WebSocket**，查询用 REST，异步通知用 Webhook。三种模式覆盖所有消费场景。
 4. **快捷方式 API**（`/state`、`/manuscript`）减少外部服务理解内部文件结构的负担。
@@ -678,9 +679,9 @@ class AudiobookHarness(Harness):
             sync_on_change=True,
             path_mapping={
                 # Worker 本地路径 → OSS 路径的映射规则
-                # {book_slug} 由 FileSyncManager 从路径中提取
-                "/root/.work/{book_slug}/":          "books/{book_slug}/workspace/",
-                "~/.claude/projects/{path_hash}/":   "books/{book_slug}/session/",
+                # {task_id} 由 FileSyncManager 通过 SessionRegistry 映射
+                "/root/.work/{book_slug}/":          "tasks/{task_id}/workspace/",
+                "~/.claude/projects/{path_hash}/":   "tasks/{task_id}/session/",
             },
             debounce_tiers={
                 "state.json": 0.5,                   # 关键文件 — 几乎实时
@@ -747,13 +748,13 @@ class AudiobookHarness(Harness):
             cwd="/root",
         )
         # 注册会话
-        self.session_registry.register(book.slug, worker_id, task_id, mode="producing")
+        self.session_registry.register(book.task_id, worker_id, task_id, book_slug=book.slug, mode="producing")
 
-    async def handle_edit_request(self, book_slug: str, message: str):
+    async def handle_edit_request(self, task_id: str, message: str):
         """处理修改请求 — 路由到正确 Worker 的 --resume"""
-        session = self.session_registry.get(book_slug)
+        session = self.session_registry.get(task_id)
         if not session:
-            raise NotFoundError(f"Session for {book_slug} not found")
+            raise NotFoundError(f"Session for {task_id} not found")
 
         worker_state = await self.get_worker_slot_state(session.worker_id)
         if worker_state.edit_slots.used >= worker_state.edit_slots.max:
@@ -776,11 +777,12 @@ class AudiobookHarness(Harness):
 ```python
 # Audiobook 特有的 API（挂载在 Manager FastAPI 上）
 
-@app.post("/api/books/produce")
+@app.post("/api/tasks/produce")
 async def produce_book(request: ProduceBookRequest):
     """提交做书请求"""
     harness.book_queue.enqueue(BookRequest(
-        slug=request.book_slug,
+        task_id=request.task_id,             # 外部服务提供的任务 ID
+        slug=request.book_slug,              # 插件内部使用的 slug
         raw_text=request.raw_text,           # 原始文本内容
         target_pct=request.target_pct,
         metadata=request.metadata,           # 可选: {book_name, author, ...}
@@ -788,13 +790,13 @@ async def produce_book(request: ProduceBookRequest):
     # 尝试立即分发（如果有空闲 Worker）
     for worker_id in registry.list_ready_workers():
         await harness._dispatch_pending_books(worker_id)
-    return {"status": "queued", "book_slug": request.book_slug}
+    return {"status": "queued", "task_id": request.task_id}
 
-@app.post("/api/sessions/{book_slug}/chat")
-async def send_edit_message(book_slug: str, request: ChatRequest):
+@app.post("/api/tasks/{task_id}/chat")
+async def send_edit_message(task_id: str, request: ChatRequest):
     """向已完成的会话发送修改指令"""
-    task_id = await harness.handle_edit_request(book_slug, request.message)
-    return {"status": "started", "task_id": task_id}
+    edit_task_id = await harness.handle_edit_request(task_id, request.message)
+    return {"status": "started", "task_id": edit_task_id}
 
 @app.get("/api/sessions")
 async def list_sessions():
@@ -823,8 +825,8 @@ async def list_workers():
 
 ```
 SessionRegistry 是路由的核心:
-  1. 做书完成时注册: book_slug → (worker_id, session_id)
-  2. 修改请求到来时: 查 book_slug → 得到 worker_id → 发到该 Worker
+  1. 做书完成时注册: task_id → (worker_id, session_id, book_slug)
+  2. 修改请求到来时: 查 task_id → 得到 worker_id → 发到该 Worker
   3. session_id 更新: --resume 后 Claude Code 可能返回新 session_id → 更新注册表
 
 路由失败场景:
@@ -889,7 +891,7 @@ Manager 收到 PROCESS_EXIT:
    → 外部服务知道数据可能滞后几秒
 
 3. 强制刷新（可选）:
-   GET /api/books/{slug}/files/{path}?force_sync=true
+   GET /api/tasks/{task_id}/files/{path}?force_sync=true
    → Manager 通知 Worker Runtime 立即上传该文件（跳过防抖）
    → 等待上传完成后返回最新内容
    → 延迟增加 ~1-3s，但保证最新
