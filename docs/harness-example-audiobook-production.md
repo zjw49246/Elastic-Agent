@@ -231,7 +231,7 @@ WorkerSlotState (per Worker, 由 Worker Runtime 上报):
 #### 新书生产
 
 ```
-做书前端提交: {book_slug: "outliers", book_path: "/books/outliers.pdf", target_pct: 12}
+做书前端提交: {book_slug: "outliers", raw_text: "...(原始文本)...", target_pct: 12, book_name?: "异类", author?: "马尔科姆·格拉德威尔"}
   │
   ▼
 Manager BookQueue 入队
@@ -243,9 +243,9 @@ SlotScheduler 查找有空闲生产槽位的 Worker:
   │
   ▼
 通过 Worker 2 的 Runtime 执行:
-  1. 上传 book PDF 到 Worker
+  1. 将原始文本写入 Worker 本地文件
   2. 启动 Claude Code:
-     claude -p "/audiobook /books/outliers.pdf nonfiction_default target_pct=12" \
+     claude -p "/audiobook /root/books/outliers/raw_text.md nonfiction_default target_pct=12" \
        --dangerously-skip-permissions --output-format stream-json
   │
   ▼
@@ -332,7 +332,7 @@ Manager ChatRelay:
 | **工作目录** | `.work/{book_slug}/` | 全部中间产物和最终讲稿 | 做书成果全部丢失 |
 | **Session 文件** | `~/.claude/projects/{path-hash}/*.jsonl` | Claude Code 对话历史 | 无法 `--resume`，丧失修改能力 |
 | **项目配置** | `~/.claude/projects/{path-hash}/.claude.json` | Claude Code 项目级设置 | `--resume` 时可能行为异常 |
-| **源 PDF** | `/root/books/{slug}.pdf` | 书籍原始文件 | 新 Worker 恢复时无源文件 |
+| **源文本** | `/root/books/{slug}/raw_text.md` | 书籍原始文本（外部服务提供） | 新 Worker 恢复时无源文件 |
 
 **不需要备份的**（Bootstrap 可重建）：Claude Code 二进制、audiobook-nonfiction 插件、Python 依赖、Node.js、系统配置。**凭证**由 CredentialPool 管理，不通过 OSS 备份。
 
@@ -343,7 +343,8 @@ oss://audiobook-production/
 ├── books/
 │   ├── outliers/                           # 每本书一个独立目录
 │   │   ├── source/
-│   │   │   └── outliers.pdf                # 源 PDF（上传时即存一份）
+│   │   │   ├── raw_text.md                 # 原始文本（提交时即存一份）
+│   │   │   └── metadata.json               # 书名、作者等元数据（可选字段，后续扩展）
 │   │   ├── workspace/                      # .work/outliers/ 的镜像
 │   │   │   ├── state.json
 │   │   │   ├── compressed.md
@@ -373,7 +374,7 @@ Worker Runtime 的 FileSyncManager:
   监听范围:
     /root/.work/{book_slug}/           → oss://bucket/books/{slug}/workspace/
     ~/.claude/projects/{path-hash}/    → oss://bucket/books/{slug}/session/
-    /root/books/{slug}.pdf             → oss://bucket/books/{slug}/source/
+    /root/books/{slug}/raw_text.md     → oss://bucket/books/{slug}/source/
 
   触发策略:
     inotify 监听 → 文件变更 → 按优先级分层防抖:
@@ -498,8 +499,7 @@ OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/books/upload` | `POST` (multipart) | 上传源 PDF，存入 OSS，返回 `oss_path` |
-| `/api/books/produce` | `POST` | 提交一本或多本做书请求（入队）|
+| `/api/books/produce` | `POST` | 提交一本或多本做书请求（入队），请求体包含原始文本 + 可选元数据 |
 | `/api/books/{slug}/retry` | `POST` | 重试：`{from_phase: 3}` 从指定 Phase 重新开始，或 `{from_phase: 0}` 全部重来 |
 | `/api/books/{slug}/continue` | `POST` | 断点续跑失败的任务（等价于 /continue-book） |
 | `/api/books/{slug}/cancel` | `POST` | 取消正在进行的做书（发 SIGINT 给 Claude Code） |
@@ -520,7 +520,7 @@ POST /api/books/outliers/retry
   5. 启动 Claude Code: /continue-book outliers → 从 Phase 3 开始重跑
 
   from_phase=0 (全部重来):
-    清空整个 workspace + session → 重新 /audiobook
+    清空整个 workspace + session → 从 OSS 取源文本 → 重新 /audiobook
 ```
 
 #### Chat / 修改
@@ -662,10 +662,10 @@ class AudiobookHarness(Harness):
             InstallClaudeCodeStep(),
             InjectCredentialStep(),
             InstallAudiobookPluginStep(),
-            InstallPythonDepsStep(),
             StartWorkerRuntimeStep(),
             # 注意: 不在 Bootstrap 中启动 Claude Code 会话
             # 会话由 BookQueue 调度后按需启动
+            # 原始文本在做书请求到达时写入 Worker，不在 Bootstrap 中处理
         ]
 
     def get_file_sync_config(self) -> FileSyncConfig:
@@ -732,12 +732,17 @@ class AudiobookHarness(Harness):
     async def _start_production(self, worker_id: str, book: BookRequest):
         """在指定 Worker 上启动做书"""
         runtime = self.manager.get_runtime_client(worker_id)
-        # 上传 PDF
-        await runtime.upload_file(book.pdf_path, f"/root/books/{book.slug}.pdf")
+        # 将原始文本写入 Worker（同时存一份到 OSS）
+        text_dir = f"/root/books/{book.slug}"
+        await runtime.execute(["mkdir", "-p", text_dir])
+        await runtime.write_file(f"{text_dir}/raw_text.md", book.raw_text)
+        if book.metadata:
+            await runtime.write_file(f"{text_dir}/metadata.json", json.dumps(book.metadata))
+        await self._sync_source_to_oss(book)
         # 启动 Claude Code
         task_id = await runtime.execute(
             command=["claude", "-p",
-                f"/audiobook /root/books/{book.slug}.pdf {book.persona} target_pct={book.target_pct}",
+                f"/audiobook {text_dir}/raw_text.md {book.persona} target_pct={book.target_pct}",
                 "--dangerously-skip-permissions", "--output-format", "stream-json"],
             cwd="/root",
         )
@@ -776,8 +781,9 @@ async def produce_book(request: ProduceBookRequest):
     """提交做书请求"""
     harness.book_queue.enqueue(BookRequest(
         slug=request.book_slug,
-        pdf_path=request.book_path,
+        raw_text=request.raw_text,           # 原始文本内容
         target_pct=request.target_pct,
+        metadata=request.metadata,           # 可选: {book_name, author, ...}
     ))
     # 尝试立即分发（如果有空闲 Worker）
     for worker_id in registry.list_ready_workers():
@@ -1021,7 +1027,7 @@ Worker Runtime 的槽位管理:
 | **Webhook 事件通知** | 做书完成/失败/Phase 切换 → 推送到注册的 URL | 通用 — 后端系统异步事件驱动 |
 | **任务重试/续跑** | 从指定 Phase 重新开始 或 断点续跑失败任务 | 通用 — 长时间任务的容错 |
 | **常驻 Worker** | 手动扩容/缩容，不自动销毁 | 通用 — 稳定工作负载场景 |
-| **文件上传到 Worker** | Bootstrap 或运行时上传 PDF 等输入文件 | 通用 — 任何需要输入文件的任务 |
+| **文件写入到 Worker** | 运行时将原始文本等输入写入 Worker 文件系统 | 通用 — 任何需要输入数据的任务 |
 | **跨 Worker Session 迁移** | session + workspace 备份到 OSS 后可在新 Worker 恢复 | 通用 — Worker 故障恢复 |
 
 ### 7.2 与其他 Harness 的交叉验证
