@@ -321,28 +321,144 @@ Manager ChatRelay:
   (除非引入跨 Worker 的 session 迁移机制 — MVP 不做)
 ```
 
-### 3.4 文件实时同步
+### 3.4 备份范围与云存储结构
+
+#### 需要备份的完整范围
+
+对于一个可能被销毁的 Worker，需要备份到 OSS/S3 的内容：
+
+| 内容 | 路径 | 说明 | 不备份的后果 |
+|------|------|------|-------------|
+| **工作目录** | `.work/{book_slug}/` | 全部中间产物和最终讲稿 | 做书成果全部丢失 |
+| **Session 文件** | `~/.claude/projects/{path-hash}/*.jsonl` | Claude Code 对话历史 | 无法 `--resume`，丧失修改能力 |
+| **项目配置** | `~/.claude/projects/{path-hash}/.claude.json` | Claude Code 项目级设置 | `--resume` 时可能行为异常 |
+| **源 PDF** | `/root/books/{slug}.pdf` | 书籍原始文件 | 新 Worker 恢复时无源文件 |
+
+**不需要备份的**（Bootstrap 可重建）：Claude Code 二进制、audiobook-nonfiction 插件、Python 依赖、Node.js、系统配置。**凭证**由 CredentialPool 管理，不通过 OSS 备份。
+
+#### 每本书独立的 OSS 目录结构
 
 ```
-文件同步通道（双重保障）:
+oss://audiobook-production/
+├── books/
+│   ├── outliers/                           # 每本书一个独立目录
+│   │   ├── source/
+│   │   │   └── outliers.pdf                # 源 PDF（上传时即存一份）
+│   │   ├── workspace/                      # .work/outliers/ 的镜像
+│   │   │   ├── state.json
+│   │   │   ├── compressed.md
+│   │   │   ├── blueprint.md
+│   │   │   ├── manuscript_final.md
+│   │   │   ├── delivery/
+│   │   │   │   ├── manuscript.md
+│   │   │   │   └── intro.md
+│   │   │   └── ...
+│   │   ├── session/                        # Claude Code session 文件
+│   │   │   ├── session.jsonl               # 主对话历史
+│   │   │   └── .claude.json                # 项目配置
+│   │   └── _sync_manifest.json             # 同步元数据（见下方）
+│   ├── sapiens/
+│   │   └── ...
+│   └── thinking-fast-and-slow/
+│       └── ...
+```
 
-通道 1: Worker → OSS/S3 (持久化)
-  Worker Runtime 使用 inotify 监听 .work/ 目录
-    → 文件创建/修改 → 防抖 2s → 增量上传到 OSS/S3
-    → 路径映射: .work/{slug}/xxx → oss://bucket/{worker_id}/{slug}/xxx
-    → 用途: 持久化存储，崩溃恢复，前端文件下载
+**关键设计：以 book_slug 为 key，不以 worker_id 为 key。** 原因：一本书的 session 可能因为 Worker 故障而迁移到新 Worker，如果按 worker_id 组织，迁移后路径就变了。
 
-通道 2: Worker → Manager → 前端 (实时通知)
-  Worker Runtime 监听 .work/ 目录
-    → FILE_CHANGE 事件 via WebSocket → Manager EventBus
-    → 外部 API → 前端 (文件目录实时更新)
-    → 用途: 前端知道有新文件，触发 UI 刷新
-    → 文件内容本身通过通道 1 (OSS/S3 链接) 或通道 2 GET 获取
+#### 同步机制
 
-为什么不只用 WebSocket 传文件内容?
-  - 讲稿文件可达 50-100KB，WebSocket 传输影响聊天流延迟
-  - OSS/S3 是更适合文件下载的基础设施（CDN、断点续传）
-  - 通知与数据分离: WS 告诉前端"有新文件了"，前端从 OSS 下载
+```
+Worker Runtime 的 FileSyncManager:
+
+  监听范围:
+    /root/.work/{book_slug}/           → oss://bucket/books/{slug}/workspace/
+    ~/.claude/projects/{path-hash}/    → oss://bucket/books/{slug}/session/
+    /root/books/{slug}.pdf             → oss://bucket/books/{slug}/source/
+
+  触发策略:
+    inotify 监听 → 文件变更 → 按优先级分层防抖:
+      关键文件 (state.json):           0.5s 后上传
+      中等文件 (manuscript_*, audit_*): 2s 防抖后上传
+      大文件 (raw_text.md, compressed): 5s 防抖后上传
+
+  上传方式:
+    OSS PutObject / S3 PutObject — 单文件原子上传
+    上传完成后更新 _sync_manifest.json
+
+  同步元数据 (_sync_manifest.json):
+    {
+      "last_sync_at": "2026-05-17T14:30:00Z",
+      "worker_id": "worker-2",
+      "files": {
+        "workspace/state.json":        {"size": 1234, "md5": "abc...", "synced_at": "..."},
+        "workspace/manuscript_final.md": {"size": 58201, "md5": "def...", "synced_at": "..."},
+        "session/session.jsonl":       {"size": 203456, "md5": "ghi...", "synced_at": "..."},
+        ...
+      }
+    }
+
+  通知通道 (与同步独立):
+    文件变更同时触发 FILE_CHANGE 事件 via WebSocket → Manager → 外部服务
+    用途: 前端实时刷新文件列表（知道有新文件了）
+    文件内容从 OSS 下载（不走 WebSocket）
+```
+
+#### 内容查询：统一从云存储读取
+
+**所有文件内容查询都从 OSS/S3 读取，不走 Worker。** 理由：
+
+| 从 Worker 读 | 从云存储读 |
+|-------------|-----------|
+| Worker 离线 = 读不到 | 永远可用 |
+| 增加 Worker 负担 | Worker 零开销 |
+| 需要知道 book→worker 映射 | 只需要 book_slug |
+| Worker Runtime WS 通道拥挤 | CDN 加速，大文件友好 |
+
+**一致性保证：**
+
+OSS/S3 的 PutObject 是原子操作 — 一旦能读到就是完整的。唯一问题是"最新版本是否已经上传"。解决方案：
+
+1. **_sync_manifest.json** 记录每个文件的最后同步时间和 MD5
+2. 外部查询 API 返回 `synced_at` 时间戳，调用者知道数据的新鲜度
+3. 如果需要确认最新：对比 manifest 中该文件的 `synced_at` 与当前时间的差值
+4. 防抖窗口内的写入可能尚未上传 — API 响应中标注 `may_be_stale_within_seconds: 5`
+
+```
+查询流程:
+  GET /api/books/{slug}/files/workspace/manuscript_final.md
+    │
+    ▼
+  Manager 读取 oss://bucket/books/{slug}/_sync_manifest.json
+    → 确认文件存在 + 获取 OSS 路径
+    │
+    ▼
+  生成 OSS 预签名 URL（有效期 5 分钟）或直接代理读取
+    → 返回给外部服务
+    │
+    ▼
+  响应头包含:
+    X-Synced-At: 2026-05-17T14:30:00Z
+    X-Sync-Lag-Max: 5  (秒，防抖窗口)
+```
+
+#### Session 备份启用跨 Worker 迁移
+
+有了 session 备份到 OSS，之前"MVP 不做"的跨 Worker 迁移变得可行：
+
+```
+场景: Worker 2 离线，用户要修改 Worker 2 上的 "outliers"
+
+迁移流程:
+  1. 从 OSS 下载: books/outliers/workspace/ + books/outliers/session/
+  2. 选择有空闲修改槽位的 Worker 3
+  3. 上传到 Worker 3: .work/outliers/ + ~/.claude/projects/.../
+  4. 在 Worker 3 上 --resume → 成功恢复
+  5. 更新 SessionRegistry: outliers → worker-3
+  6. 后续修改请求路由到 Worker 3
+
+限制:
+  需要确认 Claude Code session .jsonl 中没有绑定绝对路径
+  如果有 → 需要 sed 替换路径（或确保两台 Worker 的 cwd 一致）
 ```
 
 ### 3.5 Chat 双向中继
@@ -374,18 +490,147 @@ Manager ChatRelay:
     → /continue-book 读取该文件继续
 ```
 
-### 3.6 外部服务 API 使用
+### 3.6 外部服务 API 完整设计
 
-| 需求 | 端点 | 说明 |
+外部服务（做书前后端）通过以下 API 与 Elastic-Agent 交互。按功能域分组：
+
+#### 做书生命周期
+
+| 端点 | 方法 | 说明 |
 |------|------|------|
-| 新书请求 | `POST /api/books/produce` | 入队做书 |
-| 发修改指令 | `POST /api/sessions/{slug}/chat` | 路由到 Worker --resume |
-| 实时聊天流 | `WS /api/external/traces/{node_id}/stream` | Claude Code NDJSON |
-| 文件变更通知 | `WS /api/external/files/{node_id}/watch` | inotify 事件 |
-| 文件下载 | `GET /api/external/files/{node_id}/{path}` 或 OSS 直链 | 按需读取 |
-| 会话列表 | `GET /api/sessions` | 所有已注册的 session |
-| Worker 状态 | `GET /api/workers` | 各 Worker 槽位占用 |
-| Phase 进度 | `GET /api/external/files/{node_id}/.work/{slug}/state.json` | state.json |
+| `/api/books/upload` | `POST` (multipart) | 上传源 PDF，存入 OSS，返回 `oss_path` |
+| `/api/books/produce` | `POST` | 提交一本或多本做书请求（入队）|
+| `/api/books/{slug}/retry` | `POST` | 重试：`{from_phase: 3}` 从指定 Phase 重新开始，或 `{from_phase: 0}` 全部重来 |
+| `/api/books/{slug}/continue` | `POST` | 断点续跑失败的任务（等价于 /continue-book） |
+| `/api/books/{slug}/cancel` | `POST` | 取消正在进行的做书（发 SIGINT 给 Claude Code） |
+| `/api/books/{slug}/status` | `GET` | 返回当前 Phase、state、进度百分比、Worker ID |
+| `/api/books/queue` | `GET` | 查看做书队列（排队中 + 进行中 + 已完成 + 失败） |
+
+**重试的设计要点：**
+
+```
+POST /api/books/outliers/retry
+  Body: { "from_phase": 3 }
+
+处理流程:
+  1. 从 OSS 下载 outliers 的 workspace（获取到 Phase 2 的产物）
+  2. 删除 Phase 3 及之后的产物文件（sections/, drafts/, styled/, manuscript_*, ...）
+  3. 修改 state.json: phase=3, state 回退到对应状态
+  4. 上传修改后的 workspace 到空闲 Worker
+  5. 启动 Claude Code: /continue-book outliers → 从 Phase 3 开始重跑
+
+  from_phase=0 (全部重来):
+    清空整个 workspace + session → 重新 /audiobook
+```
+
+#### Chat / 修改
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/books/{slug}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
+| `/api/books/{slug}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
+| `/api/books/{slug}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 session .jsonl 解析） |
+
+**Chat stream 的统一设计：**
+
+```
+WS /api/books/outliers/chat/stream
+
+  连接后推送该书的所有 Claude Code 输出:
+    - 如果正在生产 → 推送生产过程的 NDJSON
+    - 如果正在修改 → 推送修改过程的 NDJSON
+    - 如果空闲 → 保持连接，等下次操作时自动推送
+
+  注意: 外部服务不需要知道 node_id 或 worker_id
+  路由由 Manager 内部完成:
+    book_slug → SessionRegistry → worker_id → Worker Runtime WS → 转发
+```
+
+#### 内容查询（统一从 OSS 读取）
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/books/{slug}/files` | `GET` | 列出该书的全部文件（从 _sync_manifest.json） |
+| `/api/books/{slug}/files/{path}` | `GET` | 读取指定文件内容（从 OSS 代理或返回预签名 URL） |
+| `/api/books/{slug}/files/{path}/url` | `GET` | 返回 OSS 预签名 URL（大文件直接下载） |
+| `/api/books/{slug}/state` | `GET` | 快捷方式：读取 state.json（等价于 files/workspace/state.json） |
+| `/api/books/{slug}/manuscript` | `GET` | 快捷方式：读取最终讲稿（自动选择 compliant 或 final 版本） |
+| `/api/books/{slug}/export` | `GET` | 打包下载：delivery/ 目录 + intro + state.json → zip |
+
+**所有内容都从 OSS 读取**，响应包含同步时间信息：
+
+```json
+{
+  "content": "...",
+  "synced_at": "2026-05-17T14:30:00Z",
+  "sync_lag_max_seconds": 5
+}
+```
+
+#### 文件变更通知
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/books/{slug}/files/watch` | `WS` | 订阅该书的文件变更事件 |
+
+```
+事件格式:
+  {
+    "event": "created" | "modified",
+    "path": "workspace/manuscript_final.md",
+    "size": 58201,
+    "synced_at": "2026-05-17T14:30:05Z"
+  }
+
+前端收到后:
+  → 刷新文件列表 UI
+  → 如果是 state.json 变更 → 更新 Phase 进度条
+  → 如果是 manuscript_* → 可选自动刷新讲稿预览
+```
+
+#### Worker 管理
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/workers` | `GET` | 列出所有 Worker 及槽位状态 |
+| `/api/workers/scale-out` | `POST` | 手动扩容 `{count: 1}` |
+| `/api/workers/{id}` | `DELETE` | 手动缩容（需无活跃会话） |
+| `/api/workers/{id}/sessions` | `GET` | 列出该 Worker 上的所有 session |
+
+#### 事件通知（Webhook）
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/webhooks` | `POST` | 注册 Webhook URL |
+| `/api/webhooks` | `GET` | 列出已注册的 Webhook |
+| `/api/webhooks/{id}` | `DELETE` | 删除 Webhook |
+
+```
+Webhook 事件类型:
+  book.production.started    做书开始（分配到 Worker）
+  book.production.phase      Phase 切换（附带 phase 编号）
+  book.production.completed  做书完成（附带 delivery 路径）
+  book.production.failed     做书失败（附带 failure type + report 路径）
+  book.edit.completed        修改完成
+  worker.unhealthy           Worker 异常
+  worker.added               新 Worker 上线
+```
+
+**为什么需要 Webhook？** 前端可以用 WebSocket 获取实时流，但后端服务（如通知系统、计费系统、批量管理）需要异步事件驱动，轮询不合适。
+
+#### 全局状态
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/dashboard` | `GET` | 总览：队列长度、进行中/已完成/失败数、Worker 数、总成本 |
+| `/api/books` | `GET` | 所有书的列表 + 状态摘要（支持分页、过滤） |
+
+#### API 设计原则
+
+1. **以 book_slug 为主键**，不暴露 worker_id 和 node_id 给外部。路由是 Manager 内部事务。
+2. **读操作走 OSS**，写操作（做书/修改/重试）走 Worker。
+3. **实时流用 WebSocket**，查询用 REST，异步通知用 Webhook。三种模式覆盖所有消费场景。
+4. **快捷方式 API**（`/state`、`/manuscript`）减少外部服务理解内部文件结构的负担。
 
 ---
 
@@ -425,10 +670,25 @@ class AudiobookHarness(Harness):
 
     def get_file_sync_config(self) -> FileSyncConfig:
         return FileSyncConfig(
-            watch_paths=["/root/.work/"],
-            sync_target="oss://audiobook-production/",  # 或 s3://
-            debounce_seconds=2,
-            sync_on_change=True,  # 有变更就同步，不只是定期
+            watch_paths=[
+                "/root/.work/",                          # 工作目录（所有书）
+                "~/.claude/projects/",                   # Session 文件 + 项目配置
+            ],
+            sync_target="oss://audiobook-production/",
+            sync_on_change=True,
+            path_mapping={
+                # Worker 本地路径 → OSS 路径的映射规则
+                # {book_slug} 由 FileSyncManager 从路径中提取
+                "/root/.work/{book_slug}/":          "books/{book_slug}/workspace/",
+                "~/.claude/projects/{path_hash}/":   "books/{book_slug}/session/",
+            },
+            debounce_tiers={
+                "state.json": 0.5,                   # 关键文件 — 几乎实时
+                "manuscript_*": 2,                   # 讲稿 — 2s 防抖
+                "audit_*": 2,                        # 审核报告 — 2s 防抖
+                "*": 5,                              # 其他 — 5s 防抖
+            },
+            write_manifest=True,                     # 每次同步后更新 _sync_manifest.json
         )
 
     def get_event_handlers(self) -> dict:
@@ -599,33 +859,39 @@ Manager 收到 PROCESS_EXIT:
   → 释放槽位
 ```
 
-### 5.3 文件同步的完整性保证
+### 5.3 文件查询一致性
 
-**挑战：** 做书过程产生大量文件（raw_text.md、compressed.md、各种 draft、audit JSON 等），必须及时同步到 OSS 供前端浏览。但如果同步太频繁会产生大量小文件 IO。
+**挑战：** 外部服务从 OSS 读取文件内容时，如何确保读到的是最新的、已上传完成的版本？
 
-**方案：**
+**问题场景：**
+- Claude Code 在 Worker 上修改了 manuscript_final.md
+- FileSyncManager 的防抖窗口还没到期，尚未上传
+- 此时外部服务查询 → 拿到的是旧版本
+
+**方案：三层保证**
 
 ```
-分层同步策略:
+1. 单文件原子性:
+   OSS PutObject / S3 PutObject 是原子操作
+   → 一旦能读到，就是完整的文件（不存在"读到半个文件"）
+   → 不需要额外的锁或临时文件
 
-  关键文件 (state.json, metrics.json):
-    → 变更后 0.5s 内同步（几乎实时）
-    → 前端靠这些文件构建进度条
+2. 版本新鲜度标注:
+   每次同步批次完成后更新 _sync_manifest.json:
+     { "last_sync_at": "...", "files": { "path": {"synced_at": "...", "md5": "..."} } }
+   API 响应包含 synced_at 和 sync_lag_max_seconds
+   → 外部服务知道数据可能滞后几秒
 
-  中等文件 (manuscript_*.md, audit_*.json, blueprint.md):
-    → 变更后 2s 防抖同步
-    → 前端可以点击查看
+3. 强制刷新（可选）:
+   GET /api/books/{slug}/files/{path}?force_sync=true
+   → Manager 通知 Worker Runtime 立即上传该文件（跳过防抖）
+   → 等待上传完成后返回最新内容
+   → 延迟增加 ~1-3s，但保证最新
 
-  大文件 (raw_text.md, compressed.md):
-    → 变更后 5s 防抖同步
-    → 通常只在 Phase 1 生成一次
-
-  实现:
-    Worker Runtime 的 FileSyncManager:
-      - inotify 监听 .work/ 递归
-      - 按文件路径匹配 → 不同防抖等级
-      - debounce timer 到期 → 增量上传（只传变化的文件）
-      - 上传到 OSS: oss://bucket/{worker_id}/{book_slug}/...
+实际影响:
+  防抖窗口最大 5s → 外部查询最多滞后 5 秒
+  对于 Phase 进度（state.json，0.5s 防抖）→ 几乎实时
+  对于讲稿预览（2s 防抖）→ 用户感知不到延迟
 ```
 
 ### 5.4 并发控制
@@ -750,9 +1016,13 @@ Worker Runtime 的槽位管理:
 | **Session 路由** | 修改请求路由到 session 所在的 Worker | 通用 — 有状态工作负载的亲和性路由 |
 | **Session 持久化** | 做书完成后会话不销毁，支持随时 --resume | 通用 — 任何需要多轮交互的 Agent |
 | **双向 Chat 中继** | 外部 → Manager → Worker → Claude Code (--resume) | 通用 — 人工审批、交互式 Agent |
-| **文件实时同步** | .work/ 目录变更立即同步到 OSS/S3 | 通用 — 需要外部实时查看 Agent 产物 |
+| **文件实时同步到云存储** | .work/ + session 文件 → OSS/S3，分层防抖 + 同步清单 | 通用 — 需要外部实时查看 Agent 产物 |
+| **从云存储统一读取** | 内容查询走 OSS 不走 Worker，附带一致性元数据 | 通用 — 解耦读路径和 Worker 生命周期 |
+| **Webhook 事件通知** | 做书完成/失败/Phase 切换 → 推送到注册的 URL | 通用 — 后端系统异步事件驱动 |
+| **任务重试/续跑** | 从指定 Phase 重新开始 或 断点续跑失败任务 | 通用 — 长时间任务的容错 |
 | **常驻 Worker** | 手动扩容/缩容，不自动销毁 | 通用 — 稳定工作负载场景 |
 | **文件上传到 Worker** | Bootstrap 或运行时上传 PDF 等输入文件 | 通用 — 任何需要输入文件的任务 |
+| **跨 Worker Session 迁移** | session + workspace 备份到 OSS 后可在新 Worker 恢复 | 通用 — Worker 故障恢复 |
 
 ### 7.2 与其他 Harness 的交叉验证
 
@@ -766,7 +1036,11 @@ Worker Runtime 的槽位管理:
 | 优雅缩容 | ✅ 长时间训练 | ✅ 30min 任务 | ✅ 手动缩容需检查活跃会话 | **框架核心** |
 | 双层凭证 | ✅ WandB/HF | ✅ Git key | ✅ Claude 账号 | **框架核心** |
 | 双向 Chat | ✅ 飞书指令 | ✅ Plan 审批 | ✅ **修改指令 + 合规决策** | **框架核心** |
-| 文件同步到 OSS/S3 | — | — | ✅ **.work/ 实时同步** | **新增** |
+| 文件同步到 OSS/S3 | — | — | ✅ **.work/ + session 实时同步** | **新增** |
+| 云存储统一读取 | — | — | ✅ **内容查询走 OSS** | **新增** |
+| Webhook 通知 | ✅ 飞书 | — | ✅ **完成/失败/Phase 通知** | **新增** |
+| 任务重试/续跑 | — | ✅ 重试 | ✅ **from_phase + continue** | **新增** |
+| 跨 Worker 迁移 | — | — | ✅ **OSS → 新 Worker** | **新增** |
 | 常驻 Worker | ✅ | ✅ | ✅ | 已有 |
 
 ### 7.3 成本估算
