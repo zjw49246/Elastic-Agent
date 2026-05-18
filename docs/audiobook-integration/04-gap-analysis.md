@@ -695,6 +695,81 @@ class TaskStatus(str, enum.Enum):
 
 ---
 
+### 3.19 [P1] 修改流程未重新注册文件同步映射
+
+**现状：**
+
+04-gap-analysis §3.1 方案中，生产完成后发送 `UNREGISTER_SYNC_MAPPING` 停止文件同步。但修改流程（`--resume`）会产生新的文件变更（如更新 manuscript_final.md），这些变更需要同步到 OSS。
+
+**影响：**
+- 修改过程中的文件变更不会同步到 OSS
+- audio_book_echo_editor 读取的最终稿仍是修改前的旧版本
+- `task.edit.completed` webhook 中指向的 manuscript 可能是过时的
+
+**补充方案：**
+
+修改流程需要包含同步映射的注册和注销：
+
+```
+handle_edit_request(task_id, message):
+  1. 检查 session 状态和槽位
+  2. 重新注册同步映射:
+     await runtime.send_message("REGISTER_SYNC_MAPPING", mapping)
+  3. 启动 Claude Code --resume
+  4. 修改完成 (_on_process_exit):
+     → 触发 FileSyncManager 立即 flush 所有待同步文件
+     → 等待 flush 完成
+     → 发送 UNREGISTER_SYNC_MAPPING
+     → 发送 task.edit.completed webhook
+```
+
+**变更点：** 02-audiobook-agent-service §4.1 (handle_edit_request)
+
+---
+
+### 3.20 [P1] 同一任务的并发修改请求未做互斥
+
+**现状：**
+
+`handle_edit_request` 只检查 Worker 的 edit_slots 总量是否满，不检查当前 task_id 是否已有正在进行的修改。如果用户快速连续发送两条修改指令（如"修改第三章"和"修改第五章"），两个 `--resume` 进程会同时恢复同一个 session，可能导致 session 文件损坏。
+
+**影响：**
+- Claude Code session .jsonl 被两个进程同时读写 → 文件损坏
+- 两个进程产生的输出交叉混乱
+- 可能导致该 session 永久不可用
+
+**补充方案：**
+
+在 `handle_edit_request` 开头增加 per-task 互斥检查：
+
+```python
+async def handle_edit_request(self, task_id: str, message: str):
+    session = self.session_registry.get(task_id)
+    if not session:
+        raise NotFoundError(...)
+
+    # 新增: 检查该任务是否已有正在进行的修改
+    if session.status == "editing":
+        raise ConflictError(
+            f"Task {task_id} already has an active modification. "
+            "Please wait for the current edit to complete."
+        )
+
+    # 检查 Worker edit_slots
+    worker_state = await self.get_worker_slot_state(session.worker_id)
+    if worker_state.edit_slots.used >= worker_state.edit_slots.max:
+        raise CapacityError(...)
+
+    session.status = "editing"
+    # ... 启动 --resume
+```
+
+audio_book_echo_editor 前端也应在 UI 层面禁止同一任务的并发修改请求（按钮置灰 + 提示"修改进行中"）。
+
+**变更点：** 02-audiobook-agent-service §4.1 (handle_edit_request)、03-audiobook-app-adaptation 前端
+
+---
+
 ## 4. 问题汇总与状态
 
 | # | 严重度 | 标题 | 状态 | 影响文档 |
@@ -717,3 +792,5 @@ class TaskStatus(str, enum.Enum):
 | 3.16 | P3 | 取消状态映射 | 建议新增 CANCELLED 枚举 | 跑书方案 §6.3 |
 | 3.17 | P3 | 前端直连安全 | JWT token + CORS | 跑书方案 §5.5 |
 | 3.18 | P3 | 监控告警 | 后续迭代 | 非 MVP |
+| 3.19 | P1 | 修改流程未重新注册同步映射 | 修改前 REGISTER、完成后 flush+UNREGISTER | harness §4.1 |
+| 3.20 | P1 | 同一任务并发修改无互斥 | session.status=="editing" 时拒绝新修改 | harness §4.1, 前端 |

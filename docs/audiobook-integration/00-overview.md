@@ -492,4 +492,6 @@ Audiobook Agent Service → audio_book_echo_editor 的所有 Webhook 事件共�
 | SessionRegistry 内存丢失导致修改不可路由 | 高 | JSON 持久化 + 启动时从 manifest 重建 | 04-gap-analysis §3.3 |
 | 单 Worker 4 并发 Claude 账号额度耗尽 | 中 | CredentialPool 按槽位预分配 + 额度监控 | 04-gap-analysis §3.6 |
 | Webhook 丢失导致 audio_book 状态不更新 | 中 | 轮询兜底 + 事件重放 | 04-gap-analysis §3.9 |
+| 修改流程文件不同步（sync mapping 已注销） | 中 | 修改前重新 REGISTER，完成后 flush + UNREGISTER | 04-gap-analysis §3.19 |
+| 同一任务并发修改导致 session 损坏 | 高 | session.status 互斥检查 + 前端按钮防重 | 04-gap-analysis §3.20 |
 | OSS 同步延迟导致前端读到旧数据 | 低 | 三种新鲜度策略（事件驱动/直接查询/强制刷新） | 02-audiobook-agent-service §5.3 |

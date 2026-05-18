@@ -249,7 +249,7 @@ POST /api/tasks/{task_id}/chat
 | HTTP | 场景 |
 |------|------|
 | 404 | 任务不存在 |
-| 409 | 任务未完成（无 session） |
+| 409 | 任务未完成（无 session），或该任务已有修改正在进行中 |
 | 429 | 修改槽位已满（含 `retry_after` 秒数） |
 | 503 | Worker 离线 |
 
