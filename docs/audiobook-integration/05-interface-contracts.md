@@ -784,30 +784,80 @@ Audiobook Agent Service 解析 `phase` 字段（**数字**）来确定当前进�
 |------|------|------|
 | `FILE_SYNCED` | `{task_id, path, oss_key, synced_at, md5}` | 文件同步完成通知（比 FILE_CHANGE 多了 oss_key） |
 
-### 5.2 Harness 接口扩展
+### 5.2 Harness 接口完整定义
+
+> **注意：** 以下是框架 Harness 基类的**完整**接口，综合了 Audiobook、ML Research、CCM、Idea Review 四个 Harness 的需求。所有方法都有合理的默认实现，Harness 只需 override 自己需要的。
 
 ```python
 class Harness(ABC):
-    # 已有接口
-    def get_worker_lifecycle(self) -> WorkerLifecycle: ...
-    def get_bootstrap_steps(self) -> list[BootstrapStep]: ...
-    def get_event_handlers(self) -> dict: ...
 
-    # 新增接口
+    # ── 基础配置（所有 Harness 都会用到） ──
+
+    def get_worker_lifecycle(self) -> WorkerLifecycle:
+        """Worker 生命周期模型：PERSISTENT（常驻）或 EPHEMERAL（按需创建/销毁）"""
+        return WorkerLifecycle.PERSISTENT
+
+    @abstractmethod
+    def get_bootstrap_steps(self) -> list[BootstrapStep]:
+        """Bootstrap 初始化步骤列表。每个 Harness 必须实现。"""
+        ...
+
+    def get_event_handlers(self) -> dict[FrameworkEvent, Callable]:
+        """订阅框架事件的回调函数映射"""
+        return {}
+
     def get_worker_capacity(self) -> WorkerCapacity:
-        """返回 Worker 容量配置（槽位模型）"""
+        """Worker 并发容量。Audiobook 用 AudiobookWorkerCapacity 子类扩展。"""
         return WorkerCapacity(max_concurrent_tasks=1)
 
+    # ── 代码部署 ──
+
+    def get_repo_url(self) -> str | None:
+        """Worker 上需要 clone 的代码仓库 URL。返回 None 表示不需要 clone。"""
+        return None
+
+    def get_service_definitions(self) -> list[ServiceDefinition]:
+        """Worker 上需要注册的常驻服务（systemd unit）。
+        返回空列表表示无常驻服务（batch processing 模式，如 Idea Review）。"""
+        return []
+
+    # ── 凭证 ──
+
+    def get_app_credentials(self) -> list[str]:
+        """应用凭证名称列表（Git key、WandB token、API key 等）。
+        框架在 Bootstrap 时将这些凭证安全注入 Worker 环境。"""
+        return []
+
+    # ── 健康检查 ──
+
+    def get_health_check(self) -> dict | None:
+        """自定义 L3 应用级健康检查。返回 None 使用默认（进程存活检查）。
+        示例: {"type": "http", "url": "http://localhost:8080/status", "interval": 30}
+        示例: {"type": "command", "command": "python3 -c 'import sdk; print(ok)'", "interval": 60}
+        """
+        return None
+
+    # ── 扩缩容 ──
+
+    def get_scaling_signal(self) -> ScalingSignal | None:
+        """扩缩容信号。框架的 ScalingEngine（Phase 2）根据此信号自动决策。
+        返回 None 表示不参与自动扩缩容（仅手动操作）。"""
+        return None
+
+    # ── 文件同步（opt-in，默认关闭） ──
+
     def get_file_sync_config(self) -> FileSyncConfig:
-        """返回文件同步模板配置（动态映射通过 REGISTER_SYNC_MAPPING 推送）"""
+        """文件同步模板配置。enabled=False 时整个 FileSyncManager 不激活。"""
         return FileSyncConfig(enabled=False)
 
     def get_task_sync_mapping(self, task_context: dict) -> SyncMapping:
-        """给定任务上下文，返回该任务的同步映射。Manager 启动任务时调用。"""
+        """给定任务上下文，返回该任务的同步映射。仅在 file sync 启用时需要。"""
         raise NotImplementedError
 
+    # ── 任务生命周期回调 ──
+
     async def on_task_completed(self, task_id: str, result: dict) -> None:
-        """任务完成回调。Harness 可在此注册 session、发送 Webhook 等。"""
+        """任务完成回调。Harness 可在此注册 session、发送 Webhook、写回外部 API 等。"""
         pass
 
     async def on_task_failed(self, task_id: str, error: dict) -> None:
