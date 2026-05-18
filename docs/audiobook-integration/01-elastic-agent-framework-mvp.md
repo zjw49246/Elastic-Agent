@@ -42,6 +42,9 @@
 - [ ] **T-035** REGISTER_SYNC_MAPPING / UNREGISTER_SYNC_MAPPING 协议消息（Manager→Worker 动态注册/注销同步映射）
 - [ ] **T-036** FileSyncManager 上传错误处理（重试、分片上传、本地缓冲）
 - [ ] **T-037** FILE_SYNCED 事件类型（区别于 FILE_CHANGE，确认文件已同步到 OSS）
+- [ ] **T-038** Worker 进程日志落盘（stdout/stderr → 本地 NDJSON 文件 + LOG 事件双写）
+- [ ] **T-039** Manager 结构化操作日志（JSON Lines 格式，覆盖扩缩容/Bootstrap/对账/凭证/Webhook 全部关键操作）
+- [ ] **T-040** LOG 事件结构化解析（解析 Claude Code NDJSON 为 typed event，支持按 type 过滤和 token 统计）
 - [ ] **T-016** Manager FastAPI 服务骨架 + 节点管理 REST API
 - [ ] **T-017** Claude Code AgentType（安装命令、启动命令、健康检查探针）
 
@@ -66,6 +69,8 @@
 - [ ] **T-118** DryRunProvider 空跑验证
 - [ ] **T-119** 单元测试：FileSyncManager 防抖逻辑 + 同步清单生成
 - [ ] **T-120** 集成测试：Worker 文件变更 → OSS/S3 同步 → 外部 API 读取一致性
+- [ ] **T-121** 单元测试：日志落盘完整性（进程正常退出 + 崩溃退出场景）
+- [ ] **T-122** 集成测试：Worker 日志落盘 → FileSyncManager → OSS → 外部 API 读取一致性
 
 ---
 
@@ -167,7 +172,10 @@
 
 数据流 ②：日志回传（高频，大流量）
   Worker → Manager → EventBus → 外部 API (WebSocket/SSE) → 前端
-  每行 Claude Code stdout (NDJSON) 产生一个 LogEvent
+  每行 Claude Code stdout/stderr (NDJSON) 产生一个 LogEvent
+  Worker Runtime 同时将原始输出写入本地日志文件（per-task NDJSON）
+  本地日志文件通过 FileSyncManager 持久化到 OSS/S3
+  实时流用于前端展示，持久化日志用于历史查询和排障
 
 数据流 ③：文件同步（持续，中等流量）
   Worker FileSyncManager: inotify → 分层防抖 → 增量上传 OSS/S3
@@ -335,7 +343,10 @@ Manager → Worker (命令):
               停止监听该任务的文件变更并清理映射。
 
 Worker → Manager (事件):
-  LOG          日志行             {task_id, stream, data, timestamp}
+  LOG          日志行             {task_id, stream, data, timestamp, parsed?}
+                                  stream: "stdout" | "stderr"
+                                  data: 原始输出行（字符串）
+                                  parsed: 可选的结构化解析结果（见下方说明）
   PROCESS_EXIT 进程退出           {task_id, exit_code, timestamp}
   FILE_CONTENT 文件内容响应       {request_id, path, content}
   FILE_CHANGE  文件变更事件       {path, event, content?, timestamp}
@@ -374,21 +385,30 @@ Worker → Manager (事件):
 
 ```
 Worker Runtime 管理的进程:
-  ┌────────────────────────────────────────┐
-  │ Worker Runtime (FastAPI + WS client)   │
-  │                                        │
-  │  processes: dict[task_id, Process]      │
-  │                                        │
-  │  每个进程:                              │
-  │    ├── asyncio.create_subprocess_exec   │
-  │    ├── stdout → 逐行读取 → LOG 事件     │
-  │    ├── stderr → 逐行读取 → LOG 事件     │
-  │    └── 退出 → PROCESS_EXIT 事件         │
-  │                                        │
-  │  文件监听:                              │
-  │    ├── watchdog Observer (inotify)      │
-  │    └── 变更 → FILE_CHANGE 事件          │
-  └────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ Worker Runtime (FastAPI + WS client)           │
+  │                                                │
+  │  processes: dict[task_id, Process]              │
+  │                                                │
+  │  每个进程:                                      │
+  │    ├── asyncio.create_subprocess_exec           │
+  │    ├── stdout → 逐行读取 → 双写:               │
+  │    │     ├── LOG 事件发送到 Manager（实时流）    │
+  │    │     └── 追加写入本地日志文件（持久化）      │
+  │    ├── stderr → 逐行读取 → 双写（同上）         │
+  │    └── 退出 → PROCESS_EXIT 事件                │
+  │              → 关闭日志文件                     │
+  │              → 触发 FileSyncManager 立即同步    │
+  │                日志文件到 OSS（跳过防抖）       │
+  │                                                │
+  │  日志文件路径:                                  │
+  │    由 TaskSyncMapper 的映射决定，默认:          │
+  │    {task_work_dir}/logs/{task_id}.ndjson        │
+  │                                                │
+  │  文件监听:                                      │
+  │    ├── watchdog Observer (inotify)              │
+  │    └── 变更 → FILE_CHANGE 事件                  │
+  └────────────────────────────────────────────────┘
 
 停止进程的信号序列:
   SIGINT → 等待 10s → SIGTERM → 等待 5s → SIGKILL
@@ -426,26 +446,71 @@ Worker Runtime 管理的进程:
     → Manager 转发到外部 WebSocket
 ```
 
-#### 轨迹缓存策略
+#### 轨迹存储：实时缓冲 + 持久化双层
 
 ```
                   ┌─────────────────────────┐
-                  │     轨迹缓存 (内存)       │
+                  │   实时轨迹缓冲 (内存)     │
                   │                         │
-  LOG 事件 ──────▶│  环形缓冲 (per-worker)  │──────▶ 实时订阅者 (WebSocket/SSE)
-                  │  容量: 10000 条/worker   │
+  LOG 事件 ──────▶│  环形缓冲 (per-task)    │──────▶ 实时订阅者 (WebSocket/SSE)
+                  │  容量: 5000 条/task      │
                   │                         │
-                  │  查询接口:               │──────▶ 历史查询 (REST GET)
+                  │  查询接口:               │──────▶ 近期查询 (REST GET)
                   │  by node_id             │
                   │  by task_id             │
                   │  by time range          │
                   └─────────────────────────┘
 
-MVP 不持久化轨迹到数据库。理由:
-  - 轨迹的主要消费场景是实时流（前端看 Agent 在做什么）
-  - 历史查询在 MVP 阶段频率极低
-  - 内存环形缓冲足够（10000 条 × 50 Worker × ~200B/条 ≈ 100MB）
-  - 后续 Phase 2 引入 ClickHouse/PostgreSQL 做轨迹持久化
+                  ┌─────────────────────────┐
+                  │   持久化轨迹 (OSS/S3)    │
+                  │                         │
+  Worker 日志文件 ─▶│  logs/{task_id}.ndjson  │──────▶ 历史查询 / 排障 / 回放
+  (FileSyncManager) │  per-task 独立文件      │
+                  │                         │
+                  └─────────────────────────┘
+
+两层职责分工:
+  - 实时缓冲: 服务当前活跃的 WebSocket/SSE 订阅者和近期 REST 查询
+    容量改为 per-task（非 per-worker），每个任务独立 5000 条
+    任务结束后缓冲可释放（历史查询走 OSS）
+  - 持久化日志: Worker Runtime 在读取进程输出时同步写入本地文件
+    FileSyncManager 将文件同步到 OSS/S3
+    任务完成后触发立即同步（跳过防抖），确保日志完整
+    支持完整的历史查询、聊天记录回放、运维排障
+```
+
+#### LOG 事件结构化解析
+
+Worker Runtime 在发送 LOG 事件时，如果 data 是合法 JSON 且包含 `type` 字段（Claude Code stream-json 格式），则同时附带 `parsed` 字段：
+
+```
+LOG 事件（增强）:
+  {
+    "task_id": "123",
+    "stream": "stdout",
+    "data": "{\"type\":\"assistant\",\"content\":\"开始 Phase 1...\"}",
+    "timestamp": "2026-05-17T10:01:23Z",
+    "parsed": {
+      "type": "assistant",
+      "subtype": null,
+      "cost_usd": null,
+      "session_id": null
+    }
+  }
+
+parsed 字段的 type 枚举（来自 Claude Code stream-json）:
+  system       系统消息（模型、配置信息）
+  assistant    Claude 输出文本
+  user         用户输入（-p 参数）
+  tool_use     工具调用（Read/Edit/Bash 等）
+  tool_result  工具执行结果
+  result       最终结果（包含 session_id, cost_usd, context_usage）
+
+框架层面的处理:
+  - 实时缓冲支持按 parsed.type 过滤（如只返回 assistant + result）
+  - result 类型的事件额外提取 session_id 和 cost_usd 到 PROCESS_EXIT
+  - 非 JSON 行或无 type 字段的行：parsed = null（不影响转发）
+  - stderr 输出: parsed 始终为 null（stderr 不是 NDJSON 格式）
 ```
 
 #### 认证模型
@@ -783,12 +848,14 @@ EventBus
   ├── 生产者: HealthChecker (WORKER_UNHEALTHY)
   ├── 生产者: ElasticAgentManager (NODE_CREATING, NODE_READY, ...)
   ├── 生产者: CredentialPool (CREDENTIAL_ROTATED, CREDENTIAL_EXHAUSTED)
+  ├── 生产者: OperationLogger (SCALE_OUT, BOOTSTRAP_STEP, RECONCILE, ...)
   │
   ├── 消费者: 外部 API traces 端点 (订阅 LOG 事件)
   ├── 消费者: 外部 API files 端点 (订阅 FILE_CHANGE 事件)
   ├── 消费者: Harness 事件回调 (订阅框架事件)
   ├── 消费者: HealthChecker (订阅 HEARTBEAT 超时)
-  └── 消费者: 轨迹缓存 (订阅 LOG 事件 → 写入环形缓冲)
+  ├── 消费者: 轨迹缓存 (订阅 LOG 事件 → 写入环形缓冲)
+  └── 消费者: OperationLogger (所有事件 → 结构化 JSON Lines 日志文件)
 
 实现:
   MVP 用 asyncio.Queue 的 fan-out 模式:
@@ -800,6 +867,71 @@ EventBus
     - MVP 是单进程，内存 Queue 足够
     - 延迟更低（纳秒 vs 毫秒）
     - 无外部依赖
+```
+
+### 3.8 结构化操作日志
+
+框架所有关键操作写入结构化日志文件，用于运维排障和审计。
+
+```
+日志文件: ~/.elastic-agent/operations.log (JSON Lines 格式，按日轮转)
+
+每条日志包含:
+  {
+    "ts": "2026-05-17T10:01:23Z",
+    "level": "INFO",
+    "component": "bootstrap",
+    "action": "step_completed",
+    "node_id": "aliyun:i-bp1xxx",
+    "details": {"step": "install-claude-code", "duration_ms": 12345},
+    "trace_id": "op-abc123"
+  }
+
+覆盖的操作类别:
+
+  扩缩容:
+    scale_out_started     {count, trigger}
+    scale_out_completed   {nodes[], duration_ms}
+    scale_in_started      {node_id, reason}
+    instance_created      {node_id, instance_type, region}
+    instance_terminated   {node_id, reason}
+
+  Bootstrap:
+    bootstrap_started     {node_id, steps[]}
+    step_started          {node_id, step_name}
+    step_completed        {node_id, step_name, duration_ms}
+    step_failed           {node_id, step_name, error, stderr}
+    bootstrap_completed   {node_id, total_duration_ms}
+    bootstrap_failed      {node_id, failed_step, strategy}
+
+  健康检查:
+    health_check_passed   {node_id, level}
+    health_check_failed   {node_id, level, consecutive_failures}
+    worker_marked_unhealthy {node_id, reason}
+
+  凭证:
+    credential_assigned   {node_id, credential_id, slot_type}
+    credential_rotated    {node_id, old_id, new_id, reason}
+    credential_recovered  {node_id, credential_id}
+    quota_warning         {credential_id, usage_pct}
+
+  对账:
+    reconcile_started     {}
+    orphan_found          {instance_id, action}
+    ghost_found           {node_id, action}
+    reconcile_completed   {orphans, ghosts, duration_ms}
+
+  Webhook:
+    webhook_sent          {event_type, task_id, target_url, status_code}
+    webhook_retry         {event_type, task_id, attempt, next_retry_at}
+    webhook_failed        {event_type, task_id, attempts, error}
+
+  Worker 连接:
+    worker_connected      {node_id, reconnect: bool}
+    worker_disconnected   {node_id, reason}
+
+日志轮转: 按日轮转，保留 30 天。
+Harness 可通过 self.logger 写入同一日志流。
 ```
 
 ---
@@ -1134,9 +1266,10 @@ elastic-agent/
 │   │   ├── monitor/            # 健康检查 + 额度监控 + 云端对账 + 事件总线
 │   │   ├── scheduler/          # Drain 机制
 │   │   ├── external_api/       # 轨迹流 + 文件传输 + 认证 + FastAPI Router
+│   │   ├── logging/            # 结构化操作日志 + 日志轮转
 │   │   └── security/           # Manager↔Worker 认证
 │   ├── manager/                # FastAPI 应用 + ElasticAgentManager + 配置模型
-│   ├── worker/                 # Runtime 服务入口 + 进程管理 + FileSyncManager
+│   ├── worker/                 # Runtime 服务入口 + 进程管理 + 日志落盘 + FileSyncManager
 │   └── cli/                    # 命令行入口
 ├── dashboard/                  # React + Vite + Ant Design 前端
 ├── infra/
@@ -1199,7 +1332,14 @@ credentials:
 
 external_api:
   enabled: true
-  trace_buffer_size: 10000
+  trace_buffer_size: 5000                  # per-task 缓冲条数
+
+logging:
+  operations_log: "~/.elastic-agent/operations.log"
+  log_level: "INFO"
+  rotation: "daily"
+  retention_days: 30
+  worker_process_log_dir: "logs/"          # Worker 进程日志目录（相对于任务工作目录）
 
 monitor:
   health_check_interval: 30

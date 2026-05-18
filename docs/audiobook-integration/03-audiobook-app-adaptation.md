@@ -1758,7 +1758,7 @@ ELASTIC_AGENT_POLL_INTERVAL_SECONDS=300
 | 获取最终讲书稿 | `/api/tasks/{task_id}/script-production/manuscript` | GET | `task_id` | markdown 文本和来源文件 | OSS manifest + OSS object |
 | 导出交付包 | `/api/tasks/{task_id}/script-production/export` | GET | `task_id` | zip 文件或预签名 URL | OSS `delivery/audiobook_delivery.zip` |
 | 发送修改指令 | `/api/tasks/{task_id}/script-production/chat` | POST | `message`、`idempotency_key` 可选 | `edit_run_id`、状态 | Audiobook Agent Service chat |
-| 查看聊天历史 | `/api/tasks/{task_id}/script-production/chat/history` | GET | `task_id` | 历史消息 | OSS session/logs |
+| 查看聊天历史 | `/api/tasks/{task_id}/script-production/chat/history` | GET | `task_id` | 历史消息 | OSS `logs/*.ndjson` |
 | 获取 WS 直连配置 | `/api/tasks/{task_id}/script-production/stream-config` | GET | `task_id` | `ws_url`、`token`、`expires_at` | Audiobook Agent Service stream-config |
 
 ### 10.2 创建任务接口的字段变化
@@ -1956,7 +1956,7 @@ oss://{bucket}/elastic-agent/tasks/{task_id}/
 | 单文件内容 | `/api/tasks/{task_id}/script-production/files/{path}` | manifest 中对应 OSS object | path 必须存在于 manifest |
 | 最终讲书稿 | `/api/tasks/{task_id}/script-production/manuscript` | manifest + OSS object | 按优先级选择最终稿 |
 | 导出包 | `/api/tasks/{task_id}/script-production/export` | `delivery/audiobook_delivery.zip` | 返回文件或预签名 URL |
-| 聊天历史 | `/api/tasks/{task_id}/script-production/chat/history` | `sessions/session.jsonl` + `logs/*.ndjson` | 后端解析后返回 |
+| 聊天历史 | `/api/tasks/{task_id}/script-production/chat/history` | `logs/*.ndjson`（Worker Runtime 双写的持久化日志） | 按 parsed.type 过滤 assistant/result 消息后返回 |
 
 最终稿选择优先级：
 

@@ -435,6 +435,10 @@ oss://audiobook-production/
 │   │   ├── session/                        # Claude Code session 文件
 │   │   │   ├── session.jsonl               # 主对话历史
 │   │   │   └── .claude.json                # 项目配置
+│   │   ├── logs/
+│   │   │   ├── production.ndjson            # 生产过程完整 NDJSON 日志（Worker Runtime 自动写入）
+│   │   │   └── edits/
+│   │   │       └── {edit_run_id}.ndjson     # 修改过程 NDJSON 日志
 │   │   └── _sync_manifest.json             # 同步元数据（见下方）
 │   ├── {task_id_2}/
 │   │   └── ...
@@ -637,9 +641,16 @@ Session 文件备份到 OSS 后，理论上可以在另一台 Worker 上恢复�
 
 上行 (Claude Code → 前端):
   Claude Code stdout (stream-json NDJSON)
-    → Worker Runtime 逐行读取 → LOG 消息 via WS
-    → Manager EventBus → 外部 API 轨迹流
+    → Worker Runtime 逐行读取，双写:
+        1. LOG 事件 via WS → Manager EventBus → 外部 API 轨迹流（实时推送）
+        2. 本地 NDJSON 日志文件（持久化，用于历史查询和排障）
+           生产模式 → logs/production.ndjson
+           修改模式 → logs/edits/{edit_run_id}.ndjson
+    → 日志文件随 FileSyncManager 同步到 OSS
     → 做书前端 WebSocket → 渲染为聊天气泡
+
+  chat/history 从 OSS 上持久化的 logs/*.ndjson 文件解析，
+  而非内存中的 trace buffer，因此即使 Manager 重启也不丢失历史记录。
 
 下行 (前端 → Claude Code):
   目前 Claude Code -p (prompt mode) 是单次输入
@@ -702,7 +713,7 @@ POST /api/tasks/{task_id}/retry
 | `/api/tasks/{task_id}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
 | `/api/tasks/{task_id}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
 | `/api/tasks/{task_id}/chat/stream-config` | `GET` | 获取 WS 直连 token（前端用此 token 直连 chat/stream，避免双层代理） |
-| `/api/tasks/{task_id}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 session .jsonl 解析） |
+| `/api/tasks/{task_id}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 logs/*.ndjson 解析，按 parsed.type 过滤 assistant/result 消息） |
 
 **Chat stream 的统一设计：**
 
@@ -852,7 +863,10 @@ class AudiobookHarness(Harness):
         REGISTER_SYNC_MAPPING 推送到 Worker 的 TaskSyncMapper。
         """
         return FileSyncConfig(
-            watch_base_paths=["/root/.work/", "~/.claude/projects/"],
+            watch_base_paths=[
+                "/root/.work/",          # workspace + logs/ 都在此目录下
+                "~/.claude/projects/",   # session 文件
+            ],
             debounce_tiers={
                 "state.json": 0.5,       # 关键文件 — 几乎实时
                 "manuscript_*": 2,        # 讲稿 — 2s 防抖
@@ -1305,9 +1319,10 @@ Audiobook Agent Service 维护每个 task 的 last_progress_time:
 session_id 提取优先级:
 
   Primary: 从 stream-json 的 result 事件提取（正常路径）
-    Worker Runtime 在读取 stdout 时:
-      如果行是 JSON 且 type="result" → 提取 session_id
+    Worker Runtime 在读取 stdout 时对每行 NDJSON 做结构化解析（parsed 字段）:
+      如果 parsed.type="result" → 提取 parsed.session_id
       在 PROCESS_EXIT 事件中附带 session_id
+    这是最可靠的提取路径，因为 result 事件是 Claude Code 的正常结束信号
     适用: Claude Code 正常退出的情况
 
   Secondary: 扫描 ~/.claude/projects/{path_hash}/ 目录
@@ -1411,6 +1426,8 @@ PROCESS_EXIT 时的关键动作:
 | **任务重试/续跑** | 从指定 Phase 重新开始 或 断点续跑失败任务 | 通用 — 长时间任务的容错 |
 | **常驻 Worker** | 手动扩容/缩容，不自动销毁 | 通用 — 稳定工作负载场景 |
 | **文件写入到 Worker** | 运行时将原始文本等输入写入 Worker 文件系统 | 通用 — 任何需要输入数据的任务 |
+| **Worker 进程日志落盘** | Worker Runtime 进程输出双写（LOG 事件 + 本地文件），持久化到 OSS，支持历史查询和排障 | 通用 — 所有 Harness 都需要历史日志 |
+| **LOG 事件结构化解析** | 解析 Claude Code NDJSON 输出为 typed event（assistant/tool_use/result...），支持过滤和统计 | 通用 — 需要从输出中提取 session_id、cost 等 |
 | **跨 Worker Session 迁移** | session + workspace 备份到 OSS 后可在新 Worker 恢复 | 通用 — **MVP 不做**，数据基础已备 |
 
 ### 7.2 与其他 Harness 的交叉验证

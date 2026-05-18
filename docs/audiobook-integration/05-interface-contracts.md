@@ -644,9 +644,9 @@ oss://{bucket}/{oss.prefix}/
 │   ├── session.jsonl                # Claude Code 对话历史
 │   └── .claude.json                 # 项目配置
 └── logs/
-    ├── production.ndjson            # 生产过程 NDJSON 日志
+    ├── production.ndjson            # Worker Runtime 自动写入的生产过程完整日志
     └── edits/
-        └── {edit_run_id}.ndjson     # 修改过程日志
+        └── {edit_run_id}.ndjson     # Worker Runtime 自动写入的修改过程日志
 ```
 
 ### 4.2 _sync_manifest.json 格式
@@ -702,8 +702,8 @@ oss://{bucket}/{oss.prefix}/
 | `delivery_export` | 打包下载 | delivery/audiobook_delivery.zip |
 | `session` | Claude Code 对话历史 | session/session.jsonl |
 | `session_config` | Claude Code 项目配置 | session/.claude.json |
-| `log_production` | 生产日志 | logs/production.ndjson |
-| `log_edit` | 修改日志 | logs/edits/*.ndjson |
+| `log_production` | 生产过程完整 NDJSON 日志（Worker Runtime 双写） | logs/production.ndjson |
+| `log_edit` | 修改过程完整 NDJSON 日志（Worker Runtime 双写） | logs/edits/*.ndjson |
 | `workspace_file` | 其他工作文件 | workspace/**/* |
 
 ### 4.3 最终稿选择优先级
@@ -763,6 +763,63 @@ Audiobook Agent Service 解析 `phase` 字段（**数字**）来确定当前进�
 
 此映射由 Audiobook Agent Service 负责，audio_book_echo_editor 只接收字符串枚举。
 
+### 4.5 chat/history 响应格式
+
+`GET /api/tasks/{task_id}/chat/history` 从 OSS 的 `logs/production.ndjson`（或 `logs/edits/{edit_run_id}.ndjson`）解析后返回。
+
+**响应格式：**
+
+```json
+{
+  "task_id": "123",
+  "messages": [
+    {
+      "role": "user",
+      "content": "/audiobook /root/books/outliers/raw_text.md nonfiction_default target_pct=12",
+      "timestamp": "2026-05-17T10:00:01Z"
+    },
+    {
+      "role": "assistant",
+      "content": "开始 Phase 1: 书籍解构...",
+      "timestamp": "2026-05-17T10:00:05Z"
+    },
+    {
+      "role": "tool_use",
+      "tool_name": "Read",
+      "tool_input": {"file_path": "/root/books/outliers/raw_text.md"},
+      "timestamp": "2026-05-17T10:00:06Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Phase 1 完成，已生成 compressed.md...",
+      "timestamp": "2026-05-17T10:05:30Z"
+    }
+  ],
+  "total_messages": 1234,
+  "source": "logs/production.ndjson",
+  "has_more": true,
+  "next_offset": 50
+}
+```
+
+**解析规则：**
+
+从 NDJSON 日志中逐行解析，按 `parsed.type` 字段过滤和映射：
+
+| NDJSON type | 响应中的 role | 包含字段 |
+|---|---|---|
+| `user` | `user` | content |
+| `assistant` | `assistant` | content |
+| `tool_use` | `tool_use` | tool_name, tool_input |
+| `tool_result` | `tool_result` | tool_name, output (截断到 500 字符) |
+| `result` | `result` | session_id, cost_usd, duration_seconds |
+| `system` | (跳过) | — |
+
+**分页参数：**
+- `offset`: 起始消息索引（默认 0）
+- `limit`: 返回消息数（默认 50，最大 200）
+- `types`: 过滤消息类型，逗号分隔（如 `types=assistant,result`，默认返回全部）
+
 ---
 
 ## 5. Elastic-Agent 框架内部契约
@@ -783,6 +840,17 @@ Audiobook Agent Service 解析 `phase` 字段（**数字**）来确定当前进�
 | 类型 | 字段 | 说明 |
 |------|------|------|
 | `FILE_SYNCED` | `{task_id, path, oss_key, synced_at, md5}` | 文件同步完成通知（比 FILE_CHANGE 多了 oss_key） |
+| `LOG` | `{task_id, stream, data, timestamp, parsed?}` | parsed 为可选的 NDJSON 结构化解析结果 |
+
+`parsed` 字段（当 `data` 是合法 Claude Code stream-json 时自动填充）：
+
+```json
+{
+  "type": "assistant" | "user" | "tool_use" | "tool_result" | "result" | "system",
+  "cost_usd": float | null,
+  "session_id": string | null
+}
+```
 
 ### 5.2 Harness 接口完整定义
 

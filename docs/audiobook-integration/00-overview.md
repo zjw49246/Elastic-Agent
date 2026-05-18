@@ -124,13 +124,13 @@ app.include_router(audiobook_api_router)
 | 模块 | 职责 | 不做什么 |
 |------|------|---------|
 | CloudProvider | 抹平阿里云/AWS 差异，实例 CRUD | 不决定何时创建/销毁 |
-| Worker Runtime | Manager↔Worker 双向通信，进程管理，文件操作 | 不理解任务业务语义 |
+| Worker Runtime | Manager↔Worker 双向通信，进程管理，日志双写（实时流+本地落盘），文件操作 | 不理解任务业务语义 |
 | NodeRegistry | 节点状态持久化 | 不知道"槽位"概念 |
 | Bootstrap Pipeline | 可插拔初始化步骤 | 不内置 audiobook 插件安装 |
 | HealthChecker | L1/L2/L3 健康检查 | 不定义"卡住"的业务含义 |
 | CloudReconciler | 标签对账，孤儿清理 | — |
 | EventBus | 内部事件分发 | 不定义业务事件 |
-| External API | 通用轨迹流、文件访问、集群状态 | 不暴露 task/chat/session 接口 |
+| External API | 通用轨迹流（实时+历史）、文件访问、集群状态 | 不暴露 task/chat/session 接口 |
 | FileSyncManager | Worker 文件 → OSS/S3 同步，防抖，清单 | 不知道 book_slug → task_id 映射 |
 | Harness 接口 | 定义 `Harness` 基类和回调契约 | 不提供具体实现 |
 | IaC | Terraform (阿里云) + CDK (AWS) 基础网络 | 不管实例创建 |
@@ -249,7 +249,11 @@ audio_book_echo_editor 后端收到修改完成 Webhook:
 Worker Claude Code  │  Audiobook Agent Service │  audio_book 后端    前端
   stdout NDJSON ────┼→ EventBus → External API ├──────────────→ 前端 WS 直连
                     │  (前端通过 stream-config  │                (短期 JWT token
-                    │   获取 token 后直连)       │                 由后端颁发)
+  Worker Runtime    │   获取 token 后直连)       │                 由后端颁发)
+  同时双写:          │                          │
+  ├ LOG 事件(实时流) │                          │
+  └ 本地日志文件 ────┼→ FileSyncManager → OSS   │──→ chat/history 接口
+                    │    logs/{task_id}.ndjson  │    (从 OSS 读取持久化日志)
                     │                          │
                     ├── 文件同步 ───────────────┤
                     │                          │
