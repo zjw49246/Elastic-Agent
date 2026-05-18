@@ -701,6 +701,7 @@ POST /api/tasks/{task_id}/retry
 |------|------|------|
 | `/api/tasks/{task_id}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
 | `/api/tasks/{task_id}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
+| `/api/tasks/{task_id}/chat/stream-config` | `GET` | 获取 WS 直连 token（前端用此 token 直连 chat/stream，避免双层代理） |
 | `/api/tasks/{task_id}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 session .jsonl 解析） |
 
 **Chat stream 的统一设计：**
@@ -825,8 +826,8 @@ class AudiobookHarness(Harness):
     def get_worker_lifecycle(self) -> WorkerLifecycle:
         return WorkerLifecycle.PERSISTENT  # 常驻，手动开启/关闭
 
-    def get_worker_capacity(self) -> WorkerCapacity:
-        return WorkerCapacity(
+    def get_worker_capacity(self) -> AudiobookWorkerCapacity:
+        return AudiobookWorkerCapacity(
             max_production_slots=self.config.get("max_production_slots", 1),
             max_edit_slots=self.config.get("max_edit_slots", 3),
         )

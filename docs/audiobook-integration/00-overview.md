@@ -247,7 +247,9 @@ audio_book_echo_editor 后端收到修改完成 Webhook:
                     ┌── 聊天流 (chat stream) ──┐
                     │                          │
 Worker Claude Code  │  Audiobook Agent Service │  audio_book 后端    前端
-  stdout NDJSON ────┼→ EventBus → External API ├→ WS 代理 ─────→ 聊天框渲染
+  stdout NDJSON ────┼→ EventBus → External API ├──────────────→ 前端 WS 直连
+                    │  (前端通过 stream-config  │                (短期 JWT token
+                    │   获取 token 后直连)       │                 由后端颁发)
                     │                          │
                     ├── 文件同步 ───────────────┤
                     │                          │
@@ -323,6 +325,7 @@ oss://{ELASTIC_AGENT_OSS_BUCKET}/{ELASTIC_AGENT_OSS_PREFIX}/tasks/{task_id}/
 ```
 
 - `ELASTIC_AGENT_OSS_BUCKET` 和 `ELASTIC_AGENT_OSS_PREFIX` 由 audio_book_echo_editor 在提交做书请求时指定
+- 提交 API 中 `oss.prefix` 已包含 `tasks/{task_id}/`（如 `elastic-agent/tasks/123/`），Audiobook Agent Service 直接使用，不再拼接
 - Audiobook Agent Service 按此路径配置 FileSyncManager
 - audio_book_echo_editor 按此路径读取文件
 
@@ -413,7 +416,7 @@ Audiobook Svc Phase 2 (修改模式) ──→ audio_book Phase β (前端集成
 **格式要点：**
 - `files` 使用数组格式（非 dict），支持 `role` 字段便于语义查询
 - `oss_key` 是完整的 OSS 对象路径（不包含 bucket）
-- `role` 字段值：`state`、`source`、`manuscript_final`、`manuscript_compliant`、`delivery_manuscript`、`delivery_export`、`session`、`log`、`workspace_file`
+- `role` 字段值：`state`、`source`、`source_metadata`、`manuscript_final`、`manuscript_compliant`、`delivery_manuscript`、`delivery_intro`、`delivery_export`、`session`、`session_config`、`log_production`、`log_edit`、`workspace_file`（完整定义见 [05-interface-contracts.md §4.2](05-interface-contracts.md)）
 - `md5` 用于增量同步判断和完整性校验
 
 ---
@@ -427,6 +430,7 @@ Audiobook Agent Service → audio_book_echo_editor 的所有 Webhook 事件共�
   "event_id": "evt_20260517_001",
   "event_type": "task.production.completed",
   "task_id": "123",
+  "sequence": 7,
   "timestamp": "2026-05-17T14:30:00Z",
   "data": {
     "status": "completed",

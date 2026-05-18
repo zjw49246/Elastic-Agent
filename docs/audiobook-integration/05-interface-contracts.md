@@ -108,7 +108,7 @@ POST /api/tasks/produce
 | callback.url | string | 是 | HTTPS URL | Webhook 回调地址 |
 | callback.secret_id | string | 是 | | 验签密钥标识 |
 | oss.bucket | string | 是 | | 产物写入的 OSS bucket |
-| oss.prefix | string | 是 | 末尾含 / | 产物 OSS 路径前缀 |
+| oss.prefix | string | 是 | 末尾含 /，已包含 `tasks/{task_id}/` | 产物 OSS 路径前缀（如 `elastic-agent/tasks/123/`） |
 | options.keep_session | bool | 是 | | 是否保留 session 供后续修改 |
 
 **响应（200）：**
@@ -612,7 +612,8 @@ audio_book_echo_editor 必须保证：
 ### 4.1 目录结构
 
 ```
-oss://{bucket}/{prefix}/tasks/{task_id}/
+oss://{bucket}/{oss.prefix}/
+  (oss.prefix 已包含 tasks/{task_id}/，如 elastic-agent/tasks/123/)
 ├── _sync_manifest.json              # 同步清单（索引文件）
 ├── source/
 │   ├── raw_text.md                  # 原始文本
@@ -743,7 +744,24 @@ audio_book_echo_editor 从 manifest 中选择最终稿的规则：
 }
 ```
 
-Audiobook Agent Service 解析 `phase` 字段来确定当前进度，映射到 Webhook 的 `phase` 枚举。
+Audiobook Agent Service 解析 `phase` 字段（**数字**）来确定当前进度，映射到 Webhook 的 `phase` 枚举（**字符串**）：
+
+| state.json phase (数字) | Webhook phase (字符串) | 含义 |
+|---|---|---|
+| 0 | `phase_00_init` | 初始化 |
+| 1 | `phase_01_decomposition` | 书籍解构 |
+| 2 | `phase_02_blueprint` | 战略蓝图 |
+| 3 | `phase_03_slicing` | 源文切片 |
+| 4 | `phase_04_draft` | 主体生产 |
+| 5 | `phase_05_persona` | 人格融合 |
+| 6 | `phase_06_opening_closing` | 开头结尾 |
+| 7 | `phase_07_audit` | 审核循环 |
+| 8 | `phase_08_compliance` | 合规处理 |
+| 8.5 | `phase_08_5_intro` | 简介生成 |
+| 9 | `phase_09_delivery` | 交付打包 |
+| state=DELIVERED | `completed` | 全部完成 |
+
+此映射由 Audiobook Agent Service 负责，audio_book_echo_editor 只接收字符串枚举。
 
 ---
 

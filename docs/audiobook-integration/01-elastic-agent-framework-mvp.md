@@ -733,12 +733,12 @@ Layer 2: 应用凭证（Harness 声明，框架传递）
 
   Primary Slot (production):
     - 使用高配额凭证（主账号）
-    - CLAUDE_CONFIG_DIR=/root/.claude-slot-production/
+    - CLAUDE_CONFIG_DIR=/root/.claude-prod/
     - 长时间运行，承担主要创作工作
 
   Secondary Slot(s) (edit):
     - 使用普通配额凭证（副账号）
-    - CLAUDE_CONFIG_DIR=/root/.claude-slot-edit-{n}/
+    - CLAUDE_CONFIG_DIR=/root/.claude-edit-{n}/
     - 短时间运行，按需启动
 
   隔离机制:
