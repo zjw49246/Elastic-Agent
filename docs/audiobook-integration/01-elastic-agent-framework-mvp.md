@@ -1,6 +1,6 @@
 # Elastic-Agent MVP 详细实现计划（Audiobook Integration 更新版）
 
-> **本文档是 [../mvp-plan.md](../mvp-plan.md) 的更新版本，针对 Audiobook Harness 集成场景做了修正。**
+> **本文档是 [archive/mvp-plan.md](archive/mvp-plan.md) 的更新版本，针对 Audiobook Harness 集成场景做了修正。**
 > 修正内容来自 [04-gap-analysis.md](04-gap-analysis.md) 中识别的 Gap，包括：
 > - FileSyncManager 动态映射（TaskSyncMapper）
 > - 新增通信协议消息类型（REGISTER_SYNC_MAPPING / UNREGISTER_SYNC_MAPPING / FILE_SYNCED）
