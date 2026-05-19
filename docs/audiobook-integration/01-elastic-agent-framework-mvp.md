@@ -918,9 +918,16 @@ Worker 依赖（Bootstrap 时安装）:
 Level 1: Worker 侧（周期性检查）
   Worker Runtime 每 60-90s（随机化，防反检测）对本机所有活跃凭证执行:
     1. 读取 {config_dir}/.credentials.json 获取 accessToken
-    2. Token 续期（如果距过期 < 5min）:
+    2. Token 续期（如果 now_ms >= expiresAt - 5min）:
        POST https://console.anthropic.com/v1/oauth/token
-       {grant_type: refresh_token, refresh_token: ..., client_id: 9d1c250a-...}
+       Content-Type: application/x-www-form-urlencoded
+       {grant_type=refresh_token, refresh_token=..., client_id=9d1c250a-...}
+       → 成功: 更新 accessToken + expiresAt，写回 .credentials.json
+       → 失败: 降级处理:
+         a. 先尝试用过期 token 继续（Anthropic 有短暂宽限期）
+         b. 如果额度 API 也返回 auth error → 标记 stale=true, error="refresh_failed"
+         c. 上报 Manager → Manager 触发重新登录（自动执行 14 步 OAuth）
+         d. 重新登录也失败 → 标记 login_status="login_failed" → 该账号退出分配池
     3. 调用额度 API:
        GET https://api.anthropic.com/api/oauth/usage
        Headers: Authorization: Bearer {accessToken}
@@ -1790,6 +1797,37 @@ mitmproxy 只在登录时使用（约 30-60 秒），登录完成后关闭。正
 - `expiresAt`: Unix 毫秒时间戳
 - Token 续期时机: `now_ms >= expiresAt - 5 * 60 * 1000`（过期前 5 分钟）
 - 续期后 `expiresAt = (now + expires_in) * 1000`
+- 续期请求可能返回新的 `refresh_token`（token rotation），也可能返回原值
+- Content-Type: `application/x-www-form-urlencoded`（不是 JSON）
+
+#### Token 过期的完整降级链
+
+```
+accessToken 即将过期
+  │
+  ▼
+尝试 refresh（用 refreshToken 换新 accessToken）
+  ├── 成功 → 更新 token → 继续正常运行（用户无感知）
+  │
+  └── 失败（refreshToken 也失效）
+        │
+        ▼
+      降级尝试: 用过期的 accessToken 继续
+        ├── 仍然可用（Anthropic 有短暂宽限期）→ 继续运行 + 标记 stale
+        │
+        └── 不可用（API 返回 auth error）
+              │
+              ▼
+            Worker 上报 → Manager 触发重新登录（自动执行 14 步 OAuth）
+              ├── 登录成功 → 获得新 token → 写入 .credentials.json → 恢复
+              │
+              └── 登录也失败 → 标记 login_status="login_failed"
+                    → 该账号退出分配池 → 触发轮换到其他账号
+                    → CREDENTIAL_EXHAUSTED 事件（如果无可用替代）
+```
+
+与 agent-ml-research 的差异: agent-ml-research 在 refresh 失败后标记 error 等待人工处理。
+我们的框架多了一步——自动重新执行 OAuth 登录，减少运维干预。
 
 ### 12.3 额度监控技术细节
 
