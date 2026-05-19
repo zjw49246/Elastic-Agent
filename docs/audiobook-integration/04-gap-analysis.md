@@ -480,12 +480,13 @@ Worker 常驻运行，不断接收新书生产任务。每本书在 `/root/.work
 
 **补充方案：**
 
-在 audiobook-nonfiction 插件仓库中创建适配清单，确保：
-- `/audiobook` 命令参数格式兼容 Worker Runtime 调用
-- state.json 输出字段包含 Elastic-Agent 需要的所有信息
-- delivery/ 目录结构标准化
+audiobook-nonfiction 插件本身**不做改造**（保持与产品经理 ZIP 包一致）。
+所有适配逻辑放在 Audiobook Agent Service (ABS) 中：
+- ABS 侧解析 state.json（不要求插件修改 state.json 格式）
+- ABS 侧识别 delivery/ 实际输出文件名（不要求插件标准化目录）
+- ABS 侧组装 /audiobook 命令参数（不要求插件修改参数接口）
 
-**变更点：** 需要新增一个 audiobook 插件适配文档（在 audiobook-nonfiction 独立仓库中执行）
+**变更点：** ABS A-022~A-025（适配逻辑在 ABS 仓库）
 
 ---
 

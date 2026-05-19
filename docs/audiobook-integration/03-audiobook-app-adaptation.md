@@ -1601,16 +1601,60 @@ getScriptProductionManuscript: (taskId: number) =>
 
 | backend | 展示 |
 | --- | --- |
-| `legacy_ai_service` | 当前 Agent 输出、步骤重跑、模型调用、Prompt 查看 |
-| `elastic_agent` | Elastic phase 时间线、实时 chat、文件列表、最终稿预览、session 信息 |
+| `legacy_ai_service` | 当前 Agent 输出、步骤重跑、模型调用、Prompt 查看（不变） |
+| `elastic_agent` | **左右分栏布局**（见下方） |
 
-`BookProductionProgress` 需要识别 `elastic_*` 的 `current_step`，至少展示：
+#### Elastic Agent 模式的 TaskDetail 布局
 
-```text
-排队中 -> Worker 已分配 -> 生产中 -> 文件同步中 -> 待审核
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Task: 《思考，快与慢》  │  状态: 生产中  │ Phase 4/10 (40%) │
+├────────────────────────────┬────────────────────────────────┤
+│                            │                                │
+│    Chat 流（左侧）         │    文件目录（右侧）             │
+│                            │                                │
+│  ┌──────────────────────┐  │  📁 workspace/                 │
+│  │ Claude: 开始 Phase 4  │  │    📄 state.json              │
+│  │ 主体生产...           │  │    📄 compressed.md            │
+│  │                      │  │    📄 blueprint.md             │
+│  │ [工具调用] Write      │  │    📁 sections/               │
+│  │ drafts/draft_01.md   │  │    📁 drafts/    ← 新文件高亮  │
+│  │                      │  │       📄 draft_01.md  🟢      │
+│  │ Claude: 第一章底稿    │  │    📁 styled/                 │
+│  │ 完成，开始第二章...    │  │  📁 delivery/                 │
+│  │                      │  │  📁 session/                   │
+│  │         ...           │  │                                │
+│  │                      │  │  ─── 文件预览区 ───            │
+│  ├──────────────────────┤  │  (点击文件名 → 在此处预览内容)  │
+│  │ [输入框] 发送修改指令  │  │                                │
+│  │ (仅 completed 状态)   │  │                                │
+│  └──────────────────────┘  │                                │
+│                            │                                │
+├────────────────────────────┴────────────────────────────────┤
+│  Phase 进度条: ■■■■□□□□□□ Phase 4 主体生产 (40%)            │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-后续可以细化为 Elastic 的 10 Phase。
+**左侧 Chat 流：**
+- 数据来源: 轮询 `GET /api/tasks/{id}/script-production/chat/live?offset=N`（每 2-3 秒）
+- 收到 `task.file.synced` webhook 通知时立即轮询
+- 显示: Claude 的文本输出渲染为聊天气泡，工具调用折叠显示
+- 生产模式: 只读（用户不能中途输入）
+- 修改模式: 底部输入框可用，发送后调用 `POST /api/tasks/{id}/script-production/chat`
+
+**右侧文件目录：**
+- 数据来源: `GET /api/tasks/{id}/script-production/files`（从 OSS manifest）
+- 收到 `task.file.synced` webhook 通知时刷新文件列表
+- 新增/更新的文件用绿色标记 🟢
+- 点击文件名 → 在右侧下方预览区显示内容（markdown 渲染）
+- 支持下载单个文件
+
+**底部进度条：**
+- 数据来源: `GET /api/tasks/{id}/script-production` 的 `phase` 和 `progress_pct`
+- 收到 `task.phase.changed` webhook 通知时更新
+- 10 Phase 名称: 初始化 → 解构 → 蓝图 → 切片 → 生产 → 融合 → 开头结尾 → 审核 → 合规 → 交付
+
+`BookProductionProgress` 需要识别 `elastic_*` 的 `current_step`。
 
 ### 7.4 列表筛选
 

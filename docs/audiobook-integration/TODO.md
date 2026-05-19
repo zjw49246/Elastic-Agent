@@ -12,6 +12,8 @@
 
 ## 0. 仓库初始化 — [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent)
 
+> 📖 参考: [00-overview.md](00-overview.md) §2 仓库架构
+
 - [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
 - [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），通过 `uv add git+https://github.com/zjw49246/Elastic-Agent.git` 引入框架
 - [ ] **S-003** [ABS] 更新 CLAUDE.md / 编写 README.md，引用本方案文档
@@ -19,6 +21,8 @@
 ---
 
 ## 1. Elastic-Agent 框架 — [Elastic-Agent](https://github.com/zjw49246/Elastic-Agent)
+
+> 📖 参考: [01-elastic-agent-framework-mvp.md](01-elastic-agent-framework-mvp.md) — 框架 MVP 完整设计
 
 ### P0 — 必须完成
 
@@ -134,6 +138,8 @@
 
 ## 2. Audiobook Agent Service — [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent)
 
+> 📖 参考: [02-audiobook-agent-service.md](02-audiobook-agent-service.md) — Harness 实现、API、调度
+
 ### 仓库初始化
 
 - [ ] **A-000** [ABS] 清理旧代码（删除 audio_book_echo_agent 仓库中旧文件：backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock，保留 CLAUDE.md、.git/ 和 .gitignore）
@@ -155,6 +161,10 @@
 - [ ] **A-019** [ABS] Session ID 多源提取（stream-json parsed / 目录扫描 / state.json）  `02 §5.8`
 - [ ] **A-020** [ABS] Retry/Continue 编排（OSS 恢复 workspace、清理 Phase 产物、重跑）  `02 §5`
 - [ ] **A-021** [ABS] Worker 目录生命周期管理（磁盘监控 + 过期清理 + 手动清理 API）  `02 §5.6`
+- [ ] **A-022** [ABS] state.json 解析适配 — 在 ABS 侧读取插件的 state.json，提取 session_id（插件不改）  `02 §5`
+- [ ] **A-023** [ABS] delivery/ 目录适配 — 识别插件实际输出的文件名，映射到 manifest role  `02 §5`
+- [ ] **A-024** [ABS] /audiobook 命令组装 — 将 produce 请求参数转为 Claude Code CLI 命令  `02 §4.1`
+- [ ] **A-025** [ABS] Phase 映射 — state.json phase 数字 → Webhook phase 字符串枚举  `05 §4.4`
 
 ### API 端点
 
@@ -209,6 +219,8 @@
 ---
 
 ## 3. audio_book_echo_editor — [audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor)
+
+> 📖 参考: [03-audiobook-app-adaptation.md](03-audiobook-app-adaptation.md) — 双引擎适配、数据模型、前端 UI
 
 ### 数据模型
 
@@ -300,6 +312,8 @@
 
 ## 4. 跨仓库集成测试
 
+> 📖 参考: [06-testing-isolation.md](06-testing-isolation.md) §5-§9 — 渐进式测试级别 + 拼接方案 + 人工验收
+
 - [ ] **I-001** [EA + ABS] Audiobook Agent Service 使用 Elastic-Agent 框架创建 Worker + Bootstrap
 - [ ] **I-002** [ABS + ABE] audio_book_echo_editor 提交做书 → Audiobook Agent Service 执行 → Webhook 回调
 - [ ] **I-003** [EA + ABS + ABE] 全链路：前端提交 → Elastic 做书 → OSS 同步 → Webhook → 回灌 AgentOutput → 审核
@@ -309,20 +323,27 @@
 
 ---
 
-## 4.5 [audiobook-nonfiction](https://github.com/zjw49246/audiobook-nonfiction) 插件适配
+## 4.5 [audiobook-nonfiction](https://github.com/zjw49246/audiobook-nonfiction) 插件
 
-> audiobook-nonfiction 是 Claude Code 的 Skill 插件，实现 10 Phase 有声书生产流水线。
-> 仓库已创建，以下是根据 Elastic-Agent 方案需要做的适配。
+> audiobook-nonfiction 仓库保持与产品经理提供的 ZIP 包完全一致，**不做任何改造**。
+> 拿到新 ZIP 直接覆盖仓库内容即可更新。
+>
+> 所有适配逻辑（state.json 解析、phase 映射、delivery 路径、命令参数组装）
+> 都放在 Audiobook Agent Service [ABS] 中，插件本身不感知 Elastic-Agent 框架。
 
-- [x] **P-000** [插件] ~~创建 GitHub 仓库 `audiobook-nonfiction`~~ ✓ 已完成
-- [ ] **P-001** [插件] state.json 增加 session_id 字段（做书完成时写入，作为 session_id 提取的冗余来源）  `04 §3.12`
-- [ ] **P-002** [插件] delivery/ 目录结构标准化（确保文件名为 audiobook_manuscript.md / audiobook_delivery.zip）  `04 §3.12`
-- [ ] **P-003** [插件] 确认 /audiobook 命令参数与 Worker Runtime EXECUTE 命令格式兼容  `04 §3.12`
-- [ ] **P-004** [插件] state.json phase 字段值与方案中的 phase 枚举一致（0~9 + DELIVERED）  `05 §4.4`
+- [x] **P-000** [插件] ~~创建 GitHub 仓库~~ ✓ 已完成
+
+以下原 P-001~P-004 已移至 ABS 仓库（在 ABS 侧做适配，不改插件）：
+- ~~**P-001**~~ → ABS A-022: 在 ABS 侧解析 state.json 提取 session_id（不修改插件的 state.json 格式）
+- ~~**P-002**~~ → ABS A-023: 在 ABS 侧适配 delivery/ 目录结构（识别插件实际输出的文件名）
+- ~~**P-003**~~ → ABS A-024: 在 ABS 侧组装 /audiobook 命令参数（适配 Worker Runtime EXECUTE 格式）
+- ~~**P-004**~~ → ABS A-025: 在 ABS 侧做 state.json phase 数字 → Webhook phase 字符串映射
 
 ---
 
 ## 5. 配置变量完整清单
+
+> 📖 参考: [01-elastic-agent-framework-mvp.md](01-elastic-agent-framework-mvp.md) §10 配置管理 + [05-interface-contracts.md](05-interface-contracts.md) §4-§5 数据格式
 
 ### 可配置数量速查表
 
@@ -521,6 +542,8 @@ oss:
 ---
 
 ## 6. 开发阶段依赖
+
+> 📖 参考: [00-overview.md](00-overview.md) §6 开发阶段与依赖
 
 ```
 Phase A (Week 1-2):  EA T-001~T-006, T-011, T-012
