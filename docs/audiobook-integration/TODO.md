@@ -39,11 +39,15 @@
 - [ ] **T-010** [EA] Manager ↔ Worker 认证（per-Worker Bearer Token）  `01 §3.6`
 - [ ] **T-011** [EA] NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）  `01 §3.5`
 - [ ] **T-012** [EA] 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）  `01 §3.5`
-- [ ] **T-013** [EA] 外部服务 API — 实时轨迹流（WebSocket + SSE 双通道）  `01 §3.3`
-- [ ] **T-014** [EA] 外部服务 API — 文件变更通知（inotify → WebSocket 事件推送）  `01 §3.3`
+- [ ] **T-013** [EA] 内部轨迹流 — EventBus LOG 事件分发（Harness 回调、phase 检测用，不对外暴露）  `01 §3.3`
+- [ ] **T-014** [EA] 文件同步通知 — FILE_SYNCED 事件 → WebhookEmitter 推送（外部通过 Webhook 感知）  `01 §3.3`
 - [ ] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
 - [ ] **T-016** [EA] Manager FastAPI 服务骨架 + 节点管理 REST API  `01 §2.1`
-- [ ] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、健康检查探针）  `01 §3.5`
+- [ ] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）  `01 §3.5`
+- [ ] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
+- [ ] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
+- [ ] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
+- [ ] **T-053** [EA] WebhookEmitter — 事件回调 + HMAC 签名 + 重试 + 死信队列  `01 §3.9`
 - [ ] **T-030** [EA] FileSyncManager — Worker 侧文件主动同步到 OSS/S3  `01 §3.4`
 - [ ] **T-031** [EA] FileSyncManager — Harness 配置接口  `01 §3.4`
 - [ ] **T-032** [EA] FileSyncManager — Worker 侧云存储凭证注入  `01 §3.4`
@@ -102,6 +106,10 @@
 - [ ] **T-133** [EA] QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复
 - [ ] **T-134** [EA] 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理
 - [ ] **T-137** [EA] 账号-Worker 绑定：互斥分配 / 亲和复用（Step 1-3）/ Worker 下线清理 / max_accounts_per_worker
+- [ ] **T-138** [EA] TaskRegistry：CRUD + 持久化 + 崩溃恢复 + Worker 下线清理
+- [ ] **T-139** [EA] TaskScheduler：容量检查 + 多 Worker 选择 + 无空闲返回 None
+- [ ] **T-140** [EA] TaskRouter：路由到正确 Worker + --resume 自动组装 + Worker 离线错误
+- [ ] **T-141** [EA] WebhookEmitter：HMAC 签名 + 重试延迟 + 死信队列 + 幂等
 
 ### 测试 — 集成测试
 
@@ -158,7 +166,7 @@
 - [ ] **A-016** [ABS] TaskSyncMapper 映射推送 — 注册/注销同步映射到 Worker  `02 §3.4`
 - ~~**A-017**~~ 已移至框架: EA T-053 (WebhookEmitter)
 - [ ] **A-018** [ABS] 进度超时检测 — 30 分钟无 LOG/FILE 事件标记 stalled  `02 §5.7`
-- [ ] **A-019** [ABS] Session ID 多源提取（stream-json parsed / 目录扫描 / state.json）  `02 §5.8`
+- [ ] **A-019** [ABS] Session ID fallback — 框架提取失败时从 state.json 读取（源 A+B 在框架 T-017）  `02 §5.8`
 - [ ] **A-020** [ABS] Retry/Continue 编排（OSS 恢复 workspace、清理 Phase 产物、重跑）  `02 §5`
 - [ ] **A-021** [ABS] Worker 目录生命周期管理（磁盘监控 + 过期清理 + 手动清理 API）  `02 §5.6`
 - [ ] **A-022** [ABS] state.json 解析适配 — 在 ABS 侧读取插件的 state.json，提取 session_id（插件不改）  `02 §5`
@@ -189,7 +197,7 @@
 - [ ] **A-100** [ABS] BookQueue：入队/出队/优先级排序/持久化/空队列
 - ~~**A-101**~~ 已移至框架: EA T-138 (TaskRegistry 测试)
 - ~~**A-102**~~ 已移至框架: EA T-139 (TaskScheduler 测试)
-- [ ] **A-103** [ABS] WebhookEmitter：重试延迟策略/死信队列/幂等 event_id/HMAC 签名
+- ~~**A-103**~~ 已移至框架: EA T-141 (WebhookEmitter 测试)
 - [ ] **A-104** [ABS] Session ID 多源提取：stream-json parsed / 目录扫描 / state.json 回退
 - [ ] **A-105** [ABS] 并发修改互斥：同一 task 二次修改返回 409
 - ~~**A-106**~~ 已移至框架: EA T-140 (TaskRouter 测试)
@@ -258,8 +266,8 @@
 ### 前端
 
 - [ ] **B-040** [ABE] 创建任务弹窗 — 增加跑书方式选择  `03 §7.1`
-- [ ] **B-041** [ABE] TaskDetail — 按 backend 展示不同 UI  `03 §7.3`
-- [ ] **B-042** [ABE] Elastic phase 时间线 + 进度条  `03 §7.3`
+- [ ] **B-041** [ABE] TaskDetail — Elastic 模式三栏布局（左 Chat + 中文件目录 + 右文件预览）  `03 §7.3`
+- [ ] **B-042** [ABE] Elastic Phase 指示器（顶栏 "Phase N · 阶段名称" 文字格式）  `03 §7.3`
 - [ ] **B-043** [ABE] Elastic 文件列表 + 预览  `03 §7.3`
 - [ ] **B-044** [ABE] Elastic chat 修改界面  `03 §7.3`
 - [ ] **B-045** [ABE] 任务列表 — 增加 backend 筛选  `03 §7.4`
@@ -551,8 +559,8 @@ Phase B (Week 2-3):  EA T-007~T-010, T-016
                      ABS A-000, A-001, A-002          ← ABS 仓库清理 + 脚手架
 Phase C (Week 3-4):  EA T-030~T-040, T-013~T-015
                      ABS A-010~A-016                  ← 需要框架 Phase B 完成
-Phase D (Week 4-5):  EA T-017~T-023, T-026, T-041~T-048
-                     ABS A-017~A-021, A-030~A-039     ← 需要框架 Phase C 完成
+Phase D (Week 4-5):  EA T-017~T-023, T-026, T-041~T-053
+                     ABS A-018~A-025, A-030~A-039     ← 需要框架 Phase C 完成
                      ABE B-001~B-003, B-050           ← 数据模型可先行
 Phase E (Week 5-6):  EA T-024~T-029
                      ABE B-010~B-034                  ← 需要 ABS API 稳定
