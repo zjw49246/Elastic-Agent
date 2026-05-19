@@ -988,6 +988,72 @@ Level 2: Manager 侧（汇聚 + 决策）
   如果任务很长（如 Audiobook 生产 2h），则在任务完成前就标记"下次任务用新凭证"
 ```
 
+#### 账号-Worker 绑定（IP 亲和性）
+
+```
+核心规则:
+  1. 同一个账号在同一时刻只能登录在一台 Worker 上（绝对互斥）
+  2. 如果账号上次登录的 Worker 仍然在线，优先在该 Worker 上继续使用
+  3. 每台 Worker 同时登录的账号数有上限（可配置）
+
+数据模型 (pool_status.json 中):
+  "prod-1": {
+    ...
+    "assigned_to": "aliyun:i-bp1xxx",     // 当前绑定的 Worker（null = 未绑定）
+    "last_worker": "aliyun:i-bp1xxx",     // 上次登录的 Worker（即使已回收也记录）
+    "last_worker_alive": true              // Manager 定期刷新（从 NodeRegistry 判断）
+  }
+
+分配算法:
+
+  allocate(group, target_worker) → account_id | None:
+
+    Step 1: 已绑定该 Worker 的同 group 账号（优先复用）
+      candidates = [a for a in accounts
+                    if a.group == group
+                    and a.assigned_to == target_worker
+                    and a.available]
+      if candidates: return candidates[0]
+
+    Step 2: 上次在该 Worker 登录过、当前未被分配的账号（亲和复用，免登录）
+      candidates = [a for a in accounts
+                    if a.group == group
+                    and a.assigned_to is None
+                    and a.last_worker == target_worker
+                    and a.available]
+      if candidates: return sort_by_last_used(candidates)[0]
+
+    Step 3: 从未分配的账号中选（需要登录）
+      candidates = [a for a in accounts
+                    if a.group == group
+                    and a.assigned_to is None
+                    and a.available]
+      if candidates: return sort_by_last_used(candidates)[0]
+
+    Step 4: 全部已分配或不可用
+      return None  → 排队等待或告警
+
+  互斥保证:
+    - assigned_to 是排他字段: 一个账号同时只能 assigned_to 一个 Worker
+    - 分配前检查: if account.assigned_to is not None and account.assigned_to != target_worker → 跳过
+    - Manager 单进程: pool_status.json 的读写在同一进程内，不需要分布式锁
+
+  每 Worker 最大账号数限制:
+    分配前检查: count(accounts where assigned_to == target_worker) < max_accounts_per_worker
+    超过 → 拒绝分配 → 等待该 Worker 上的账号被回收
+
+  轮换时的亲和性:
+    账号额度耗尽需要轮换时:
+      1. 回收旧账号: assigned_to = null（但保留 last_worker）
+      2. 分配新账号: 走上述 allocate() 流程
+      3. 如果 Step 2 命中 → 新账号上次就在这个 Worker 上 → 不需要重新登录（token 还在本地）
+      4. 如果 Step 3 命中 → 需要在 Worker 上执行自动登录
+
+  Worker 下线时:
+    清理: 所有 assigned_to == 该 Worker 的账号 → assigned_to = null
+    保留: last_worker 不清理（Worker 重新上线时可以亲和复用）
+```
+
 #### 多 Slot Worker 的凭证隔离
 
 ```
@@ -1543,6 +1609,7 @@ credentials:
   quota_check_interval: 60        # Worker 侧额度检查间隔（秒）
   rotation_strategy: "least_used_first"  # 轮换策略
   login_timeout: 240              # 单次自动登录超时（秒）
+  max_accounts_per_worker: 4      # 每 Worker 最大同时登录账号数
 
 external_api:
   enabled: true
@@ -1777,22 +1844,17 @@ Worker 侧处理:
 
 #### 选号算法
 
+轮换时复用 §3.6 的 `allocate(group, target_worker)` 算法（三步亲和查找）。额外排除当前正在被替换的账号：
+
 ```python
-def select_replacement(pool, current_id, group):
-    candidates = [
-        a for a in pool.accounts
-        if a.group == group
-        and a.enabled
-        and a.available
-        and a.id != current_id
-        and a.assigned_to is None
-    ]
-    if not candidates:
-        return None
-    # 按 last_used 升序（最久未用的优先）
-    candidates.sort(key=lambda a: a.last_used or 0)
-    return candidates[0]
+def select_replacement(pool, current_id, group, target_worker):
+    # 先回收旧账号的绑定（但保留 last_worker）
+    pool.release(current_id)  # assigned_to = null
+    # 用亲和算法分配新账号
+    return pool.allocate(group, target_worker, exclude=[current_id])
 ```
+
+如果 Step 2 命中（新账号上次就在这个 Worker 上），token 可能还在本地，不需要重新登录。
 
 #### 轮换时的凭证传递
 

@@ -64,6 +64,7 @@
 | T-045 | 自动轮换（等待任务完成 → 分配新账号 → 登录/分发 → 恢复槽位） | 01 §3.6 |
 | T-046 | 冷却恢复（5h 窗口到期后自动标记 available） | 01 §3.6 |
 | T-047 | CREDENTIAL_LOGIN / QUOTA_STATUS / CREDENTIAL_ROTATE 协议消息 | 01 §3.6 |
+| T-048 | 账号-Worker 绑定（IP 亲和性：互斥分配、亲和复用、max_accounts_per_worker 限制） | 01 §3.6 |
 
 ### P1 — 应该完成
 
@@ -102,6 +103,7 @@
 | T-132 | CredentialPool：accounts.json 加载 / 分组 / 分配 / 回收 / pool_status 持久化 |
 | T-133 | QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复 |
 | T-134 | 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理 |
+| T-137 | 账号-Worker 绑定：互斥分配 / 亲和复用（Step 1-3）/ Worker 下线清理 / max_accounts_per_worker |
 
 ### 测试 — 集成测试
 
@@ -323,6 +325,23 @@
 
 ## 5. 配置变量完整清单
 
+### 可配置数量速查表
+
+| 参数 | 默认值 | 配置位置 | 仓库 | 说明 |
+|---|---|---|---|---|
+| 每 Worker 生产槽位 | 1 | ABS `config.yaml` → `audiobook.max_production_slots` | ABS | 同时做几本新书 |
+| 每 Worker 修改槽位 | 3 | ABS `config.yaml` → `audiobook.max_edit_slots` | ABS | 同时修改几本书 |
+| 每 Worker 最大账号数 | 4 | EA `config.yaml` → `credentials.max_accounts_per_worker` | EA | 同时登录的 Claude 账号数 |
+| 全局最大实例数 | 30 | EA `config.yaml` → `provider.aliyun.max_instances` | EA | 最多创建多少台 Worker |
+| 额度告警阈值 | 85% | EA `config.yaml` → `credentials.quota_threshold` | EA | 5h 窗口使用率 |
+| 做书超时 | 7200s | ABS `config.yaml` → `audiobook.claude_code.production_timeout` | ABS | 单本书最长时间 |
+| 修改超时 | 1800s | ABS `config.yaml` → `audiobook.claude_code.edit_timeout` | ABS | 单次修改最长时间 |
+| 进度超时 | 1800s | ABS `config.yaml` → `audiobook.progress_timeout` | ABS | 无输出多久判定卡死 |
+| 缩容等待超时 | 3600s | EA `config.yaml` → `drain.timeout` | EA | 缩容前等当前任务 |
+| 额度检查间隔 | 60-90s | EA `config.yaml` → `credentials.quota_check_interval` | EA | 随机化防反检测 |
+| 单步 Bootstrap 超时 | 300s | EA `config.yaml` → `bootstrap.default_step_timeout` | EA | |
+| 自动登录超时 | 240s | EA `config.yaml` → `credentials.login_timeout` | EA | 单次 OAuth 流程 |
+
 ### 5.1 Elastic-Agent 框架 [EA]
 
 **配置文件 `config.yaml`：**
@@ -372,6 +391,7 @@ credentials:
   quota_check_interval: 60                 # Worker 侧额度检查间隔（秒）
   rotation_strategy: "least_used_first"    # 轮换策略：least_used_first | round_robin
   login_timeout: 240                       # 单次自动登录超时（秒）
+  max_accounts_per_worker: 4               # 每 Worker 最大同时登录账号数
   login_dependencies:                      # Worker 上自动登录的依赖（Bootstrap 时安装）
     - playwright
     - playwright-stealth
