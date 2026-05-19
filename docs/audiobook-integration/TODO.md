@@ -26,9 +26,9 @@
 
 ### P0 — 必须完成
 
-- [ ] **T-001** [EA] 项目脚手架搭建（pyproject.toml、目录结构、CI 基础）  `01 §9`
-- [ ] **T-002** [EA] CloudProvider 抽象基类 + Instance/InstanceConfig 数据模型  `01 §3.1`
-- [ ] **T-049** [EA] Harness 抽象基类 + 相关接口定义（WorkerCapacity, FileSyncConfig, SyncMapping, WorkerLifecycle, BootstrapStep, ScalingSignal）  `05 §5.2`
+- [x] **T-001** [EA] 项目脚手架搭建（pyproject.toml、目录结构、CI 基础）  `01 §9`
+- [x] **T-002** [EA] CloudProvider 抽象基类 + Instance/InstanceConfig 数据模型  `01 §3.1`
+- [x] **T-049** [EA] Harness 抽象基类 + 相关接口定义（WorkerCapacity, FileSyncConfig, SyncMapping, WorkerLifecycle, BootstrapStep, ScalingSignal）  `05 §5.2`
 - [ ] **T-003** [EA] 阿里云 ECS Provider（alibabacloud SDK V2.0 直连）  `01 §3.1`
 - [ ] **T-004** [EA] AWS EC2 Provider（boto3 SDK 直连）  `01 §3.1`
 - [ ] **T-005** [EA] 阿里云前置准备文档 + 验证脚本（VPC/VSwitch/安全组/密钥对，控制台手动创建）  `01 §4`
