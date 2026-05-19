@@ -34,15 +34,16 @@
 
 ---
 
-## 2. 三仓库架构
+## 2. 仓库架构
 
 ### 2.1 仓库划分
 
 | 仓库 | 职责 | 技术栈 | 部署形态 |
 |------|------|--------|---------|
-| **Elastic-Agent** | 通用弹性计算框架：云资源管理、Worker Runtime、通信协议、External API、FileSyncManager | Python 3.11+, FastAPI | GitHub 包（`uv add git+https://github.com/zjw49246/Elastic-Agent.git`） |
-| **Audiobook Agent Service** (新建) | 基于 Elastic-Agent 的有声书生产服务：AudiobookHarness、BookQueue、SessionRegistry、SlotScheduler、ChatRelay、Audiobook 专用 API | Python 3.11+, FastAPI | 独立部署的 Manager 服务 |
-| **audio_book_echo_editor** | 现有做书前后端：双引擎适配层、Elastic 客户端、Webhook 处理、OSS 文件读取、前端 UI | Python (FastAPI) + React/TS | 现有部署，增量改造 |
+| **[Elastic-Agent](https://github.com/zjw49246/Elastic-Agent)** | 通用弹性计算框架：云管理、Worker Runtime、TaskRegistry/Scheduler/Router、WebhookEmitter、CredentialPool、FileSyncManager | Python 3.11+, FastAPI | GitHub 包 |
+| **[Audiobook Agent Service](https://github.com/zjw49246/audio_book_echo_agent)** | 薄业务层：AudiobookHarness、BookQueue、Phase 检测、Audiobook API | Python 3.11+, FastAPI | 独立部署的 Manager 服务 |
+| **[audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor)** | 现有做书前后端：双引擎适配层、Elastic 客户端、Webhook 处理、OSS 文件读取、前端 UI | Python (FastAPI) + React/TS | 现有部署，增量改造 |
+| **audiobook-nonfiction** (需新建) | Claude Code 有声书插件：10 Phase 生产流水线、22 个子 Agent、/audiobook 命令 | Claude Code Skill | 安装在 Worker 上 |
 
 ### 2.2 依赖关系
 
@@ -63,8 +64,8 @@
 │                                │
 │  import elastic_agent          │──── uv add git+https://github.com/zjw49246/Elastic-Agent.git
 │  实现 AudiobookHarness         │
-│  暴露 Audiobook 专用 API       │
-│  推送 Webhook 到 audio_book    │
+│  纯业务逻辑（BookQueue + API）  │
+│  推送 Webhook 通过框架          │
 └───────────┬────────────────────┘
             │ WebSocket (Worker 反向连接)
             ▼
@@ -83,37 +84,30 @@
 Elastic-Agent 不是一个独立部署的服务，而是一个 **Python 包**（`elastic-agent`），提供：
 
 ```python
-# Audiobook Agent Service 中的使用方式
-from elastic_agent.core.providers import AliyunProvider, AWSProvider
-from elastic_agent.core.runtime import WorkerRuntimeServer, WorkerRuntimeClient
-from elastic_agent.core.registry import NodeRegistry
-from elastic_agent.core.bootstrap import BootstrapPipeline
-from elastic_agent.core.monitor import HealthChecker, CloudReconciler, EventBus
-from elastic_agent.core.external_api import create_external_api_router
-from elastic_agent.core.security import TokenAuthenticator
-from elastic_agent.worker import WorkerRuntime, FileSyncManager
+# Audiobook Agent Service 的 main.py 示意
 from elastic_agent.manager import ElasticAgentManager
-from elastic_agent.harness import Harness, HarnessConfig
+from elastic_agent.core.providers import AliyunProvider
+from elastic_agent.harness import Harness
 
-# Audiobook Agent Service 实现自己的 Harness
 class AudiobookHarness(Harness):
+    """有声书专用 Harness — 只包含业务逻辑"""
     ...
 
-# 组装并启动 Manager
 manager = ElasticAgentManager(
     harness=AudiobookHarness(config),
     provider=AliyunProvider(aliyun_config),
-    ...
 )
-app = manager.create_app()  # FastAPI app
-# 然后挂载 Audiobook 专用路由
-app.include_router(audiobook_api_router)
+app = manager.create_app()
+
+# 挂载少量 Audiobook 专用路由（produce、retry from phase 等）
+from audiobook_agent_service.api import audiobook_router
+app.include_router(audiobook_router)
 ```
 
 这种设计意味着：
 - Elastic-Agent 框架是可复用的（其他 Harness 如 ML Research、CCM 也可以用）
 - Audiobook Agent Service 拥有完整的部署和配置控制权
-- Audiobook 专用逻辑（BookQueue、SessionRegistry 等）不污染框架
+- Audiobook 专用逻辑（BookQueue、Phase 检测等）不污染框架
 
 ---
 
@@ -124,30 +118,30 @@ app.include_router(audiobook_api_router)
 | 模块 | 职责 | 不做什么 |
 |------|------|---------|
 | CloudProvider | 抹平阿里云/AWS 差异，实例 CRUD | 不决定何时创建/销毁 |
-| Worker Runtime | Manager↔Worker 双向通信，进程管理，日志双写（LOG 事件+本地 NDJSON 落盘），文件操作 | 不理解任务业务语义 |
-| NodeRegistry | 节点状态持久化 | 不知道"槽位"概念 |
+| Worker Runtime | Manager↔Worker 双向通信，进程管理，日志双写，文件操作 | 不理解任务业务语义 |
+| NodeRegistry | 节点状态持久化 | — |
+| TaskRegistry | task→worker 映射，元数据持久化，崩溃恢复 | 不知道"book"或"phase"概念 |
+| TaskScheduler | 容量感知的任务分发（WorkerCapacity 检查后选择 Worker） | 不定义具体容量模型（由 Harness 扩展） |
+| TaskRouter | 后续命令路由到正确的 Worker（含 --resume 发起） | 不知道命令的业务含义 |
+| WebhookEmitter | 向注册的回调 URL 推送事件，HMAC 签名，重试，死信队列 | 不决定何时发什么事件（由 Harness 触发） |
 | Bootstrap Pipeline | 可插拔初始化步骤 | 不内置 audiobook 插件安装 |
+| CredentialPool | 账号池管理、自动登录、额度监控、自动轮换 | — |
+| Claude Code AgentType | NDJSON 解析、session_id 提取、--resume 命令组装、进程生命周期 | 不理解 audiobook phase |
 | HealthChecker | L1/L2/L3 健康检查 | 不定义"卡住"的业务含义 |
 | CloudReconciler | 标签对账，孤儿清理 | — |
-| EventBus | 内部事件分发 | 不定义业务事件 |
-| External API | REST 文件访问、轨迹查询、集群状态 | 不暴露 task/chat/session 接口 |
+| EventBus | 内部事件分发 | — |
 | FileSyncManager | Worker 文件 → OSS/S3 同步，防抖，清单 | 不知道 book_slug → task_id 映射 |
-| Harness 接口 | 定义 `Harness` 基类和回调契约 | 不提供具体实现 |
 | 前置准备 | 阿里云/AWS 控制台创建 VPC/安全组/密钥对 | 不管实例创建 |
 
 ### 3.2 Audiobook Agent Service (Application)
 
 | 模块 | 职责 | 数据存储 |
 |------|------|---------|
-| AudiobookHarness | 实现 Harness 接口，定义 Bootstrap 步骤、事件回调、文件同步配置 | — |
+| AudiobookHarness | 实现 Harness 接口：定义 Bootstrap 步骤、扩展 WorkerCapacity（production + edit slots）、事件回调 | — |
 | BookQueue | 做书请求排队，优先级调度 | 内存 + JSON 持久化 |
-| SessionRegistry | task_id → (worker_id, session_id, book_slug) 映射 | JSON 持久化（崩溃可恢复） |
-| SlotScheduler | 查找空闲 Worker、生产/修改槽位管理 | 从 Worker Runtime 状态获取 |
-| ChatRelay | 用户修改指令 → Worker `--resume`，聊天记录通过 OSS 日志提供 | — |
-| TaskSyncMapper | 维护 Worker 上 book_slug ↔ task_id ↔ OSS prefix 的映射，推送给 Worker | 同步到 Worker Runtime |
-| Webhook Emitter | 向 audio_book_echo_editor 推送事件 | 回调 URL 配置 |
-| Audiobook API | `/api/tasks/produce`、`/api/tasks/{id}/chat`、`/api/tasks/{id}/status` 等 | — |
-| Retry/Continue Logic | 从 OSS 恢复 workspace、清理 Phase 产物、重跑 | 操作 OSS + Worker 文件系统 |
+| Phase 检测 | 订阅 FILE_SYNCED → 读 state.json → 映射 phase → 调框架 WebhookEmitter | — |
+| Audiobook API | `/api/tasks/produce`、`/api/tasks/{id}/chat` 等业务端点 | — |
+| Retry/Continue | 从 OSS 恢复 workspace、清理 Phase 产物、/continue-book | 操作 OSS |
 
 ### 3.3 audio_book_echo_editor (Existing App Adaptation)
 
@@ -181,7 +175,7 @@ audio_book_echo_editor 后端:
         ▼
 Audiobook Agent Service (Manager):
   1. BookQueue 入队
-  2. SlotScheduler 查找空闲 Worker (production_slot 有空位)
+  2. 框架 TaskScheduler 查找空闲 Worker (production_slot 有空位)
   3. 通过 Worker Runtime 写入原始文本到 Worker
   4. 同时上传原始文本到 OSS (tasks/{task_id}/source/)
   5. TaskSyncMapper 注册映射: book_slug ↔ task_id ↔ OSS prefix
@@ -201,7 +195,7 @@ Worker 上 Claude Code 执行 (1-2 小时):
         ▼
 Claude Code 完成 (PROCESS_EXIT):
   1. Worker Runtime 从 result 事件提取 session_id
-  2. Manager: SessionRegistry 注册, 释放生产槽位
+  2. Manager: 框架 TaskRegistry 注册 session_id, 释放生产槽位
   3. Webhook → audio_book: task.production.completed (附带 OSS 指针)
         │
         ▼
@@ -229,9 +223,9 @@ audio_book_echo_editor 后端:
         │
         ▼
 Audiobook Agent Service:
-  1. SessionRegistry 查找: task_id → worker_id, session_id
-  2. 检查 Worker edit_slots 是否有空
-  3. Worker Runtime: claude -p "修改指令" --resume {session_id} ...
+  1. 框架 TaskRegistry 查找: task_id → worker_id, session_id
+  2. 框架 TaskScheduler 检查 Worker edit_slots 是否有空
+  3. 框架 TaskRouter 发送 --resume 命令到 Worker
   4. 修改过程: NDJSON → 日志文件 → FileSyncManager → OSS → 前端轮询
   5. 文件变更 → OSS 同步
   6. 完成 → Webhook → audio_book: task.edit.completed

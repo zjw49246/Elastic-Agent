@@ -46,7 +46,11 @@
 - [ ] **T-039** Manager 结构化操作日志（JSON Lines 格式，覆盖扩缩容/Bootstrap/对账/凭证/Webhook 全部关键操作）
 - [ ] **T-040** LOG 事件结构化解析（解析 Claude Code NDJSON 为 typed event，支持按 type 过滤和 token 统计）
 - [ ] **T-016** Manager FastAPI 服务骨架 + 节点管理 REST API
-- [ ] **T-017** Claude Code AgentType（安装命令、启动命令、健康检查探针）
+- [ ] **T-017** Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）
+- [ ] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
+- [ ] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
+- [ ] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
+- [ ] **T-053** [EA] WebhookEmitter — 事件回调 + HMAC 签名 + 重试 + 死信队列  `01 §3.9`
 
 ### P1 — 应该完成
 
@@ -77,6 +81,10 @@
 - [ ] **T-120** 集成测试：Worker 文件变更 → OSS/S3 同步 → 外部 API 读取一致性
 - [ ] **T-121** 单元测试：日志落盘完整性（进程正常退出 + 崩溃退出场景）
 - [ ] **T-122** 集成测试：Worker 日志落盘 → FileSyncManager → OSS → 外部 API 读取一致性
+- [ ] **T-138** [EA] TaskRegistry：CRUD + 持久化 + 崩溃恢复 + Worker 下线清理
+- [ ] **T-139** [EA] TaskScheduler：容量检查 + 多 Worker 选择 + 无空闲返回 None
+- [ ] **T-140** [EA] TaskRouter：路由到正确 Worker + --resume 自动组装 + Worker 离线错误
+- [ ] **T-141** [EA] WebhookEmitter：HMAC 签名 + 重试延迟 + 死信队列 + 幂等
 
 ---
 
@@ -1218,6 +1226,109 @@ EventBus
 Harness 可通过 self.logger 写入同一日志流。
 ```
 
+### 3.9 任务管理
+
+框架内置通用的任务跟踪、调度、路由和通知能力，Harness 不需要自己实现这些。
+
+#### TaskRegistry
+
+```
+任务注册表，管理 task→worker 的映射关系。
+
+  数据模型 (per-task):
+    task_id:      "123"
+    worker_id:    "aliyun:i-bp1xxx"
+    session_id:   "claude-session-abc"     (Claude Code AgentType 自动提取)
+    status:       "running" | "completed" | "failed"
+    metadata:     {}                        (Harness 自定义字段，如 book_slug)
+    created_at:   "2026-05-17T10:00:00Z"
+    updated_at:   "2026-05-17T11:45:00Z"
+
+  持久化: ~/.elastic-agent/task_registry.json (每次更新写入)
+  崩溃恢复: Manager 重启时读取 → 对比 NodeRegistry 在线 Worker → 清理已下线的任务
+  Worker 下线: 该 Worker 上的所有任务标记为 "worker_lost"
+
+  API:
+    manager.task_registry.register(task_id, worker_id, metadata)
+    manager.task_registry.get(task_id) → TaskRecord | None
+    manager.task_registry.update(task_id, session_id=..., status=...)
+    manager.task_registry.unregister(task_id)
+    manager.task_registry.list_by_worker(worker_id) → list[TaskRecord]
+```
+
+#### TaskScheduler
+
+```
+容量感知的任务分发。根据 WorkerCapacity 找到有空闲容量的 Worker。
+
+  调度算法:
+    1. 遍历所有 READY 状态的 Worker
+    2. 对比 TaskRegistry 中该 Worker 的活跃任务数 vs WorkerCapacity.max_concurrent_tasks
+    3. 返回有空闲容量的 Worker（多个时选任务最少的）
+    4. 无空闲 Worker → 返回 None（调用方决定排队或拒绝）
+
+  Harness 可扩展:
+    AudiobookHarness 扩展 WorkerCapacity 为 production_slots + edit_slots
+    → TaskScheduler 的容量检查自动适配子类的字段
+
+  API:
+    manager.task_scheduler.find_available_worker(capacity_requirement=None) → worker_id | None
+```
+
+#### TaskRouter
+
+```
+后续命令路由：将命令发送到任务所在的 Worker。
+
+  路由逻辑:
+    1. 从 TaskRegistry 查找 task_id → worker_id
+    2. 检查 Worker 是否在线（NodeRegistry）
+    3. 通过 Worker Runtime WS 连接发送 EXECUTE 命令
+    4. 返回进程 task_id（用于跟踪输出）
+
+  --resume 支持:
+    TaskRouter 结合 Claude Code AgentType 自动组装 --resume 命令:
+    if record.session_id:
+      command = agent_type.build_command(prompt=message, session_id=record.session_id)
+    else:
+      command = agent_type.build_command(prompt=message)
+
+  错误处理:
+    task_id 不存在 → NotFoundError
+    Worker 离线 → WorkerOfflineError
+    Worker 容量满 → CapacityFullError
+
+  API:
+    manager.task_router.send_command(task_id, command, env=None) → process_task_id
+    manager.task_router.send_followup(task_id, message) → process_task_id  (自动 --resume)
+```
+
+#### WebhookEmitter
+
+```
+向外部系统推送事件通知。
+
+  注册:
+    Harness 在启动时或通过 produce 请求动态注册回调 URL:
+    manager.webhook_emitter.register(target_id, url, secret)
+
+  发送:
+    manager.webhook_emitter.emit(event_type, task_id, data)
+    → 构造 JSON body
+    → HMAC-SHA256 签名 (X-Elastic-Agent-Signature)
+    → POST 到注册的 URL
+    → 非 2xx → 重试 (1s, 5s, 30s, 5min, 30min)
+    → 5 次失败 → 写入死信队列
+
+  死信队列: ~/.elastic-agent/webhook_dead_letters.json
+  操作日志: 每次发送/重试/失败都写入 operations.log
+
+  API:
+    manager.webhook_emitter.register(target_id, url, secret)
+    manager.webhook_emitter.emit(event_type, task_id, data)
+    manager.webhook_emitter.replay_dead_letters()
+```
+
 ---
 
 ## 4. 前置准备
@@ -1475,6 +1586,8 @@ elastic-agent/
 │   │   ├── bootstrap/          # Pipeline + 失败策略 + 内置步骤
 │   │   ├── registry/           # NodeRegistry (JSON 存储)
 │   │   ├── monitor/            # 健康检查 + 额度监控 + 云端对账 + 事件总线
+│   │   ├── task/               # TaskRegistry + TaskScheduler + TaskRouter
+│   │   ├── webhook/            # WebhookEmitter + 签名 + 重试
 │   │   ├── scheduler/          # Drain 机制
 │   │   ├── external_api/       # 轨迹流 + 文件传输 + 认证 + FastAPI Router
 │   │   ├── logging/            # 结构化操作日志 + 日志轮转

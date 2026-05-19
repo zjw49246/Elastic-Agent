@@ -1,11 +1,12 @@
 # Audiobook x Elastic-Agent 全量 TODO
 
-> 本文件汇总三个仓库的全部待办事项。每个 TODO 标注所属仓库和优先级。
+> 本文件汇总四个仓库的全部待办事项。每个 TODO 标注所属仓库和优先级。
 >
 > **仓库缩写：**
 > - **[EA]** = [Elastic-Agent](https://github.com/zjw49246/Elastic-Agent) — 通用弹性计算框架
 > - **[ABS]** = [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent) — Audiobook Agent Service
 > - **[ABE]** = [audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor) — 现有做书前后端
+> - **[插件]** = audiobook-nonfiction（需新建 GitHub 仓库）— Claude Code 有声书插件
 
 ---
 
@@ -145,11 +146,11 @@
 - [ ] **A-010** [ABS] AudiobookHarness — 实现 Harness 接口  `02 §4.1`
 - [ ] **A-011** [ABS] Bootstrap 步骤定义（Node.js/Claude Code/凭证/插件/Runtime）  `02 §4.1`
 - [ ] **A-012** [ABS] BookQueue — 做书请求排队 + 优先级调度  `02 §3.2`
-- [ ] **A-013** [ABS] SessionRegistry — task→worker 映射 + JSON 持久化  `02 §3.2`
-- [ ] **A-014** [ABS] SlotScheduler — 生产/修改槽位管理 + 空闲 Worker 查找  `02 §3.2`
-- [ ] **A-015** [ABS] ChatRelay — 修改指令路由 + --resume 调用  `02 §3.5`
+- ~~**A-013**~~ 已移至框架: EA T-050 (TaskRegistry)
+- ~~**A-014**~~ 已移至框架: EA T-051 (TaskScheduler)
+- ~~**A-015**~~ 已移至框架: EA T-052 (TaskRouter)
 - [ ] **A-016** [ABS] TaskSyncMapper 映射推送 — 注册/注销同步映射到 Worker  `02 §3.4`
-- [ ] **A-017** [ABS] WebhookEmitter — 向 audio_book_echo_editor 推送事件 + 重试  `05 §3`
+- ~~**A-017**~~ 已移至框架: EA T-053 (WebhookEmitter)
 - [ ] **A-018** [ABS] 进度超时检测 — 30 分钟无 LOG/FILE 事件标记 stalled  `02 §5.7`
 - [ ] **A-019** [ABS] Session ID 多源提取（stream-json parsed / 目录扫描 / state.json）  `02 §5.8`
 - [ ] **A-020** [ABS] Retry/Continue 编排（OSS 恢复 workspace、清理 Phase 产物、重跑）  `02 §5`
@@ -308,10 +309,12 @@
 
 ---
 
-## 4.5 外部依赖（audiobook-nonfiction 插件适配）
+## 4.5 audiobook-nonfiction 插件（需新建 GitHub 仓库）
 
-> 以下改动在 audiobook-nonfiction 插件仓库中执行，不在三个主仓库范围内，但是必要的前置条件。
+> audiobook-nonfiction 是 Claude Code 的 Skill 插件，实现 10 Phase 有声书生产流水线。
+> 当前代码尚未开源，需要创建独立的 GitHub 仓库，并根据 Elastic-Agent 方案做适配。
 
+- [ ] **P-000** [插件] 创建 GitHub 仓库 `audiobook-nonfiction`，初始化项目结构（CLAUDE.md、README.md）
 - [ ] **P-001** [插件] state.json 增加 session_id 字段（做书完成时写入，作为 session_id 提取的冗余来源）  `04 §3.12`
 - [ ] **P-002** [插件] delivery/ 目录结构标准化（确保文件名为 audiobook_manuscript.md / audiobook_delivery.zip）  `04 §3.12`
 - [ ] **P-003** [插件] 确认 /audiobook 命令参数与 Worker Runtime EXECUTE 命令格式兼容  `04 §3.12`

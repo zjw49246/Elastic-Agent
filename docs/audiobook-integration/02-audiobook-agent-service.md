@@ -22,33 +22,26 @@ Audiobook Agent Service 是一个 **独立的 Python 应用**（独立仓库、�
 
 ```python
 # Audiobook Agent Service 的 main.py 示意
-from elastic_agent.core.providers import AliyunProvider
-from elastic_agent.core.runtime import WorkerRuntimeServer
-from elastic_agent.core.registry import NodeRegistry
-from elastic_agent.core.monitor import HealthChecker, EventBus
-from elastic_agent.core.external_api import create_external_api_router
-from elastic_agent.worker import FileSyncManager
 from elastic_agent.manager import ElasticAgentManager
+from elastic_agent.core.providers import AliyunProvider
 from elastic_agent.harness import Harness
 
 class AudiobookHarness(Harness):
-    """有声书稿生产系统的 Elastic-Agent Harness 实现"""
+    """有声书专用 Harness — 只包含业务逻辑"""
     ...
 
-# 组装并启动
+# Manager 内部自动组装全部框架组件
+# (TaskRegistry, TaskScheduler, TaskRouter, WebhookEmitter,
+#  CredentialPool, Worker Runtime, FileSyncManager, etc.)
 manager = ElasticAgentManager(
     harness=AudiobookHarness(config),
     provider=AliyunProvider(aliyun_config),
-    ...
 )
-app = manager.create_app()  # FastAPI app，包含框架通用路由
+app = manager.create_app()
 
-# 挂载 Audiobook 专用路由
+# 挂载少量 Audiobook 专用路由（produce、retry from phase 等）
 from audiobook_agent_service.api import audiobook_router
 app.include_router(audiobook_router)
-
-# 启动服务
-uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
 ### 0.3 不包含什么
@@ -211,15 +204,10 @@ worker:
 │                    Audiobook Agent Service (Manager 进程)             │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                   Audiobook 业务层 (本仓库实现)                 │  │
+│  │               Audiobook 业务层 (本仓库实现, 薄业务层)            │  │
 │  │                                                                │  │
-│  │  BookQueue        SessionRegistry      ChatRelay              │  │
-│  │  做书请求队列      session→worker 映射   双向消息中继            │  │
-│  │                                                                │  │
-│  │  SlotScheduler    TaskSyncMapper       WebhookEmitter         │  │
-│  │  槽位调度          动态同步映射           事件推送               │  │
-│  │    生产请求 → 找有空生产槽位的 Worker                           │  │
-│  │    修改请求 → 找 session 所在的 Worker + 检查修改槽位            │  │
+│  │  BookQueue        Phase 检测        Audiobook API              │  │
+│  │  做书请求队列      Phase 进度解析     有声书专用路由              │  │
 │  └────────────────────────┬───────────────────────────────────────┘  │
 │                           │                                          │
 │  ┌────────────────────────▼───────────────────────────────────────┐  │
@@ -228,6 +216,10 @@ worker:
 │  │  CloudProvider    NodeRegistry     ExternalAPI(轨迹/文件)      │  │
 │  │  CredentialPool   HealthChecker    FileSyncManager             │  │
 │  │  EventBus         Bootstrap        Worker Runtime Server       │  │
+│  │  TaskRegistry     TaskScheduler    TaskRouter                  │  │
+│  │  task→worker 映射  槽位调度          双向消息路由                │  │
+│  │  WebhookEmitter                                                │  │
+│  │  事件推送                                                       │  │
 │  └────────────────────────┬───────────────────────────────────────┘  │
 └───────────────────────────┼──────────────────────────────────────────┘
                             │ Worker Runtime (WebSocket)
@@ -250,10 +242,10 @@ worker:
 
 #### Session Registry
 
-每个做书会话在 Audiobook Agent Service 中注册，用于路由修改请求到正确的 Worker。
+每个做书会话通过框架的 TaskRegistry 注册，用于路由修改请求到正确的 Worker。
 
 ```
-SessionRegistry (Manager 侧):
+TaskRegistry (框架提供, Manager 侧):
   task_id → {
     worker_id:   "worker-1"
     session_id:  "abc123-def456"       # Claude Code 的 session ID
@@ -268,7 +260,7 @@ SessionRegistry (Manager 侧):
 **持久化要求：**
 
 ```
-存储路径: ~/.elastic-agent/session_registry.json
+存储路径: ~/.elastic-agent/task_registry.json (框架自动管理)
 写入策略: 每次 register / update 后立即写入（操作频率低，不需要防抖）
 格式: {task_id: {worker_id, session_id, book_slug, status, cwd, created_at, finished_at}}
 
@@ -313,7 +305,7 @@ WorkerSlotState (per Worker, 由 Worker Runtime 上报):
 Manager BookQueue 入队
   │
   ▼
-SlotScheduler 查找有空闲生产槽位的 Worker:
+TaskScheduler 查找有空闲生产槽位的 Worker:
   Worker 1: production_slots 1/1 ← 满
   Worker 2: production_slots 0/1 ← 空闲 ✓
   │
@@ -343,7 +335,7 @@ Claude Code 输出 phase=9, state=DELIVERED, session_id=abc123
   │
   ▼
 Manager:
-  SessionRegistry 注册: {task-001 → worker-2, book_slug: outliers, session_id: abc123, status: idle}
+  TaskRegistry 注册: {task-001 → worker-2, book_slug: outliers, session_id: abc123, status: idle}
   Worker 2 的 production_slots: 1/1 → 0/1 (释放生产槽位)
   通知前端: 做书完成
 ```
@@ -359,8 +351,8 @@ Manager:
   { "message": "请修改第三章的开头，换一种更吸引人的方式" }
   │
   ▼
-Manager ChatRelay:
-  1. SessionRegistry 查找: task_id → worker-2, book_slug=outliers, session_id=abc123
+Manager TaskRouter:
+  1. TaskRegistry 查找: task_id → worker-2, book_slug=outliers, session_id=abc123
   2. 检查 Worker 2 的 edit_slots: 2/3 → 有空位 ✓
   3. 通过 Worker 2 的 Runtime 执行:
      claude -p "请修改第三章的开头，换一种更吸引人的方式" \
@@ -380,7 +372,7 @@ Worker Runtime:
 修改完成 (process_exit):
   → 释放修改槽位 (edit_slots: 2/3)
   → 更新 session_id (Claude Code 每次 resume 可能产生新 session_id)
-  → SessionRegistry 更新
+  → TaskRegistry 更新
   → 前端显示修改结果
 ```
 
@@ -389,7 +381,7 @@ Worker Runtime:
 ```
 场景: Worker 2 的修改槽位已满 (3/3)，用户对 Worker 2 上的另一本书发修改请求
 
-Manager ChatRelay:
+Manager TaskRouter:
   1. 查找 session → Worker 2
   2. 检查 edit_slots: 3/3 → 满
   3. 返回 429: "该 Worker 修改槽位已满，请稍后重试"
@@ -457,7 +449,7 @@ oss://audiobook-production/
 ```
 Manager 侧 (Audiobook Agent Service):
   新任务分配到 Worker 时:
-    1. SessionRegistry 注册 task_id → (worker_id, book_slug)
+    1. TaskRegistry 注册 task_id → (worker_id, book_slug)
     2. 调用 Harness.get_task_sync_mapping(task_context) 获取映射规则
     3. 发送 REGISTER_SYNC_MAPPING 消息到 Worker:
        {task_id, book_slug, oss_prefix, mappings, session_path_hash}
@@ -630,7 +622,7 @@ Session 文件备份到 OSS 后，理论上可以在另一台 Worker 上恢复�
 > 理由：
 > 1. Claude Code session .jsonl 可能包含绝对路径引用，跨机器需要路径修补，可靠性未验证
 > 2. MVP 阶段 Worker 是手动管理的常驻实例，离线是低频异常事件
-> 3. 迁移涉及下载+上传+路径校验+SessionRegistry 更新，链路复杂度高
+> 3. 迁移涉及下载+上传+路径校验+TaskRegistry 更新，链路复杂度高
 >
 > 数据基础已具备（session 已备份到 OSS），后续 Phase 需要时可启用迁移功能。
 
@@ -826,11 +818,9 @@ class AudiobookHarness(Harness):
 
     def __init__(self, config: dict):
         self.config = config
-        self.session_registry = SessionRegistry(
-            persist_path=config.get("session_registry_path",
-                                    "~/.elastic-agent/session_registry.json")
-        )
         self.book_queue = BookQueue()
+        # TaskRegistry/TaskScheduler/TaskRouter/WebhookEmitter 由框架自动创建
+        # 通过 self.manager.task_registry 等访问
 
     def get_worker_lifecycle(self) -> WorkerLifecycle:
         return WorkerLifecycle.PERSISTENT  # 常驻，手动开启/关闭
@@ -902,7 +892,7 @@ class AudiobookHarness(Harness):
     async def _on_process_exit(self, data: dict):
         """Claude Code 进程退出 — 更新会话状态，释放槽位，立即同步 session"""
         task_id = data["task_id"]
-        session_info = self.session_registry.get_by_task(task_id)
+        session_info = self.manager.task_registry.get_by_task(task_id)
         if not session_info:
             return
 
@@ -959,14 +949,14 @@ class AudiobookHarness(Harness):
             env={"CLAUDE_CONFIG_DIR": "/root/.claude-prod/"},
         )
         # 注册会话
-        self.session_registry.register(
+        self.manager.task_registry.register(
             book.task_id, worker_id, task_id,
             book_slug=book.slug, mode="producing"
         )
 
     async def handle_edit_request(self, task_id: str, message: str):
         """处理修改请求 — 路由到正确 Worker 的 --resume"""
-        session = self.session_registry.get(task_id)
+        session = self.manager.task_registry.get(task_id)
         if not session:
             raise NotFoundError(f"Session for {task_id} not found")
 
@@ -1061,7 +1051,7 @@ async def cleanup_task_workspace(task_id: str):
 **Session 路由方案：**
 
 ```
-SessionRegistry 是路由的核心:
+TaskRegistry 是路由的核心:
   1. 做书完成时注册: task_id → (worker_id, session_id, book_slug)
   2. 修改请求到来时: 查 task_id → 得到 worker_id → 发到该 Worker
   3. session_id 更新: --resume 后 Claude Code 可能返回新 session_id → 更新注册表
@@ -1105,7 +1095,7 @@ Step 2: 降级到 /continue-book + 新会话 + workspace 上下文
     ✗ 需要重新加载文件上下文（token 消耗增加）
   │
   ▼
-更新 SessionRegistry:
+更新 TaskRegistry:
   新的 session_id 替换旧的（后续修改使用新 session）
 ```
 
@@ -1130,7 +1120,7 @@ Worker Runtime 在读取每行 stdout 时:
 
 Manager 收到 PROCESS_EXIT:
   → 通过多源策略提取 session_id（见 §5.8）
-  → 更新 SessionRegistry 中的 session_id
+  → 更新 TaskRegistry 中的 session_id
   → 释放槽位
 ```
 
@@ -1254,7 +1244,7 @@ Worker Runtime 的槽位管理:
       2. 归档（压缩 + 上传）未同步的文件到 OSS
       3. 删除本地 workspace: rm -rf /root/.work/{book_slug}/
       4. 保留 session 目录元数据（用于后续可能的恢复）
-      5. SessionRegistry 标记 status="archived"
+      5. TaskRegistry 标记 status="archived"
     正在被 FileSyncManager 活跃同步的 → 不清理
 
 手动清理 API:
@@ -1262,7 +1252,7 @@ Worker Runtime 的槽位管理:
     → 检查无活跃进程（producing/editing 状态不允许清理）
     → 确认 OSS 备份完整（对比 manifest）
     → 清理 Worker 本地文件
-    → SessionRegistry 标记为 "archived"
+    → TaskRegistry 标记为 "archived"
     → 返回 {"status": "archived", "task_id": task_id}
 
 Session 文件压缩:
@@ -1338,7 +1328,7 @@ session_id 提取优先级:
 
   Fallback: 所有方式都失败
     → session_id = None
-    → SessionRegistry 中标记 session_id_missing = true
+    → TaskRegistry 中标记 session_id_missing = true
     → 修改请求到来时 → 使用 hybrid 策略的 Step 2（/continue-book）
 
 PROCESS_EXIT 时的关键动作:
@@ -1360,7 +1350,7 @@ PROCESS_EXIT 时的关键动作:
 
 1. 实现 `AudiobookHarness` 基础接口（bootstrap, lifecycle, capacity）
 2. 实现 `BookQueue`（内存队列 + JSON 持久化）
-3. 实现 `SessionRegistry`（内存 + JSON 持久化 + 启动恢复）
+3. 实现 `TaskRegistry`（内存 + JSON 持久化 + 启动恢复）
 4. 实现 `TaskSyncMapper`（动态同步映射，REGISTER/UNREGISTER 消息）
 5. 实现做书 API: `POST /api/tasks/produce`
 6. 实现状态查询 API: `GET /api/tasks/{task_id}/status`
@@ -1375,14 +1365,13 @@ PROCESS_EXIT 时的关键动作:
 
 **目标：** 对已完成的书发送修改请求，支持 --resume 恢复对话。
 
-1. 实现 `ChatRelay`（修改请求路由到正确 Worker）
-2. 实现修改 API: `POST /api/tasks/{task_id}/chat`
+1. 实现修改 API: `POST /api/tasks/{task_id}/chat`（使用框架 TaskRouter 路由到正确 Worker）
 3. 实现 hybrid --resume 策略（先 resume，失败降级到 /continue-book）
 4. 实现凭证隔离（CredentialPool 按槽位分配，独立 CLAUDE_CONFIG_DIR）
 5. 实现 session_id 多源提取（Primary/Secondary/Tertiary）
 6. 实现进度超时检测（30 分钟无进展 -> stalled）
 7. 验证并发修改（同时修改 2-3 本）
-8. 验证 session_id 更新（--resume 后新 id 写入 SessionRegistry）
+8. 验证 session_id 更新（--resume 后新 id 写入 TaskRegistry）
 
 **依赖：** Phase 1 完成
 
@@ -1390,8 +1379,8 @@ PROCESS_EXIT 时的关键动作:
 
 **目标：** 多台 Worker 并行做书，队列调度，Webhook 通知外部服务。
 
-1. 实现 `SlotScheduler`（跨 Worker 查找空闲槽位）
-2. 实现 `WebhookEmitter`（向 audio_book_echo_editor 推送事件）
+1. 配置框架 TaskScheduler（扩展 AudiobookWorkerCapacity 的生产/修改槽位逻辑）
+2. 配置框架 WebhookEmitter（注册 audio_book_echo_editor 的回调 URL）
 3. 实现 Worker 目录生命周期管理（磁盘监控、自动清理、手动清理 API）
 4. 实现重试/续跑: `POST /api/tasks/{task_id}/retry`, `POST /api/tasks/{task_id}/continue`
 5. 手动扩容到 3 台 Worker → 提交多本书 → 验证队列分发
@@ -1404,9 +1393,9 @@ PROCESS_EXIT 时的关键动作:
 
 ---
 
-## 7. 对 Elastic-Agent 框架的需求
+## 7. Elastic-Agent 框架提供的能力
 
-### 7.1 Audiobook 特有但普适的需求
+### 7.1 Audiobook 使用的框架能力
 
 | 需求 | 说明 | 普适性 |
 |------|------|--------|
@@ -1418,7 +1407,7 @@ PROCESS_EXIT 时的关键动作:
 | **从云存储统一读取** | 内容查询走 OSS 不走 Worker，附带一致性元数据 | 通用 — 解耦读路径和 Worker 生命周期 |
 | **TaskSyncMapper / 动态同步映射** | Worker 上多任务 -> 多 OSS 路径的动态映射，由 Manager 推送 | 通用 — 任何单 Worker 多任务场景 |
 | **FILE_SYNCED 事件类型** | 文件同步完成后的通知（含 oss_key、synced_at 等），外部服务统一使用此事件 | 通用 — 外部服务需要知道何时可从 OSS 读取 |
-| **Harness 级状态持久化钩子** | SessionRegistry 等 Harness 数据的持久化支持 | 通用 — Manager 崩溃恢复 |
+| **Harness 级状态持久化钩子** | TaskRegistry 等 Harness 数据的持久化支持 | 通用 — Manager 崩溃恢复 |
 | **Per-task 凭证隔离支持** | EXECUTE 时指定 CLAUDE_CONFIG_DIR 环境变量 | 通用 — 多账号并发场景 |
 | **Webhook 事件通知** | 做书完成/失败/Phase 切换 -> 推送到注册的 URL | 通用 — 后端系统异步事件驱动 |
 | **任务重试/续跑** | 从指定 Phase 重新开始 或 断点续跑失败任务 | 通用 — 长时间任务的容错 |
