@@ -42,8 +42,8 @@
 - [x] **T-013** [EA] 内部轨迹流 — EventBus LOG 事件分发（Harness 回调、phase 检测用，不对外暴露）  `01 §3.3`
 - [x] **T-014** [EA] 文件同步通知 — FILE_SYNCED 事件 → WebhookEmitter 推送（外部通过 Webhook 感知）  `01 §3.3`
 - [ ] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
-- [ ] **T-016** [EA] Manager FastAPI 服务骨架 + 节点管理 REST API  `01 §2.1`
-- [ ] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）  `01 §3.5`
+- [x] **T-016** [EA] Manager FastAPI 服务骨架 + 节点管理 REST API  `01 §2.1`
+- [x] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）  `01 §3.5`
 - [ ] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
 - [ ] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
 - [ ] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
