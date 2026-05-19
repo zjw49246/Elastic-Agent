@@ -43,7 +43,7 @@
 | **[Elastic-Agent](https://github.com/zjw49246/Elastic-Agent)** | 通用弹性计算框架：云管理、Worker Runtime、TaskRegistry/Scheduler/Router、WebhookEmitter、CredentialPool、FileSyncManager | Python 3.11+, FastAPI | GitHub 包 |
 | **[Audiobook Agent Service](https://github.com/zjw49246/audio_book_echo_agent)** | 薄业务层：AudiobookHarness、BookQueue、Phase 检测、Audiobook API | Python 3.11+, FastAPI | 独立部署的 Manager 服务 |
 | **[audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor)** | 现有做书前后端：双引擎适配层、Elastic 客户端、Webhook 处理、OSS 文件读取、前端 UI | Python (FastAPI) + React/TS | 现有部署，增量改造 |
-| **audiobook-nonfiction** (需新建) | Claude Code 有声书插件：10 Phase 生产流水线、22 个子 Agent、/audiobook 命令 | Claude Code Skill | 安装在 Worker 上 |
+| **[audiobook-nonfiction](https://github.com/zjw49246/audiobook-nonfiction)** | Claude Code 有声书插件：10 Phase 生产流水线、22 个子 Agent、/audiobook 命令 | Claude Code Skill | 安装在 Worker 上 |
 
 ### 2.2 依赖关系
 

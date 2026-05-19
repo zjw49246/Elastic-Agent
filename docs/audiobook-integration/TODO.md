@@ -6,7 +6,7 @@
 > - **[EA]** = [Elastic-Agent](https://github.com/zjw49246/Elastic-Agent) — 通用弹性计算框架
 > - **[ABS]** = [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent) — Audiobook Agent Service
 > - **[ABE]** = [audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor) — 现有做书前后端
-> - **[插件]** = audiobook-nonfiction（需新建 GitHub 仓库）— Claude Code 有声书插件
+> - **[插件]** = [audiobook-nonfiction](https://github.com/zjw49246/audiobook-nonfiction) — Claude Code 有声书插件
 
 ---
 
@@ -309,12 +309,12 @@
 
 ---
 
-## 4.5 audiobook-nonfiction 插件（需新建 GitHub 仓库）
+## 4.5 [audiobook-nonfiction](https://github.com/zjw49246/audiobook-nonfiction) 插件适配
 
 > audiobook-nonfiction 是 Claude Code 的 Skill 插件，实现 10 Phase 有声书生产流水线。
-> 当前代码尚未开源，需要创建独立的 GitHub 仓库，并根据 Elastic-Agent 方案做适配。
+> 仓库已创建，以下是根据 Elastic-Agent 方案需要做的适配。
 
-- [ ] **P-000** [插件] 创建 GitHub 仓库 `audiobook-nonfiction`，初始化项目结构（CLAUDE.md、README.md）
+- [x] **P-000** [插件] ~~创建 GitHub 仓库 `audiobook-nonfiction`~~ ✓ 已完成
 - [ ] **P-001** [插件] state.json 增加 session_id 字段（做书完成时写入，作为 session_id 提取的冗余来源）  `04 §3.12`
 - [ ] **P-002** [插件] delivery/ 目录结构标准化（确保文件名为 audiobook_manuscript.md / audiobook_delivery.zip）  `04 §3.12`
 - [ ] **P-003** [插件] 确认 /audiobook 命令参数与 Worker Runtime EXECUTE 命令格式兼容  `04 §3.12`
