@@ -21,8 +21,8 @@ audio_book_echo_editor          Audiobook Agent Service          Worker (Elastic
         │   OSS 读取 ◀─── OSS 写入 ◀────│────── FileSyncManager ─────────│
         │   (manifest/文件/聊天日志)      │                                │
         │                                │                                │
-        ├── REST/WS ───────────────────▶│                                │
-        │   (聊天轮询/实时通知)           ├── WebSocket (Runtime) ─────▶│
+        ├── REST ──────────────────────▶│                                │
+        │   (聊天轮询 chat/live)         ├── WebSocket (Runtime) ─────▶│
         │                                │   (命令/日志/心跳/文件事件)     │
         └────────────────────────────────┘                                │
 ```
@@ -977,7 +977,7 @@ MVP 阶段不做 URL 版本（如 `/v1/`）。后续如需破坏性变更，通�
 |------|---|------|
 | HTTP 请求超时 | 30s | audio_book → Agent Service |
 | Webhook 发送超时 | 10s | Agent Service → audio_book |
-| WebSocket 心跳 | 30s | 前端 ↔ Agent Service |
+| Worker Runtime 心跳 | 30s | Worker ↔ Manager（框架内部） |
 | raw_text 最大大小 | 10MB | 超过则用 raw_text_oss_uri |
 | Webhook 最大重试 | 5 次 | 约 35 分钟内 |
 | chat message 最大长度 | 10000 字符 | 单条修改指令 |

@@ -248,7 +248,7 @@ Worker Claude Code  │  Audiobook Agent Service  │  audio_book 后端     前
                     │  │  EventBus (内部用途:     │
                     │  │  Phase 检测、调度等)      │
                     │  └ NDJSON 日志文件 ─────────┼→ FileSyncManager → OSS
-                    │    logs/{task_id}.ndjson   │
+                    │    logs/production.ndjson  │
                     │        │                  │
                     │        ▼                  │
                     │  ABE 后端 REST 读取 OSS ───┼──→ 前端轮询 chat/history
