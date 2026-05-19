@@ -52,6 +52,19 @@
 | T-039 | Manager 结构化操作日志（JSON Lines，全部关键操作） | 01 §3.8 |
 | T-040 | LOG 事件结构化解析（NDJSON → typed event） | 01 §3.3 |
 
+**凭证管理（自动登录 + 额度监控 + 自动轮换）：**
+
+| ID | 任务 | 详见 |
+|---|---|---|
+| T-026 | CredentialPool 账号池管理（accounts.json 加载、pool_status.json、分组、分配/回收） | 01 §3.6 |
+| T-041 | ClaudeOAuthProvider 自动登录（14 步 OAuth：171mail + Playwright + mitmproxy） | 01 §3.6 |
+| T-042 | Worker Bootstrap 登录步骤（为每个 Slot 执行自动登录，串行，失败回滚） | 01 §3.6 |
+| T-043 | Worker 侧额度监控（每 60s 调用 usage API，Token 续期，QUOTA_STATUS 上报） | 01 §3.6 |
+| T-044 | Manager 侧 QuotaMonitor（汇聚额度数据，阈值检测，QUOTA_WARNING 事件） | 01 §3.6 |
+| T-045 | 自动轮换（等待任务完成 → 分配新账号 → 登录/分发 → 恢复槽位） | 01 §3.6 |
+| T-046 | 冷却恢复（5h 窗口到期后自动标记 available） | 01 §3.6 |
+| T-047 | CREDENTIAL_LOGIN / QUOTA_STATUS / CREDENTIAL_ROTATE 协议消息 | 01 §3.6 |
+
 ### P1 — 应该完成
 
 | ID | 任务 | 详见 |
@@ -61,8 +74,6 @@
 | T-023 | Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug） | 01 §3.5 |
 | T-024 | Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程） | 01 §3.5 |
 | T-025 | 优雅缩容 Drain | 01 §3.5 |
-| T-026 | 凭证分发（Bootstrap 注入环境变量 / .credentials.json） | 01 §3.6 |
-| T-027 | 基础额度监控 | 01 §3.6 |
 | T-028 | 手动扩缩容 API（scale_out / scale_in / remove_node） | 01 §6 |
 | T-029 | 基础 Web UI（节点列表、状态卡片、手动操作） | 01 §6 |
 
@@ -88,6 +99,9 @@
 | T-126 | Worker 断线重连：指数退避、日志缓冲、重连后回放 |
 | T-127 | 外部 API 认证：有效/无效/过期 API Key |
 | T-128 | Spot/抢占式实例处理：回收事件检测 + 状态更新 |
+| T-132 | CredentialPool：accounts.json 加载 / 分组 / 分配 / 回收 / pool_status 持久化 |
+| T-133 | QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复 |
+| T-134 | 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理 |
 
 ### 测试 — 集成测试
 
@@ -107,6 +121,8 @@
 | T-129 | Manager 崩溃恢复：重启 → NodeRegistry 重建 → Worker 重连 → 状态一致 |
 | T-130 | 凭证轮换 E2E：额度耗尽 → 自动换号 → 进程使用新凭证 |
 | T-131 | 多 Worker 并发：5+ Worker 同时连接 + 并发执行命令 |
+| T-135 | 自动登录 E2E：171mail + Playwright + mitmproxy → credentials.json 生成 |
+| T-136 | 额度监控 E2E：Worker 上报 → Manager 汇聚 → 阈值告警 → 触发轮换 |
 
 ---
 
@@ -350,9 +366,17 @@ bootstrap:
   failure_strategy: "terminate_and_retry"  # terminate_and_retry | retry_from_failed | leave_for_debug
 
 credentials:
-  pool_file: "~/.elastic-agent/credentials.json"
-  quota_threshold: 0.85                    # 额度使用率告警阈值
-  check_interval: 60                       # 额度检查间隔（秒）
+  accounts_file: "~/.elastic-agent/accounts.json"     # 账号池定义
+  pool_status_file: "~/.elastic-agent/pool_status.json" # 运行时状态（框架自动维护）
+  quota_threshold: 0.85                    # 5h 额度使用率告警阈值
+  quota_check_interval: 60                 # Worker 侧额度检查间隔（秒）
+  rotation_strategy: "least_used_first"    # 轮换策略：least_used_first | round_robin
+  login_timeout: 240                       # 单次自动登录超时（秒）
+  login_dependencies:                      # Worker 上自动登录的依赖（Bootstrap 时安装）
+    - playwright
+    - playwright-stealth
+    - mitmproxy
+    - chrome
 
 external_api:
   enabled: true

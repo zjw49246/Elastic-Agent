@@ -55,8 +55,14 @@
 - [ ] **T-023** Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）
 - [ ] **T-024** Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）
 - [ ] **T-025** 优雅缩容 Drain（draining 标记 → 等待完成 → 回收凭证 → 终止）
-- [ ] **T-026** 凭证分发（API Key 方式，Bootstrap 注入环境变量 / .credentials.json）
-- [ ] **T-027** 基础额度监控（轮询 Worker 侧 quota 状态，阈值告警）
+- [ ] **T-026** CredentialPool 账号池管理（accounts.json 加载、pool_status.json 持久化、分组、分配/回收）
+- [ ] **T-041** ClaudeOAuthProvider 自动登录（Worker 侧 14 步 OAuth 流程：171mail + Playwright + mitmproxy）
+- [ ] **T-042** Worker Bootstrap 登录步骤（为每个分配的 Slot 执行自动登录，串行执行，失败回滚）
+- [ ] **T-043** Worker 侧额度监控（每 60s 调用 usage API，Token 续期，QUOTA_STATUS 事件上报）
+- [ ] **T-044** Manager 侧 QuotaMonitor（汇聚 Worker 额度数据，阈值检测，QUOTA_WARNING 事件）
+- [ ] **T-045** 自动轮换（额度耗尽 → 等待当前任务完成 → 分配新账号 → 登录/分发凭证 → 恢复槽位）
+- [ ] **T-046** 冷却恢复（5h 窗口到期后自动标记账号为 available）
+- [ ] **T-047** CREDENTIAL_LOGIN / QUOTA_STATUS / CREDENTIAL_ROTATE 协议消息
 - [ ] **T-028** 手动扩缩容 API（scale_out / scale_in / remove_node）
 - [ ] **T-029** 基础 Web UI（节点列表、状态卡片、手动操作）
 
@@ -776,12 +782,11 @@ FileSyncManager 运行在每个 Worker 上（Worker Runtime 的子组件）:
 #### 两层凭证模型
 
 ```
-Layer 1: Agent 凭证（框架管理）
-  Claude Code 的登录态（OAuth refresh token）
-  存储: credentials.json（Manager 本地）
-  分发: Bootstrap 时写入 Worker 的 ~/.claude/.credentials.json
-  回收: 节点终止或 Drain 时回收到池子
-  轮换: 额度耗尽时自动换号（Phase 2 实现）
+Layer 1: Agent 凭证（框架管理，全自动）
+  Claude Max 订阅账号的 OAuth token（accessToken + refreshToken）
+  框架负责: 自动登录获取 → 分发到 Worker → 额度监控 → 自动轮换 → 回收
+  存储: accounts.json（Manager 本地账号池定义）
+  运行时状态: pool_status.json（各账号额度、可用性、分配状态）
 
 Layer 2: 应用凭证（Harness 声明，框架传递）
   Git SSH key、WandB API key、HuggingFace token 等
@@ -789,33 +794,221 @@ Layer 2: 应用凭证（Harness 声明，框架传递）
   Bootstrap 时从 Manager 安全传递到 Worker（环境变量或文件）
 ```
 
-#### 多 Slot Worker 的凭证隔离
+#### 账号池
 
-> **[更新] 原设计假设每个 Worker 只运行一个 Agent 进程。Audiobook Harness 的双 Slot 模型（production + edit）要求同一台机器上并行运行多个 Claude Code 进程，每个进程需要独立的凭证。**
+```
+账号池配置 (~/.elastic-agent/accounts.json):
+{
+  "accounts": [
+    {
+      "id": "prod-1",
+      "email": "user1@171mail.com",
+      "email_token": "sk-mailapi-abc...",   // 171mail API token，用于自动登录
+      "group": "high_quota",                // 账号分组
+      "enabled": true
+    },
+    {
+      "id": "prod-2",
+      "email": "user2@171mail.com",
+      "email_token": "sk-mailapi-def...",
+      "group": "high_quota",
+      "enabled": true
+    },
+    {
+      "id": "edit-1",
+      "email": "user3@171mail.com",
+      "email_token": "sk-mailapi-ghi...",
+      "group": "standard",
+      "enabled": true
+    }
+  ],
+  "groups": {
+    "high_quota": {"description": "主账号，用于生产槽位（Opus 密集）"},
+    "standard":   {"description": "副账号，用于修改槽位（Sonnet 轻量）"}
+  }
+}
+
+运行时状态 (~/.elastic-agent/pool_status.json, 框架自动维护):
+{
+  "last_updated": "2026-05-19T12:34:56Z",
+  "accounts": {
+    "prod-1": {
+      "email": "user1@171mail.com",
+      "group": "high_quota",
+      "assigned_to": "aliyun:i-bp1xxx",    // 当前分配给哪个 Worker
+      "slot_type": "production",            // 分配给哪种槽位
+      "config_dir": "/root/.claude-prod",   // Worker 上的凭证目录
+      "five_hour": {"utilization": 45, "resets_at": "2026-05-19T17:34:56Z"},
+      "seven_day": {"utilization": 62, "resets_at": "2026-05-26T00:00:00Z"},
+      "available": true,
+      "login_status": "logged_in",          // logged_in / expired / login_failed / not_logged_in
+      "last_login_at": "2026-05-18T10:00:00Z",
+      "last_quota_check": "2026-05-19T12:34:50Z"
+    }
+  }
+}
+```
+
+#### 自动登录（OAuth 14 步流程）
+
+```
+框架内置 ClaudeOAuthProvider，在 Worker 上执行自动登录。
+（设计参考 agent-ml-research 的 account_login.py）
+
+触发时机:
+  1. Bootstrap 时: 为每个分配的凭证执行登录
+  2. Token 过期时: refreshToken 失效，需要重新登录
+  3. 手动触发: 运维 API 触发重新登录
+
+登录流程（在 Worker 上执行）:
+  Manager 发送 CREDENTIAL_LOGIN 命令到 Worker Runtime:
+    {account_id, email, email_token, config_dir}
+
+  Worker Runtime 执行登录脚本:
+    1. 文件锁防并发（per-account）
+    2. 调用 171mail API 触发发送 magic link:
+       POST https://b.171mail.com/api/v1/claude/send {email}
+       → 返回 deviceId + clientSha
+    3. 轮询 171mail 收件箱获取 magic link:
+       GET https://b.171mail.com/api/v1/getClaudeMessage?token={email_token}
+       → 每 2s 轮询，超时 90s
+    4. 验证 magic link:
+       POST https://b.171mail.com/api/v1/claude/verify {link, deviceId, clientSha, email}
+       → 返回 Anthropic session cookie + sessionKey
+    5. 启动 mitmproxy（修正 Claude CLI OAuth redirect_uri bug）
+    6. 启动 Claude CLI: claude auth login --email {email}
+       环境变量: CLAUDE_CONFIG_DIR={config_dir}, HTTPS_PROXY=mitm
+    7. 从 CLI stdout 提取 OAuth authorize URL
+    8. Playwright 打开 Chrome（需要 Xvfb）:
+       a. 注入 session cookie
+       b. 身份验证: GET https://claude.ai/api/account 确认 email 匹配
+       c. 导航到 OAuth URL
+       d. 等待 Cloudflare 验证通过
+       e. 点击 "Authorize" 按钮
+       f. 捕获 callback URL 中的 code + state
+    9. 将 code+state 发送到 CLI 的 localhost 回调端口
+   10. CLI 完成 token 交换，写入 {config_dir}/.credentials.json:
+       {claudeAiOauth: {accessToken, refreshToken, expiresAt}}
+   11. 验证: claude auth status 确认登录成功
+   12. 清理: 关闭 Playwright、停止 mitmproxy、释放文件锁
+
+  Worker Runtime 上报 CREDENTIAL_LOGIN_RESULT:
+    {account_id, ok, error?, expires_at?}
+
+Worker 依赖（Bootstrap 时安装）:
+  - Python 3.11+ (Worker Runtime 自带)
+  - Playwright + playwright-stealth + Chrome
+  - Xvfb (Linux headed Chrome 需要)
+  - mitmproxy (mitmdump)
+  - Node.js + Claude Code CLI
+
+登录耗时: 约 30-60 秒/账号
+并发: 同一 Worker 上串行登录（文件锁），不同 Worker 可并行
+```
+
+#### 额度监控
+
+```
+两级额度监控:
+
+Level 1: Worker 侧（周期性检查）
+  Worker Runtime 每 60s 对本机所有活跃凭证执行:
+    1. 读取 {config_dir}/.credentials.json 获取 accessToken
+    2. Token 续期（如果距过期 < 5min）:
+       POST https://console.anthropic.com/v1/oauth/token
+       {grant_type: refresh_token, refresh_token: ..., client_id: 9d1c250a-...}
+    3. 调用额度 API:
+       GET https://api.anthropic.com/api/oauth/usage
+       Headers: Authorization: Bearer {accessToken}
+               anthropic-beta: oauth-2025-04-20
+    4. 解析响应:
+       {
+         "five_hour":  {"utilization": 45, "resets_at": "2026-05-19T17:34:56Z"},
+         "seven_day":  {"utilization": 62, "resets_at": "2026-05-26T00:00:00Z"}
+       }
+    5. 发送 QUOTA_STATUS 事件到 Manager:
+       {credential_id, five_hour_pct, seven_day_pct, five_hour_resets_at, available}
+
+  额度 API 限流处理:
+    返回 rate_limit_error → 使用本地缓存值 + 标记 stale
+    指数退避: 180s → 360s → ... → 2880s（上限）
+    额度 API 限流不影响 Claude Code 正常使用
+
+Level 2: Manager 侧（汇聚 + 决策）
+  QuotaMonitor 收集所有 Worker 的 QUOTA_STATUS 事件:
+    1. 更新 pool_status.json 中的额度数据
+    2. 阈值检测:
+       five_hour_pct >= quota_threshold (85%) → 触发 QUOTA_WARNING 事件
+       five_hour_pct >= 95% 或 API 返回 rate_limit → 触发轮换
+    3. Harness 可订阅 QUOTA_WARNING 发送告警（飞书/Webhook）
+```
+
+#### 自动轮换（切号）
+
+```
+触发条件:
+  - 额度 >= 95%（接近硬限制）
+  - Claude Code 进程返回 rate_limit 错误
+  - Token 过期且 refresh 失败（需要重新登录）
+
+轮换流程:
+  1. QuotaMonitor 检测到账号 "prod-1" 在 Worker W1 上额度耗尽
+  2. CredentialPool 查找替代账号:
+     过滤: 同 group + enabled + available (five_hour < threshold) + 未被分配
+     排序: five_hour_pct 升序（最空闲优先）
+  3. 如果找到替代账号 "prod-2":
+     a. 等待当前任务完成（不中断执行中的 Claude Code 进程）
+     b. 检查 "prod-2" 的登录状态:
+        - 已登录且 token 有效 → 直接分发凭证文件到 Worker
+        - token 过期 → 先 refresh token
+        - 未登录 → 在 Worker 上执行自动登录流程
+     c. 将新凭证写入 Worker 的 config_dir（覆盖旧凭证文件）
+     d. 更新 pool_status.json:
+        "prod-1": assigned_to=null, available=false（冷却中，5h 窗口后自动恢复）
+        "prod-2": assigned_to=W1, slot_type=production
+     e. 标记槽位可用 → 恢复接受新任务
+     f. 操作日志: credential_rotated {node_id, old_id: prod-1, new_id: prod-2, reason: quota_exceeded}
+  4. 如果没有替代账号（所有账号都耗尽）:
+     → 发送 CREDENTIAL_EXHAUSTED 事件
+     → 该 Worker 的对应槽位暂停接受任务
+     → Harness 回调: 可选告警运维、排队等待、尝试重新登录已冷却账号
+
+冷却恢复:
+  被标记 available=false 的账号，当 resets_at 时间到达时:
+  → 额度 API 下一次检查发现 five_hour_pct 降到阈值以下
+  → 自动标记 available=true → 可再次被分配
+
+不中断原则:
+  轮换永远不中断正在执行的 Claude Code 进程
+  等待当前任务完成（PROCESS_EXIT）后再切换凭证
+  如果任务很长（如 Audiobook 生产 2h），则在任务完成前就标记"下次任务用新凭证"
+```
+
+#### 多 Slot Worker 的凭证隔离
 
 ```
 多 Slot 凭证隔离策略:
 
   Primary Slot (production):
-    - 使用高配额凭证（主账号）
+    - 从 "high_quota" 分组分配
     - CLAUDE_CONFIG_DIR=/root/.claude-prod/
     - 长时间运行，承担主要创作工作
 
   Secondary Slot(s) (edit):
-    - 使用普通配额凭证（副账号）
+    - 从 "standard" 分组分配
     - CLAUDE_CONFIG_DIR=/root/.claude-edit-{n}/
     - 短时间运行，按需启动
 
   隔离机制:
-    - 每个 Claude Code 进程通过不同的 CLAUDE_CONFIG_DIR 隔离
-    - 凭证文件写入各自的 config dir: {CLAUDE_CONFIG_DIR}/.credentials.json
-    - Bootstrap 时 Manager 为每个 Slot 分配独立凭证
-    - 回收时按 Slot 分别回收
+    - 每个 Claude Code 进程通过不同的 CLAUDE_CONFIG_DIR 使用独立凭证
+    - Bootstrap 时: Manager 为每个 Slot 分配账号 → 在 Worker 上逐个登录
+    - 额度独立: 各 Slot 的账号额度互不影响
+    - 回收时: 按 Slot 分别回收到对应 group
 
   凭证分配策略:
-    - Primary slot → 从 CredentialPool 的 "high_quota" 分组分配
-    - Edit slot → 从 CredentialPool 的 "standard" 分组分配
-    - 如果 standard 分组耗尽 → 可以临时使用 high_quota（但需要告警）
+    - Primary slot → 从 "high_quota" 分组的可用账号中选择
+    - Edit slot → 从 "standard" 分组的可用账号中选择
+    - 如果 "standard" 耗尽 → 临时使用 "high_quota"（发出告警）
 ```
 
 #### Manager ↔ Worker 认证
@@ -1340,9 +1533,12 @@ bootstrap:
   failure_strategy: "terminate_and_retry"
 
 credentials:
-  pool_file: "~/.elastic-agent/credentials.json"
-  quota_threshold: 0.85           # 额度使用率告警阈值
-  check_interval: 60              # 额度检查间隔（秒）
+  accounts_file: "~/.elastic-agent/accounts.json"       # 账号池定义
+  pool_status_file: "~/.elastic-agent/pool_status.json" # 运行时状态（自动维护）
+  quota_threshold: 0.85           # 5h 额度使用率告警阈值
+  quota_check_interval: 60        # Worker 侧额度检查间隔（秒）
+  rotation_strategy: "least_used_first"  # 轮换策略
+  login_timeout: 240              # 单次自动登录超时（秒）
 
 external_api:
   enabled: true
