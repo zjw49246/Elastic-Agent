@@ -135,6 +135,9 @@
 | T-202 | MockOAuthServer 实现（模拟 171mail + Anthropic OAuth + Usage API） | 06 §2.1 |
 | T-203 | MockOSS 实现（本地文件系统模拟 OSS PutObject/GetObject） | 06 §2.1 |
 | T-204 | create_test_manager() 工厂函数（一键创建带全部 Mock 的测试 Manager） | 06 §2.1 |
+| T-205 | LocalWorkerProcess（本地启动真实 Worker Runtime 进程用于 L3+ 测试） | 06 §5.2 |
+| T-206 | 测试级别框架（conftest.py: 环境变量驱动的 provider/worker/oss fixture 切换） | 06 §5.2 |
+| T-207 | pytest marker 注册（level0 ~ level6，CI 按凭证可用性选择执行范围） | 06 §8 |
 
 ---
 

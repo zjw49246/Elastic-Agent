@@ -448,88 +448,229 @@ class MockOSSReader:
 
 ---
 
-## 5. 三仓库拼接的集成测试
+## 5. 渐进式测试级别
 
-独立测试通过后，用真实组件替换 Mock 逐步拼接：
+除了全 Mock 和全真实两个极端，每个依赖可以独立地在 Mock / Real 之间切换。通过环境变量选择级别，同一套测试代码适配不同环境。
 
-### 5.1 拼接阶段
+### 5.1 六个可替换的依赖
 
+| 依赖 | Mock 实现 | Real 实现 | 切换条件 |
+|---|---|---|---|
+| 云 API | DryRunProvider | AliyunProvider / AWSProvider | 有云凭证 |
+| Worker Runtime | MockWorker (进程内 WS) | 真实 Worker Runtime (本地进程或远程 VM) | 有 Worker 二进制 |
+| Claude Code CLI | MockClaudeOutput (预录 NDJSON) | 真实 `claude` CLI | 有 Claude 账号 |
+| OSS/S3 | MockOSS (本地文件系统) | 真实阿里云 OSS / AWS S3 | 有 OSS 凭证 |
+| Agent Service | MockAgentService | 真实 ABS 实例 | ABS 已部署 |
+| ABE 环境 | WebhookCatcher | ABE 测试环境 | ABE 已部署 |
+
+### 5.2 EA 框架的测试级别
+
+| 级别 | 云 | Worker | Claude | OSS | 验证什么 | 耗时 | 成本 |
+|---|---|---|---|---|---|---|---|
+| **L0 Unit** | — | — | — | — | 数据模型、算法、序列化 | 秒 | 0 |
+| **L1 Component** | DryRun | Mock | Mock | Mock | Manager 编排、WS 通信、Bootstrap 状态机 | 秒 | 0 |
+| **L2 Cloud** | **真实** | Mock | Mock | Mock | 云 API 调用正确性（创建/销毁/标签） | 分钟 | ~¥0.1 |
+| **L3 Worker** | **真实** | **真实**(本地) | Mock | Mock | Bootstrap 全流程、Worker Runtime 连接 | 分钟 | ~¥0.5 |
+| **L4 Agent** | **真实** | **真实** | **真实** | Mock | Claude Code 执行、日志双写、session_id 提取 | 10min+ | Claude token |
+| **L5 Storage** | **真实** | **真实** | Mock | **真实** | FileSyncManager → OSS、manifest 生成 | 分钟 | ~¥0.01 |
+| **L6 Full** | **真实** | **真实** | **真实** | **真实** | 端到端：创建 VM → 做书 → OSS 同步 | 1h+ | ¥5+ |
+
+```python
+# conftest.py — 根据环境变量选择级别
+import os, pytest
+
+TEST_LEVEL = int(os.environ.get("EA_TEST_LEVEL", "1"))
+
+@pytest.fixture
+def provider():
+    if TEST_LEVEL >= 2 and os.environ.get("ALICLOUD_ACCESS_KEY_ID"):
+        return AliyunProvider(real_config)
+    return DryRunProvider()
+
+@pytest.fixture
+def worker(provider):
+    if TEST_LEVEL >= 3:
+        return LocalWorkerProcess()   # 本地启动真实 Worker Runtime
+    return MockWorker()
+
+@pytest.fixture
+def claude_runner():
+    if TEST_LEVEL >= 4 and shutil.which("claude"):
+        return RealClaudeRunner()     # 真实 CLI
+    return MockClaudeOutput.production_success()
+
+@pytest.fixture
+def oss():
+    if TEST_LEVEL >= 5 and os.environ.get("ABS_OSS_ACCESS_KEY_ID"):
+        return RealOSSClient(real_oss_config)
+    return MockOSS(tmp_path)
 ```
-阶段 1: EA + ABS（不含 ABE）
-  EA 真实 Manager + DryRunProvider + MockWorker
-  ABS 真实 Harness + 真实 API
-  验证: produce → MockWorker 执行 → session 注册 → Webhook 发出
 
-阶段 2: EA + ABS + 真实 Worker（不含 ABE）
-  EA 真实 Manager + DryRunProvider + 真实 Worker Runtime（本地进程）
-  ABS 真实 Harness
-  验证: produce → 真实 Worker 上 Claude Code 执行 → 文件同步到 MockOSS
+L2 的价值：验证云 SDK 调用是否正确（参数、标签、安全组），不需要等 Bootstrap。创建实例后立即销毁，成本极低。
 
-阶段 3: EA + ABS + ABE（全链路，DryRun 云）
-  ABE 真实后端 → ABS 真实服务 → EA DryRunProvider + MockWorker
-  验证: 前端创建任务 → Elastic 做书 → Webhook → 回灌 → 审核流程
+L3 的价值：验证 SSH 连接、Bootstrap 命令执行、Worker Runtime 启动。不消耗 Claude token。Worker Runtime 在本地进程中运行（不需要真实 VM）：
 
-阶段 4: 全真实（含真实云）
-  ABE → ABS → EA + 真实阿里云 ECS + 真实 Worker + 真实 OSS
-  验证: 端到端全链路
+```python
+class LocalWorkerProcess:
+    """在本地启动真实的 Worker Runtime 进程，连接到测试 Manager。"""
+
+    async def start(self, manager_url, token):
+        self.proc = await asyncio.create_subprocess_exec(
+            "python", "-m", "elastic_agent.worker",
+            "--manager-url", manager_url,
+            "--token", token,
+        )
+
+    async def stop(self):
+        self.proc.terminate()
 ```
 
-### 5.2 拼接测试用例
+L4 的价值：验证真实 Claude Code CLI 的行为——NDJSON 输出格式、session_id 提取、`--resume` 是否可用。这是 Mock 无法替代的，因为 Claude Code 的输出格式可能随版本变化。
 
-| ID | 阶段 | 测试内容 |
-|---|---|---|
-| I-001 | 1 | ABS 使用 EA 创建 MockWorker + Bootstrap |
-| I-002 | 1 | ABS produce → MockWorker 执行 → Webhook 到 WebhookCatcher |
-| I-003 | 2 | 真实 Worker Runtime 连接 + 执行 Claude Code（本地） |
-| I-004 | 3 | ABE 创建 Elastic 任务 → ABS 执行 → Webhook → ABE 回灌 |
-| I-005 | 3 | ABE 发送修改 → ABS --resume → Webhook → ABE 更新 |
-| I-006 | 4 | 真实阿里云 ECS + 真实做书 + 真实 OSS + 真实 Webhook |
+### 5.3 ABS Agent Service 的测试级别
+
+| 级别 | EA 框架 | Worker | Claude | OSS | Webhook 目标 | 验证什么 |
+|---|---|---|---|---|---|---|
+| **L0 Unit** | — | — | — | — | — | 队列、注册表、调度算法 |
+| **L1 Component** | DryRun + MockWorker | Mock | Mock | Mock | WebhookCatcher | Harness 编排、API |
+| **L2 Real Worker** | DryRun | **真实**(本地) | Mock | Mock | WebhookCatcher | Worker Runtime 集成 |
+| **L3 Real Claude** | DryRun | **真实** | **真实** | Mock | WebhookCatcher | 真实做书流程（无真实 VM） |
+| **L4 Real OSS** | DryRun | **真实** | **真实** | **真实** | WebhookCatcher | 文件同步到 OSS |
+| **L5 Real Cloud** | **真实云** | **真实** | **真实** | **真实** | WebhookCatcher | 全真实基础设施 |
+| **L6 Full** | **真实云** | **真实** | **真实** | **真实** | **ABE 测试环境** | 含 ABE 的全链路 |
+
+L3 是一个关键级别：在本地机器上用 DryRunProvider（不创建真实 VM），但启动真实的 Worker Runtime 进程 + 真实的 Claude Code CLI，执行一本短书的生产。验证整个做书流程的业务逻辑，不需要云账号。
+
+### 5.4 ABE 做书前后端的测试级别
+
+| 级别 | Agent Service | OSS | 验证什么 |
+|---|---|---|---|
+| **L0 Unit** | — | — | 模型、映射、slug 生成 |
+| **L1 Mock** | MockAgentService | MockOSSReader | Client、Webhook、API 全覆盖 |
+| **L2 Real ABS** | **真实 ABS**(L1 模式) | MockOSSReader | 跨服务 HTTP 调用 |
+| **L3 Real OSS** | **真实 ABS** | **真实 OSS** | 文件读取端到端 |
+| **L4 Full** | **真实 ABS**(L5/L6 模式) | **真实 OSS** | ABE → ABS → Worker → Claude → OSS → Webhook → ABE |
+
+L2 的价值：ABE 后端连接到一个真实运行的 ABS 实例（ABS 自己用 DryRun + MockWorker），验证 HTTP 接口契约是否对齐。不需要云账号、不需要 Claude。
 
 ---
 
-## 6. Mock 工具的代码归属
+## 6. 三仓库拼接的集成测试
+
+独立测试通过后，逐步拼接：
+
+### 6.1 拼接矩阵
+
+```
+          ┌─ ABE ─┐   ┌── ABS ──┐   ┌── EA ──┐   ┌─ 外部 ─┐
+          │       │   │         │   │        │   │        │
+拼接 1:   │ Mock  │ → │  Real   │ → │ DryRun │   │ Mock   │
+          │       │   │ L1 模式 │   │+MockWk │   │        │
+          │       │   │         │   │        │   │        │
+拼接 2:   │ Mock  │ → │  Real   │ → │ DryRun │   │ Real   │
+          │       │   │ L3 模式 │   │+RealWk │   │ Claude │
+          │       │   │         │   │+RealCC │   │        │
+          │       │   │         │   │        │   │        │
+拼接 3:   │ Real  │ → │  Real   │ → │ DryRun │   │ Mock   │
+          │ 测试环境│   │ L1 模式 │   │+MockWk │   │ Claude │
+          │       │   │         │   │        │   │        │
+拼接 4:   │ Real  │ → │  Real   │ → │ Real   │   │ Real   │
+          │ 测试环境│   │ L6 模式 │   │ 阿里云  │   │ 全部   │
+          └───────┘   └─────────┘   └────────┘   └────────┘
+```
+
+### 6.2 拼接测试用例
+
+| ID | 拼接 | EA 模式 | ABS 模式 | ABE | Claude | 测试内容 |
+|---|---|---|---|---|---|---|
+| I-001 | 1 | DryRun+MockWk | L1 | Mock | Mock | ABS produce → MockWorker → Webhook |
+| I-002 | 2 | DryRun+RealWk | L3 | Mock | **Real** | 真实 Claude Code 做书 → session_id |
+| I-003 | 2 | DryRun+RealWk | L4 | Mock | **Real** | 做书 + 文件同步到**真实 OSS** |
+| I-004 | 3 | DryRun+MockWk | L1 | **Real 测试环境** | Mock | ABE 创建任务 → ABS → Webhook → ABE 回灌 |
+| I-005 | 3 | DryRun+MockWk | L1 | **Real 测试环境** | Mock | ABE chat 修改 → ABS → Webhook → ABE 更新 |
+| I-006 | 4 | **真实阿里云** | L6 | **Real 测试环境** | **Real** | 全链路：ABE → ABS → 阿里云 ECS → Claude → OSS → Webhook |
+
+---
+
+## 7. Mock 工具的代码归属
 
 | Mock 组件 | 归属仓库 | 导出方式 | 消费方 |
 |---|---|---|---|
-| DryRunProvider | EA | `elastic_agent.testing` | EA 自己 + ABS |
-| MockWorker | EA | `elastic_agent.testing` | EA 自己 + ABS |
-| MockOAuthServer | EA | `elastic_agent.testing` | EA 自己 |
-| MockOSS | EA | `elastic_agent.testing` | EA 自己 + ABS |
+| DryRunProvider | EA | `elastic_agent.testing` | EA + ABS |
+| MockWorker | EA | `elastic_agent.testing` | EA + ABS |
+| LocalWorkerProcess | EA | `elastic_agent.testing` | EA + ABS（L3+ 级别） |
+| MockOAuthServer | EA | `elastic_agent.testing` | EA |
+| MockOSS | EA | `elastic_agent.testing` | EA + ABS |
 | create_test_manager | EA | `elastic_agent.testing` | ABS |
-| MockClaudeOutput | ABS | `audiobook_agent_service.testing` | ABS 自己 |
-| WebhookCatcher | ABS | `audiobook_agent_service.testing` | ABS 自己 |
-| MockAgentService | ABE | `tests/mocks/` | ABE 自己 |
-| WebhookSimulator | ABE | `tests/mocks/` | ABE 自己 |
-| MockOSSReader | ABE | `tests/mocks/` | ABE 自己 |
+| MockClaudeOutput | ABS | `audiobook_agent_service.testing` | ABS |
+| WebhookCatcher | ABS | `audiobook_agent_service.testing` | ABS |
+| MockAgentService | ABE | `tests/mocks/` | ABE |
+| WebhookSimulator | ABE | `tests/mocks/` | ABE |
+| MockOSSReader | ABE | `tests/mocks/` | ABE |
 
 ---
 
-## 7. CI 配置建议
+## 8. CI 配置
 
 ```yaml
-# 每个仓库的 CI 独立运行，不依赖其他仓库的服务
+# 每个仓库的 CI 独立运行
+# 通过环境变量 *_TEST_LEVEL 和凭证环境变量控制测试级别
 
 # EA CI
 test:
-  - pytest tests/unit/          # 纯内存，无外部依赖
-  - pytest tests/component/     # DryRunProvider + MockWorker
-  - pytest tests/credential/    # MockOAuthServer
-  - pytest tests/filesync/      # MockOSS
-  # 以下仅在 CI 有云凭证时执行
-  - pytest tests/integration/ -m "cloud" --skip-if-no-creds
+  script:
+    - EA_TEST_LEVEL=0 pytest tests/ -m "level0"              # 必跑：纯单元测试
+    - EA_TEST_LEVEL=1 pytest tests/ -m "level0 or level1"    # 必跑：+ Mock 组件测试
+    - |
+      if [ -n "$ALICLOUD_ACCESS_KEY_ID" ]; then
+        EA_TEST_LEVEL=2 pytest tests/ -m "level2"            # 可选：真实云 API（创建+立即销毁）
+      fi
+    - |
+      if [ -n "$CLAUDE_CODE_AVAILABLE" ]; then
+        EA_TEST_LEVEL=4 pytest tests/ -m "level4"            # 可选：真实 Claude Code
+      fi
 
 # ABS CI
 test:
-  - pip install elastic-agent   # 安装框架（含 testing 模块）
-  - pytest tests/unit/
-  - pytest tests/component/     # 使用 EA 的 DryRunProvider + MockWorker
-  - pytest tests/api/           # httpx TestClient
-  - pytest tests/webhook/       # WebhookCatcher
+  script:
+    - pip install elastic-agent                               # 安装框架（含 testing 模块）
+    - ABS_TEST_LEVEL=0 pytest tests/ -m "level0"             # 必跑：纯单元测试
+    - ABS_TEST_LEVEL=1 pytest tests/ -m "level0 or level1"   # 必跑：+ DryRun 组件测试
+    - |
+      if [ -n "$CLAUDE_CODE_AVAILABLE" ]; then
+        ABS_TEST_LEVEL=3 pytest tests/ -m "level3"           # 可选：DryRun + 真实 Claude
+      fi
+    - |
+      if [ -n "$ABS_OSS_ACCESS_KEY_ID" ]; then
+        ABS_TEST_LEVEL=4 pytest tests/ -m "level4"           # 可选：+ 真实 OSS
+      fi
 
 # ABE CI
 test:
-  - pytest tests/unit/
-  - pytest tests/elastic/       # MockAgentService + WebhookSimulator + MockOSSReader
-  - pytest tests/api/
-  - npm run test                # 前端测试
+  script:
+    - ABE_TEST_LEVEL=0 pytest tests/ -m "level0"             # 必跑：纯单元测试
+    - ABE_TEST_LEVEL=1 pytest tests/ -m "level0 or level1"   # 必跑：+ Mock ABS 测试
+    - |
+      if [ -n "$ABS_TEST_URL" ]; then
+        ABE_TEST_LEVEL=2 pytest tests/ -m "level2"           # 可选：连接真实 ABS (L1 模式)
+      fi
+    - npm run test                                            # 前端测试
+```
+
+每次 push 必跑 L0 + L1（全 Mock，秒级完成，零成本）。L2+ 按凭证可用性自动启用。
+
+### 本地开发时的常用命令
+
+```bash
+# 快速验证（全 Mock，几秒完成）
+EA_TEST_LEVEL=1 pytest tests/
+
+# 验证云 API 调用（需要阿里云凭证，几分钟，~¥0.1）
+EA_TEST_LEVEL=2 pytest tests/ -m "level2"
+
+# 验证真实 Claude Code（需要 Claude 账号，10+ 分钟）
+EA_TEST_LEVEL=4 pytest tests/ -m "level4"
+
+# ABS 连接 ABE 测试环境
+ABS_TEST_LEVEL=6 ABE_WEBHOOK_URL=https://test.audiobook.example.com/api/elastic-agent/webhook pytest tests/ -m "level6"
 ```
