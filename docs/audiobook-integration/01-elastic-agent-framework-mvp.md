@@ -840,10 +840,14 @@ Layer 2: 应用凭证（Harness 声明，框架传递）
       "config_dir": "/root/.claude-prod",   // Worker 上的凭证目录
       "five_hour": {"utilization": 45, "resets_at": "2026-05-19T17:34:56Z"},
       "seven_day": {"utilization": 62, "resets_at": "2026-05-26T00:00:00Z"},
-      "available": true,
+      "available": true,                      // 综合判定，见下方规则
       "login_status": "logged_in",          // logged_in / expired / login_failed / not_logged_in
+      "stale": false,                       // Token 读取或 refresh 失败
+      "error": null,                        // 当前错误码（auth_expired / rate_limited / ...）
+      "backoff_until": null,                // 额度 API 限流退避到期时间
       "last_login_at": "2026-05-18T10:00:00Z",
-      "last_quota_check": "2026-05-19T12:34:50Z"
+      "last_quota_check": "2026-05-19T12:34:50Z",
+      "last_used": "2026-05-19T12:00:00Z"  // 上次被选中使用的时间（用于轮换排序）
     }
   }
 }
@@ -912,7 +916,7 @@ Worker 依赖（Bootstrap 时安装）:
 两级额度监控:
 
 Level 1: Worker 侧（周期性检查）
-  Worker Runtime 每 60s 对本机所有活跃凭证执行:
+  Worker Runtime 每 60-90s（随机化，防反检测）对本机所有活跃凭证执行:
     1. 读取 {config_dir}/.credentials.json 获取 accessToken
     2. Token 续期（如果距过期 < 5min）:
        POST https://console.anthropic.com/v1/oauth/token
@@ -1609,3 +1613,207 @@ export SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
 | WebSocket | FastAPI native + websockets | 标准 |
 | 文件监听 | watchdog | 跨平台 inotify/kqueue 封装 |
 | 包管理 | uv | 快速安装，锁文件可靠 |
+| 浏览器自动化 | Playwright + playwright-stealth | 自动登录 OAuth 流程 |
+| HTTP 代理 | mitmproxy (mitmdump) | 修正 CLI OAuth redirect_uri |
+
+---
+
+## 12. 凭证管理体系详解
+
+> 本节是 §3.6 的实现参考，提供 Claude Code 账号全生命周期管理的完整技术细节。
+> 设计参考 [agent-ml-research](https://github.com/caoxiaoyuyuyuyuyu/agent-ml-research) 的凭证管理系统。
+
+### 12.1 原理概述
+
+Claude Code CLI 使用 Claude Max 订阅账号（而非 API Key）运行。每个账号通过 OAuth 流程获取 access/refresh token 对，存储在本地 `.credentials.json` 文件中。Claude Max 有 **5 小时滑动窗口**的 token 使用量限制——高并发场景下单账号很快耗尽。
+
+框架的凭证管理体系解决以下问题：
+
+```
+  账号登录         额度监控          自动轮换          多槽位隔离
+    │                │                │                │
+    ▼                ▼                ▼                ▼
+171mail 魔法链接   Anthropic        等当前任务完成    每个 Claude Code
+  + Playwright     usage API        → 换一个          进程使用独立的
+  + mitmproxy      5h/7d 窗口       额度充足的        CLAUDE_CONFIG_DIR
+  = OAuth token    → 阈值告警        账号              = 互不干扰
+```
+
+完整的凭证生命周期：
+
+```
+运维配置 accounts.json（email + 171mail token）
+    │
+    ▼
+Bootstrap: Manager 为每个 Slot 从 CredentialPool 分配账号
+    │
+    ▼
+Worker 上执行自动登录: 171mail → OAuth → .credentials.json
+    │
+    ▼
+正常运行: Claude Code 使用 token 调用 API
+    │
+    ├── Worker 每 60-90s 检查额度 ─→ QUOTA_STATUS 上报 Manager
+    │       │
+    │       ├── five_hour < 85% → 正常
+    │       ├── five_hour >= 85% → QUOTA_WARNING（告警）
+    │       └── five_hour >= 95% → 触发轮换
+    │
+    ├── Token 即将过期（< 5min）→ 自动 refresh → 续期
+    │       │
+    │       └── refresh 失败 → 重新执行自动登录
+    │
+    └── 任务完成/Worker 销毁 → 凭证回收到池子
+```
+
+### 12.2 OAuth 登录流程技术细节
+
+自动登录在 Worker 上执行（因为 credentials.json 需要在 Worker 本地文件系统）。
+
+#### 为什么需要 mitmproxy
+
+Claude CLI 2.1.x 的 `auth login` 命令存在一个 OAuth bug：它在 token 交换请求中使用 `redirect_uri: http://localhost:{port}/callback`，但 Anthropic OAuth 服务端期望的是 `https://platform.claude.com/oauth/code/callback`。mitmproxy 拦截这个 POST 请求并修正 `redirect_uri`，同时去掉 `code` 参数中的 `#state` 后缀。
+
+```
+mitmproxy addon 做了两件事:
+  1. POST /v1/oauth/token 请求体中:
+     redirect_uri: http://localhost:N/callback
+       → 改为: https://platform.claude.com/oauth/code/callback
+  2. code 参数:
+     abc123#state → abc123（去掉 #state 后缀）
+```
+
+mitmproxy 只在登录时使用（约 30-60 秒），登录完成后关闭。正常的 Claude Code 运行不经过 mitmproxy。
+
+#### 关键 API 端点
+
+| 用途 | URL | 方法 | 说明 |
+|---|---|---|---|
+| 触发发送 magic link | `https://b.171mail.com/api/v1/claude/send` | POST | 入参: `{email}` |
+| 轮询收件箱 | `https://b.171mail.com/api/v1/getClaudeMessage?token={email_token}` | GET | 每 2s，超时 90s |
+| 验证 magic link | `https://b.171mail.com/api/v1/claude/verify` | POST | 入参: `{link, info: {deviceId, clientSha, email}}`，返回 cookie + sessionKey |
+| 身份验证 | `https://claude.ai/api/account` | GET | 用 171mail 返回的 cookie，确认 email 匹配 |
+| OAuth 授权 | `https://claude.com/cai/oauth/authorize?...` | GET (浏览器) | CLI stdout 输出此 URL |
+| Token 交换 | `https://console.anthropic.com/v1/oauth/token` | POST | CLI 内部调用，mitmproxy 修正 redirect_uri |
+| Token 续期 | `https://console.anthropic.com/v1/oauth/token` | POST | `{grant_type: refresh_token, refresh_token, client_id}` |
+| 额度查询 | `https://api.anthropic.com/api/oauth/usage` | GET | `Authorization: Bearer {accessToken}`, `anthropic-beta: oauth-2025-04-20` |
+
+#### OAuth Client ID
+
+所有 token 交换和续期请求使用同一个 Client ID：
+
+```
+9d1c250a-e61b-44d9-88ed-5944d1962f5e
+```
+
+这是 Claude CLI 硬编码的 OAuth Client ID（公开值，非密钥）。
+
+#### .credentials.json 格式
+
+```json
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-...",
+    "refreshToken": "sk-ant-ort01-...",
+    "expiresAt": 1716129296000
+  }
+}
+```
+
+- `expiresAt`: Unix 毫秒时间戳
+- Token 续期时机: `now_ms >= expiresAt - 5 * 60 * 1000`（过期前 5 分钟）
+- 续期后 `expiresAt = (now + expires_in) * 1000`
+
+### 12.3 额度监控技术细节
+
+#### Usage API 响应格式
+
+```json
+{
+  "five_hour": {
+    "utilization": 45,
+    "resets_at": "2026-05-19T17:34:56Z"
+  },
+  "seven_day": {
+    "utilization": 62,
+    "resets_at": "2026-05-26T00:00:00Z"
+  }
+}
+```
+
+- `utilization`: 0-100 的整数百分比
+- `resets_at`: 当前窗口到期时间（ISO 8601）
+
+#### 账号可用性判定
+
+一个账号 `available=true` 当且仅当以下**全部满足**：
+
+| 条件 | 说明 |
+|---|---|
+| `enabled=true` | 账号未被运维禁用 |
+| `login_status=logged_in` | 登录成功，token 有效 |
+| `stale=false` | Token 读取/refresh 无错误 |
+| `five_hour.utilization < 85%` | 5h 窗口未超阈值 |
+| `backoff_until=null` 或已过期 | 不在 API 限流退避期 |
+
+任何一个条件不满足 → `available=false`，不会被 CredentialPool 选中分配。
+
+#### 额度 API 限流处理
+
+Usage API 本身有请求频率限制。被限流时：
+
+```
+Worker 侧处理:
+  1. API 返回 rate_limit_error
+  2. 使用本地缓存的上次成功查询结果（如果 < 30min）
+  3. 标记 stale=true, error="usage_api_rate_limited"
+  4. available 保持 true（额度 API 限流 ≠ Claude 聊天 API 限流）
+  5. 指数退避: 下次检查延迟 180s → 360s → ... → 2880s
+  6. 退避期间跳过该账号的额度检查
+  7. 退避到期后恢复正常检查频率
+```
+
+### 12.4 轮换（切号）技术细节
+
+#### 选号算法
+
+```python
+def select_replacement(pool, current_id, group):
+    candidates = [
+        a for a in pool.accounts
+        if a.group == group
+        and a.enabled
+        and a.available
+        and a.id != current_id
+        and a.assigned_to is None
+    ]
+    if not candidates:
+        return None
+    # 按 last_used 升序（最久未用的优先）
+    candidates.sort(key=lambda a: a.last_used or 0)
+    return candidates[0]
+```
+
+#### 轮换时的凭证传递
+
+新账号可能处于三种登录状态：
+
+| 状态 | 处理 |
+|---|---|
+| 已登录，token 有效 | SCP `.credentials.json` 到 Worker 的 config_dir |
+| 已登录，token 过期 | 先 refresh token → 成功则 SCP → 失败则重新登录 |
+| 未登录 | 在 Worker 上执行完整的自动登录流程 |
+
+#### 冷却与恢复
+
+```
+账号被标记 unavailable（额度耗尽）后:
+  不立即回收 — 它可能还在 Worker 上供正在运行的进程使用
+  
+  恢复流程:
+    Worker 侧额度检查发现 five_hour.utilization 降到阈值以下
+    （通常在 resets_at 到期后 60-90s 内检测到）
+    → QUOTA_STATUS 上报 {available: true}
+    → Manager 更新 pool_status.json
+    → 该账号重新进入可分配池
+```
