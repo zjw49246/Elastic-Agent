@@ -126,6 +126,16 @@
 | T-135 | 自动登录 E2E：171mail + Playwright + mitmproxy → credentials.json 生成 |
 | T-136 | 额度监控 E2E：Worker 上报 → Manager 汇聚 → 阈值告警 → 触发轮换 |
 
+### 测试工具（`elastic_agent.testing` 导出，供下游仓库使用）
+
+| ID | 任务 | 详见 |
+|---|---|---|
+| T-200 | DryRunProvider 实现（模拟云 API，内存实例生命周期） | 06 §2.1 |
+| T-201 | MockWorker 实现（模拟 Worker Runtime WS 连接，可配置 NDJSON 输出） | 06 §2.1 |
+| T-202 | MockOAuthServer 实现（模拟 171mail + Anthropic OAuth + Usage API） | 06 §2.1 |
+| T-203 | MockOSS 实现（本地文件系统模拟 OSS PutObject/GetObject） | 06 §2.1 |
+| T-204 | create_test_manager() 工厂函数（一键创建带全部 Mock 的测试 Manager） | 06 §2.1 |
+
 ---
 
 ## 2. Audiobook Agent Service [ABS]
@@ -207,6 +217,13 @@
 | A-118 | API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/stream-config/history/files-sync/workers） |
 | A-119 | 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成 |
 | A-120 | 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister |
+
+### 测试工具（`audiobook_agent_service.testing` 导出）
+
+| ID | 任务 | 详见 |
+|---|---|---|
+| A-200 | MockClaudeOutput 实现（预录 NDJSON 序列：成功/失败/卡住/修改等场景） | 06 §3.1 |
+| A-201 | WebhookCatcher 实现（捕获 Webhook 事件，支持 wait_for_event + assert_sequence） | 06 §3.1 |
 
 ---
 
@@ -307,6 +324,14 @@
 | B-131 | TaskDetail 双引擎切换：legacy 展示 Agent 输出 / Elastic 展示 phase+chat+files |
 | B-132 | Elastic chat 界面：发送消息 → 显示回复 → 修改完成 |
 | B-133 | 任务列表筛选：按 script_generation_backend 过滤 |
+
+### 测试工具（`tests/mocks/`）
+
+| ID | 任务 | 详见 |
+|---|---|---|
+| B-200 | MockAgentService 实现（模拟 ABS 全部 API 端点，可配置返回值） | 06 §4.1 |
+| B-201 | WebhookSimulator 实现（向 ABE 发送带签名的模拟 Webhook 事件） | 06 §4.1 |
+| B-202 | MockOSSReader 实现（预置 manifest + 文件内容，模拟 OSS 读取） | 06 §4.1 |
 
 ---
 
