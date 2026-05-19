@@ -31,8 +31,8 @@
 - [x] **T-049** [EA] Harness 抽象基类 + 相关接口定义（WorkerCapacity, FileSyncConfig, SyncMapping, WorkerLifecycle, BootstrapStep, ScalingSignal）  `05 §5.2`
 - [x] **T-003** [EA] 阿里云 ECS Provider（alibabacloud SDK V2.0 直连）  `01 §3.1`
 - [x] **T-004** [EA] AWS EC2 Provider（boto3 SDK 直连）  `01 §3.1`
-- [ ] **T-005** [EA] 阿里云前置准备文档 + 验证脚本（VPC/VSwitch/安全组/密钥对，控制台手动创建）  `01 §4`
-- [ ] **T-006** [EA] AWS 前置准备文档 + 验证脚本（VPC/Subnet/SG/KeyPair，控制台手动创建）  `01 §4`
+- [x] **T-005** [EA] 阿里云前置准备文档 + 验证脚本（VPC/VSwitch/安全组/密钥对，控制台手动创建）  `01 §4`
+- [x] **T-006** [EA] AWS 前置准备文档 + 验证脚本（VPC/Subnet/SG/KeyPair，控制台手动创建）  `01 §4`
 - [x] **T-007** [EA] Worker Runtime 服务端（进程执行、日志双写落盘、文件操作）  `01 §3.2`
 - [x] **T-008** [EA] Worker Runtime 客户端（Manager 侧远程调用抽象）  `01 §3.2`
 - [x] **T-009** [EA] Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）  `01 §3.2`
@@ -48,9 +48,9 @@
 - [x] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
 - [x] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
 - [x] **T-053** [EA] WebhookEmitter — 事件回调 + HMAC 签名 + 重试 + 死信队列  `01 §3.9`
-- [ ] **T-030** [EA] FileSyncManager — Worker 侧文件主动同步到 OSS/S3  `01 §3.4`
-- [ ] **T-031** [EA] FileSyncManager — Harness 配置接口  `01 §3.4`
-- [ ] **T-032** [EA] FileSyncManager — Worker 侧云存储凭证注入  `01 §3.4`
+- [x] **T-030** [EA] FileSyncManager — Worker 侧文件主动同步到 OSS/S3  `01 §3.4`
+- [x] **T-031** [EA] FileSyncManager — Harness 配置接口  `01 §3.4`
+- [x] **T-032** [EA] FileSyncManager — Worker 侧云存储凭证注入  `01 §3.4`
 - [ ] **T-033** [EA] 外部服务 API — 文件内容从云存储读取  `01 §3.3`
 - [ ] **T-034** [EA] TaskSyncMapper — Worker 侧动态同步映射  `01 §3.4`
 - [ ] **T-035** [EA] REGISTER/UNREGISTER_SYNC_MAPPING 协议消息  `01 §3.2`
@@ -79,7 +79,7 @@
 - [x] **T-023** [EA] Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）  `01 §3.5`
 - [x] **T-024** [EA] Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）  `01 §3.5`
 - [x] **T-025** [EA] 优雅缩容 Drain  `01 §3.5`
-- [ ] **T-028** [EA] 手动扩缩容 API（scale_out / scale_in / remove_node）  `01 §6`
+- [x] **T-028** [EA] 手动扩缩容 API（scale_out / scale_in / remove_node）  `01 §6`
 - [ ] **T-029** [EA] 基础 Web UI（节点列表、状态卡片、手动操作）  `01 §6`
 
 ### 测试 — 单元测试
