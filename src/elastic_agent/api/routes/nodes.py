@@ -7,12 +7,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from elastic_agent.api.auth import require_api_key
 from elastic_agent.core.registry import NodeStatus
 
-router = APIRouter(tags=["nodes"])
+router = APIRouter(tags=["nodes"], dependencies=[Depends(require_api_key)])
 
 
 def _mgr():

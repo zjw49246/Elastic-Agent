@@ -9,10 +9,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elastic_agent.api.app import create_app
+from elastic_agent.api.auth import reset_api_keys
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
 from elastic_agent.core.registry import NodeRecord, NodeStatus
 from elastic_agent.manager.manager import ElasticAgentManager
+
+API_KEY = "test-api-key-for-routes"
 
 
 # ------------------------------------------------------------------
@@ -76,6 +79,14 @@ class InMemoryProvider(CloudProvider):
 # ------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def setup_api_keys(monkeypatch):
+    monkeypatch.setenv("ELASTIC_AGENT_EXTERNAL_API_KEYS", API_KEY)
+    reset_api_keys()
+    yield
+    reset_api_keys()
+
+
 @pytest.fixture
 def tmp_config(tmp_path):
     cfg = ElasticAgentConfig()
@@ -103,6 +114,7 @@ async def client(app, manager):
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
+        headers={"Authorization": f"Bearer {API_KEY}"},
     ) as ac:
         await manager.start()
         yield ac
