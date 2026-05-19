@@ -37,8 +37,8 @@
 - [ ] **T-008** [EA] Worker Runtime 客户端（Manager 侧远程调用抽象）  `01 §3.2`
 - [x] **T-009** [EA] Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）  `01 §3.2`
 - [ ] **T-010** [EA] Manager ↔ Worker 认证（per-Worker Bearer Token）  `01 §3.6`
-- [ ] **T-011** [EA] NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）  `01 §3.5`
-- [ ] **T-012** [EA] 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）  `01 §3.5`
+- [x] **T-011** [EA] NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）  `01 §3.5`
+- [x] **T-012** [EA] 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）  `01 §3.5`
 - [ ] **T-013** [EA] 内部轨迹流 — EventBus LOG 事件分发（Harness 回调、phase 检测用，不对外暴露）  `01 §3.3`
 - [ ] **T-014** [EA] 文件同步通知 — FILE_SYNCED 事件 → WebhookEmitter 推送（外部通过 Webhook 感知）  `01 §3.3`
 - [ ] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
