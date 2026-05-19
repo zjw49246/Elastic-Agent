@@ -1,6 +1,6 @@
 # 独立测试与 Mock 策略
 
-> 三个仓库可以完全独立开发和测试。本文档定义每个仓库的隔离测试策略、Mock 组件、以及最后拼接的集成测试方案。
+> 各仓库可以完全独立开发和测试。本文档定义每个仓库的隔离测试策略、Mock 组件、以及最后拼接的集成测试方案。
 
 ---
 
@@ -268,7 +268,7 @@ class WebhookCatcher:
 
 | 测试层 | Mock 依赖 | 覆盖范围 |
 |---|---|---|
-| 单元测试 | 纯内存 | BookQueue、SessionRegistry、SlotScheduler、Phase 映射 |
+| 单元测试 | 纯内存 | BookQueue、Phase 映射（TaskRegistry/TaskScheduler 在框架层测试） |
 | 组件测试 | DryRunProvider + MockWorker + MockClaudeOutput | Harness 编排、做书/修改全流程、进度检测 |
 | API 测试 | 同上 + httpx TestClient | 10 个 API 端点的请求/响应/错误码 |
 | Webhook 测试 | 同上 + WebhookCatcher | 事件发送、重试、签名、幂等 |
@@ -298,7 +298,7 @@ async def test_production_happy_path():
     await catcher.wait_for_event("task.production.completed", timeout=5)
 
     # 验证
-    assert harness.session_registry.get("task-1").session_id == "mock-session-xxx"
+    assert manager.task_registry.get("task-1").session_id == "mock-session-xxx"
     catcher.assert_event_sequence([
         "task.production.queued",
         "task.production.started",
@@ -555,7 +555,7 @@ L2 的价值：ABE 后端连接到一个真实运行的 ABS 实例（ABS 自己�
 
 ---
 
-## 6. 三仓库拼接的集成测试
+## 6. 多仓库拼接的集成测试
 
 独立测试通过后，逐步拼接：
 

@@ -1388,7 +1388,7 @@ Manager 崩溃后重启:
      - HealthChecker 重新启动（从 0 开始计数）
   5. [NEW] 恢复 Harness 级状态:
      - Harness 自身的持久化状态也需要恢复（不仅仅是 NodeRegistry）
-     - 例如 Audiobook Harness 的 SessionRegistry（session↔Worker 映射、
+     - 例如框架的 TaskRegistry（task↔Worker 映射、
        session 状态、当前 task 进度等）需要从持久化存储重建
      - 恢复顺序: NodeRegistry → Harness 状态 → 等待 Worker 重连 → 对账
 

@@ -2,7 +2,7 @@
 
 > 本文档描述 **Audiobook Agent Service** 的完整设计方案。Audiobook Agent Service 是一个**独立仓库/独立部署的应用**，通过 `import elastic_agent` 引入 Elastic-Agent 框架作为 Library，实现有声书稿全自动化生产系统的 Manager 进程。
 >
-> 本文档基于 audiobook-nonfiction v1.1.1 的真实代码分析，以及 [00-overview.md](00-overview.md) 中定义的三仓库架构。
+> 本文档基于 audiobook-nonfiction v1.1.1 的真实代码分析，以及 [00-overview.md](00-overview.md) 中定义的多仓库架构。
 
 ---
 
@@ -265,13 +265,13 @@ TaskRegistry (框架提供, Manager 侧):
 格式: {task_id: {worker_id, session_id, book_slug, status, cwd, created_at, finished_at}}
 
 启动恢复流程:
-  1. 读取 session_registry.json
+  1. 读取 task_registry.json
   2. 对比 NodeRegistry 中的在线 Worker → 清理已不存在 Worker 的 session
   3. 对存活 Worker 的 session → 标记状态为 "idle"（重启期间任务可能已完成或终止）
   4. 可选验证: 对比 OSS _sync_manifest.json → 确认 session 数据完整性
 
 兜底重建:
-  如果 session_registry.json 丢失或损坏:
+  如果 task_registry.json 丢失或损坏:
     → 扫描所有 task 的 OSS _sync_manifest.json
     → 从 manifest 的 worker_id + session 文件重建映射
     → 这个过程较慢（需要 ListObjects），仅作为最后手段
@@ -1009,7 +1009,7 @@ async def send_edit_message(task_id: str, request: ChatRequest):
 @app.get("/api/sessions")
 async def list_sessions():
     """列出所有注册的会话"""
-    return harness.session_registry.list_all()
+    return manager.task_registry.list_all()
 
 @app.get("/api/workers")
 async def list_workers():
@@ -1023,7 +1023,7 @@ async def list_workers():
 @app.delete("/api/tasks/{task_id}/workspace")
 async def cleanup_task_workspace(task_id: str):
     """手动清理 Worker 上的任务工作目录"""
-    session = harness.session_registry.get(task_id)
+    session = manager.task_registry.get(task_id)
     if not session:
         raise HTTPException(404, "Task not found")
     if session.status in ("producing", "editing"):
@@ -1036,7 +1036,7 @@ async def cleanup_task_workspace(task_id: str):
     runtime = harness.manager.get_runtime_client(session.worker_id)
     await runtime.execute(["rm", "-rf", session.cwd])
     session.status = "archived"
-    harness.session_registry.update(session)
+    manager.task_registry.update(session)
     return {"status": "archived", "task_id": task_id}
 ```
 

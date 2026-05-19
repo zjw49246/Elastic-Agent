@@ -2,7 +2,7 @@
 
 > 本文档是 Audiobook 有声书稿生产系统接入 Elastic-Agent 弹性计算框架的**顶层设计总览**。
 >
-> 三个独立仓库将按本文档描述的架构和接口契约分别开发。
+> 四个独立仓库将按本文档描述的架构和接口契约分别开发。
 
 ---
 
@@ -296,7 +296,7 @@ audio_book 的 Task.id = "123"
   → Audiobook Agent Service 的 external_task_id = "123"
   → OSS 路径: tasks/123/
   → Webhook 中的 task_id = "123"
-  → SessionRegistry 的 key = "123"
+  → TaskRegistry 的 key = "123"
 ```
 
 不引入额外的 ID 转换层。Elastic-Agent 框架内部的 `task_id` 也直接使用这个值。
@@ -375,7 +375,7 @@ Audiobook Svc Phase 2 (修改模式) ──→ audio_book Phase β (前端集成
 
 ## 7. _sync_manifest.json 统一格式
 
-三个仓库共享同一份 manifest 格式规范：
+所有仓库共享同一份 manifest 格式规范：
 
 ```json
 {
@@ -482,8 +482,8 @@ Audiobook Agent Service → audio_book_echo_editor 的所有 Webhook 事件共�
 | [03-audiobook-app-adaptation.md](03-audiobook-app-adaptation.md) | audio_book_echo_editor 适配方案（双引擎、数据模型、前端） | audio_book_echo_editor 开发者 |
 | [04-gap-analysis.md](04-gap-analysis.md) | 方案缺陷分析与补充方案 | 全员 |
 | [05-interface-contracts.md](05-interface-contracts.md) | 三方接口契约（API、事件、数据格式） | 全员 |
-| [06-testing-isolation.md](06-testing-isolation.md) | 独立测试与 Mock 策略（三仓库隔离测试 + 拼接方案） | 全员 |
-| [TODO.md](TODO.md) | 三仓库全量 TODO + 配置变量清单 + 开发阶段依赖 | 全员 |
+| [06-testing-isolation.md](06-testing-isolation.md) | 独立测试与 Mock 策略（各仓库隔离测试 + 拼接方案） | 全员 |
+| [TODO.md](TODO.md) | 全量 TODO + 配置变量清单 + 开发阶段依赖 | 全员 |
 
 ---
 
@@ -493,7 +493,7 @@ Audiobook Agent Service → audio_book_echo_editor 的所有 Webhook 事件共�
 |------|--------|---------|------|
 | Claude Code `--resume` 可靠性未经大规模验证 | 高 | Phase 1 即验证；备用方案: `/continue-book` 从 state.json 恢复 | 04-gap-analysis §3.5 |
 | FileSyncManager 多任务路径映射复杂度 | 高 | TaskSyncMapper 组件独立设计，映射表持久化 | 04-gap-analysis §3.1 |
-| SessionRegistry 内存丢失导致修改不可路由 | 高 | JSON 持久化 + 启动时从 manifest 重建 | 04-gap-analysis §3.3 |
+| TaskRegistry 内存丢失导致修改不可路由 | 高 | JSON 持久化 + 启动时从 manifest 重建 | 04-gap-analysis §3.3 |
 | 单 Worker 4 并发 Claude 账号额度耗尽 | 中 | CredentialPool 按槽位预分配 + 额度监控 | 04-gap-analysis §3.6 |
 | Webhook 丢失导致 audio_book 状态不更新 | 中 | 轮询兜底 + 事件重放 | 04-gap-analysis §3.9 |
 | 修改流程文件不同步（sync mapping 已注销） | 中 | 修改前重新 REGISTER，完成后 flush + UNREGISTER | 04-gap-analysis §3.19 |

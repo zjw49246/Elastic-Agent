@@ -41,7 +41,7 @@ path_mapping={
 但 `{task_id}` 和 `{book_slug}` 是每个任务不同的动态值。一台 Worker 上可能同时有多本书（1 个生产 + 多个修改），每本书的 `book_slug → task_id → OSS prefix` 映射不同。
 
 **影响：**
-- FileSyncManager 运行在 Worker 上，但映射信息在 Manager 的 SessionRegistry 中
+- FileSyncManager 运行在 Worker 上，但映射信息在 Manager 的 TaskRegistry 中
 - 如果映射缺失或错误，文件会同步到错误的 OSS 路径
 - 方案中未说明 FileSyncManager 如何获取和维护这个映射
 
@@ -52,7 +52,7 @@ path_mapping={
 ```
 Manager 侧:
   新任务分配到 Worker 时:
-    1. SessionRegistry 注册 task_id → (worker_id, book_slug)
+    1. TaskRegistry 注册 task_id → (worker_id, book_slug)
     2. 发送 REGISTER_SYNC_MAPPING 消息到 Worker:
        {task_id, book_slug, oss_prefix, path_hash, watch_paths}
 
@@ -82,7 +82,7 @@ Worker 侧 (TaskSyncMapper):
 
 ---
 
-### 3.2 [P0] 三仓库边界未明确定义
+### 3.2 [P0] 仓库边界未明确定义
 
 **现状：**
 
@@ -97,7 +97,7 @@ Worker 侧 (TaskSyncMapper):
 
 **补充方案：**
 
-见 [00-overview.md §2 和 §3](00-overview.md) — 明确定义三仓库为：
+见 [00-overview.md §2 和 §3](00-overview.md) — 明确定义各仓库为：
 1. Elastic-Agent (Library/Package)
 2. Audiobook Agent Service (Application，依赖 elastic-agent 包)
 3. audio_book_echo_editor (Existing app，通过 HTTP/Webhook 与 Audiobook Agent Service 交互)
@@ -106,11 +106,11 @@ Worker 侧 (TaskSyncMapper):
 
 ---
 
-### 3.3 [P0] SessionRegistry 无持久化导致崩溃后修改不可路由
+### 3.3 [P0] TaskRegistry 无持久化导致崩溃后修改不可路由
 
 **现状：**
 
-harness-example 中 `SessionRegistry` 是内存数据结构。如果 Audiobook Agent Service 进程重启，所有 `task_id → (worker_id, session_id)` 映射丢失。
+harness-example 中 `TaskRegistry` 是内存数据结构。如果 Audiobook Agent Service 进程重启，所有 `task_id → (worker_id, session_id)` 映射丢失。
 
 **影响：**
 - 重启后所有已完成任务的修改请求无法路由
@@ -118,15 +118,15 @@ harness-example 中 `SessionRegistry` 是内存数据结构。如果 Audiobook A
 
 **补充方案：**
 
-1. **SessionRegistry JSON 持久化**（与 NodeRegistry 一致的策略）：
+1. **TaskRegistry JSON 持久化**（与 NodeRegistry 一致的策略）：
    ```
-   ~/.elastic-agent/session_registry.json
+   ~/.elastic-agent/task_registry.json
    写入策略: 每次注册/更新后写入（写入频率低，不需要防抖）
    格式: {task_id: {worker_id, session_id, book_slug, status, cwd, ...}}
    ```
 
 2. **启动时重建**：
-   - 读取 session_registry.json
+   - 读取 task_registry.json
    - 对比 NodeRegistry 中的在线 Worker → 清理已不存在 Worker 的 session
    - 对比 OSS manifest → 验证 session 数据完整性
 
@@ -135,7 +135,7 @@ harness-example 中 `SessionRegistry` 是内存数据结构。如果 Audiobook A
    - 启动时扫描所有 manifest 可重建映射
    - 但扫描全量 manifest 较慢，适合作为兜底
 
-**变更点：** harness-example §3.2 (SessionRegistry)、MVP 方案 §5.2 (Manager 崩溃恢复)
+**变更点：** harness-example §3.2 (TaskRegistry)、MVP 方案 §5.2 (Manager 崩溃恢复)
 
 ---
 
@@ -305,7 +305,7 @@ Audiobook Agent Service 收到 retry(task_id, from_phase):
      (这个脚本需要在 audiobook 插件中提供)
   5. 通过 Worker Runtime 启动 Claude Code:
      claude -p "/continue-book {slug}" ...
-  6. 更新 SessionRegistry
+  6. 更新 TaskRegistry
   7. Webhook → audio_book: task.production.started
 ```
 
@@ -347,7 +347,7 @@ Worker 常驻运行，不断接收新书生产任务。每本书在 `/root/.work
      → 检查无活跃进程
      → 确认 OSS 备份完整（对比 manifest）
      → 清理 Worker 本地文件
-     → 从 SessionRegistry 标记为 archived
+     → 从 TaskRegistry 标记为 archived
    ```
 
 3. **session 文件压缩**：
@@ -485,7 +485,7 @@ Worker 常驻运行，不断接收新书生产任务。每本书在 `/root/.work
 - state.json 输出字段包含 Elastic-Agent 需要的所有信息
 - delivery/ 目录结构标准化
 
-**变更点：** 需要新增一个 audiobook 插件适配文档（不在三仓库范围内，属于第四方调整）
+**变更点：** 需要新增一个 audiobook 插件适配文档（在 audiobook-nonfiction 独立仓库中执行）
 
 ---
 
@@ -690,7 +690,7 @@ handle_edit_request(task_id, message):
 
 ```python
 async def handle_edit_request(self, task_id: str, message: str):
-    session = self.session_registry.get(task_id)
+    session = self.task_registry.get(task_id)
     if not session:
         raise NotFoundError(...)
 
@@ -721,8 +721,8 @@ audio_book_echo_editor 前端也应在 UI 层面禁止同一任务的并发修�
 | # | 严重度 | 标题 | 状态 | 影响文档 |
 |---|--------|------|------|---------|
 | 3.1 | P0 | FileSyncManager 多任务路径映射 | 补充方案已定义 | MVP §3.4, harness §4.1 |
-| 3.2 | P0 | 三仓库边界未定义 | 已在 00-overview.md 解决 | 全部 |
-| 3.3 | P0 | SessionRegistry 无持久化 | 补充方案已定义 | harness §3.2, MVP §5.2 |
+| 3.2 | P0 | 仓库边界未定义 | 已在 00-overview.md 解决 | 全部 |
+| 3.3 | P0 | TaskRegistry 无持久化 | 补充方案已定义 | harness §3.2, MVP §5.2 |
 | 3.4 | P1 | manifest 格式不一致 | 统一为 array 格式 | harness §3.4, MVP §3.4 |
 | 3.5 | P1 | session_id 提取可靠性 | 多源提取 + 冗余存储 | harness §5.2, 插件调整 |
 | 3.6 | P1 | 多凭证并发额度 | 按槽位隔离凭证 | MVP §3.6, harness §5.4 |

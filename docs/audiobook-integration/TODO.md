@@ -177,12 +177,12 @@
 ### 测试 — 单元测试
 
 - [ ] **A-100** [ABS] BookQueue：入队/出队/优先级排序/持久化/空队列
-- [ ] **A-101** [ABS] SessionRegistry：CRUD + JSON 持久化 + 崩溃恢复 + 从 OSS manifest 重建
-- [ ] **A-102** [ABS] SlotScheduler：生产槽位分配/修改槽位分配/槽位满拒绝/Worker 选择策略
+- ~~**A-101**~~ 已移至框架: EA T-138 (TaskRegistry 测试)
+- ~~**A-102**~~ 已移至框架: EA T-139 (TaskScheduler 测试)
 - [ ] **A-103** [ABS] WebhookEmitter：重试延迟策略/死信队列/幂等 event_id/HMAC 签名
 - [ ] **A-104** [ABS] Session ID 多源提取：stream-json parsed / 目录扫描 / state.json 回退
 - [ ] **A-105** [ABS] 并发修改互斥：同一 task 二次修改返回 409
-- [ ] **A-106** [ABS] ChatRelay：session 路由到正确 Worker / Worker 离线返回 503 / 修改槽位满返回 429
+- ~~**A-106**~~ 已移至框架: EA T-140 (TaskRouter 测试)
 - [ ] **A-107** [ABS] 进度超时检测：正常任务不告警 / 超时任务标记 stalled / 自动 SIGINT
 - [ ] **A-108** [ABS] Retry/Continue 编排：Phase 清理逻辑 / OSS workspace 恢复 / state.json 回退
 - [ ] **A-109** [ABS] 凭证隔离：CLAUDE_CONFIG_DIR 按 slot 分配 / 修改流程重注册 sync mapping
@@ -196,7 +196,7 @@
 - [ ] **A-111** [ABS] 修改模式：produce → 完成 → chat → --resume → 文件同步 → Webhook
 - [ ] **A-112** [ABS] 多 Worker 队列分发：3 Worker + 5 任务 → 负载均衡 → 全部完成
 - [ ] **A-113** [ABS] Webhook 发送 + 重试：正常发送 / 目标 503 重试 / 死信队列
-- [ ] **A-117** [ABS] Audiobook Agent Service 崩溃恢复：重启 → SessionRegistry 重建 → 任务继续
+- [ ] **A-117** [ABS] Audiobook Agent Service 崩溃恢复：重启 → 框架 TaskRegistry 自动恢复 → 任务继续
 - [ ] **A-118** [ABS] API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/chat-live/history/files-sync/workers）
 - [ ] **A-119** [ABS] 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成
 - [ ] **A-120** [ABS] 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister
@@ -446,7 +446,7 @@ audiobook:
   max_production_slots: 1                       # 每 Worker 最大生产槽位
   max_edit_slots: 3                             # 每 Worker 最大修改槽位
   progress_timeout: 1800                        # 进度超时（秒），默认 30 分钟
-  session_registry_path: "~/.elastic-agent/session_registry.json"
+  # task_registry 由框架自动管理，路径在 EA config.yaml 的 registry.path 配置
   book_queue_path: "~/.elastic-agent/book_queue.json"
 
   claude_code:
