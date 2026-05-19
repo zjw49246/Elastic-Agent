@@ -51,11 +51,11 @@
 - [x] **T-030** [EA] FileSyncManager — Worker 侧文件主动同步到 OSS/S3  `01 §3.4`
 - [x] **T-031** [EA] FileSyncManager — Harness 配置接口  `01 §3.4`
 - [x] **T-032** [EA] FileSyncManager — Worker 侧云存储凭证注入  `01 §3.4`
-- [ ] **T-033** [EA] 外部服务 API — 文件内容从云存储读取  `01 §3.3`
-- [ ] **T-034** [EA] TaskSyncMapper — Worker 侧动态同步映射  `01 §3.4`
-- [ ] **T-035** [EA] REGISTER/UNREGISTER_SYNC_MAPPING 协议消息  `01 §3.2`
-- [ ] **T-036** [EA] FileSyncManager 上传错误处理（重试、分片、缓冲）  `01 §3.4`
-- [ ] **T-037** [EA] FILE_SYNCED 事件类型  `01 §3.2`
+- [x] **T-033** [EA] 外部服务 API — 文件内容从云存储读取  `01 §3.3`
+- [x] **T-034** [EA] TaskSyncMapper — Worker 侧动态同步映射  `01 §3.4`
+- [x] **T-035** [EA] REGISTER/UNREGISTER_SYNC_MAPPING 协议消息  `01 §3.2`
+- [x] **T-036** [EA] FileSyncManager 上传错误处理（重试、分片、缓冲）  `01 §3.4`
+- [x] **T-037** [EA] FILE_SYNCED 事件类型  `01 §3.2`
 - [ ] **T-038** [EA] Worker 进程日志落盘（stdout/stderr 双写到本地 NDJSON 文件）  `01 §3.2`
 - [ ] **T-039** [EA] Manager 结构化操作日志（JSON Lines，全部关键操作）  `01 §3.8`
 - [ ] **T-040** [EA] LOG 事件结构化解析（NDJSON → typed event）  `01 §3.3`
