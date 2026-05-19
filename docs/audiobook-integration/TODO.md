@@ -11,9 +11,9 @@
 
 ## 0. 仓库初始化
 
-- [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的全部旧代码（92 个文件：backend/、frontend/、worker/、tests/、infra/、*.md），从空仓库开始按新方案搭建
-- [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、.gitignore、CI 基础），依赖 `elastic-agent` 包
-- [ ] **S-003** [ABS] 编写 CLAUDE.md / README.md，引用本方案文档
+- [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
+- [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），依赖 `elastic-agent` 包
+- [ ] **S-003** [ABS] 更新 CLAUDE.md / 编写 README.md，引用本方案文档
 
 ---
 
