@@ -1711,17 +1711,30 @@ script_generation_backend?: string
 后端新增环境变量：
 
 ```text
+# 功能开关
 ELASTIC_AGENT_ENABLED=false
-ELASTIC_AGENT_MANAGER_URL=
-ELASTIC_AGENT_API_KEY=
-ELASTIC_AGENT_WEBHOOK_SECRET=
-ELASTIC_AGENT_STREAM_SECRET=
+
+# Audiobook Agent Service 连接
+ELASTIC_AGENT_MANAGER_URL=                     # 如 http://10.0.1.100:8000
+ELASTIC_AGENT_API_KEY=                         # Bearer Token
+ELASTIC_AGENT_WEBHOOK_SECRET=                  # Webhook HMAC 验签密钥
+ELASTIC_AGENT_STREAM_SECRET=                   # 前端 WS 直连 JWT 密钥（与 ABS 共享）
+
+# 默认做书参数
 ELASTIC_AGENT_DEFAULT_PERSONA=nonfiction_default
 ELASTIC_AGENT_DEFAULT_TARGET_PCT=12
-ELASTIC_AGENT_REQUEST_TIMEOUT_SECONDS=30
-ELASTIC_AGENT_OSS_BUCKET=
-ELASTIC_AGENT_OSS_PREFIX=tasks/
-ELASTIC_AGENT_POLL_INTERVAL_SECONDS=300
+
+# 超时与轮询
+ELASTIC_AGENT_REQUEST_TIMEOUT_SECONDS=30       # 调用 Agent Service 超时
+ELASTIC_AGENT_POLL_INTERVAL_SECONDS=300        # Webhook 补偿轮询间隔
+
+# OSS 配置（读取 Elastic 产物）
+ELASTIC_AGENT_OSS_BUCKET=                      # 如 audio-book-echo-editor-sh-oss
+ELASTIC_AGENT_OSS_PREFIX=elastic-agent/        # 不含 tasks/（produce 请求中拼接）
+ELASTIC_AGENT_OSS_ENDPOINT=                    # 如 oss-cn-shanghai.aliyuncs.com
+# OSS 读取凭证：复用项目已有的阿里云 OSS 配置；如果 bucket 不同需额外配置：
+# ELASTIC_AGENT_OSS_ACCESS_KEY_ID=
+# ELASTIC_AGENT_OSS_ACCESS_KEY_SECRET=
 ```
 
 前端不直接配置 Audiobook Agent Service URL，统一走后端代理（WS stream-config 例外）。

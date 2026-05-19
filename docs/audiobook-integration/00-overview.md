@@ -484,6 +484,7 @@ Audiobook Agent Service → audio_book_echo_editor 的所有 Webhook 事件共�
 | [03-audiobook-app-adaptation.md](03-audiobook-app-adaptation.md) | audio_book_echo_editor 适配方案（双引擎、数据模型、前端） | audio_book_echo_editor 开发者 |
 | [04-gap-analysis.md](04-gap-analysis.md) | 方案缺陷分析与补充方案 | 全员 |
 | [05-interface-contracts.md](05-interface-contracts.md) | 三方接口契约（API、事件、数据格式） | 全员 |
+| [TODO.md](TODO.md) | 三仓库全量 TODO + 配置变量清单 + 开发阶段依赖 | 全员 |
 
 ---
 

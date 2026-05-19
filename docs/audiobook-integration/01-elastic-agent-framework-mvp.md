@@ -1302,52 +1302,80 @@ elastic-agent/
 
 ```yaml
 # config.yaml
+server:
+  host: "0.0.0.0"                 # Manager FastAPI 监听地址
+  port: 8000                      # Manager FastAPI 监听端口
+
 provider:
-  type: "aliyun"  # "aliyun" | "aws"
+  type: "aliyun"                  # "aliyun" | "aws" | "dryrun"
   aliyun:
     region_id: "cn-hangzhou"
-    image_id: "m-bp1xxxx"
+    image_id: "m-bp1xxxx"         # 自定义镜像 ID
     instance_type: "ecs.c6.large"
-    security_group_id: ""          # 从 terraform output 填入
-    vswitch_id: ""                 # 从 terraform output 填入
+    security_group_id: ""         # Terraform output
+    vswitch_id: ""                # Terraform output
     key_pair_name: "elastic-agent-key"
-    ssh_key_path: "~/.ssh/elastic-agent.pem"
+    ssh_key_path: "~/.ssh/elastic-agent-aliyun.pem"
     max_instances: 30
+    spot_enabled: false           # 是否使用抢占式实例
   aws:
     region: "ap-northeast-1"
-    ami_id: "ami-xxxxx"
+    ami_id: "ami-xxxxx"           # 自定义 AMI ID
     default_instance_type: "t3.large"
-    security_group_ids: []         # 从 cdk deploy 输出填入
-    subnet_id: ""                  # 从 cdk deploy 输出填入
+    security_group_ids: []        # CDK output
+    subnet_id: ""                 # CDK output
+    key_pair_name: "elastic-agent-key"
+    ssh_key_path: "~/.ssh/elastic-agent-aws.pem"
+    max_instances: 30
 
 worker:
-  ssh_user: "root"                 # 阿里云 root, AWS ubuntu
+  ssh_user: "root"                # 阿里云 root, AWS ubuntu
   runtime_port: 8080
-  heartbeat_interval: 30           # 秒
-  unhealthy_threshold: 3           # 连续 N 次心跳超时
+  heartbeat_interval: 30          # 秒
+  unhealthy_threshold: 3          # 连续 N 次心跳超时标记 unhealthy
+
+bootstrap:
+  default_step_timeout: 300       # 单步默认超时（秒）
+  max_retries: 2                  # Bootstrap 失败最大重试次数
+  failure_strategy: "terminate_and_retry"
 
 credentials:
-  pool_file: "credentials.json"
-  quota_threshold: 0.85
+  pool_file: "~/.elastic-agent/credentials.json"
+  quota_threshold: 0.85           # 额度使用率告警阈值
+  check_interval: 60              # 额度检查间隔（秒）
 
 external_api:
   enabled: true
-  trace_buffer_size: 5000                  # per-task 缓冲条数
+  trace_buffer_size: 5000         # per-task 实时缓冲条数
 
 logging:
   operations_log: "~/.elastic-agent/operations.log"
-  log_level: "INFO"
+  log_level: "INFO"               # DEBUG | INFO | WARNING | ERROR
   rotation: "daily"
   retention_days: 30
-  worker_process_log_dir: "logs/"          # Worker 进程日志目录（相对于任务工作目录）
+  worker_process_log_dir: "logs/" # Worker 进程日志目录（相对于任务工作目录）
 
 monitor:
-  health_check_interval: 30
-  reconcile_interval: 300
+  health_check_interval: 30       # 秒
+  reconcile_interval: 300         # 云端对账间隔（秒）
+
+drain:
+  timeout: 3600                   # 缩容等待超时（秒）
 
 registry:
   path: "~/.elastic-agent/registry.json"
 ```
+
+**敏感配置（仅通过环境变量传入，不写入配置文件）：**
+
+| 环境变量 | 说明 |
+|---|---|
+| `ALICLOUD_ACCESS_KEY_ID` | 阿里云 RAM 子账号 AccessKey ID |
+| `ALICLOUD_ACCESS_KEY_SECRET` | 阿里云 RAM 子账号 AccessKey Secret |
+| `AWS_ACCESS_KEY_ID` | AWS IAM 用户 Access Key |
+| `AWS_SECRET_ACCESS_KEY` | AWS IAM 用户 Secret Key |
+| `AWS_SESSION_TOKEN` | 可选，STS 临时凭证 |
+| `ELASTIC_AGENT_EXTERNAL_API_KEYS` | 外部 API 认证密钥（逗号分隔） |
 
 ### 10.3 IaC 输出集成
 
