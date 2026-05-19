@@ -156,3 +156,13 @@ async def drain_node(node_id: str) -> dict:
     if not ok:
         raise HTTPException(404, f"Node {node_id} not found")
     return {"node_id": node_id, "status": "draining"}
+
+
+@router.delete("/nodes/{node_id}")
+async def remove_node(node_id: str) -> dict:
+    """T-028: Remove a node from the registry. Terminates instance if still running."""
+    mgr = _mgr()
+    ok = await mgr.remove_node(node_id)
+    if not ok:
+        raise HTTPException(404, f"Node {node_id} not found")
+    return {"node_id": node_id, "status": "removed"}

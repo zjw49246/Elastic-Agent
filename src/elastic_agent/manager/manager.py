@@ -175,6 +175,23 @@ class ElasticAgentManager:
         await self.registry.update(node_id, status=NodeStatus.DRAINING)
         return True
 
+    async def remove_node(self, node_id: str) -> bool:
+        """Remove a node from registry. Terminates instance if still running."""
+        node = await self.registry.get(node_id)
+        if node is None:
+            return False
+        if node.status not in (NodeStatus.TERMINATED, NodeStatus.FAILED):
+            try:
+                await self.provider.terminate_instance(node.instance_id)
+            except Exception:
+                logger.warning("Failed to terminate instance %s during removal", node.instance_id)
+            await self.connection_manager.disconnect_worker(node_id)
+        await self.task_registry.cleanup_worker(node_id)
+        await self.registry.remove(node_id)
+        await self.event_bus.emit("NODE_REMOVED", node_id, {"instance_id": node.instance_id})
+        logger.info("Node %s removed from registry", node_id)
+        return True
+
     async def get_node_status(self, node_id: str) -> dict[str, Any] | None:
         node = await self.registry.get(node_id)
         if node is None:

@@ -25,6 +25,7 @@ aws = [
 ]
 worker = [
     "watchdog>=5.0.0",
+    "oss2>=2.18.0",
 ]
 all = [
     "elastic-agent[aliyun,aws,worker]",

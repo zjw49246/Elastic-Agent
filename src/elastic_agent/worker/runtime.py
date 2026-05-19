@@ -31,15 +31,18 @@ from elastic_agent.core.protocols.messages import (
     ExecuteMessage,
     FileChangeMessage,
     FileContentMessage,
+    FileSyncedMessage,
     HealthCheckMessage,
     HeartbeatMessage,
     LogMessage,
     Message,
     ProcessExitMessage,
     ReadFileMessage,
+    RegisterSyncMappingMessage,
     SendInputMessage,
     StatusMessage,
     StopMessage,
+    UnregisterSyncMappingMessage,
     UploadFileMessage,
     WatchFilesMessage,
     UnwatchMessage,
@@ -81,6 +84,8 @@ class WorkerRuntime:
 
         self._send_queue: asyncio.Queue[str] = asyncio.Queue()
         self._reconnect_event = asyncio.Event()
+
+        self._file_sync_manager: Any = None
 
     @property
     def connected(self) -> bool:
@@ -151,6 +156,8 @@ class WorkerRuntime:
     async def stop(self) -> None:
         """Gracefully shut down: stop all processes, close connection."""
         self._running = False
+        if self._file_sync_manager:
+            await self._file_sync_manager.stop()
         for task_id in list(self._processes.keys()):
             await self._stop_process(task_id, "SIGTERM")
         if self._ws:
@@ -202,6 +209,8 @@ class WorkerRuntime:
             "MESSAGE": self._handle_message,
             "WATCH_FILES": self._handle_watch_files,
             "UNWATCH": self._handle_unwatch,
+            "REGISTER_SYNC_MAPPING": self._handle_register_sync_mapping,
+            "UNREGISTER_SYNC_MAPPING": self._handle_unregister_sync_mapping,
         }
         handler = handlers.get(msg.type)
         if handler:
@@ -488,14 +497,52 @@ class WorkerRuntime:
 
     async def _handle_watch_files(self, msg: WatchFilesMessage) -> None:
         logger.debug("WATCH_FILES received (request_id=%s) — delegated to FileSyncManager", msg.request_id)
-        await self._send_event(ErrorMessage(
-            error_type="not_implemented",
-            message="WATCH_FILES handled by FileSyncManager (not yet implemented)",
-            recoverable=True,
-        ))
 
     async def _handle_unwatch(self, msg: UnwatchMessage) -> None:
         logger.debug("UNWATCH received (request_id=%s) — delegated to FileSyncManager", msg.request_id)
+
+    async def _handle_register_sync_mapping(self, msg: RegisterSyncMappingMessage) -> None:
+        from elastic_agent.worker.file_sync import FileSyncManager, SyncMappingEntry, create_storage_backend
+
+        if self._file_sync_manager is None:
+            storage = create_storage_backend()
+            self._file_sync_manager = FileSyncManager(
+                worker_id=self._worker_id or "unknown",
+                storage=storage,
+                on_file_synced=self._on_file_synced,
+                on_file_changed=self._on_file_changed,
+            )
+            await self._file_sync_manager.start()
+
+        entry = SyncMappingEntry(
+            task_id=msg.task_id,
+            book_slug=msg.book_slug,
+            oss_prefix=msg.oss_prefix,
+            watch_paths=msg.watch_paths,
+            session_path_hash=msg.session_path_hash,
+        )
+        self._file_sync_manager.register_mapping(entry)
+
+    async def _handle_unregister_sync_mapping(self, msg: UnregisterSyncMappingMessage) -> None:
+        if self._file_sync_manager:
+            await self._file_sync_manager.unregister_mapping(msg.task_id)
+
+    async def _on_file_synced(
+        self, task_id: str, path: str, oss_key: str, synced_at: str, md5: str
+    ) -> None:
+        await self._send_event(FileSyncedMessage(
+            task_id=task_id,
+            path=path,
+            oss_key=oss_key,
+            synced_at=_utcnow(),
+            md5=md5,
+        ))
+
+    async def _on_file_changed(self, task_id: str, path: str, event_type: str) -> None:
+        await self._send_event(FileChangeMessage(
+            path=path,
+            event=event_type,
+        ))
 
     # ---- Heartbeat ----
 
