@@ -10,12 +10,17 @@ import asyncio
 import logging
 from typing import Any
 
+from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.event_bus import EventBus
 from elastic_agent.core.protocols.messages import Message
 from elastic_agent.core.reconciler import CloudReconciler
 from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
 from elastic_agent.core.providers.base import CloudProvider
+from elastic_agent.core.task_registry import TaskRegistry
+from elastic_agent.core.task_router import TaskRouter
+from elastic_agent.core.task_scheduler import TaskScheduler
+from elastic_agent.core.webhook_emitter import WebhookEmitter
 from elastic_agent.harness.base import Harness
 from elastic_agent.manager.connection import WorkerConnectionManager
 
@@ -37,6 +42,7 @@ class ElasticAgentManager:
         config: ElasticAgentConfig,
         provider: CloudProvider,
         harness: Harness | None = None,
+        agent_type: AgentType | None = None,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -51,6 +57,24 @@ class ElasticAgentManager:
             reconcile_interval=config.monitor.reconcile_interval,
         )
 
+        self.task_registry = TaskRegistry(config.task_registry.path)
+        self.task_scheduler = TaskScheduler(
+            node_registry=self.registry,
+            task_registry=self.task_registry,
+            harness=harness,
+        )
+        self.task_router = TaskRouter(
+            task_registry=self.task_registry,
+            node_registry=self.registry,
+            connection_manager=self.connection_manager,
+            agent_type=agent_type,
+        )
+        self.webhook_emitter = WebhookEmitter(
+            dead_letter_path=config.webhook.dead_letter_path,
+            retry_delays=config.webhook.retry_delays,
+            send_timeout=config.webhook.send_timeout,
+        )
+
         self.connection_manager.on_message = self._on_worker_message
         self.connection_manager.on_connect = self._on_worker_connect
         self.connection_manager.on_disconnect = self._on_worker_disconnect
@@ -59,12 +83,18 @@ class ElasticAgentManager:
 
     async def start(self) -> None:
         await self.registry.load()
+        await self.task_registry.load()
+
+        online_workers = set(self.connection_manager.connected_workers)
+        await self.task_registry.recover(online_workers)
+
         await self.reconciler.start_periodic()
         self._started = True
         logger.info("ElasticAgentManager started")
 
     async def stop(self) -> None:
         await self.reconciler.stop_periodic()
+        await self.webhook_emitter.stop()
         self._started = False
         logger.info("ElasticAgentManager stopped")
 
@@ -174,5 +204,6 @@ class ElasticAgentManager:
         logger.info("Worker %s connected to Manager", worker_id)
 
     async def _on_worker_disconnect(self, worker_id: str) -> None:
+        await self.task_registry.cleanup_worker(worker_id)
         await self.event_bus.emit("WORKER_DISCONNECTED", worker_id, {})
         logger.info("Worker %s disconnected from Manager", worker_id)

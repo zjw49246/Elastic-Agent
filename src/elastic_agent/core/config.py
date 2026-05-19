@@ -96,6 +96,16 @@ class RegistryConfig(BaseSettings):
     path: str = "~/.elastic-agent/registry.json"
 
 
+class TaskRegistryConfig(BaseSettings):
+    path: str = "~/.elastic-agent/task_registry.json"
+
+
+class WebhookConfig(BaseSettings):
+    retry_delays: list[float] = Field(default_factory=lambda: [1, 5, 30, 300, 1800])
+    send_timeout: float = 10.0
+    dead_letter_path: str = "~/.elastic-agent/webhook_dead_letters.json"
+
+
 class ElasticAgentConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -107,6 +117,8 @@ class ElasticAgentConfig(BaseSettings):
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     drain: DrainConfig = Field(default_factory=DrainConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
+    task_registry: TaskRegistryConfig = Field(default_factory=TaskRegistryConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ElasticAgentConfig:
