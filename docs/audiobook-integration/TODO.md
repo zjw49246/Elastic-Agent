@@ -116,7 +116,7 @@
 
 | ID | 任务 | 说明 |
 |---|---|---|
-| A-000 | 清理旧代码 | 删除 audio_book_echo_agent 仓库中全部现有文件（backend/、frontend/、worker/、tests/、infra/、CLAUDE.md、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），仅保留 .git/ 和 .gitignore |
+| A-000 | 清理旧代码 | 删除 audio_book_echo_agent 仓库中旧文件（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md、.git/ 和 .gitignore |
 | A-001 | 项目脚手架 | 新建 pyproject.toml（依赖 elastic-agent），src/ 目录结构，CI 配置 |
 | A-002 | 配置模型 | AudiobookServiceConfig Pydantic 模型，环境变量 + config.yaml 支持 |
 

@@ -408,8 +408,8 @@ Manager ChatRelay:
 | 内容 | 路径 | 说明 | 不备份的后果 |
 |------|------|------|-------------|
 | **工作目录** | `.work/{book_slug}/` | 全部中间产物和最终讲稿 | 做书成果全部丢失 |
-| **Session 文件** | `~/.claude/projects/{path-hash}/*.jsonl` | Claude Code 对话历史 | 无法 `--resume`，丧失修改能力 |
-| **项目配置** | `~/.claude/projects/{path-hash}/.claude.json` | Claude Code 项目级设置 | `--resume` 时可能行为异常 |
+| **Session 文件** | `~/.claude/projects/{path_hash}/*.jsonl` | Claude Code 对话历史 | 无法 `--resume`，丧失修改能力 |
+| **项目配置** | `~/.claude/projects/{path_hash}/.claude.json` | Claude Code 项目级设置 | `--resume` 时可能行为异常 |
 | **源文本** | `/root/books/{slug}/raw_text.md` | 书籍原始文本（外部服务提供） | 新 Worker 恢复时无源文件 |
 
 **不需要备份的**（Bootstrap 可重建）：Claude Code 二进制、audiobook-nonfiction 插件、Python 依赖、Node.js、系统配置。**凭证**由 CredentialPool 管理，不通过 OSS 备份。

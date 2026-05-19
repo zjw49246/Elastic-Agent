@@ -403,7 +403,7 @@ Worker Runtime 管理的进程:
   │                                                │
   │  日志文件路径:                                  │
   │    由 TaskSyncMapper 的映射决定，默认:          │
-  │    {task_work_dir}/logs/{task_id}.ndjson        │
+  │    {task_work_dir}/logs/production.ndjson        │
   │                                                │
   │  文件监听:                                      │
   │    ├── watchdog Observer (inotify)              │
@@ -464,7 +464,7 @@ Worker Runtime 管理的进程:
                   ┌─────────────────────────┐
                   │   持久化轨迹 (OSS/S3)    │
                   │                         │
-  Worker 日志文件 ─▶│  logs/{task_id}.ndjson  │──────▶ 历史查询 / 排障 / 回放
+  Worker 日志文件 ─▶│  logs/production.ndjson │──────▶ 历史查询 / 排障 / 回放
   (FileSyncManager) │  per-task 独立文件      │
                   │                         │
                   └─────────────────────────┘

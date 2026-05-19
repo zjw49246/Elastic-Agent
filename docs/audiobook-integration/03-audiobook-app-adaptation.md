@@ -946,9 +946,9 @@ oss://{bucket}/elastic-agent/tasks/{task_id}/
   delivery/
     audiobook_manuscript.md
     audiobook_delivery.zip
-  sessions/
+  session/
     session.jsonl
-    claude_project.json
+    .claude.json
   logs/
     production.ndjson
     edits/
@@ -965,7 +965,7 @@ oss://{bucket}/elastic-agent/tasks/{task_id}/
 | `workspace/manuscript_compliant.md` | 如果经过合规处理，优先使用 |
 | `delivery/audiobook_manuscript.md` | 最终交付稿，优先级最高 |
 | `delivery/audiobook_delivery.zip` | 打包下载 |
-| `sessions/session.jsonl` | 后续 chat/history/resume 需要 |
+| `session/session.jsonl` | 后续 chat/history/resume 需要 |
 | `logs/production.ndjson` | 排障和前端日志回放 |
 
 最终稿选择优先级：
@@ -1264,7 +1264,7 @@ async def start_task(task_id: int, options: ElasticAgentOptions) -> None:
         metadata=build_book_metadata(task.book),
         callback_url=f"{settings.BACKEND_URL}/api/elastic-agent/webhook",
         oss_bucket=settings.ELASTIC_AGENT_OSS_BUCKET,
-        oss_prefix=f"{settings.ELASTIC_AGENT_OSS_PREFIX}/tasks/{task.id}/",
+        oss_prefix=f"{settings.ELASTIC_AGENT_OSS_PREFIX}tasks/{task.id}/",
     )
 
     result = await elastic_agent_client.produce_book(request)
@@ -1951,9 +1951,9 @@ oss://{bucket}/elastic-agent/tasks/{task_id}/
   delivery/
     audiobook_manuscript.md
     audiobook_delivery.zip
-  sessions/
+  session/
     session.jsonl
-    claude_project.json
+    .claude.json
   logs/
     production.ndjson
     edits/

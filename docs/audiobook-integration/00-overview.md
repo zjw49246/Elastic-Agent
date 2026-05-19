@@ -308,7 +308,7 @@ audio_book 的 Task.id = "123"
 所有文件同步到同一个 OSS bucket，路径统一格式：
 
 ```
-oss://{ELASTIC_AGENT_OSS_BUCKET}/{ELASTIC_AGENT_OSS_PREFIX}/tasks/{task_id}/
+oss://{ELASTIC_AGENT_OSS_BUCKET}/{ELASTIC_AGENT_OSS_PREFIX}tasks/{task_id}/
   ├── _sync_manifest.json
   ├── source/
   │   ├── raw_text.md
