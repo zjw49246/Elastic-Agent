@@ -44,10 +44,10 @@
 - [ ] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
 - [x] **T-016** [EA] Manager FastAPI 服务骨架 + 节点管理 REST API  `01 §2.1`
 - [x] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）  `01 §3.5`
-- [ ] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
-- [ ] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
-- [ ] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
-- [ ] **T-053** [EA] WebhookEmitter — 事件回调 + HMAC 签名 + 重试 + 死信队列  `01 §3.9`
+- [x] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
+- [x] **T-051** [EA] TaskScheduler — 容量感知分发（WorkerCapacity 检查，Harness 可扩展）  `01 §3.9`
+- [x] **T-052** [EA] TaskRouter — 后续命令路由到 Worker（含 --resume 自动组装）  `01 §3.9`
+- [x] **T-053** [EA] WebhookEmitter — 事件回调 + HMAC 签名 + 重试 + 死信队列  `01 §3.9`
 - [ ] **T-030** [EA] FileSyncManager — Worker 侧文件主动同步到 OSS/S3  `01 §3.4`
 - [ ] **T-031** [EA] FileSyncManager — Harness 配置接口  `01 §3.4`
 - [ ] **T-032** [EA] FileSyncManager — Worker 侧云存储凭证注入  `01 §3.4`
