@@ -1,0 +1,358 @@
+"""Tests for Worker Runtime server (T-007)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from elastic_agent.worker.runtime import WorkerRuntime
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    rt = WorkerRuntime(
+        manager_url="ws://localhost:9999/ws/runtime",
+        auth_token="test-token-123",
+        worker_id="test-worker-1",
+        heartbeat_interval=60,
+        log_dir=str(tmp_path / "logs"),
+    )
+    return rt
+
+
+class TestWorkerRuntimeInit:
+    def test_initial_state(self, runtime):
+        assert not runtime.connected
+        assert runtime.active_processes == []
+        assert runtime._worker_id == "test-worker-1"
+        assert runtime._auth_token == "test-token-123"
+
+    def test_custom_log_dir(self, tmp_path):
+        custom = tmp_path / "custom-logs"
+        rt = WorkerRuntime(
+            manager_url="ws://localhost:9999/ws/runtime",
+            auth_token="tok",
+            log_dir=str(custom),
+        )
+        assert rt._log_dir == custom
+
+
+class TestNDJSONParsing:
+    def test_valid_claude_output(self):
+        line = json.dumps({"type": "assistant", "content": "hello", "subtype": "text"})
+        result = WorkerRuntime._try_parse_ndjson(line)
+        assert result is not None
+        assert result["type"] == "assistant"
+        assert result["subtype"] == "text"
+        assert result["cost_usd"] is None
+        assert result["session_id"] is None
+
+    def test_result_with_session_and_cost(self):
+        line = json.dumps({
+            "type": "result",
+            "session_id": "sess-abc",
+            "cost_usd": 0.05,
+        })
+        result = WorkerRuntime._try_parse_ndjson(line)
+        assert result["type"] == "result"
+        assert result["session_id"] == "sess-abc"
+        assert result["cost_usd"] == 0.05
+
+    def test_non_json_line(self):
+        assert WorkerRuntime._try_parse_ndjson("plain text output") is None
+
+    def test_json_without_type(self):
+        line = json.dumps({"data": "value"})
+        assert WorkerRuntime._try_parse_ndjson(line) is None
+
+    def test_empty_string(self):
+        assert WorkerRuntime._try_parse_ndjson("") is None
+
+    def test_json_array(self):
+        assert WorkerRuntime._try_parse_ndjson("[1,2,3]") is None
+
+
+class TestProcessExecution:
+    @pytest.mark.asyncio
+    async def test_execute_and_capture_output(self, runtime, tmp_path):
+        """Test that EXECUTE starts a process and captures stdout/stderr."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        msg = ExecuteMessage(
+            task_id="task-1",
+            command=[sys.executable, "-c", "import sys; print('hello stdout'); print('error line', file=sys.stderr)"],
+            cwd=str(tmp_path),
+        )
+
+        await runtime._handle_execute(msg)
+        assert "task-1" in runtime._processes
+
+        task = runtime._process_tasks["task-1"]
+        await task
+
+        assert "task-1" not in runtime._processes
+
+        log_msgs = [json.loads(m) for m in sent_messages if '"LOG"' in m]
+        exit_msgs = [json.loads(m) for m in sent_messages if '"PROCESS_EXIT"' in m]
+
+        stdout_logs = [m for m in log_msgs if m["stream"] == "stdout"]
+        stderr_logs = [m for m in log_msgs if m["stream"] == "stderr"]
+
+        assert len(stdout_logs) >= 1
+        assert any("hello stdout" in m["data"] for m in stdout_logs)
+        assert len(stderr_logs) >= 1
+        assert any("error line" in m["data"] for m in stderr_logs)
+
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_logs_to_file(self, runtime, tmp_path):
+        """Test that process output is dual-written to a local NDJSON file."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        msg = ExecuteMessage(
+            task_id="task-log",
+            command=[sys.executable, "-c", "print('logged line')"],
+            cwd=str(tmp_path),
+        )
+
+        await runtime._handle_execute(msg)
+        await runtime._process_tasks["task-log"]
+
+        log_file = runtime._log_dir / "task-log.ndjson"
+        assert log_file.exists()
+        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        assert len(lines) >= 1
+        assert any(l["data"] == "logged line" for l in lines)
+
+    @pytest.mark.asyncio
+    async def test_execute_nonexistent_command(self, runtime, tmp_path):
+        """Test that executing a nonexistent command sends error + exit events."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        msg = ExecuteMessage(
+            task_id="task-bad",
+            command=["/nonexistent/binary"],
+            cwd=str(tmp_path),
+        )
+
+        await runtime._handle_execute(msg)
+
+        error_msgs = [json.loads(m) for m in sent_messages if '"ERROR"' in m]
+        exit_msgs = [json.loads(m) for m in sent_messages if '"PROCESS_EXIT"' in m]
+
+        assert len(error_msgs) >= 1
+        assert error_msgs[0]["error_type"] == "execute_failed"
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] == -1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_task_rejected(self, runtime, tmp_path):
+        """Test that starting a second process with same task_id is rejected."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        msg = ExecuteMessage(
+            task_id="task-dup",
+            command=[sys.executable, "-c", "import time; time.sleep(10)"],
+            cwd=str(tmp_path),
+        )
+
+        await runtime._handle_execute(msg)
+        assert "task-dup" in runtime._processes
+
+        await runtime._handle_execute(msg)
+
+        error_msgs = [json.loads(m) for m in sent_messages if '"duplicate_task"' in m]
+        assert len(error_msgs) == 1
+
+        await runtime._stop_process("task-dup", "SIGKILL")
+        await runtime._process_tasks["task-dup"]
+
+
+class TestStopProcess:
+    @pytest.mark.asyncio
+    async def test_stop_running_process(self, runtime, tmp_path):
+        """Test that STOP sends signal and process exits."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage, StopMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        msg = ExecuteMessage(
+            task_id="task-stop",
+            command=[sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=str(tmp_path),
+        )
+
+        await runtime._handle_execute(msg)
+        assert "task-stop" in runtime._processes
+
+        process_task = runtime._process_tasks["task-stop"]
+        await asyncio.sleep(0.2)
+
+        stop_msg = StopMessage(task_id="task-stop", signal="SIGTERM")
+        await runtime._handle_stop(stop_msg)
+        await process_task
+
+        exit_msgs = [json.loads(m) for m in sent_messages if '"PROCESS_EXIT"' in m]
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] != 0
+
+    @pytest.mark.asyncio
+    async def test_stop_nonexistent_process(self, runtime):
+        """Test stopping a process that doesn't exist is a no-op."""
+        from elastic_agent.core.protocols.messages import StopMessage
+
+        stop_msg = StopMessage(task_id="nonexistent", signal="SIGTERM")
+        await runtime._handle_stop(stop_msg)
+
+
+class TestReadFile:
+    @pytest.mark.asyncio
+    async def test_read_existing_file(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import ReadFileMessage
+
+        test_file = tmp_path / "test.txt"
+        test_file.write_text("hello world")
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = ReadFileMessage(request_id="req-1", path=str(test_file))
+        await runtime._handle_read_file(msg)
+
+        content_msgs = [json.loads(m) for m in sent_messages if '"FILE_CONTENT"' in m]
+        assert len(content_msgs) == 1
+        assert content_msgs[0]["content"] == "hello world"
+        assert content_msgs[0]["request_id"] == "req-1"
+
+    @pytest.mark.asyncio
+    async def test_read_nonexistent_file(self, runtime):
+        from elastic_agent.core.protocols.messages import ReadFileMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = ReadFileMessage(request_id="req-2", path="/nonexistent/file.txt")
+        await runtime._handle_read_file(msg)
+
+        error_msgs = [json.loads(m) for m in sent_messages if '"ERROR"' in m]
+        assert len(error_msgs) == 1
+        assert "read_file_failed" in error_msgs[0]["error_type"]
+
+
+class TestUploadFile:
+    @pytest.mark.asyncio
+    async def test_upload_file(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import UploadFileMessage
+        import base64
+
+        target = tmp_path / "uploaded" / "data.txt"
+        content = base64.b64encode(b"file content here").decode()
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = UploadFileMessage(path=str(target), content_base64=content, mode="0644")
+        await runtime._handle_upload_file(msg)
+
+        assert target.exists()
+        assert target.read_text() == "file content here"
+
+
+class TestHealthCheck:
+    @pytest.mark.asyncio
+    async def test_health_check_response(self, runtime):
+        from elastic_agent.core.protocols.messages import HealthCheckMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        await runtime._handle_health_check(HealthCheckMessage())
+
+        status_msgs = [json.loads(m) for m in sent_messages if '"STATUS"' in m]
+        assert len(status_msgs) == 1
+        s = status_msgs[0]
+        assert "cpu" in s
+        assert "mem" in s
+        assert "disk" in s
+        assert isinstance(s["active_processes"], list)
+
+
+class TestMessageInput:
+    @pytest.mark.asyncio
+    async def test_send_input_no_process(self, runtime):
+        from elastic_agent.core.protocols.messages import SendInputMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = SendInputMessage(task_id="no-such-task", payload="hello")
+        await runtime._handle_message(msg)
+
+        error_msgs = [json.loads(m) for m in sent_messages if '"no_process"' in m]
+        assert len(error_msgs) == 1
