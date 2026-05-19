@@ -13,6 +13,8 @@ from typing import Any
 from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.event_bus import EventBus
+from elastic_agent.core.log_event_parser import LogEventParser
+from elastic_agent.core.operations_logger import OperationsLogger
 from elastic_agent.core.protocols.messages import Message
 from elastic_agent.core.reconciler import CloudReconciler
 from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
@@ -78,6 +80,15 @@ class ElasticAgentManager:
             send_timeout=config.webhook.send_timeout,
         )
 
+        self.operations_logger = OperationsLogger(
+            log_path=config.logging.operations_log,
+            retention_days=config.logging.retention_days,
+            log_level=config.logging.log_level,
+        )
+        self.log_event_parser = LogEventParser(
+            buffer_size=config.external_api.trace_buffer_size,
+        )
+
         self.connection_manager.on_message = self._on_worker_message
         self.connection_manager.on_connect = self._on_worker_connect
         self.connection_manager.on_disconnect = self._on_worker_disconnect
@@ -98,6 +109,7 @@ class ElasticAgentManager:
     async def stop(self) -> None:
         await self.reconciler.stop_periodic()
         await self.webhook_emitter.stop()
+        self.operations_logger.close()
         self._started = False
         logger.info("ElasticAgentManager stopped")
 
@@ -217,13 +229,19 @@ class ElasticAgentManager:
     # ------------------------------------------------------------------
 
     async def _on_worker_message(self, worker_id: str, msg: Message) -> None:
-        await self.event_bus.emit(msg.type, worker_id, msg.model_dump())
+        data = msg.model_dump()
+        await self.event_bus.emit(msg.type, worker_id, data)
+
+        if msg.type == "LOG":
+            self.log_event_parser.process_log_event(worker_id, data)
 
     async def _on_worker_connect(self, worker_id: str) -> None:
         await self.event_bus.emit("WORKER_CONNECTED", worker_id, {})
+        self.operations_logger.log_worker_connected(worker_id)
         logger.info("Worker %s connected to Manager", worker_id)
 
     async def _on_worker_disconnect(self, worker_id: str) -> None:
         await self.task_registry.cleanup_worker(worker_id)
         await self.event_bus.emit("WORKER_DISCONNECTED", worker_id, {})
+        self.operations_logger.log_worker_disconnected(worker_id, reason="connection_lost")
         logger.info("Worker %s disconnected from Manager", worker_id)

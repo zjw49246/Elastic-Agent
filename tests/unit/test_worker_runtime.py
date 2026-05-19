@@ -339,6 +339,91 @@ class TestHealthCheck:
         assert isinstance(s["active_processes"], list)
 
 
+class TestForceSyncOnExit:
+    @pytest.mark.asyncio
+    async def test_force_sync_called_on_process_exit(self, runtime, tmp_path):
+        """T-038: FileSyncManager.force_sync() is called when process exits."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from unittest.mock import AsyncMock
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        mock_fsm = AsyncMock()
+        mock_fsm.force_sync = AsyncMock(return_value=2)
+        runtime._file_sync_manager = mock_fsm
+
+        msg = ExecuteMessage(
+            task_id="task-sync",
+            command=[sys.executable, "-c", "print('done')"],
+            cwd=str(tmp_path),
+        )
+        await runtime._handle_execute(msg)
+        await runtime._process_tasks["task-sync"]
+
+        mock_fsm.force_sync.assert_called_once_with("task-sync")
+
+    @pytest.mark.asyncio
+    async def test_force_sync_error_does_not_block_exit(self, runtime, tmp_path):
+        """T-038: Even if force_sync fails, PROCESS_EXIT is still sent."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from unittest.mock import AsyncMock
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        mock_fsm = AsyncMock()
+        mock_fsm.force_sync = AsyncMock(side_effect=RuntimeError("sync failed"))
+        runtime._file_sync_manager = mock_fsm
+
+        msg = ExecuteMessage(
+            task_id="task-sync-err",
+            command=[sys.executable, "-c", "print('done')"],
+            cwd=str(tmp_path),
+        )
+        await runtime._handle_execute(msg)
+        await runtime._process_tasks["task-sync-err"]
+
+        exit_msgs = [json.loads(m) for m in sent_messages if '"PROCESS_EXIT"' in m]
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_force_sync_when_no_fsm(self, runtime, tmp_path):
+        """T-038: No error when file_sync_manager is None."""
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+        runtime._file_sync_manager = None
+
+        msg = ExecuteMessage(
+            task_id="task-no-fsm",
+            command=[sys.executable, "-c", "print('done')"],
+            cwd=str(tmp_path),
+        )
+        await runtime._handle_execute(msg)
+        await runtime._process_tasks["task-no-fsm"]
+
+        exit_msgs = [json.loads(m) for m in sent_messages if '"PROCESS_EXIT"' in m]
+        assert len(exit_msgs) == 1
+
+
 class TestMessageInput:
     @pytest.mark.asyncio
     async def test_send_input_no_process(self, runtime):

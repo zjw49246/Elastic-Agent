@@ -310,6 +310,13 @@ class WorkerRuntime:
             self._stdin_pipes.pop(task_id, None)
             logger.info("Process for task %s exited with code %d", task_id, exit_code)
 
+            if self._file_sync_manager:
+                try:
+                    synced = await self._file_sync_manager.force_sync(task_id)
+                    logger.info("Force-synced %d files for task %s on process exit", synced, task_id)
+                except Exception:
+                    logger.exception("Failed to force-sync files for task %s on exit", task_id)
+
             await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=exit_code))
 
     async def _read_stream(
