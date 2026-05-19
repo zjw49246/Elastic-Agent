@@ -66,19 +66,47 @@
 | T-028 | 手动扩缩容 API（scale_out / scale_in / remove_node） | 01 §6 |
 | T-029 | 基础 Web UI（节点列表、状态卡片、手动操作） | 01 §6 |
 
-### 测试
+### 测试 — 单元测试
 
 | ID | 任务 |
 |---|---|
-| T-100 ~ T-109 | 单元测试（Provider mock / Registry CRUD / Protocol 序列化 / Bootstrap 状态机 / Drain 状态机 / 对账逻辑 / 轨迹流过滤 / 文件监听） |
-| T-110 ~ T-115 | 集成测试（WS 通信 / 阿里云生命周期 / AWS 生命周期 / Bootstrap E2E / 外部 API E2E / 全链路） |
-| T-116 | IaC 测试 — 阿里云 Terraform plan+apply+destroy |
-| T-117 | IaC 测试 — AWS CDK synth+deploy+destroy |
+| T-100 | CloudProvider mock：create/terminate/list/wait_until_running 接口行为 |
+| T-101 | NodeRegistry CRUD + 并发安全 + JSON 持久化 + 崩溃恢复 |
+| T-102 | Protocol 消息序列化/反序列化（全部消息类型） |
+| T-103 | Bootstrap 状态机：步骤成功/失败/超时/重试/回滚 |
+| T-104 | Drain 状态机：draining→等待完成→终止、超时强制终止 |
+| T-105 | CloudReconciler：孤儿检测、幽灵清理、状态不一致修复 |
+| T-106 | 轨迹缓冲：per-task 写入/读取/溢出/释放 |
+| T-107 | EventBus：fan-out 分发、subscribe/unsubscribe、事件过滤 |
+| T-108 | CredentialPool：分配/回收/轮换/额度检查/分组（high_quota/standard） |
+| T-109 | Config 加载：config.yaml 解析 + 环境变量覆盖 + Pydantic 校验 |
+| T-119 | FileSyncManager：防抖逻辑 + 同步清单生成 + 大小文件分流 |
+| T-121 | Worker 日志落盘：正常退出/崩溃退出场景下文件完整性 |
+| T-123 | TaskSyncMapper：注册/注销映射、路径匹配、多任务并存 |
+| T-124 | LOG 事件结构化解析：各 type 正确提取 parsed 字段、非 JSON 行容错 |
+| T-125 | Manager 操作日志：日志格式、轮转、各操作类别正确记录 |
+| T-126 | Worker 断线重连：指数退避、日志缓冲、重连后回放 |
+| T-127 | 外部 API 认证：有效/无效/过期 API Key |
+| T-128 | Spot/抢占式实例处理：回收事件检测 + 状态更新 |
+
+### 测试 — 集成测试
+
+| ID | 任务 |
+|---|---|
+| T-110 | Manager ↔ Worker WS 通信：连接/认证/双向消息/断线重连 |
+| T-111 | 阿里云全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止 |
+| T-112 | AWS 全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止 |
+| T-113 | Bootstrap E2E：全步骤执行 + 单步失败重试 + 凭证回收 |
+| T-114 | 外部 API E2E：轨迹流订阅 + 文件读取 + 认证 |
+| T-115 | 扩容 → 执行命令 → 获取输出 → 缩容 全链路 |
+| T-116 | IaC 阿里云 Terraform plan + apply + destroy |
+| T-117 | IaC AWS CDK synth + deploy + destroy |
 | T-118 | DryRunProvider 空跑验证 |
-| T-119 | 单元测试：FileSyncManager 防抖逻辑 + 同步清单生成 |
-| T-120 | 集成测试：Worker 文件变更 → OSS/S3 同步 → 外部 API 读取一致性 |
-| T-121 | 单元测试：日志落盘完整性（正常退出 + 崩溃退出） |
-| T-122 | 集成测试：日志落盘 → FileSyncManager → OSS → 外部 API 读取 |
+| T-120 | Worker 文件变更 → FileSyncManager → OSS/S3 → 外部 API 读取 |
+| T-122 | Worker 日志落盘 → FileSyncManager → OSS → 历史查询 |
+| T-129 | Manager 崩溃恢复：重启 → NodeRegistry 重建 → Worker 重连 → 状态一致 |
+| T-130 | 凭证轮换 E2E：额度耗尽 → 自动换号 → 进程使用新凭证 |
+| T-131 | 多 Worker 并发：5+ Worker 同时连接 + 并发执行命令 |
 
 ---
 
@@ -131,20 +159,36 @@
 | A-050 | Audiobook Agent Service config.yaml 定义 | 见本文件 §5 |
 | A-051 | 敏感配置环境变量定义 | 见本文件 §5 |
 
-### 测试
+### 测试 — 单元测试
 
 | ID | 任务 |
 |---|---|
-| A-100 | 单元测试：BookQueue 入队/出队/优先级 |
-| A-101 | 单元测试：SessionRegistry CRUD + 持久化 + 崩溃恢复 |
-| A-102 | 单元测试：SlotScheduler 槽位分配逻辑 |
-| A-103 | 单元测试：WebhookEmitter 重试策略 |
-| A-104 | 单元测试：Session ID 多源提取 |
-| A-105 | 单元测试：并发修改互斥检查 |
-| A-110 | 集成测试：单 Worker 端到端做书（DryRunProvider） |
-| A-111 | 集成测试：修改模式 --resume |
-| A-112 | 集成测试：多 Worker 队列分发 |
-| A-113 | 集成测试：Webhook 发送 + 重试 |
+| A-100 | BookQueue：入队/出队/优先级排序/持久化/空队列 |
+| A-101 | SessionRegistry：CRUD + JSON 持久化 + 崩溃恢复 + 从 OSS manifest 重建 |
+| A-102 | SlotScheduler：生产槽位分配/修改槽位分配/槽位满拒绝/Worker 选择策略 |
+| A-103 | WebhookEmitter：重试延迟策略/死信队列/幂等 event_id/HMAC 签名 |
+| A-104 | Session ID 多源提取：stream-json parsed / 目录扫描 / state.json 回退 |
+| A-105 | 并发修改互斥：同一 task 二次修改返回 409 |
+| A-106 | ChatRelay：session 路由到正确 Worker / Worker 离线返回 503 / 修改槽位满返回 429 |
+| A-107 | 进度超时检测：正常任务不告警 / 超时任务标记 stalled / 自动 SIGINT |
+| A-108 | Retry/Continue 编排：Phase 清理逻辑 / OSS workspace 恢复 / state.json 回退 |
+| A-109 | 凭证隔离：CLAUDE_CONFIG_DIR 按 slot 分配 / 修改流程重注册 sync mapping |
+| A-114 | 配置加载：config.yaml 解析 + 环境变量覆盖 + 必填校验 |
+| A-115 | Phase 检测：state.json phase 数字 → Webhook phase 字符串映射 |
+| A-116 | Worker 目录清理：磁盘阈值触发 / 不活跃天数归档 / 手动清理 API |
+
+### 测试 — 集成测试
+
+| ID | 任务 |
+|---|---|
+| A-110 | 单 Worker 端到端做书（DryRunProvider）：produce → 执行 → 完成 → Webhook |
+| A-111 | 修改模式：produce → 完成 → chat → --resume → 文件同步 → Webhook |
+| A-112 | 多 Worker 队列分发：3 Worker + 5 任务 → 负载均衡 → 全部完成 |
+| A-113 | Webhook 发送 + 重试：正常发送 / 目标 503 重试 / 死信队列 |
+| A-117 | Audiobook Agent Service 崩溃恢复：重启 → SessionRegistry 重建 → 任务继续 |
+| A-118 | API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/stream-config/history/files-sync/workers） |
+| A-119 | 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成 |
+| A-120 | 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister |
 
 ---
 
@@ -206,6 +250,45 @@
 | ID | 任务 | 详见 |
 |---|---|---|
 | B-050 | backend config.py 增加 ELASTIC_AGENT_* 配置 | 03 §8 |
+
+### 测试 — 单元测试
+
+| ID | 任务 |
+|---|---|
+| B-100 | ElasticAgentClient：produce/cancel/retry/continue/chat/status 全接口 mock 测试 |
+| B-101 | WebhookService 验签：有效签名通过 / 无效签名拒绝 / 过期时间戳拒绝 |
+| B-102 | WebhookService 幂等：同一 event_id 重复处理返回 200 不重复写入 |
+| B-103 | WebhookService 状态映射：每种 event_type → Task.status / script_status / current_step 正确映射 |
+| B-104 | WebhookService sequence 排序：乱序事件忽略 / gap 检测触发补偿 |
+| B-105 | OssFileService manifest 解析：正常解析 / 空 manifest / 字段缺失容错 |
+| B-106 | OssFileService 最终稿选择：delivery > compliant > final 优先级 / role 匹配 / path 回退 |
+| B-107 | OssFileService 预签名 URL 生成：path 必须在 manifest 中（防越权） |
+| B-108 | AgentOutput 回灌：elastic_audiobook + final_proofreading 双写 / 重复回灌 update 不 insert |
+| B-109 | ElasticBookProductionService：从 Task+Book 组装请求体 / book_slug 生成 / 大文本走 OSS URI |
+| B-110 | 创建任务分叉：legacy_ai_service → TaskService / elastic_agent → ElasticBookProductionService |
+| B-111 | 轮询补偿：running 状态 > 5min 无事件 → 触发状态查询 → 更新本地状态 |
+| B-112 | 状态映射完整性：Elastic queued/dispatching/running/completed/failed/cancelled → Task 状态正确映射 |
+| B-113 | TaskService 防御：elastic_agent 任务误入 legacy pipeline 抛异常 |
+
+### 测试 — 集成测试
+
+| ID | 任务 |
+|---|---|
+| B-120 | Webhook 全流程：收到 queued→started→phase.changed→completed → 状态逐步更新 → AgentOutput 写入 |
+| B-121 | 修改 Webhook 流程：edit.started → edit.completed → AgentOutput 更新 |
+| B-122 | OSS 文件读取 E2E：manifest 解析 → 文件内容读取 → 预签名 URL → 内容校验 |
+| B-123 | 创建 Elastic 任务 E2E：POST /tasks → ElasticBookProductionService → elastic_book_runs 记录创建 |
+| B-124 | script-production API 全覆盖：status/cancel/continue/retry/chat/files/manuscript 端点 |
+| B-125 | 数据库迁移测试：新增字段 + 新增表 + 现有数据不受影响 |
+
+### 测试 — 前端
+
+| ID | 任务 |
+|---|---|
+| B-130 | 创建任务弹窗：跑书方式切换 → 配置项联动显示/隐藏 |
+| B-131 | TaskDetail 双引擎切换：legacy 展示 Agent 输出 / Elastic 展示 phase+chat+files |
+| B-132 | Elastic chat 界面：发送消息 → 显示回复 → 修改完成 |
+| B-133 | 任务列表筛选：按 script_generation_backend 过滤 |
 
 ---
 
