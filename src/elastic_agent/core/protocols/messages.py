@@ -179,6 +179,28 @@ class QuotaStatusMessage(Message):
     usage_percent: float
     remaining_tokens: int | None = None
     window_resets_at: datetime | None = None
+    five_hour_pct: float = 0.0
+    seven_day_pct: float = 0.0
+    five_hour_resets_at: datetime | None = None
+    seven_day_resets_at: datetime | None = None
+    available: bool = True
+
+
+class CredentialLoginResultMessage(Message):
+    type: Literal["CREDENTIAL_LOGIN_RESULT"] = "CREDENTIAL_LOGIN_RESULT"
+    account_id: str
+    slot_index: int
+    success: bool
+    error: str | None = None
+    expires_at: datetime | None = None
+
+
+class CredentialExhaustedMessage(Message):
+    type: Literal["CREDENTIAL_EXHAUSTED"] = "CREDENTIAL_EXHAUSTED"
+    worker_id: str
+    slot_index: int
+    account_id: str
+    reason: str
 
 
 class AuthMessage(Message):
@@ -234,6 +256,8 @@ WorkerToManagerMessage = Annotated[
         ErrorMessage,
         FileSyncedMessage,
         QuotaStatusMessage,
+        CredentialLoginResultMessage,
+        CredentialExhaustedMessage,
         AuthMessage,
     ],
     Field(discriminator="type"),
@@ -263,6 +287,8 @@ AnyMessage = Annotated[
         ErrorMessage,
         FileSyncedMessage,
         QuotaStatusMessage,
+        CredentialLoginResultMessage,
+        CredentialExhaustedMessage,
         AuthMessage,
     ],
     Field(discriminator="type"),
