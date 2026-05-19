@@ -656,9 +656,10 @@ class ElasticAgentClient:
 
 1. 从 `Book.original_content` 或 `original_content_path` 获取原文。
 2. 生成 `book_slug`。
-3. 调用 Audiobook Agent Service `/api/tasks/produce`。
-4. 创建 `elastic_book_runs`。
-5. webhook 完成时回灌 `AgentOutput`。
+3. 创建 `elastic_book_runs`（status=pending，先落库再调外部服务）。
+4. 调用 Audiobook Agent Service `/api/tasks/produce`。
+5. 更新 `elastic_book_runs`（status=queued + external_task_id 等返回字段）。
+6. webhook 完成时回灌 `AgentOutput`。
 
 ### 5.9 我们与 Audiobook Agent Service 的接口契约
 
@@ -776,13 +777,17 @@ Audiobook Agent Service 返回：
 }
 ```
 
-我们收到返回后：
+提交前先创建 `elastic_book_runs` 记录（status=pending），方便跟踪调用状态。
 
-1. 写入 `elastic_book_runs.external_task_id`。
-2. 写入 `elastic_book_runs.status = queued`。
-3. 写入 `elastic_book_runs.manifest_oss_uri = oss://bucket/elastic-agent/tasks/123/_sync_manifest.json`。
+收到返回后更新：
+
+1. 更新 `elastic_book_runs.external_task_id`。
+2. 更新 `elastic_book_runs.status = queued`。
+3. 更新 `elastic_book_runs.manifest_oss_uri = oss://bucket/elastic-agent/tasks/123/_sync_manifest.json`。
 4. `Task.script_status = GENERATING`。
 5. `Task.current_step = elastic_queued`。
+
+如果调用 Audiobook Agent Service 失败，更新 `elastic_book_runs.status = failed`，记录错误信息。
 
 #### 5.9.3 查询 Elastic 任务状态
 
@@ -1267,8 +1272,11 @@ async def start_task(task_id: int, options: ElasticAgentOptions) -> None:
         oss_prefix=f"{settings.ELASTIC_AGENT_OSS_PREFIX}tasks/{task.id}/",
     )
 
+    # 先落库（status=pending），再调外部服务
+    run = await create_elastic_book_run(task, request, status="pending")
+
     result = await elastic_agent_client.produce_book(request)
-    await create_or_update_elastic_book_run(task, request, result)
+    await update_elastic_book_run(run, result)  # status=queued + external_task_id
 ```
 
 #### 5.10.4 本项目读 OSS 的方式

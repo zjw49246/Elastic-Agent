@@ -175,8 +175,8 @@ app.include_router(audiobook_api_router)
 audio_book_echo_editor 后端:
   1. 创建 Task (script_generation_backend=elastic_agent)
   2. 从 Book 表取原文和元数据
-  3. 调用 Audiobook Agent Service: POST /api/tasks/produce
-  4. 创建 elastic_book_runs 记录
+  3. 创建 elastic_book_runs 记录（status=pending，便于跟踪后续状态）
+  4. 调用 Audiobook Agent Service: POST /api/tasks/produce
         │
         ▼
 Audiobook Agent Service (Manager):
