@@ -45,6 +45,7 @@ build-backend = "hatchling.build"
 packages = ["src/elastic_agent"]
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [

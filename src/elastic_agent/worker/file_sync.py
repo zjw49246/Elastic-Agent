@@ -127,13 +127,25 @@ class PendingUpload:
 
 
 class StorageBackend:
-    """Abstract interface for cloud storage uploads."""
+    """Abstract interface for cloud storage uploads and reads."""
 
     async def upload_file(self, local_path: str, oss_key: str) -> None:
         raise NotImplementedError
 
     async def upload_bytes(self, data: bytes, oss_key: str, content_type: str = "application/octet-stream") -> None:
         raise NotImplementedError
+
+    async def read_file(self, oss_key: str) -> bytes:
+        """Read file content from storage. Returns raw bytes."""
+        raise NotImplementedError
+
+    async def file_exists(self, oss_key: str) -> bool:
+        """Check if a file exists in storage."""
+        raise NotImplementedError
+
+    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+        """Generate a pre-signed URL for direct download. Returns None if unsupported."""
+        return None
 
 
 class OSSBackend(StorageBackend):
@@ -176,8 +188,18 @@ class OSSBackend(StorageBackend):
                     data = f.read(part_size)
                     if not data:
                         break
-                    result = await asyncio.to_thread(bucket.upload_part, oss_key, upload_id, part_number, data)
-                    parts.append(oss2.models.PartInfo(part_number, result.etag))
+                    for attempt in range(PART_MAX_RETRIES):
+                        try:
+                            result = await asyncio.to_thread(
+                                bucket.upload_part, oss_key, upload_id, part_number, data,
+                            )
+                            parts.append(oss2.models.PartInfo(part_number, result.etag))
+                            break
+                        except Exception:
+                            if attempt < PART_MAX_RETRIES - 1:
+                                await asyncio.sleep(2 ** attempt)
+                            else:
+                                raise
                     part_number += 1
             await asyncio.to_thread(bucket.complete_multipart_upload, oss_key, upload_id, parts)
         except Exception:
@@ -190,6 +212,19 @@ class OSSBackend(StorageBackend):
 
         headers = {"Content-Type": content_type}
         await asyncio.to_thread(bucket.put_object, oss_key, data, headers=headers)
+
+    async def read_file(self, oss_key: str) -> bytes:
+        bucket = self._get_bucket()
+        result = await asyncio.to_thread(bucket.get_object, oss_key)
+        return await asyncio.to_thread(result.read)
+
+    async def file_exists(self, oss_key: str) -> bool:
+        bucket = self._get_bucket()
+        return await asyncio.to_thread(bucket.object_exists, oss_key)
+
+    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+        bucket = self._get_bucket()
+        return await asyncio.to_thread(bucket.sign_url, "GET", oss_key, expires)
 
 
 class S3Backend(StorageBackend):
@@ -228,6 +263,28 @@ class S3Backend(StorageBackend):
             ContentType=content_type,
         )
 
+    async def read_file(self, oss_key: str) -> bytes:
+        client = self._get_client()
+        resp = await asyncio.to_thread(client.get_object, Bucket=self._bucket_name, Key=oss_key)
+        return await asyncio.to_thread(resp["Body"].read)
+
+    async def file_exists(self, oss_key: str) -> bool:
+        client = self._get_client()
+        try:
+            await asyncio.to_thread(client.head_object, Bucket=self._bucket_name, Key=oss_key)
+            return True
+        except Exception:
+            return False
+
+    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+        client = self._get_client()
+        return await asyncio.to_thread(
+            client.generate_presigned_url,
+            "get_object",
+            Params={"Bucket": self._bucket_name, "Key": oss_key},
+            ExpiresIn=expires,
+        )
+
 
 class LocalBackend(StorageBackend):
     """Local filesystem backend for testing."""
@@ -247,6 +304,16 @@ class LocalBackend(StorageBackend):
         dest = self._base_dir / oss_key
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
+
+    async def read_file(self, oss_key: str) -> bytes:
+        dest = self._base_dir / oss_key
+        return await asyncio.to_thread(dest.read_bytes)
+
+    async def file_exists(self, oss_key: str) -> bool:
+        return (self._base_dir / oss_key).exists()
+
+    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+        return None
 
 
 def create_storage_backend(storage_type: str = "local", **kwargs) -> StorageBackend:
@@ -273,8 +340,11 @@ def create_storage_backend(storage_type: str = "local", **kwargs) -> StorageBack
 
 CRITICAL_FILES = {"state.json", "manifest.json", "_sync_manifest.json"}
 MAX_RETRIES = 3
+PART_MAX_RETRIES = 3
 RETRY_BUFFER_INTERVAL = 30.0
 MAX_BUFFER_SIZE = 1000
+MAX_BUFFER_BYTES = 500 * 1024 * 1024  # 500 MB
+MULTIPART_THRESHOLD = 10 * 1024 * 1024  # 10 MB
 
 
 def _file_md5(path: str) -> str:
@@ -333,6 +403,7 @@ class FileSyncManager:
         exclude_patterns: list[str] | None = None,
         on_file_synced: Callable | None = None,
         on_file_changed: Callable | None = None,
+        on_sync_error: Callable | None = None,
         buffer_path: str | None = None,
     ) -> None:
         self._worker_id = worker_id
@@ -341,11 +412,13 @@ class FileSyncManager:
         self._exclude_patterns = exclude_patterns or ["*.tmp", "*.swp", "__pycache__/", ".git/"]
         self._on_file_synced = on_file_synced
         self._on_file_changed = on_file_changed
+        self._on_sync_error = on_sync_error
 
         self._mappings: dict[str, SyncMappingEntry] = {}
         self._manifests: dict[str, SyncManifest] = {}
         self._debounce_timers: dict[str, asyncio.TimerHandle | None] = {}
         self._pending_buffer: list[PendingUpload] = []
+        self._buffer_bytes: int = 0
         self._buffer_path = Path(buffer_path) if buffer_path else None
 
         self._observer: Any = None
@@ -504,8 +577,18 @@ class FileSyncManager:
                 logger.warning("Upload failed after %d retries: %s → %s: %s", MAX_RETRIES, local_path, oss_key, exc)
                 if _is_critical(local_path):
                     logger.error("CRITICAL file upload failed: %s", local_path)
+                    if self._on_sync_error:
+                        try:
+                            await self._on_sync_error(task_id, local_path, oss_key, str(exc), critical=True)
+                        except Exception:
+                            pass
                 else:
                     self._buffer_failed_upload(local_path, oss_key, task_id)
+                    if self._on_sync_error:
+                        try:
+                            await self._on_sync_error(task_id, local_path, oss_key, str(exc), critical=False)
+                        except Exception:
+                            pass
 
     def _update_manifest(
         self,
@@ -641,10 +724,25 @@ class FileSyncManager:
     # ------------------------------------------------------------------
 
     def _buffer_failed_upload(self, local_path: str, oss_key: str, task_id: str) -> None:
-        if len(self._pending_buffer) >= MAX_BUFFER_SIZE:
-            logger.error("Upload buffer full (%d items), dropping oldest", MAX_BUFFER_SIZE)
-            self._pending_buffer.pop(0)
+        file_size = 0
+        try:
+            file_size = os.path.getsize(local_path)
+        except OSError:
+            pass
+
+        if len(self._pending_buffer) >= MAX_BUFFER_SIZE or self._buffer_bytes + file_size > MAX_BUFFER_BYTES:
+            logger.error(
+                "Upload buffer limit reached (items=%d/%d, bytes=%d/%d), dropping oldest",
+                len(self._pending_buffer), MAX_BUFFER_SIZE, self._buffer_bytes, MAX_BUFFER_BYTES,
+            )
+            dropped = self._pending_buffer.pop(0)
+            try:
+                self._buffer_bytes -= os.path.getsize(dropped.local_path)
+            except OSError:
+                pass
+
         self._pending_buffer.append(PendingUpload(local_path=local_path, oss_key=oss_key, task_id=task_id))
+        self._buffer_bytes += file_size
         self._save_buffer()
 
     async def _retry_loop(self) -> None:
@@ -654,6 +752,7 @@ class FileSyncManager:
                 continue
 
             remaining: list[PendingUpload] = []
+            new_bytes = 0
             for item in self._pending_buffer:
                 if not os.path.exists(item.local_path):
                     continue
@@ -664,9 +763,14 @@ class FileSyncManager:
                     item.retry_count += 1
                     if item.retry_count < 10:
                         remaining.append(item)
+                        try:
+                            new_bytes += os.path.getsize(item.local_path)
+                        except OSError:
+                            pass
                     else:
                         logger.error("Giving up on upload after 10 retries: %s", item.oss_key)
             self._pending_buffer = remaining
+            self._buffer_bytes = new_bytes
             self._save_buffer()
 
     def _save_buffer(self) -> None:
@@ -696,6 +800,10 @@ class FileSyncManager:
                 )
                 for item in data
             ]
+            self._buffer_bytes = sum(
+                os.path.getsize(p.local_path) for p in self._pending_buffer
+                if os.path.exists(p.local_path)
+            )
         except Exception:
             pass
 

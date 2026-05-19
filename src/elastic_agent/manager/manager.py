@@ -23,6 +23,7 @@ from elastic_agent.core.task_scheduler import TaskScheduler
 from elastic_agent.core.webhook_emitter import WebhookEmitter
 from elastic_agent.harness.base import Harness
 from elastic_agent.manager.connection import WorkerConnectionManager
+from elastic_agent.worker.file_sync import StorageBackend
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,12 @@ class ElasticAgentManager:
         provider: CloudProvider,
         harness: Harness | None = None,
         agent_type: AgentType | None = None,
+        file_storage: StorageBackend | None = None,
     ) -> None:
         self.config = config
         self.provider = provider
         self.harness = harness
+        self.file_storage = file_storage
 
         self.registry = NodeRegistry(config.registry.path)
         self.event_bus = EventBus()

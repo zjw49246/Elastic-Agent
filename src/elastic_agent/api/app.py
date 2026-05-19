@@ -48,9 +48,11 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
 
     from elastic_agent.api.routes.health import router as health_router
     from elastic_agent.api.routes.nodes import router as nodes_router
+    from elastic_agent.api.routes.files import router as files_router
 
     app.include_router(health_router)
     app.include_router(nodes_router, prefix="/api")
+    app.include_router(files_router, prefix="/api")
 
     @app.websocket("/ws/runtime")
     async def ws_runtime(websocket: WebSocket) -> None:
