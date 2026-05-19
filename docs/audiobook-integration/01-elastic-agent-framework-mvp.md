@@ -1826,8 +1826,16 @@ accessToken 即将过期
                     → CREDENTIAL_EXHAUSTED 事件（如果无可用替代）
 ```
 
-与 agent-ml-research 的差异: agent-ml-research 在 refresh 失败后标记 error 等待人工处理。
-我们的框架多了一步——自动重新执行 OAuth 登录，减少运维干预。
+与 agent-ml-research 的对比:
+  agent-ml-research 也有自动重新登录能力（Phase 13）:
+    watchdog 标记 refresh_failed → pool_state_watcher 发出 auth_expired 事件
+    → Manager Agent（AI）收到通知 → 调用 manager_claude_account_login MCP 工具
+    → 在 Worker 上执行 perform_login() 重新登录
+  但这个能力默认关闭（claude_account_login capability = False），需要显式启用。
+  
+  我们的框架: 将自动重新登录作为框架内置行为（非 AI 决策），无需额外启用。
+  区别在于: agent-ml-research 由 AI Agent 判断是否重新登录;
+           我们的框架由硬编码逻辑自动触发。两种方式都可行。
 
 ### 12.3 额度监控技术细节
 
