@@ -41,7 +41,7 @@
 - [x] **T-012** [EA] 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）  `01 §3.5`
 - [x] **T-013** [EA] 内部轨迹流 — EventBus LOG 事件分发（Harness 回调、phase 检测用，不对外暴露）  `01 §3.3`
 - [x] **T-014** [EA] 文件同步通知 — FILE_SYNCED 事件 → WebhookEmitter 推送（外部通过 Webhook 感知）  `01 §3.3`
-- [ ] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
+- [x] **T-015** [EA] 外部服务 API — 认证（API Key Bearer Token）  `01 §3.3`
 - [x] **T-016** [EA] Manager FastAPI 服务骨架 + 节点管理 REST API  `01 §2.1`
 - [x] **T-017** [EA] Claude Code AgentType（安装命令、启动命令、NDJSON 解析、session_id 提取、--resume 命令组装、健康检查探针）  `01 §3.5`
 - [x] **T-050** [EA] TaskRegistry — task→worker 映射，JSON 持久化，崩溃恢复，Worker 下线清理  `01 §3.9`
@@ -74,7 +74,7 @@
 
 ### P1 — 应该完成
 
-- [ ] **T-018** [EA] Bootstrap Pipeline（可插拔步骤、per-step 超时、失败策略枚举）  `01 §3.5`
+- [x] **T-018** [EA] Bootstrap Pipeline（可插拔步骤、per-step 超时、失败策略枚举）  `01 §3.5`
 - [ ] **T-019 ~ T-022** [EA] 内置 Bootstrap 步骤（系统初始化/Agent 安装/Runtime 部署/Harness 代码）  `01 §3.5`
 - [ ] **T-023** [EA] Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）  `01 §3.5`
 - [ ] **T-024** [EA] Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）  `01 §3.5`
