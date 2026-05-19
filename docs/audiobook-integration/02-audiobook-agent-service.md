@@ -12,7 +12,7 @@
 
 Audiobook Agent Service 是一个 **独立的 Python 应用**（独立仓库、独立部署），它：
 
-- 通过 `pip install elastic-agent` 引入 Elastic-Agent 框架
+- 通过 `uv add git+https://github.com/zjw49246/Elastic-Agent.git` 引入 Elastic-Agent 框架
 - 实现 `AudiobookHarness(Harness)` 接口，定义有声书生产的业务逻辑
 - 作为 **Manager 进程** 运行，管理多台 Worker 上的 Claude Code 会话
 - 暴露有声书专用 API（做书、修改、状态查询等），供 audio_book_echo_editor 调用

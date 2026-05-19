@@ -40,7 +40,7 @@
 
 | 仓库 | 职责 | 技术栈 | 部署形态 |
 |------|------|--------|---------|
-| **Elastic-Agent** | 通用弹性计算框架：云资源管理、Worker Runtime、通信协议、External API、FileSyncManager | Python 3.11+, FastAPI, Terraform, CDK | pip 包（被 Audiobook Agent Service 依赖） |
+| **Elastic-Agent** | 通用弹性计算框架：云资源管理、Worker Runtime、通信协议、External API、FileSyncManager | Python 3.11+, FastAPI | GitHub 包（`uv add git+https://github.com/zjw49246/Elastic-Agent.git`） |
 | **Audiobook Agent Service** (新建) | 基于 Elastic-Agent 的有声书生产服务：AudiobookHarness、BookQueue、SessionRegistry、SlotScheduler、ChatRelay、Audiobook 专用 API | Python 3.11+, FastAPI | 独立部署的 Manager 服务 |
 | **audio_book_echo_editor** | 现有做书前后端：双引擎适配层、Elastic 客户端、Webhook 处理、OSS 文件读取、前端 UI | Python (FastAPI) + React/TS | 现有部署，增量改造 |
 
@@ -61,7 +61,7 @@
 │   Audiobook Agent Service      │
 │   (独立部署的 Manager 服务)     │
 │                                │
-│  import elastic_agent          │──── pip install elastic-agent
+│  import elastic_agent          │──── uv add git+https://github.com/zjw49246/Elastic-Agent.git
 │  实现 AudiobookHarness         │
 │  暴露 Audiobook 专用 API       │
 │  推送 Webhook 到 audio_book    │
@@ -133,7 +133,7 @@ app.include_router(audiobook_api_router)
 | External API | REST 文件访问、轨迹查询、集群状态 | 不暴露 task/chat/session 接口 |
 | FileSyncManager | Worker 文件 → OSS/S3 同步，防抖，清单 | 不知道 book_slug → task_id 映射 |
 | Harness 接口 | 定义 `Harness` 基类和回调契约 | 不提供具体实现 |
-| IaC | Terraform (阿里云) + CDK (AWS) 基础网络 | 不管实例创建 |
+| 前置准备 | 阿里云/AWS 控制台创建 VPC/安全组/密钥对 | 不管实例创建 |
 
 ### 3.2 Audiobook Agent Service (Application)
 

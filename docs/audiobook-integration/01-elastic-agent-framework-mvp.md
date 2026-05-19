@@ -11,7 +11,7 @@
 >
 > 未修改的部分与原文档保持一致。
 >
-> **核心策略：** 阿里云优先、SDK 直连管理实例、IaC 管理基础网络（阿里云 Terraform / AWS CDK）、外部服务 API 暴露实时数据。
+> **核心策略：** 阿里云优先、SDK 直连管理实例、基础网络手动创建（控制台/CLI）、外部服务 API 暴露实时数据。
 
 ---
 
@@ -23,8 +23,8 @@
 - [ ] **T-002** CloudProvider 抽象基类 + Instance/InstanceConfig 数据模型
 - [ ] **T-003** 阿里云 ECS Provider（alibabacloud SDK V2.0 直连）
 - [ ] **T-004** AWS EC2 Provider（boto3 SDK 直连）
-- [ ] **T-005** IaC — 阿里云基础网络（Terraform: VPC/VSwitch/安全组/密钥对/NAT）
-- [ ] **T-006** IaC — AWS 基础网络（CDK Python: VPC/Subnet/SG/KeyPair/NAT）
+- [ ] **T-005** 阿里云基础网络 — 控制台手动创建 VPC/VSwitch/安全组/密钥对
+- [ ] **T-006** AWS 基础网络（如需）— 控制台手动创建 VPC/Subnet/SG/KeyPair
 - [ ] **T-007** Worker Runtime 服务端（Worker 侧：进程执行、日志流、文件操作）
 - [ ] **T-008** Worker Runtime 客户端（Manager 侧：远程调用抽象）
 - [ ] **T-009** Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）
@@ -70,8 +70,8 @@
 
 - [ ] **T-100 ~ T-109** 单元测试（Provider mock / Registry CRUD / Protocol 序列化 / Bootstrap 状态机 / Drain 状态机 / 对账逻辑 / 轨迹流过滤 / 文件监听）
 - [ ] **T-110 ~ T-115** 集成测试（Manager↔Worker WS 通信 / 阿里云全生命周期 / AWS 全生命周期 / Bootstrap E2E / 外部 API E2E / 扩容→执行→缩容全链路）
-- [ ] **T-116** IaC 测试 — 阿里云 Terraform plan+apply+destroy
-- [ ] **T-117** IaC 测试 — AWS CDK synth+deploy+destroy
+- [ ] **T-116** 基础网络验证 — 阿里云资源连通性测试
+- [ ] **T-117** 基础网络验证 — AWS 资源连通性测试（如需）
 - [ ] **T-118** DryRunProvider 空跑验证
 - [ ] **T-119** 单元测试：FileSyncManager 防抖逻辑 + 同步清单生成
 - [ ] **T-120** 集成测试：Worker 文件变更 → OSS/S3 同步 → 外部 API 读取一致性
@@ -1220,104 +1220,31 @@ Harness 可通过 self.logger 写入同一日志流。
 
 ---
 
-## 4. IaC 策略
+## 4. 前置准备
 
-### 4.1 双工具策略
+MVP 不使用 Terraform 或 CDK。基础网络资源通过阿里云控制台或 CLI 一次性手动创建。
 
-| 云 | IaC 工具 | 理由 |
-|---|---------|------|
-| **阿里云** | **Terraform** (alicloud provider) | 阿里云没有 CDK 等价物，Terraform 是唯一成熟选择 |
-| **AWS** | **CDK Python** | 项目全栈 Python，CDK 与主代码共享类型系统；后续 ASG/Lambda/SSM 集成 CDK 远优于 Terraform |
+### 4.1 阿里云资源准备
 
-### 4.2 IaC 管什么、不管什么
+在阿里云控制台中准备以下资源，将 ID 填入 config.yaml：
 
-| 资源类型 | 管理方式 | 理由 |
-|---------|---------|------|
-| VPC / 子网 / 路由表 | IaC (Terraform / CDK) | 一次性创建，环境间一致性要求高 |
-| 安全组及规则 | IaC | 安全策略需要版本控制和审计 |
-| 密钥对 | IaC | 一次性创建 |
-| NAT Gateway + EIP | IaC | 出站 IP 固定是 IP 亲和性的基础 |
-| IAM/RAM 角色 | IaC | 最小权限原则，需要审计 |
-| **ECS/EC2 实例 (Worker)** | **SDK 直连** | 动态生命周期，按需创建/销毁 |
-| **EIP（弹性 IP）** | **SDK 直连** | 跟随实例动态分配/回收 |
+| 资源 | 说明 | 配置项 |
+|---|---|---|
+| VPC | 已有 VPC 即可，不需要新建 | — |
+| VSwitch | Manager 和 Worker 在同一 VSwitch | `provider.aliyun.vswitch_id` |
+| 安全组 | 允许 VPC 内 8080 端口（Worker Runtime）+ 22 端口（SSH Bootstrap） | `provider.aliyun.security_group_id` |
+| 密钥对 | SSH 登录 Worker 用 | `provider.aliyun.key_pair_name` + `ssh_key_path` |
+| 自定义镜像（可选） | 预装 Ubuntu + Python 3.11 + Node.js 20 可加速 Bootstrap | `provider.aliyun.image_id` |
 
-### 4.3 项目结构
+Worker 使用公网 IP 出站（创建 ECS 时分配），不需要 NAT Gateway。
 
-```
-infra/
-├── aliyun/                        # Terraform (HCL)
-│   ├── modules/
-│   │   └── networking/
-│   │       ├── main.tf            # VPC, VSwitch, 安全组, NAT, 密钥对
-│   │       ├── variables.tf
-│   │       └── outputs.tf         # → vpc_id, vswitch_ids, sg_id, key_name
-│   └── environments/
-│       └── cn-hangzhou/
-│           ├── main.tf            # provider "alicloud" + module 调用
-│           ├── terraform.tfvars   # region, cidr, 实例化参数
-│           └── backend.tf         # OSS remote state
-│
-└── aws/                           # CDK Python
-    ├── app.py                     # CDK App 入口
-    ├── stacks/
-    │   └── networking_stack.py    # VPC, Subnet, SG, NAT, KeyPair
-    ├── cdk.json
-    └── requirements.txt
-```
+### 4.2 AWS 资源准备（如需）
 
-### 4.4 CDK Python 设计要点
+同理，在 AWS 控制台准备 VPC/Subnet/Security Group/Key Pair，填入 config.yaml 的 `provider.aws` 部分。
 
-```python
-# infra/aws/stacks/networking_stack.py
+### 4.3 后续演进
 
-from aws_cdk import Stack, CfnOutput
-from aws_cdk import aws_ec2 as ec2
-from constructs import Construct
-
-class ElasticAgentNetworkingStack(Stack):
-    def __init__(self, scope: Construct, id: str, **kwargs):
-        super().__init__(scope, id, **kwargs)
-
-        # CDK L2 Construct — 一行创建 VPC + 公私有子网 + NAT + 路由表
-        self.vpc = ec2.Vpc(self, "ElasticAgentVpc",
-            max_azs=2,
-            nat_gateways=1,
-            subnet_configuration=[
-                ec2.SubnetConfiguration(name="worker-private",
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
-                ec2.SubnetConfiguration(name="public",
-                    subnet_type=ec2.SubnetType.PUBLIC),
-            ],
-        )
-        # 对比 Terraform: 需要分别定义 VPC + 2 Subnet + IGW + NAT + 4 RouteTable + 4 RouteTableAssociation
-
-        self.worker_sg = ec2.SecurityGroup(self, "WorkerSG",
-            vpc=self.vpc,
-            description="Elastic-Agent Workers",
-            allow_all_outbound=True,
-        )
-        self.worker_sg.add_ingress_rule(
-            ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
-            ec2.Port.tcp(8080),
-            "Worker Runtime from VPC",
-        )
-
-        # 输出供 Manager 配置使用
-        CfnOutput(self, "VpcId", value=self.vpc.vpc_id)
-        CfnOutput(self, "PrivateSubnetIds",
-            value=",".join([s.subnet_id for s in self.vpc.private_subnets]))
-        CfnOutput(self, "SecurityGroupId", value=self.worker_sg.security_group_id)
-```
-
-**CDK vs Terraform 对比（AWS 侧）：**
-
-| 维度 | CDK Python | Terraform HCL |
-|------|-----------|---------------|
-| VPC + NAT + 路由 | 1 个 `ec2.Vpc()` 调用 | ~15 个 resource block |
-| 类型安全 | Python 类型检查，IDE 补全 | HCL 无类型，靠 `terraform validate` |
-| 测试 | `pytest` + `assertions` 模块 | `terraform plan` 输出解析 |
-| 与主代码集成 | 共享 Pydantic 模型、常量 | 完全隔离 |
-| 后续扩展 | Lambda/SSM/ASG 用 L2 construct 很自然 | 需要大量 resource block |
+当环境数量增多或需要版本化管理时，可引入 Terraform（阿里云）或 CDK（AWS）管理上述资源。MVP 阶段手动创建即可。
 
 ---
 
@@ -1430,8 +1357,8 @@ Phase A (Week 1-2): 能创建和销毁云实例
   T-002 数据模型
   T-003 阿里云 Provider
   T-004 AWS Provider
-  T-005 Terraform 阿里云网络
-  T-006 CDK AWS 网络
+  T-005 阿里云基础网络（控制台创建）
+  T-006 AWS 基础网络（控制台创建，如需）
   T-011 NodeRegistry
   T-012 云端对账
   ── 里程碑: 能通过 Python 代码创建/销毁阿里云 ECS + AWS EC2 ──
@@ -1556,9 +1483,7 @@ elastic-agent/
 │   ├── worker/                 # Runtime 服务入口 + 进程管理 + 日志落盘 + FileSyncManager
 │   └── cli/                    # 命令行入口
 ├── dashboard/                  # React + Vite + Ant Design 前端
-├── infra/
-│   ├── aliyun/                 # Terraform (HCL)
-│   └── aws/                    # CDK (Python)
+├── scripts/                    # 部署辅助脚本（可选）
 ├── tests/
 │   ├── unit/
 │   └── integration/
@@ -1596,8 +1521,8 @@ provider:
     region_id: "cn-hangzhou"
     image_id: "m-bp1xxxx"         # 自定义镜像 ID
     instance_type: "ecs.c6.large"
-    security_group_id: ""         # Terraform output
-    vswitch_id: ""                # Terraform output
+    security_group_id: ""         # 阿里云控制台创建
+    vswitch_id: ""                # 阿里云控制台创建
     key_pair_name: "elastic-agent-key"
     ssh_key_path: "~/.ssh/elastic-agent-aliyun.pem"
     max_instances: 30
@@ -1606,8 +1531,8 @@ provider:
     region: "ap-northeast-1"
     ami_id: "ami-xxxxx"           # 自定义 AMI ID
     default_instance_type: "t3.large"
-    security_group_ids: []        # CDK output
-    subnet_id: ""                 # CDK output
+    security_group_ids: []        # AWS 控制台创建
+    subnet_id: ""                 # AWS 控制台创建
     key_pair_name: "elastic-agent-key"
     ssh_key_path: "~/.ssh/elastic-agent-aws.pem"
     max_instances: 30
@@ -1667,23 +1592,12 @@ registry:
 | `AWS_SESSION_TOKEN` | 可选，STS 临时凭证 |
 | `ELASTIC_AGENT_EXTERNAL_API_KEYS` | 外部 API 认证密钥（逗号分隔） |
 
-### 10.3 IaC 输出集成
+### 10.3 获取资源 ID
 
-```bash
-# 阿里云: Terraform 输出 → 配置
-cd infra/aliyun/environments/cn-hangzhou
-terraform apply
-export SECURITY_GROUP_ID=$(terraform output -raw security_group_id)
-export VSWITCH_ID=$(terraform output -raw vswitch_ids | jq -r '.[0]')
-
-# AWS: CDK 输出 → 配置
-cd infra/aws
-cdk deploy
-export SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
-  --stack-name ElasticAgentNetworking \
-  --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
-  --output text)
-```
+在阿里云控制台创建资源后，将 ID 填入 config.yaml：
+- VSwitch ID: 阿里云控制台 → VPC → 交换机 → 复制 ID
+- 安全组 ID: 阿里云控制台 → ECS → 安全组 → 复制 ID
+- 密钥对名称: 阿里云控制台 → ECS → 密钥对 → 复制名称
 
 ---
 
@@ -1694,9 +1608,7 @@ export SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
 | 语言 | Python 3.11+ | 与三个 Harness 统一，async 生态成熟 |
 | 后端 | FastAPI | 原生 async + WebSocket + OpenAPI 文档 |
 | 阿里云 SDK | alibabacloud_ecs20140526 (V2) | 类型提示，async 友好 |
-| AWS SDK | boto3 | 标准，无替代 |
-| IaC (阿里云) | **Terraform** | 阿里云唯一成熟 IaC 选择 |
-| IaC (AWS) | **CDK Python** | 与项目同语言，L2 construct 高效，后续 Lambda/SSM 集成优势大 |
+| AWS SDK | boto3 | 标准，无替代（MVP 阿里云优先，AWS 后续） |
 | 前端 | React + Vite + Ant Design | 与 CCM 前端统一 |
 | 测试 | pytest + pytest-asyncio | 标准 |
 | SSH | asyncssh | 原生 async |

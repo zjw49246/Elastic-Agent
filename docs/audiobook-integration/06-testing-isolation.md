@@ -633,7 +633,7 @@ test:
 # ABS CI
 test:
   script:
-    - pip install elastic-agent                               # 安装框架（含 testing 模块）
+    - uv add git+https://github.com/zjw49246/Elastic-Agent.git  # 安装框架（含 testing 模块）
     - ABS_TEST_LEVEL=0 pytest tests/ -m "level0"             # 必跑：纯单元测试
     - ABS_TEST_LEVEL=1 pytest tests/ -m "level0 or level1"   # 必跑：+ DryRun 组件测试
     - |
@@ -709,7 +709,7 @@ ABS_TEST_LEVEL=6 ABE_WEBHOOK_URL=https://test.audiobook.example.com/api/elastic-
 
 - [ ] 从公网尝试连接 Worker 的 8080 端口 — 应超时（Worker 不开入站）
 - [ ] 从公网尝试连接 Manager 的 WS 端点 — 确认是否符合预期（如果 Manager 在公网则应有 API Key 认证）
-- [ ] 检查安全组规则是否符合 Terraform 定义（没有人手动加了 0.0.0.0/0 的入站规则）
+- [ ] 检查安全组规则正确（没有人手动加了 0.0.0.0/0 的入站规则）
 
 **操作日志可读性**
 

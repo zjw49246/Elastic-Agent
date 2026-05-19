@@ -12,7 +12,7 @@
 ## 0. 仓库初始化 — [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent)
 
 - [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
-- [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），依赖 `elastic-agent` 包
+- [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），通过 `uv add git+https://github.com/zjw49246/Elastic-Agent.git` 引入框架
 - [ ] **S-003** [ABS] 更新 CLAUDE.md / 编写 README.md，引用本方案文档
 
 ---
@@ -26,8 +26,8 @@
 - [ ] **T-049** [EA] Harness 抽象基类 + 相关接口定义（WorkerCapacity, FileSyncConfig, SyncMapping, WorkerLifecycle, BootstrapStep, ScalingSignal）  `05 §5.2`
 - [ ] **T-003** [EA] 阿里云 ECS Provider（alibabacloud SDK V2.0 直连）  `01 §3.1`
 - [ ] **T-004** [EA] AWS EC2 Provider（boto3 SDK 直连）  `01 §3.1`
-- [ ] **T-005** [EA] IaC — 阿里云基础网络（Terraform: VPC/VSwitch/安全组/密钥对/NAT）  `01 §4`
-- [ ] **T-006** [EA] IaC — AWS 基础网络（CDK Python: VPC/Subnet/SG/KeyPair/NAT）  `01 §4`
+- [ ] **T-005** [EA] 阿里云前置准备文档 + 验证脚本（VPC/VSwitch/安全组/密钥对，控制台手动创建）  `01 §4`
+- [ ] **T-006** [EA] AWS 前置准备文档 + 验证脚本（VPC/Subnet/SG/KeyPair，控制台手动创建）  `01 §4`
 - [ ] **T-007** [EA] Worker Runtime 服务端（进程执行、日志双写落盘、文件操作）  `01 §3.2`
 - [ ] **T-008** [EA] Worker Runtime 客户端（Manager 侧远程调用抽象）  `01 §3.2`
 - [ ] **T-009** [EA] Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）  `01 §3.2`
@@ -106,8 +106,8 @@
 - [ ] **T-113** [EA] Bootstrap E2E：全步骤执行 + 单步失败重试 + 凭证回收
 - [ ] **T-114** [EA] 外部 API E2E：轨迹流订阅 + 文件读取 + 认证
 - [ ] **T-115** [EA] 扩容 → 执行命令 → 获取输出 → 缩容 全链路
-- [ ] **T-116** [EA] IaC 阿里云 Terraform plan + apply + destroy
-- [ ] **T-117** [EA] IaC AWS CDK synth + deploy + destroy
+- [ ] **T-116** [EA] 阿里云前置资源验证：安全组规则 + VSwitch 连通性 + 密钥对 SSH 可达
+- [ ] **T-117** [EA] AWS 前置资源验证：Security Group + Subnet + Key Pair
 - [ ] **T-118** [EA] DryRunProvider 空跑验证
 - [ ] **T-120** [EA] Worker 文件变更 → FileSyncManager → OSS/S3 → 外部 API 读取
 - [ ] **T-122** [EA] Worker 日志落盘 → FileSyncManager → OSS → 历史查询
@@ -353,9 +353,9 @@ provider:
     region_id: "cn-hangzhou"
     image_id: "m-bp1xxxx"                  # 自定义镜像 ID
     instance_type: "ecs.c6.large"
-    security_group_id: ""                  # Terraform output
-    vswitch_id: ""                         # Terraform output
-    key_pair_name: "elastic-agent-key"     # Terraform output
+    security_group_id: ""                  # 阿里云控制台创建
+    vswitch_id: ""                         # 阿里云控制台创建
+    key_pair_name: "elastic-agent-key"     # 阿里云控制台创建
     ssh_key_path: "~/.ssh/elastic-agent-aliyun.pem"
     max_instances: 30
     spot_enabled: false                    # 是否使用抢占式实例
@@ -363,9 +363,9 @@ provider:
     region: "ap-northeast-1"
     ami_id: "ami-xxxxx"                    # 自定义 AMI ID
     default_instance_type: "t3.large"
-    security_group_ids: []                 # CDK output
-    subnet_id: ""                          # CDK output
-    key_pair_name: "elastic-agent-key"     # CDK output
+    security_group_ids: []                 # AWS 控制台创建
+    subnet_id: ""                          # AWS 控制台创建
+    key_pair_name: "elastic-agent-key"     # AWS 控制台创建
     ssh_key_path: "~/.ssh/elastic-agent-aws.pem"
     max_instances: 30
 
