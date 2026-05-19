@@ -338,7 +338,7 @@
 | 修改超时 | 1800s | ABS `config.yaml` → `audiobook.claude_code.edit_timeout` | ABS | 单次修改最长时间 |
 | 进度超时 | 1800s | ABS `config.yaml` → `audiobook.progress_timeout` | ABS | 无输出多久判定卡死 |
 | 缩容等待超时 | 3600s | EA `config.yaml` → `drain.timeout` | EA | 缩容前等当前任务 |
-| 额度检查间隔 | 60-90s | EA `config.yaml` → `credentials.quota_check_interval` | EA | 随机化防反检测 |
+| 账号间检查延迟 | 170-190s | EA `config.yaml` → `credentials.quota_check_delay_min/max` | EA | 单账号周期≈N×180s |
 | 单步 Bootstrap 超时 | 300s | EA `config.yaml` → `bootstrap.default_step_timeout` | EA | |
 | 自动登录超时 | 240s | EA `config.yaml` → `credentials.login_timeout` | EA | 单次 OAuth 流程 |
 
@@ -388,7 +388,9 @@ credentials:
   accounts_file: "~/.elastic-agent/accounts.json"     # 账号池定义
   pool_status_file: "~/.elastic-agent/pool_status.json" # 运行时状态（框架自动维护）
   quota_threshold: 0.85                    # 5h 额度使用率告警阈值
-  quota_check_interval: 60                 # Worker 侧额度检查间隔（秒）
+  quota_check_delay_min: 170               # 账号间检查最小延迟（秒，防反检测）
+  quota_check_delay_max: 190               # 账号间检查最大延迟（秒，随机化）
+  weekly_reserve_per_day: 0                # 7d 每天预留百分比（0=不启用）
   rotation_strategy: "least_used_first"    # 轮换策略：least_used_first | round_robin
   login_timeout: 240                       # 单次自动登录超时（秒）
   max_accounts_per_worker: 4               # 每 Worker 最大同时登录账号数

@@ -825,8 +825,14 @@ Layer 2: 应用凭证（Harness 声明，框架传递）
   "groups": {
     "high_quota": {"description": "主账号，用于生产槽位（Opus 密集）"},
     "standard":   {"description": "副账号，用于修改槽位（Sonnet 轻量）"}
-  }
+  },
+  "weekly_reserve_per_day": 0              // 7d 每天预留百分比（0=不启用）
 }
+
+设计说明:
+  email_token 直接放在 accounts.json 中（与 agent-ml-research 不同）。
+  agent-ml-research 将 email_tokens 放在独立的 email_tokens.json 文件。
+  合并到一个文件更简单，减少配置文件数量。敏感性相同（accounts.json 本身就是敏感文件）。
 
 运行时状态 (~/.elastic-agent/pool_status.json, 框架自动维护):
 {
@@ -916,7 +922,11 @@ Worker 依赖（Bootstrap 时安装）:
 两级额度监控:
 
 Level 1: Worker 侧（周期性检查）
-  Worker Runtime 每 60-90s（随机化，防反检测）对本机所有活跃凭证执行:
+  Worker Runtime 对本机所有活跃凭证轮流检查:
+    检查间隔: 每个账号之间随机延迟 170-190s（防反检测，参考 agent-ml-research）
+    单个账号的实际检查周期 ≈ N_accounts × 180s（如 4 个账号 → 每 12 分钟检查一次）
+
+  每个账号的检查步骤:
     1. 读取 {config_dir}/.credentials.json 获取 accessToken
     2. Token 续期（如果 now_ms >= expiresAt - 5min）:
        POST https://console.anthropic.com/v1/oauth/token
@@ -938,20 +948,26 @@ Level 1: Worker 侧（周期性检查）
          "seven_day":  {"utilization": 62, "resets_at": "2026-05-26T00:00:00Z"}
        }
     5. 发送 QUOTA_STATUS 事件到 Manager:
-       {credential_id, five_hour_pct, seven_day_pct, five_hour_resets_at, available}
+       {credential_id, five_hour_pct, seven_day_pct, five_hour_resets_at,
+        seven_day_resets_at, available}
 
   额度 API 限流处理:
-    返回 rate_limit_error → 使用本地缓存值 + 标记 stale
+    返回 rate_limit_error → 使用本地缓存值（30min 内有效）+ 标记 stale
     指数退避: 180s → 360s → ... → 2880s（上限）
-    额度 API 限流不影响 Claude Code 正常使用
+    额度 API 限流不影响 Claude Code 正常使用（两个独立的 API）
 
 Level 2: Manager 侧（汇聚 + 决策）
   QuotaMonitor 收集所有 Worker 的 QUOTA_STATUS 事件:
     1. 更新 pool_status.json 中的额度数据
-    2. 阈值检测:
+    2. 5h 窗口阈值检测:
        five_hour_pct >= quota_threshold (85%) → 触发 QUOTA_WARNING 事件
        five_hour_pct >= 95% 或 API 返回 rate_limit → 触发轮换
-    3. Harness 可订阅 QUOTA_WARNING 发送告警（飞书/Webhook）
+    3. 7d 窗口预算管理:
+       配置: weekly_reserve_per_day（每天预留百分比，默认 0 = 不启用）
+       动态阈值 = 100 - (剩余天数 × weekly_reserve_per_day)
+       seven_day_pct >= 动态阈值 → 标记 available=false + 发出 QUOTA_WARNING
+       用途: 防止密集做书在几天内耗尽整周额度
+    4. Harness 可订阅 QUOTA_WARNING 发送告警（飞书/Webhook）
 ```
 
 #### 自动轮换（切号）
@@ -1613,7 +1629,9 @@ credentials:
   accounts_file: "~/.elastic-agent/accounts.json"       # 账号池定义
   pool_status_file: "~/.elastic-agent/pool_status.json" # 运行时状态（自动维护）
   quota_threshold: 0.85           # 5h 额度使用率告警阈值
-  quota_check_interval: 60        # Worker 侧额度检查间隔（秒）
+  quota_check_delay_min: 170      # 账号间检查最小延迟（秒，防反检测）
+  quota_check_delay_max: 190      # 账号间检查最大延迟（秒，随机化）
+  weekly_reserve_per_day: 0       # 7d 每天预留百分比（0 = 不启用 7d 预算管理）
   rotation_strategy: "least_used_first"  # 轮换策略
   login_timeout: 240              # 单次自动登录超时（秒）
   max_accounts_per_worker: 4      # 每 Worker 最大同时登录账号数
@@ -1867,6 +1885,7 @@ accessToken 即将过期
 | `login_status=logged_in` | 登录成功，token 有效 |
 | `stale=false` | Token 读取/refresh 无错误 |
 | `five_hour.utilization < 85%` | 5h 窗口未超阈值 |
+| `seven_day` 未超动态阈值 | 7d 窗口预算未耗尽（如果启用 weekly_reserve） |
 | `backoff_until=null` 或已过期 | 不在 API 限流退避期 |
 
 任何一个条件不满足 → `available=false`，不会被 CredentialPool 选中分配。
