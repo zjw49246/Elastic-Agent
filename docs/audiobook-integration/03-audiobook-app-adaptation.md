@@ -1604,45 +1604,38 @@ getScriptProductionManuscript: (taskId: number) =>
 | `legacy_ai_service` | 当前 Agent 输出、步骤重跑、模型调用、Prompt 查看（不变） |
 | `elastic_agent` | **左右分栏布局**（见下方） |
 
-#### Elastic Agent 模式的 TaskDetail 布局
+#### Elastic Agent 模式的 TaskDetail 布局（三栏）
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  《思考，快与慢》                     Phase 4 · 主体生产     │
-├───────────────────────────────┬─────────────────────────────┤
-│                               │                             │
-│  Chat 流（左侧 ~55%）         │  文件预览（右侧 ~45%）       │
-│                               │                             │
-│  ┌─────────────────────────┐  │  ┌─ state.json ──────────┐ │
-│  │ [assistant]              │  │  │ {                      │ │
-│  │ 开始 Phase 4 主体生产... │  │  │   "phase": 4,          │ │
-│  │                         │  │  │   "state": "PRODUCING", │ │
-│  │ [tool_use] Write        │  │  │   "session_id": "abc",  │ │
-│  │ path: drafts/draft_01.md│  │  │   ...                   │ │
-│  │                         │  │  │ }                       │ │
-│  │ [assistant]              │  │  └────────────────────────┘ │
-│  │ 第一章底稿完成，开始第   │  │                             │
-│  │ 二章...                 │  │  ┌─ 文件列表 ─────────────┐ │
-│  │                         │  │  │ state.json         ●    │ │
-│  │ [tool_use] Write        │  │  │ compressed.md           │ │
-│  │ path: drafts/draft_02.md│  │  │ blueprint.md            │ │
-│  │                         │  │  │ drafts/draft_01.md  ●   │ │
-│  │          ...             │  │  │ drafts/draft_02.md  ●   │ │
-│  │                         │  │  │ (● = 最近更新)          │ │
-│  ├─────────────────────────┤  │  └────────────────────────┘ │
-│  │ 当前正在生产，请生产完   │  │                             │
-│  │ 成后发送                 │  │                             │
-│  └─────────────────────────┘  │                             │
-│                               │                             │
-└───────────────────────────────┴─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  《思考，快与慢》                                                    │
+├───────────────────────┬──────────────────┬──────────────────────────┤
+│                       │                  │                          │
+│  Chat 流（左栏）       │  文件目录（中栏）  │  文件预览（右栏）         │
+│                       │                  │                          │
+│  [assistant]          │ Phase 4 · 主体生产│  state.json              │
+│  开始 Phase 4         │                  │  ┌──────────────────────┐│
+│  主体生产...          │  state.json    ● │  │ {                    ││
+│                       │  compressed.md   │  │   "phase": 4,        ││
+│  [tool_use] Write     │  blueprint.md    │  │   "state": "PROD..", ││
+│  drafts/draft_01.md   │  sections/       │  │   "session_id": ".." ││
+│                       │  drafts/       ● │  │ }                    ││
+│  [assistant]          │    draft_01.md ● │  └──────────────────────┘│
+│  第一章底稿完成，     │    draft_02.md ● │                          │
+│  开始第二章...        │  styled/         │                          │
+│                       │  delivery/       │                          │
+│  [tool_use] Write     │                  │                          │
+│  drafts/draft_02.md   │                  │                          │
+│                       │                  │                          │
+│        ...            │  ● = 最近更新     │                          │
+│                       │                  │                          │
+├───────────────────────┤                  │                          │
+│ 当前正在生产，请生产   │                  │                          │
+│ 完成后发送            │                  │                          │
+└───────────────────────┴──────────────────┴──────────────────────────┘
 ```
 
-**顶栏：**
-- 左侧: 书名
-- 右侧: Phase 指示器，格式 `Phase N · 阶段名称`（简洁文字，非进度条）
-- 数据来源: `GET /api/tasks/{id}/script-production` 的 `phase` 字段
-
-**左侧 Chat 流（~55% 宽度）：**
+**左栏 Chat 流（~40% 宽度）：**
 - 数据来源: 轮询 `GET /api/tasks/{id}/script-production/chat/live?offset=N`（每 2-3 秒）
 - 收到 `task.file.synced` webhook 通知时立即轮询
 - 显示方式:
@@ -1653,17 +1646,20 @@ getScriptProductionManuscript: (taskId: number) =>
   - 生产中: 禁用，显示"当前正在生产，请生产完成后发送"
   - 已完成: 启用，发送后调用 `POST /api/tasks/{id}/script-production/chat`
 
-**右侧文件区（~45% 宽度）：**
-- 上半部分: 文件内容预览
-  - 默认显示 state.json（实时了解当前进度）
-  - 点击文件列表中的其他文件 → 切换预览内容
-  - Markdown 文件渲染为富文本，JSON 文件语法高亮
-- 下半部分: 文件列表（紧凑）
-  - 数据来源: `GET /api/tasks/{id}/script-production/files`（从 OSS manifest）
+**中栏文件目录（~25% 宽度）：**
+- 顶部: Phase 指示器 `Phase N · 阶段名称`（简洁文字，随 phase 更新）
+- 文件树: 从 OSS manifest 加载，树形结构展示
+  - 数据来源: `GET /api/tasks/{id}/script-production/files`
   - 收到 `task.file.synced` webhook 通知时刷新
   - 最近更新的文件用 ● 标记
-  - 点击文件名 → 上方预览区切换内容
-  - 支持下载
+  - 点击文件名 → 右栏预览该文件内容
+
+**右栏文件预览（~35% 宽度）：**
+- 显示中栏选中的文件内容
+- 默认: 显示 state.json（实时了解当前 Phase 和进度）
+- Markdown 文件: 渲染为富文本
+- JSON 文件: 语法高亮
+- 支持下载当前文件
 
 `BookProductionProgress` 需要识别 `elastic_*` 的 `current_step`，映射为 `Phase N · 阶段名称` 格式。
 
