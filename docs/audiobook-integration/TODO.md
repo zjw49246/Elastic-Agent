@@ -56,9 +56,9 @@
 - [x] **T-035** [EA] REGISTER/UNREGISTER_SYNC_MAPPING 协议消息  `01 §3.2`
 - [x] **T-036** [EA] FileSyncManager 上传错误处理（重试、分片、缓冲）  `01 §3.4`
 - [x] **T-037** [EA] FILE_SYNCED 事件类型  `01 §3.2`
-- [ ] **T-038** [EA] Worker 进程日志落盘（stdout/stderr 双写到本地 NDJSON 文件）  `01 §3.2`
-- [ ] **T-039** [EA] Manager 结构化操作日志（JSON Lines，全部关键操作）  `01 §3.8`
-- [ ] **T-040** [EA] LOG 事件结构化解析（NDJSON → typed event）  `01 §3.3`
+- [x] **T-038** [EA] Worker 进程日志落盘（stdout/stderr 双写到本地 NDJSON 文件）  `01 §3.2`
+- [x] **T-039** [EA] Manager 结构化操作日志（JSON Lines，全部关键操作）  `01 §3.8`
+- [x] **T-040** [EA] LOG 事件结构化解析（NDJSON → typed event）  `01 §3.3`
 
 **凭证管理（自动登录 + 额度监控 + 自动轮换）：**
 
