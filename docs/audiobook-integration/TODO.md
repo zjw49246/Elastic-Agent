@@ -63,12 +63,12 @@
 **凭证管理（自动登录 + 额度监控 + 自动轮换）：**
 
 - [x] **T-026** [EA] CredentialPool 账号池管理（accounts.json 加载、pool_status.json、分组、分配/回收）  `01 §3.6`
-- [ ] **T-041** [EA] ClaudeOAuthProvider 自动登录（14 步 OAuth：171mail + Playwright + mitmproxy）  `01 §3.6`
-- [ ] **T-042** [EA] Worker Bootstrap 登录步骤（为每个 Slot 执行自动登录，串行，失败回滚）  `01 §3.6`
-- [ ] **T-043** [EA] Worker 侧额度监控（每 60s 调用 usage API，Token 续期，QUOTA_STATUS 上报）  `01 §3.6`
-- [ ] **T-044** [EA] Manager 侧 QuotaMonitor（汇聚额度数据，阈值检测，QUOTA_WARNING 事件）  `01 §3.6`
-- [ ] **T-045** [EA] 自动轮换（等待任务完成 → 分配新账号 → 登录/分发 → 恢复槽位）  `01 §3.6`
-- [ ] **T-046** [EA] 冷却恢复（5h 窗口到期后自动标记 available）  `01 §3.6`
+- [x] **T-041** [EA] ClaudeOAuthProvider 自动登录（14 步 OAuth：171mail + Playwright + mitmproxy）  `01 §3.6`
+- [x] **T-042** [EA] Worker Bootstrap 登录步骤（为每个 Slot 执行自动登录，串行，失败回滚）  `01 §3.6`
+- [x] **T-043** [EA] Worker 侧额度监控（每 60s 调用 usage API，Token 续期，QUOTA_STATUS 上报）  `01 §3.6`
+- [x] **T-044** [EA] Manager 侧 QuotaMonitor（汇聚额度数据，阈值检测，QUOTA_WARNING 事件）  `01 §3.6`
+- [x] **T-045** [EA] 自动轮换（等待任务完成 → 分配新账号 → 登录/分发 → 恢复槽位）  `01 §3.6`
+- [x] **T-046** [EA] 冷却恢复（5h 窗口到期后自动标记 available）  `01 §3.6`
 - [x] **T-047** [EA] CREDENTIAL_LOGIN / QUOTA_STATUS / CREDENTIAL_ROTATE 协议消息  `01 §3.6`
 - [x] **T-048** [EA] 账号-Worker 绑定（IP 亲和性：互斥分配、亲和复用、max_accounts_per_worker 限制）  `01 §3.6`
 
