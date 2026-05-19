@@ -9,7 +9,7 @@
 
 ---
 
-## 0. 仓库初始化
+## 0. 仓库初始化 — [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent)
 
 - [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
 - [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），依赖 `elastic-agent` 包
@@ -17,7 +17,7 @@
 
 ---
 
-## 1. Elastic-Agent 框架 [EA]
+## 1. Elastic-Agent 框架 — [Elastic-Agent](https://github.com/zjw49246/Elastic-Agent)
 
 ### P0 — 必须完成
 
@@ -131,7 +131,7 @@
 
 ---
 
-## 2. Audiobook Agent Service [ABS]
+## 2. Audiobook Agent Service — [audio_book_echo_agent](https://github.com/zjw49246/audio_book_echo_agent)
 
 ### 仓库初始化
 
@@ -207,7 +207,7 @@
 
 ---
 
-## 3. audio_book_echo_editor [ABE]
+## 3. audio_book_echo_editor — [audio_book_echo_editor](https://github.com/zjw49246/audio_book_echo_editor)
 
 ### 数据模型
 
