@@ -33,8 +33,8 @@
 - [x] **T-004** [EA] AWS EC2 Provider（boto3 SDK 直连）  `01 §3.1`
 - [ ] **T-005** [EA] 阿里云前置准备文档 + 验证脚本（VPC/VSwitch/安全组/密钥对，控制台手动创建）  `01 §4`
 - [ ] **T-006** [EA] AWS 前置准备文档 + 验证脚本（VPC/Subnet/SG/KeyPair，控制台手动创建）  `01 §4`
-- [ ] **T-007** [EA] Worker Runtime 服务端（进程执行、日志双写落盘、文件操作）  `01 §3.2`
-- [ ] **T-008** [EA] Worker Runtime 客户端（Manager 侧远程调用抽象）  `01 §3.2`
+- [x] **T-007** [EA] Worker Runtime 服务端（进程执行、日志双写落盘、文件操作）  `01 §3.2`
+- [x] **T-008** [EA] Worker Runtime 客户端（Manager 侧远程调用抽象）  `01 §3.2`
 - [x] **T-009** [EA] Manager ↔ Worker 通信协议（WebSocket 反向连接 + 消息类型）  `01 §3.2`
 - [ ] **T-010** [EA] Manager ↔ Worker 认证（per-Worker Bearer Token）  `01 §3.6`
 - [x] **T-011** [EA] NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）  `01 §3.5`
