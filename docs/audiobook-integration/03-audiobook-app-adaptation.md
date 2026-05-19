@@ -1608,53 +1608,64 @@ getScriptProductionManuscript: (taskId: number) =>
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Task: 《思考，快与慢》  │  状态: 生产中  │ Phase 4/10 (40%) │
-├────────────────────────────┬────────────────────────────────┤
-│                            │                                │
-│    Chat 流（左侧）         │    文件目录（右侧）             │
-│                            │                                │
-│  ┌──────────────────────┐  │  📁 workspace/                 │
-│  │ Claude: 开始 Phase 4  │  │    📄 state.json              │
-│  │ 主体生产...           │  │    📄 compressed.md            │
-│  │                      │  │    📄 blueprint.md             │
-│  │ [工具调用] Write      │  │    📁 sections/               │
-│  │ drafts/draft_01.md   │  │    📁 drafts/    ← 新文件高亮  │
-│  │                      │  │       📄 draft_01.md  🟢      │
-│  │ Claude: 第一章底稿    │  │    📁 styled/                 │
-│  │ 完成，开始第二章...    │  │  📁 delivery/                 │
-│  │                      │  │  📁 session/                   │
-│  │         ...           │  │                                │
-│  │                      │  │  ─── 文件预览区 ───            │
-│  ├──────────────────────┤  │  (点击文件名 → 在此处预览内容)  │
-│  │ [输入框] 发送修改指令  │  │                                │
-│  │ (仅 completed 状态)   │  │                                │
-│  └──────────────────────┘  │                                │
-│                            │                                │
-├────────────────────────────┴────────────────────────────────┤
-│  Phase 进度条: ■■■■□□□□□□ Phase 4 主体生产 (40%)            │
-└─────────────────────────────────────────────────────────────┘
+│  《思考，快与慢》                     Phase 4 · 主体生产     │
+├───────────────────────────────┬─────────────────────────────┤
+│                               │                             │
+│  Chat 流（左侧 ~55%）         │  文件预览（右侧 ~45%）       │
+│                               │                             │
+│  ┌─────────────────────────┐  │  ┌─ state.json ──────────┐ │
+│  │ [assistant]              │  │  │ {                      │ │
+│  │ 开始 Phase 4 主体生产... │  │  │   "phase": 4,          │ │
+│  │                         │  │  │   "state": "PRODUCING", │ │
+│  │ [tool_use] Write        │  │  │   "session_id": "abc",  │ │
+│  │ path: drafts/draft_01.md│  │  │   ...                   │ │
+│  │                         │  │  │ }                       │ │
+│  │ [assistant]              │  │  └────────────────────────┘ │
+│  │ 第一章底稿完成，开始第   │  │                             │
+│  │ 二章...                 │  │  ┌─ 文件列表 ─────────────┐ │
+│  │                         │  │  │ state.json         ●    │ │
+│  │ [tool_use] Write        │  │  │ compressed.md           │ │
+│  │ path: drafts/draft_02.md│  │  │ blueprint.md            │ │
+│  │                         │  │  │ drafts/draft_01.md  ●   │ │
+│  │          ...             │  │  │ drafts/draft_02.md  ●   │ │
+│  │                         │  │  │ (● = 最近更新)          │ │
+│  ├─────────────────────────┤  │  └────────────────────────┘ │
+│  │ 当前正在生产，请生产完   │  │                             │
+│  │ 成后发送                 │  │                             │
+│  └─────────────────────────┘  │                             │
+│                               │                             │
+└───────────────────────────────┴─────────────────────────────┘
 ```
 
-**左侧 Chat 流：**
+**顶栏：**
+- 左侧: 书名
+- 右侧: Phase 指示器，格式 `Phase N · 阶段名称`（简洁文字，非进度条）
+- 数据来源: `GET /api/tasks/{id}/script-production` 的 `phase` 字段
+
+**左侧 Chat 流（~55% 宽度）：**
 - 数据来源: 轮询 `GET /api/tasks/{id}/script-production/chat/live?offset=N`（每 2-3 秒）
 - 收到 `task.file.synced` webhook 通知时立即轮询
-- 显示: Claude 的文本输出渲染为聊天气泡，工具调用折叠显示
-- 生产模式: 只读（用户不能中途输入）
-- 修改模式: 底部输入框可用，发送后调用 `POST /api/tasks/{id}/script-production/chat`
+- 显示方式:
+  - `assistant` 类型: 渲染为 Claude 消息气泡
+  - `tool_use` 类型: 折叠显示工具名 + 关键参数（如文件路径）
+  - `result` 类型: 显示完成摘要
+- 底部输入框:
+  - 生产中: 禁用，显示"当前正在生产，请生产完成后发送"
+  - 已完成: 启用，发送后调用 `POST /api/tasks/{id}/script-production/chat`
 
-**右侧文件目录：**
-- 数据来源: `GET /api/tasks/{id}/script-production/files`（从 OSS manifest）
-- 收到 `task.file.synced` webhook 通知时刷新文件列表
-- 新增/更新的文件用绿色标记 🟢
-- 点击文件名 → 在右侧下方预览区显示内容（markdown 渲染）
-- 支持下载单个文件
+**右侧文件区（~45% 宽度）：**
+- 上半部分: 文件内容预览
+  - 默认显示 state.json（实时了解当前进度）
+  - 点击文件列表中的其他文件 → 切换预览内容
+  - Markdown 文件渲染为富文本，JSON 文件语法高亮
+- 下半部分: 文件列表（紧凑）
+  - 数据来源: `GET /api/tasks/{id}/script-production/files`（从 OSS manifest）
+  - 收到 `task.file.synced` webhook 通知时刷新
+  - 最近更新的文件用 ● 标记
+  - 点击文件名 → 上方预览区切换内容
+  - 支持下载
 
-**底部进度条：**
-- 数据来源: `GET /api/tasks/{id}/script-production` 的 `phase` 和 `progress_pct`
-- 收到 `task.phase.changed` webhook 通知时更新
-- 10 Phase 名称: 初始化 → 解构 → 蓝图 → 切片 → 生产 → 融合 → 开头结尾 → 审核 → 合规 → 交付
-
-`BookProductionProgress` 需要识别 `elastic_*` 的 `current_step`。
+`BookProductionProgress` 需要识别 `elastic_*` 的 `current_step`，映射为 `Phase N · 阶段名称` 格式。
 
 ### 7.4 列表筛选
 
