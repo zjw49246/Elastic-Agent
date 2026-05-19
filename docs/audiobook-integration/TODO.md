@@ -75,10 +75,10 @@
 ### P1 — 应该完成
 
 - [x] **T-018** [EA] Bootstrap Pipeline（可插拔步骤、per-step 超时、失败策略枚举）  `01 §3.5`
-- [ ] **T-019 ~ T-022** [EA] 内置 Bootstrap 步骤（系统初始化/Agent 安装/Runtime 部署/Harness 代码）  `01 §3.5`
-- [ ] **T-023** [EA] Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）  `01 §3.5`
-- [ ] **T-024** [EA] Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）  `01 §3.5`
-- [ ] **T-025** [EA] 优雅缩容 Drain  `01 §3.5`
+- [x] **T-019 ~ T-022** [EA] 内置 Bootstrap 步骤（系统初始化/Agent 安装/Runtime 部署/Harness 代码）  `01 §3.5`
+- [x] **T-023** [EA] Bootstrap 失败处理（terminate-retry / retry-from-failed / leave-for-debug）  `01 §3.5`
+- [x] **T-024** [EA] Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）  `01 §3.5`
+- [x] **T-025** [EA] 优雅缩容 Drain  `01 §3.5`
 - [ ] **T-028** [EA] 手动扩缩容 API（scale_out / scale_in / remove_node）  `01 §6`
 - [ ] **T-029** [EA] 基础 Web UI（节点列表、状态卡片、手动操作）  `01 §6`
 
