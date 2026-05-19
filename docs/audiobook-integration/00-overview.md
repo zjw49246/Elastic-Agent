@@ -20,14 +20,14 @@
 **痛点：** 当前 Pipeline 基于 `AIRequestQueue` + `ai_service` 的短请求模式，每个 Agent 是独立 API 调用。无法支持：
 - Claude Code 长会话（1-2 小时/本书）
 - 会话级上下文保持和后续修改（`--resume`）
-- 实时文件同步和聊天流
+- 文件同步和聊天记录持久化
 - 多 Worker 并行做书
 
 ### 1.2 目标
 
 引入 Elastic-Agent 框架，在不影响现有 Pipeline 稳定运行的前提下，新增"Elastic-Agent 跑书引擎"：
 - 整本书交给一个 Claude Code 会话，端到端自动完成
-- 实时 chat 流 + 文件同步到前端
+- 聊天记录 + 文件同步到 OSS，前端轮询获取
 - 完成后保留会话，支持随时修改
 - 多 Worker 并行，队列调度
 - 完成后回灌现有任务系统，复用审核/TTS/BGM 流程
@@ -124,13 +124,13 @@ app.include_router(audiobook_api_router)
 | 模块 | 职责 | 不做什么 |
 |------|------|---------|
 | CloudProvider | 抹平阿里云/AWS 差异，实例 CRUD | 不决定何时创建/销毁 |
-| Worker Runtime | Manager↔Worker 双向通信，进程管理，日志双写（实时流+本地落盘），文件操作 | 不理解任务业务语义 |
+| Worker Runtime | Manager↔Worker 双向通信，进程管理，日志双写（LOG 事件+本地 NDJSON 落盘），文件操作 | 不理解任务业务语义 |
 | NodeRegistry | 节点状态持久化 | 不知道"槽位"概念 |
 | Bootstrap Pipeline | 可插拔初始化步骤 | 不内置 audiobook 插件安装 |
 | HealthChecker | L1/L2/L3 健康检查 | 不定义"卡住"的业务含义 |
 | CloudReconciler | 标签对账，孤儿清理 | — |
 | EventBus | 内部事件分发 | 不定义业务事件 |
-| External API | 通用轨迹流（实时+历史）、文件访问、集群状态 | 不暴露 task/chat/session 接口 |
+| External API | REST 文件访问、轨迹查询、集群状态 | 不暴露 task/chat/session 接口 |
 | FileSyncManager | Worker 文件 → OSS/S3 同步，防抖，清单 | 不知道 book_slug → task_id 映射 |
 | Harness 接口 | 定义 `Harness` 基类和回调契约 | 不提供具体实现 |
 | IaC | Terraform (阿里云) + CDK (AWS) 基础网络 | 不管实例创建 |
@@ -143,7 +143,7 @@ app.include_router(audiobook_api_router)
 | BookQueue | 做书请求排队，优先级调度 | 内存 + JSON 持久化 |
 | SessionRegistry | task_id → (worker_id, session_id, book_slug) 映射 | JSON 持久化（崩溃可恢复） |
 | SlotScheduler | 查找空闲 Worker、生产/修改槽位管理 | 从 Worker Runtime 状态获取 |
-| ChatRelay | 用户修改指令 → Worker `--resume`，chat 流中继 | — |
+| ChatRelay | 用户修改指令 → Worker `--resume`，聊天记录通过 OSS 日志提供 | — |
 | TaskSyncMapper | 维护 Worker 上 book_slug ↔ task_id ↔ OSS prefix 的映射，推送给 Worker | 同步到 Worker Runtime |
 | Webhook Emitter | 向 audio_book_echo_editor 推送事件 | 回调 URL 配置 |
 | Audiobook API | `/api/tasks/produce`、`/api/tasks/{id}/chat`、`/api/tasks/{id}/status` 等 | — |
@@ -191,7 +191,9 @@ Audiobook Agent Service (Manager):
         │
         ▼
 Worker 上 Claude Code 执行 (1-2 小时):
-  - stdout NDJSON → Worker Runtime → Manager EventBus → External API
+  - stdout NDJSON → Worker Runtime 双写:
+    ├ LOG 事件 → Manager EventBus (内部: Phase 检测、调度)
+    └ NDJSON 日志文件 → FileSyncManager → OSS → 前端轮询 chat/history
   - 文件变更 → FileSyncManager → OSS (根据 TaskSyncMapper 的映射)
   - 文件同步完成 → FILE_SYNCED 事件 → Manager → Webhook → audio_book
   - Phase 切换 → state.json 变更 → Webhook → audio_book: task.phase.changed
@@ -230,7 +232,7 @@ Audiobook Agent Service:
   1. SessionRegistry 查找: task_id → worker_id, session_id
   2. 检查 Worker edit_slots 是否有空
   3. Worker Runtime: claude -p "修改指令" --resume {session_id} ...
-  4. 修改过程: NDJSON → chat stream → 前端
+  4. 修改过程: NDJSON → 日志文件 → FileSyncManager → OSS → 前端轮询
   5. 文件变更 → OSS 同步
   6. 完成 → Webhook → audio_book: task.edit.completed
         │
@@ -244,26 +246,28 @@ audio_book_echo_editor 后端收到修改完成 Webhook:
 ### 4.3 实时数据流
 
 ```
-                    ┌── 聊天流 (chat stream) ──┐
-                    │                          │
-Worker Claude Code  │  Audiobook Agent Service │  audio_book 后端    前端
-  stdout NDJSON ────┼→ EventBus → External API ├──────────────→ 前端 WS 直连
-                    │  (前端通过 stream-config  │                (短期 JWT token
-  Worker Runtime    │   获取 token 后直连)       │                 由后端颁发)
-  同时双写:          │                          │
-  ├ LOG 事件(实时流) │                          │
-  └ 本地日志文件 ────┼→ FileSyncManager → OSS   │──→ chat/history 接口
-                    │    logs/{task_id}.ndjson  │    (从 OSS 读取持久化日志)
-                    │                          │
-                    ├── 文件同步 ───────────────┤
-                    │                          │
-  文件变更 ─────────┼→ FileSyncManager → OSS   │
-  FILE_SYNCED 事件 ─┼→ EventBus → Webhook ─────┼→ 更新 manifest ─→ 文件列表刷新
-                    │                          │
-                    ├── 状态更新 ───────────────┤
-                    │                          │
-  state.json 变更 ──┼→ OSS 同步 + Webhook ─────┼→ 更新 phase ────→ 进度条更新
-                    └──────────────────────────┘
+                    ┌── 聊天流 ─────────────────┐
+                    │                           │
+Worker Claude Code  │  Audiobook Agent Service  │  audio_book 后端     前端
+  stdout NDJSON ────┼→ Worker Runtime 双写:      │
+                    │  ├ LOG 事件 → Manager      │
+                    │  │  EventBus (内部用途:     │
+                    │  │  Phase 检测、调度等)      │
+                    │  └ NDJSON 日志文件 ─────────┼→ FileSyncManager → OSS
+                    │    logs/{task_id}.ndjson   │
+                    │        │                  │
+                    │        ▼                  │
+                    │  ABE 后端 REST 读取 OSS ───┼──→ 前端轮询 chat/history
+                    │                           │
+                    ├── 文件同步 ────────────────┤
+                    │                           │
+  文件变更 ─────────┼→ FileSyncManager → OSS    │
+  FILE_SYNCED 事件 ─┼→ EventBus → Webhook ──────┼→ 更新 manifest ─→ 文件列表刷新
+                    │                           │
+                    ├── 状态更新 ────────────────┤
+                    │                           │
+  state.json 变更 ──┼→ OSS 同步 + Webhook ──────┼→ 更新 phase ────→ 进度条更新
+                    └───────────────────────────┘
 ```
 
 ---

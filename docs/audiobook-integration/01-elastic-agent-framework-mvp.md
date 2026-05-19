@@ -31,8 +31,8 @@
 - [ ] **T-010** Manager ↔ Worker 认证（per-Worker Bearer Token）
 - [ ] **T-011** NodeRegistry（节点状态持久化，JSON 文件 + 线程安全锁）
 - [ ] **T-012** 云端标签对账（启动时 + 周期性扫描，清理孤儿实例）
-- [ ] **T-013** 外部服务 API — 实时轨迹流（WebSocket + SSE 双通道）
-- [ ] **T-014** 外部服务 API — 文件变更通知（inotify → WebSocket 事件推送）
+- [ ] **T-013** 内部轨迹流 — EventBus LOG 事件分发（Harness 回调、phase 检测、轨迹缓存）
+- [ ] **T-014** 文件同步通知 — FILE_SYNCED → Webhook 推送到 Harness 回调 URL
 - [ ] **T-015** 外部服务 API — 认证（API Key Bearer Token）
 - [ ] **T-030** FileSyncManager — Worker 侧文件主动同步到 OSS/S3（inotify 监听 + 分层防抖 + 同步清单）
 - [ ] **T-031** FileSyncManager — Harness 配置接口（`get_file_sync_config()`: 监听路径、同步目标、防抖策略）
@@ -177,18 +177,19 @@
   Execute / Stop / ReadFile / WatchFiles / HealthCheck
 
 数据流 ②：日志回传（高频，大流量）
-  Worker → Manager → EventBus → 外部 API (WebSocket/SSE) → 前端
+  Worker → Manager → EventBus → 内部消费（phase 检测、进度监控）
   每行 Claude Code stdout/stderr (NDJSON) 产生一个 LogEvent
   Worker Runtime 同时将原始输出写入本地日志文件（per-task NDJSON）
-  本地日志文件通过 FileSyncManager 持久化到 OSS/S3
-  实时流用于前端展示，持久化日志用于历史查询和排障
+  本地日志文件通过 FileSyncManager 持久化到 OSS/S3（数据流 ③）
+  外部访问日志走 OSS（前端/ABE 从 OSS 读取 NDJSON 文件）
 
 数据流 ③：文件同步（持续，中等流量）
   Worker FileSyncManager: inotify → 分层防抖 → 增量上传 OSS/S3
-  Worker → Manager: FILE_CHANGE 事件 (通知前端有新文件)
+  同步范围: workspace 文件 + NDJSON 日志文件（统一由 FileSyncManager 管理）
+  Worker → Manager: FILE_CHANGE 事件 (内部使用，Harness 逻辑)
   Worker → Manager: FILE_SYNCED 事件 (确认文件已同步到 OSS/S3)
   外部读取: 直接从 OSS/S3 读取（不走 Worker）
-  外部订阅: Manager → FILE_CHANGE 事件流 → 前端刷新文件列表
+  外部通知: FILE_SYNCED 事件 → Webhook → ABE，ABE 从 OSS 读取最新文件
 
 数据流 ④：心跳与状态（低频，关键路径）
   Worker → Manager: Heartbeat（30s 间隔）
@@ -423,33 +424,29 @@ Worker Runtime 管理的进程:
 
 ### 3.3 外部服务 API 层
 
-**设计目标：** 外部服务（前端 UI、监控系统、第三方集成）通过 Manager 获取实时 Agent 轨迹和 Worker 文件，不需要直接访问 Worker。
+**设计目标：** 外部服务（ABE 前端、监控系统、第三方集成）通过 Manager REST API 查询集群状态和文件元数据，通过 OSS 读取文件内容和日志数据，通过 Webhook 接收文件同步通知。实时轨迹流仅供框架内部使用（Harness 回调、phase 检测）。
 
 #### 数据流路径
 
 ```
-实时轨迹流:
+实时轨迹流（框架内部）:
   Worker Claude Code stdout
     → Worker Runtime 逐行读取
     → LOG 消息 via WS
     → Manager EventBus
-    → 外部 API 轨迹流端点 (WebSocket / SSE)
-    → 外部消费者
+    → 内部消费者（Harness 事件回调、轨迹缓存、phase 检测）
+  外部消费者（ABE 前端等）通过轮询 OSS 上的 NDJSON 日志文件获取聊天数据
 
 文件访问:
-  外部请求 GET /api/external/files/{node_id}/{path}
-    → Manager 查找 node_id 对应的 WS 连接
-    → 发送 READ_FILE 命令到 Worker
-    → Worker 读取本地文件
-    → FILE_CONTENT 响应 via WS
-    → Manager 返回给外部
+  外部请求 GET /api/external/files/{task_id}/{path}
+    → Manager 从 OSS/S3 读取（不走 Worker）
+    → 响应包含 synced_at（调用者知道数据新鲜度）
 
-文件变更监听:
-  外部订阅 WS /api/external/files/{node_id}/watch
-    → Manager 转发 WATCH_FILES 命令到 Worker
-    → Worker inotify 监听
-    → FILE_CHANGE 事件 via WS
-    → Manager 转发到外部 WebSocket
+文件同步通知:
+  Worker FileSyncManager 上传完成
+    → FILE_SYNCED 事件 via WS → Manager
+    → Webhook 推送 task.file.synced → ABE
+    → ABE 从 OSS 读取最新文件
 ```
 
 #### 轨迹存储：实时缓冲 + 持久化双层
@@ -458,7 +455,7 @@ Worker Runtime 管理的进程:
                   ┌─────────────────────────┐
                   │   实时轨迹缓冲 (内存)     │
                   │                         │
-  LOG 事件 ──────▶│  环形缓冲 (per-task)    │──────▶ 实时订阅者 (WebSocket/SSE)
+  LOG 事件 ──────▶│  环形缓冲 (per-task)    │──────▶ 内部实时订阅者 (Harness 回调)
                   │  容量: 5000 条/task      │
                   │                         │
                   │  查询接口:               │──────▶ 近期查询 (REST GET)
@@ -476,7 +473,7 @@ Worker Runtime 管理的进程:
                   └─────────────────────────┘
 
 两层职责分工:
-  - 实时缓冲: 服务当前活跃的 WebSocket/SSE 订阅者和近期 REST 查询
+  - 实时缓冲: 服务框架内部的实时订阅者（Harness 回调、phase 检测）和近期 REST 查询
     容量改为 per-task（非 per-worker），每个任务独立 5000 条
     任务结束后缓冲可释放（历史查询走 OSS）
   - 持久化日志: Worker Runtime 在读取进程输出时同步写入本地文件
@@ -523,7 +520,7 @@ parsed 字段的 type 枚举（来自 Claude Code stream-json）:
 
 ```
 外部 API 认证 (MVP):
-  所有外部 API 请求必须携带 API Key:
+  REST 请求必须携带 API Key:
     - URL 参数: ?api_key=xxx
     - 或 Header: Authorization: Bearer xxx
 
@@ -533,8 +530,9 @@ parsed 字段的 type 枚举（来自 Claude Code stream-json）:
         - "key-for-frontend"
         - "key-for-monitoring"
 
-  WebSocket 连接在首条消息中认证:
-    {"type": "auth", "api_key": "xxx"}
+  Webhook 回调认证:
+    Harness 注册回调 URL 时提供 secret
+    Manager 推送时用 HMAC-SHA256 签名 payload
 
 后续演进:
   Phase 2: OAuth 2.0 Client Credentials（支持 scope 控制）
@@ -598,7 +596,7 @@ FileSyncManager 运行在每个 Worker 上（Worker Runtime 的子组件）:
   │    4. 计时器到期 → 上传到 oss_prefix + 相对路径           │
   │    5. 上传完成 → 更新 _sync_manifest.json                │
   │    6. 发送 FILE_SYNCED 事件到 Manager（确认已同步）       │
-  │    7. 同时发送 FILE_CHANGE 事件到 Manager（通知前端）     │
+  │    7. 同时发送 FILE_CHANGE 事件到 Manager（内部使用，Harness 逻辑）     │
   │    8. 收到 UNREGISTER_SYNC_MAPPING → 移除 inotify watch  │
   │       → 做最终同步（确保最后的文件变更不丢）→ 清理映射    │
   └─────────────────────────────────────────────────────────┘
@@ -613,9 +611,9 @@ FileSyncManager 运行在每个 Worker 上（Worker Runtime 的子组件）:
     Worker Runtime 用这些凭证调用 PutObject
 
   与原有 external_api/files 的关系:
-    T-014（文件变更通知）: Worker → Manager WS 事件 → 前端（只传事件，不传内容）
+    T-014（文件变更通知）: Worker → Manager FILE_CHANGE 事件（内部，Harness 逻辑用）
     T-033（文件内容读取）: 外部 → Manager → OSS/S3 → 返回内容（不走 Worker）
-    T-037（文件同步确认）: Worker → Manager FILE_SYNCED 事件 → 外部知道 OSS 已更新
+    T-037（文件同步确认）: Worker → Manager FILE_SYNCED → Webhook → ABE 从 OSS 读取
     FileSyncManager 是以上三者的上游 — 它保证云存储里的文件是最新的
 ```
 
@@ -1136,8 +1134,8 @@ EventBus
   ├── 生产者: CredentialPool (CREDENTIAL_ROTATED, CREDENTIAL_EXHAUSTED)
   ├── 生产者: OperationLogger (SCALE_OUT, BOOTSTRAP_STEP, RECONCILE, ...)
   │
-  ├── 消费者: 外部 API traces 端点 (订阅 LOG 事件)
-  ├── 消费者: 外部 API files 端点 (订阅 FILE_CHANGE 事件)
+  ├── 消费者: 轨迹流内部端点 (订阅 LOG 事件 → Harness 回调、phase 检测)
+  ├── 消费者: Webhook 发送器 (订阅 FILE_SYNCED 事件 → 推送到 Harness 注册的回调 URL)
   ├── 消费者: Harness 事件回调 (订阅框架事件)
   ├── 消费者: HealthChecker (订阅 HEARTBEAT 超时)
   ├── 消费者: 轨迹缓存 (订阅 LOG 事件 → 写入环形缓冲)
@@ -1454,11 +1452,11 @@ Phase C (Week 3-4): 文件同步 + 外部 API
   T-035 REGISTER_SYNC_MAPPING / UNREGISTER_SYNC_MAPPING 协议消息
   T-036 FileSyncManager 上传错误处理
   T-037 FILE_SYNCED 事件类型
-  T-013 外部 API 轨迹流
-  T-014 外部 API 文件变更通知
+  T-013 内部轨迹流 (EventBus LOG 分发)
+  T-014 文件同步通知 (FILE_SYNCED → Webhook)
   T-033 外部 API 文件内容从云存储读取
   T-015 外部 API 认证
-  ── 里程碑: Worker 文件自动同步到 OSS; 前端从 OSS 读文件 + 通过 WS 看实时输出 ──
+  ── 里程碑: Worker 文件自动同步到 OSS; 外部通过 OSS 读文件 + Webhook 接收通知 ──
 
 Phase D (Week 4-5): Bootstrap 自动化
   T-017 Claude Code AgentType
@@ -1494,7 +1492,7 @@ T-009 (协议) ──→ T-007/T-008 (Runtime) ──→ T-010 (认证) ──�
                        │         ├──→ T-036 (上传错误处理)         │
                        │         └──→ T-037 (FILE_SYNCED) ──→ T-033 (云存储文件读取)
                        │
-                       └──→ T-013/T-014 (外部 API 轨迹/通知)
+                       └──→ T-013/T-014 (内部轨迹流/Webhook 通知)
                                                                    │
 T-017 (AgentType) ──→ T-018 (Bootstrap) ──→ T-019~T-022 (步骤) ──→ T-028 (扩缩容 API)
                                    │                │

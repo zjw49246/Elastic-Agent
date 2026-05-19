@@ -205,7 +205,7 @@ worker:
 │                    做书前后端（外部服务）                               │
 │  提交做书请求 · 实时聊天框 · Phase 进度 · 文件浏览 · 发修改指令         │
 └───────────────────────────┬──────────────────────────────────────────┘
-                            │ HTTPS + WebSocket
+                            │ HTTPS + Webhook
                             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                    Audiobook Agent Service (Manager 进程)             │
@@ -551,9 +551,9 @@ inotify 监听 → 文件变更 → 按优先级分层防抖:
 **通知通道（与同步独立）：**
 
 ```
-文件变更同时触发 FILE_SYNCED 事件 via WebSocket → Manager → 外部服务
-用途: 前端实时刷新文件列表（知道有新文件了）
-文件内容从 OSS 下载（不走 WebSocket）
+文件变更同时触发 FILE_SYNCED 事件 → Manager → 外部服务（Webhook）
+用途: 前端收到通知后刷新文件列表（知道有新文件了）
+文件内容从 OSS 下载
 ```
 
 #### 内容查询：统一从云存储读取
@@ -584,16 +584,16 @@ inotify 监听 → 文件变更 → 按优先级分层防抖:
     T=0s   inotify 触发，FileSyncManager 启动防抖计时器 (2s)
     T=2s   防抖到期，开始 PutObject 上传
     T=3s   上传完成，更新 _sync_manifest.json
-    T=3s   发送 FILE_SYNCED 事件 → Manager → 外部 WebSocket
+    T=3s   发送 FILE_SYNCED 事件 → Manager → Webhook 通知外部服务
 
   在 T=0~3s 之间查询 OSS → 拿到的是旧版本（或文件不存在）
   在 T=3s 之后查询 OSS → 拿到的是最新版本
 
   外部服务如何知道"现在 OSS 上是最新的"？
 
-  方式 A（推荐）：订阅事件
-    WS /api/tasks/{task_id}/files/watch → 收到 FILE_SYNCED 事件
-    事件包含 {path, synced_at} → 此时去 OSS 读该文件，保证是最新的
+  方式 A（推荐）：订阅 FILE_SYNCED Webhook
+    注册 Webhook → 收到 task.file.synced 事件
+    事件包含 {task_id, path, synced_at} → 此时去 OSS 读该文件，保证是最新的
     适用于: 前端实时展示（收到通知才刷新 UI）
 
   方式 B：直接查询 + 接受延迟
@@ -642,14 +642,14 @@ Session 文件备份到 OSS 后，理论上可以在另一台 Worker 上恢复�
 上行 (Claude Code → 前端):
   Claude Code stdout (stream-json NDJSON)
     → Worker Runtime 逐行读取，双写:
-        1. LOG 事件 via WS → Manager EventBus → 外部 API 轨迹流（实时推送）
+        1. LOG 事件 via WS → Manager EventBus（内部监控）
         2. 本地 NDJSON 日志文件（持久化，用于历史查询和排障）
            生产模式 → logs/production.ndjson
            修改模式 → logs/edits/{edit_run_id}.ndjson
     → 日志文件随 FileSyncManager 同步到 OSS
-    → 做书前端 WebSocket → 渲染为聊天气泡
+    → 同步完成触发 FILE_SYNCED → 前端收到通知后轮询 chat/live 拉取新内容
 
-  chat/history 从 OSS 上持久化的 logs/*.ndjson 文件解析，
+  chat/live 和 chat/history 均从 OSS 上持久化的 logs/*.ndjson 文件读取，
   而非内存中的 trace buffer，因此即使 Manager 重启也不丢失历史记录。
 
 下行 (前端 → Claude Code):
@@ -711,23 +711,21 @@ POST /api/tasks/{task_id}/retry
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/tasks/{task_id}/chat` | `POST` | 发送修改指令，路由到 session 所在 Worker |
-| `/api/tasks/{task_id}/chat/stream` | `WS` | 订阅某本书的实时聊天流（生产 or 修改过程） |
-| `/api/tasks/{task_id}/chat/stream-config` | `GET` | 获取 WS 直连 token（前端用此 token 直连 chat/stream，避免双层代理） |
+| `/api/tasks/{task_id}/chat/live` | `GET` | 实时聊天轮询（从 OSS logs 增量读取，offset 分页） |
 | `/api/tasks/{task_id}/chat/history` | `GET` | 获取历史聊天记录（从 OSS 的 logs/*.ndjson 解析，按 parsed.type 过滤 assistant/result 消息） |
 
-**Chat stream 的统一设计：**
+**Chat live 轮询的统一设计：**
 
 ```
-WS /api/tasks/{task_id}/chat/stream
+GET /api/tasks/{task_id}/chat/live?offset={byte_offset}
 
-  连接后推送该书的所有 Claude Code 输出:
-    - 如果正在生产 → 推送生产过程的 NDJSON
-    - 如果正在修改 → 推送修改过程的 NDJSON
-    - 如果空闲 → 保持连接，等下次操作时自动推送
+  从 OSS 的 logs/production.ndjson 增量读取:
+    - 如果正在生产 → 返回 production.ndjson 的新行
+    - 如果正在修改 → 返回 edits/{edit_run_id}.ndjson 的新行
+    - 如果空闲 → 返回空（next_offset 不变）
 
-  注意: 外部服务不需要知道 node_id 或 worker_id
-  路由由 Manager 内部完成:
-    task_id → SessionRegistry → worker_id → Worker Runtime WS → 转发
+  前端每 2-3 秒轮询。收到 task.file.synced webhook 后可立即轮询。
+  路由由 Manager 内部完成: task_id → 确定当前活跃的日志文件 → 从 OSS 读取
 ```
 
 #### 内容查询（统一从 OSS 读取）
@@ -753,23 +751,23 @@ WS /api/tasks/{task_id}/chat/stream
 
 #### 文件变更通知
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/tasks/{task_id}/files/watch` | `WS` | 订阅该书的文件变更事件 |
+文件变更通过 Webhook（`task.file.synced`）通知外部服务，不再提供独立的 WebSocket 端点。
 
 ```
-事件格式:
+Webhook 事件格式 (task.file.synced):
   {
-    "event": "created" | "modified",
+    "event": "task.file.synced",
+    "task_id": "...",
     "path": "workspace/manuscript_final.md",
     "size": 58201,
     "synced_at": "2026-05-17T14:30:05Z"
   }
 
-前端收到后:
+前端收到 Webhook 后:
   → 刷新文件列表 UI
   → 如果是 state.json 变更 → 更新 Phase 进度条
   → 如果是 manuscript_* → 可选自动刷新讲稿预览
+  → 如果是 logs/*.ndjson → 触发 chat/live 轮询拉取新聊天内容
 ```
 
 #### Worker 管理
@@ -800,7 +798,7 @@ Webhook 事件类型:
   worker.added               新 Worker 上线
 ```
 
-**为什么需要 Webhook？** 前端可以用 WebSocket 获取实时流，但后端服务（如通知系统、计费系统、批量管理）需要异步事件驱动，轮询不合适。
+**为什么需要 Webhook？** 后端服务（如通知系统、计费系统、批量管理）需要异步事件驱动，轮询不合适。前端也依赖 Webhook 通知来触发 chat/live 轮询和文件刷新。
 
 #### 全局状态
 
@@ -813,7 +811,7 @@ Webhook 事件类型:
 
 1. **以 task_id 为主键**，不暴露 worker_id、node_id 和 book_slug 给外部。路由是 Manager 内部事务。
 2. **读操作走 OSS**，写操作（做书/修改/重试）走 Worker。
-3. **实时流用 WebSocket**，查询用 REST，异步通知用 Webhook。三种模式覆盖所有消费场景。
+3. **实时聊天用 chat/live 轮询**（数据走 OSS），查询用 REST，异步通知用 Webhook。
 4. **快捷方式 API**（`/state`、`/manuscript`）减少外部服务理解内部文件结构的负担。
 
 ---
@@ -1419,7 +1417,7 @@ PROCESS_EXIT 时的关键动作:
 | **文件实时同步到云存储** | .work/ + session 文件 -> OSS/S3，分层防抖 + 同步清单 | 通用 — 需要外部实时查看 Agent 产物 |
 | **从云存储统一读取** | 内容查询走 OSS 不走 Worker，附带一致性元数据 | 通用 — 解耦读路径和 Worker 生命周期 |
 | **TaskSyncMapper / 动态同步映射** | Worker 上多任务 -> 多 OSS 路径的动态映射，由 Manager 推送 | 通用 — 任何单 Worker 多任务场景 |
-| **FILE_SYNCED 事件类型** | 文件同步完成后的通知（比 FILE_CHANGE 多 oss_key 等信息） | 通用 — 外部服务需要知道何时可从 OSS 读取 |
+| **FILE_SYNCED 事件类型** | 文件同步完成后的通知（含 oss_key、synced_at 等），外部服务统一使用此事件 | 通用 — 外部服务需要知道何时可从 OSS 读取 |
 | **Harness 级状态持久化钩子** | SessionRegistry 等 Harness 数据的持久化支持 | 通用 — Manager 崩溃恢复 |
 | **Per-task 凭证隔离支持** | EXECUTE 时指定 CLAUDE_CONFIG_DIR 环境变量 | 通用 — 多账号并发场景 |
 | **Webhook 事件通知** | 做书完成/失败/Phase 切换 -> 推送到注册的 URL | 通用 — 后端系统异步事件驱动 |

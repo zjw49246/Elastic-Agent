@@ -409,45 +409,13 @@ Worker 常驻运行，不断接收新书生产任务。每本书在 `/root/.work
 
 ---
 
-### 3.10 [P1] 实时聊天流的 WebSocket 代理架构不明
+### 3.10 [已解决] 聊天数据获取方式
 
-**现状：**
+**原问题：** 前端通过 WebSocket 获取实时 chat 流涉及三层跳转（前端 → ABE → ABS → Worker），架构复杂。
 
-方案描述了前端通过 WebSocket 获取实时 chat 流，但链路中有三层跳转：
-```
-前端 ←WS→ audio_book 后端 ←???→ Audiobook Agent Service ←WS→ Worker Runtime
-```
+**最终方案：** 聊天数据统一通过 OSS 获取，与文件目录走相同的数据路径。Worker Runtime 将 Claude Code 输出双写到本地 NDJSON 日志文件，FileSyncManager 同步到 OSS，前端通过 ABE 后端的 `chat/live?offset=N` 接口轮询增量读取。延迟 2-3 秒，对 Audiobook 场景完全可接受。
 
-中间 `audio_book 后端 ← Audiobook Agent Service` 这一段的连接方式没有说明。
-
-**补充方案：**
-
-两种方案（推荐方案 B）：
-
-**方案 A: 双 WebSocket 代理**
-```
-前端 ←WS→ audio_book 后端 ←WS→ Audiobook Agent Service External API
-```
-- audio_book 后端需要维护到 Audiobook Service 的 WebSocket 连接
-- 复杂度高，两层 WS 管理
-
-**方案 B（推荐）: 前端直连 Audiobook Agent Service 的 External API**
-```
-前端 ←WS→ Audiobook Agent Service External API (认证 token 由 audio_book 后端颁发)
-
-具体流程:
-  1. 前端调用 audio_book 后端: GET /api/tasks/{id}/script-production/stream-token
-  2. 后端生成短期 token (包含 task_id + 过期时间 + HMAC 签名)
-  3. 前端用 token 直连 Audiobook Agent Service:
-     WS wss://agent-service.example.com/api/external/tasks/{task_id}/chat/stream?token=xxx
-  4. Audiobook Agent Service 验证 token → 建立 WS 连接 → 推送 NDJSON
-```
-
-- 优点: 减少一层代理，延迟更低，audio_book 后端不需要维护 WS 连接
-- 缺点: 前端需要知道 Audiobook Agent Service 的地址（通过配置下发）
-- 权限控制: token 是短期的（5min 有效），包含 task_id 绑定，无法越权
-
-**变更点：** 跑书方案 §5.5 (Elastic chat 接口)、audio_book 后端新增 stream-token 接口
+不再需要前端直连 ABS WebSocket、stream-config token、JWT 认证等机制。前端只与 ABE 后端通信。
 
 ---
 
@@ -638,34 +606,11 @@ class TaskStatus(str, enum.Enum):
 
 ---
 
-### 3.17 [P3] 前端直连 WebSocket 的安全考虑
+### 3.17 [已解决] 前端与 ABS 的通信安全
 
-**现状：**
+**原问题：** 前端直连 ABS WebSocket 需要独立的认证机制和 CORS 配置。
 
-如果采用 §3.10 推荐的方案 B（前端直连 Audiobook Agent Service），前端需要知道 Agent Service 的 URL。
-
-**补充方案：**
-
-```
-安全措施:
-  1. 前端从 audio_book 后端获取连接 URL 和 token:
-     GET /api/tasks/{id}/script-production/stream-config
-     返回: {
-       "ws_url": "wss://agent-service.internal/api/external/tasks/123/chat/stream",
-       "token": "eyJhbGciOi...",
-       "expires_at": "2026-05-17T15:00:00Z"
-     }
-
-  2. Token 内容 (JWT):
-     { task_id: "123", exp: 1716048000, iss: "audio-book-backend" }
-     签名密钥: Audiobook Agent Service 和 audio_book 后端共享
-
-  3. CORS 配置:
-     Audiobook Agent Service 只允许 audio_book 前端域名
-
-  4. Rate Limit:
-     每个 token 最多建立 3 个 WS 连接（防止滥用）
-```
+**最终方案：** 前端不再直连 ABS。所有数据（聊天、文件）统一通过 ABE 后端读取 OSS，前端只与 ABE 后端通信，复用现有的登录态认证。不需要额外的 JWT token、CORS 配置或 Rate Limit 机制。
 
 ---
 
@@ -784,14 +729,14 @@ audio_book_echo_editor 前端也应在 UI 层面禁止同一任务的并发修�
 | 3.7 | P1 | Retry 执行主体不明 | 全部由 Agent Service 编排 | harness §4.1 |
 | 3.8 | P1 | Worker 目录生命周期 | 定时清理 + 手动清理 API | harness §5.5 |
 | 3.9 | P1 | Webhook 补偿机制 | 重试 + 轮询 + 序号 | 跑书方案 §5.7, contracts |
-| 3.10 | P1 | 聊天流 WS 代理架构 | 前端直连 + token 认证 | 跑书方案 §5.5 |
+| 3.10 | 已解决 | 聊天数据获取方式 | 统一走 OSS 轮询（chat/live） | 跑书方案 §5.5 |
 | 3.11 | P2 | --resume 长期可靠性 | 早期验证 + 降级方案 | harness §5.1, 测试 |
 | 3.12 | P2 | 插件侧调整未列全 | 新增插件适配清单 | 插件仓库 |
 | 3.13 | P2 | L3 卡住检测 | 进度超时监控 | harness §4.1 |
 | 3.14 | P2 | book_slug 生成规则 | 明确规则 | 跑书方案 §5.10.3 |
 | 3.15 | P2 | OSS 上传容错 | 重试 + 分片 + 缓冲 | MVP §3.4 |
 | 3.16 | P3 | 取消状态映射 | 建议新增 CANCELLED 枚举 | 跑书方案 §6.3 |
-| 3.17 | P3 | 前端直连安全 | JWT token + CORS | 跑书方案 §5.5 |
+| 3.17 | 已解决 | 前端与 ABS 通信安全 | 前端不直连 ABS，复用 ABE 登录态 | 跑书方案 §5.5 |
 | 3.18 | P3 | 监控告警 | 后续迭代 | 非 MVP |
 | 3.19 | P1 | 修改流程未重新注册同步映射 | 修改前 REGISTER、完成后 flush+UNREGISTER | harness §4.1 |
 | 3.20 | P1 | 同一任务并发修改无互斥 | session.status=="editing" 时拒绝新修改 | harness §4.1, 前端 |

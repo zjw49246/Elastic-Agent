@@ -1,7 +1,7 @@
 # 跑书双引擎选择与 Elastic-Agent 接入方案
 
 > **本文件是 `docs/跑书双引擎选择与Elastic-Agent接入方案.md` 的更新版本，移入 `docs/audiobook-integration/` 系列。**
-> 主要更新：Audiobook Agent Service 定位澄清（独立 repo，引用 Elastic-Agent 框架作为库）、stream-token 直连方案、webhook sequence 排序、manifest 统一数组格式、book_slug 生成规则、轮询补偿机制、CANCELLED 状态建议等。
+> 主要更新：Audiobook Agent Service 定位澄清（独立 repo，引用 Elastic-Agent 框架作为库）、webhook sequence 排序、manifest 统一数组格式、book_slug 生成规则、轮询补偿机制、CANCELLED 状态建议、聊天数据 OSS 轮询等。
 
 ## 1. 背景
 
@@ -453,7 +453,7 @@ POST /api/tasks/{task_id}/script-production/retry
 ```text
 POST /api/tasks/{task_id}/script-production/chat
 GET  /api/tasks/{task_id}/script-production/chat/history
-WS   /api/tasks/{task_id}/script-production/chat/stream
+GET  /api/tasks/{task_id}/script-production/chat/live?offset=N
 ```
 
 发送修改请求：
@@ -484,44 +484,21 @@ WS   /api/tasks/{task_id}/script-production/chat/stream
 | Worker 离线 | 503 | MVP 不做跨 Worker session 迁移 |
 | 修改槽位满 | 429 | 返回预计可重试时间 |
 
-#### 5.5.1 Stream-token 直连方案（方案 B）
+#### 5.5.1 聊天数据获取
 
-为避免 chat stream 经过本项目后端做双重 WebSocket 代理（本项目 WS <-> Audiobook Agent Service WS），提供 stream-token 方案让前端直接连接 Audiobook Agent Service 的 WebSocket：
+聊天数据统一从 OSS 读取，与文件目录走相同的数据路径：
 
-新增接口：
+**生产/修改过程中**：
 
-```text
-GET /api/tasks/{task_id}/script-production/stream-config
-```
+- 前端轮询：`GET /api/tasks/{task_id}/script-production/chat/live?offset=N`
+- 后端从 OSS 读取 `logs/production.ndjson`（或 `logs/edits/{id}.ndjson`）
+- 返回 offset 之后的新行
+- 前端 2-3 秒轮询一次
 
-返回：
+**历史查看**：
 
-```json
-{
-  "ws_url": "wss://audiobook-agent.example.com/ws/tasks/123/chat/stream",
-  "token": "eyJhbGciOiJIUzI1NiIs...",
-  "expires_at": "2026-05-18T10:35:00Z"
-}
-```
-
-Token 规则：
-
-| 属性 | 说明 |
-| --- | --- |
-| 类型 | 短期 JWT |
-| 有效期 | 5 分钟（前端连接后 WS 保活不受影响） |
-| 绑定 | `task_id`、`user_id`，不可跨任务使用 |
-| 签名 | 由本项目后端使用 `ELASTIC_AGENT_STREAM_SECRET` 签名 |
-| 传递方式 | 前端在 WS 连接时通过 query param `?token=xxx` 或首帧 auth message 传递 |
-
-前端使用流程：
-
-1. 前端调用 `GET /api/tasks/{task_id}/script-production/stream-config` 获取 `ws_url` + `token`。
-2. 前端直接建立 WebSocket 连接到 Audiobook Agent Service：`new WebSocket(ws_url + '?token=' + token)`。
-3. Token 过期前需要重新获取（前端在 `expires_at` 前提前刷新）。
-4. 本项目后端不参与 WS 数据中转，避免双 WS 代理的延迟和复杂度。
-
-> **注意**：此方案要求前端能直接访问 Audiobook Agent Service 的 WS 端口。如果网络拓扑不允许（例如 Audiobook Agent Service 在内网），则回退到 5.5 中的 `WS /api/tasks/{task_id}/script-production/chat/stream` 由本项目后端代理。
+- `GET /api/tasks/{task_id}/script-production/chat/history`
+- 后端从 OSS 读取完整 NDJSON 日志，按 type 过滤后分页返回
 
 ### 5.6 Elastic 文件接口
 
@@ -649,7 +626,6 @@ class ElasticAgentClient:
     async def read_file(...)
     async def get_manuscript(...)
     async def get_workers(...)
-    async def get_stream_config(...)
 ```
 
 `ElasticBookProductionService` 负责：
@@ -1092,10 +1068,8 @@ GET /api/tasks/{task_id}/script-production/files
 GET /api/tasks/{task_id}/script-production/files/{path:path}
 GET /api/tasks/{task_id}/script-production/manuscript
 POST /api/tasks/{task_id}/script-production/chat
-GET /api/tasks/{task_id}/script-production/stream-config
+GET /api/tasks/{task_id}/script-production/chat/live?offset=N
 ```
-
-> **例外**：`stream-config` 返回的 `ws_url` 允许前端直接连接 Audiobook Agent Service WebSocket（见 5.5.1 和 5.11）。
 
 我们的后端负责：
 
@@ -1126,7 +1100,7 @@ GET /api/tasks/{task_id}/script-production/stream-config
 | `/api/tasks/{task_id}/script-production/export` | GET | 下载 Elastic delivery zip | 人工导出 |
 | `/api/tasks/{task_id}/script-production/chat` | POST | 对已完成 Elastic 任务发送修改指令 | 任务详情页 |
 | `/api/tasks/{task_id}/script-production/chat/history` | GET | 查看修改/生产历史 | 任务详情页 |
-| `/api/tasks/{task_id}/script-production/stream-config` | GET | 获取 WS 直连 token（见 5.11） | 前端 chat stream |
+| `/api/tasks/{task_id}/script-production/chat/live` | GET | 增量轮询聊天数据（见 5.11） | 前端 chat 轮询 |
 | `/api/tasks/{task_id}/script-production/cancel` | POST | 取消当前生产 | 任务详情页 |
 | `/api/tasks/{task_id}/script-production/continue` | POST | 续跑失败或中断任务 | 任务详情页 |
 | `/api/tasks/{task_id}/script-production/retry` | POST | 从指定 Elastic phase 重试 | 任务详情页 |
@@ -1446,8 +1420,8 @@ getScriptProductionManuscript: (taskId: number) =>
 sendScriptProductionChat: (taskId: number, message: string) =>
   api.post(`/tasks/${taskId}/script-production/chat`, { message }),
 
-getScriptProductionStreamConfig: (taskId: number) =>
-  api.get(`/tasks/${taskId}/script-production/stream-config`),
+getScriptProductionChatLive: (taskId: number, offset: number) =>
+  api.get(`/tasks/${taskId}/script-production/chat/live`, { params: { offset } }),
 
 cancelScriptProduction: (taskId: number) =>
   api.post(`/tasks/${taskId}/script-production/cancel`),
@@ -1469,77 +1443,15 @@ if (task.script_generation_backend === 'elastic_agent') {
 }
 ```
 
-### 5.11 Stream config 端点：前端直连 WS
-
-新增接口，允许前端直接建立 WebSocket 连接到 Audiobook Agent Service 的 chat stream，避免本项目后端做双重 WS 代理。
+### 5.11 聊天轮询端点
 
 ```text
-GET /api/tasks/{task_id}/script-production/stream-config
+GET /api/tasks/{task_id}/script-production/chat/live?offset=N
 ```
 
-请求前提：
+后端从 OSS 增量读取 NDJSON 日志文件，返回 offset 之后的新行。
 
-| 条件 | 说明 |
-| --- | --- |
-| 任务必须是 `elastic_agent` | 非 Elastic 任务返回 409 |
-| 任务必须有 `session_id` | 未完成的任务返回 409 |
-| Worker 必须在线 | Worker 离线返回 503 |
-
-返回：
-
-```json
-{
-  "ws_url": "wss://audiobook-agent.example.com/ws/tasks/123/chat/stream",
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "expires_at": "2026-05-18T10:35:00Z"
-}
-```
-
-Token payload 结构：
-
-```json
-{
-  "task_id": "123",
-  "user_id": 1,
-  "session_id": "claude-session-id",
-  "iat": 1747568100,
-  "exp": 1747568400
-}
-```
-
-后端实现要点：
-
-```python
-async def get_stream_config(task_id: int, current_user: User) -> dict:
-    task = await load_task(task_id)
-    assert_elastic_task(task)
-
-    run = await get_latest_elastic_book_run(task_id)
-    if not run.session_id:
-        raise HTTPException(409, "任务尚未生成 session，无法建立 stream")
-
-    # 向 Audiobook Agent Service 请求 stream config
-    config = await elastic_agent_client.get_stream_config(
-        external_task_id=run.external_task_id,
-        user_id=current_user.id,
-    )
-    return config
-```
-
-前端使用：
-
-```typescript
-const streamConfig = await tasksAPI.getScriptProductionStreamConfig(taskId);
-const ws = new WebSocket(`${streamConfig.ws_url}?token=${streamConfig.token}`);
-
-// token 过期前刷新
-const refreshTimer = setTimeout(async () => {
-  const newConfig = await tasksAPI.getScriptProductionStreamConfig(taskId);
-  // 用新 token 重连或发 auth refresh 帧
-}, (new Date(streamConfig.expires_at).getTime() - Date.now()) - 30000);
-```
-
-> **Fallback**：如果 Audiobook Agent Service 不支持 stream-config 或网络拓扑不允许前端直连，本项目后端仍提供 `WS /api/tasks/{task_id}/script-production/chat/stream` 作为代理方案。
+前端每 2-3 秒轮询。收到 `task.file.synced` webhook 通知后可立即轮询获取最新内容。
 
 ## 6. 后端执行逻辑改造点
 
@@ -1670,8 +1582,8 @@ retryScriptProduction: (taskId: number, data: { from_phase?: number; reason?: st
 sendScriptProductionChat: (taskId: number, message: string) =>
   api.post(`/tasks/${taskId}/script-production/chat`, { message }),
 
-getScriptProductionStreamConfig: (taskId: number) =>
-  api.get(`/tasks/${taskId}/script-production/stream-config`),
+getScriptProductionChatLive: (taskId: number, offset: number) =>
+  api.get(`/tasks/${taskId}/script-production/chat/live`, { params: { offset } }),
 
 getScriptProductionFiles: (taskId: number) =>
   api.get(`/tasks/${taskId}/script-production/files`),
@@ -1726,7 +1638,6 @@ ELASTIC_AGENT_ENABLED=false
 ELASTIC_AGENT_MANAGER_URL=                     # 如 http://10.0.1.100:8000
 ELASTIC_AGENT_API_KEY=                         # Bearer Token
 ELASTIC_AGENT_WEBHOOK_SECRET=                  # Webhook HMAC 验签密钥
-ELASTIC_AGENT_STREAM_SECRET=                   # 前端 WS 直连 JWT 密钥（与 ABS 共享）
 
 # 默认做书参数
 ELASTIC_AGENT_DEFAULT_PERSONA=nonfiction_default
@@ -1745,7 +1656,7 @@ ELASTIC_AGENT_OSS_ENDPOINT=                    # 如 oss-cn-shanghai.aliyuncs.co
 # ELASTIC_AGENT_OSS_ACCESS_KEY_SECRET=
 ```
 
-前端不直接配置 Audiobook Agent Service URL，统一走后端代理（WS stream-config 例外）。
+前端不直接配置 Audiobook Agent Service URL，统一走后端代理。
 
 ## 9. 权限与安全
 
@@ -1754,7 +1665,6 @@ ELASTIC_AGENT_OSS_ENDPOINT=                    # 如 oss-cn-shanghai.aliyuncs.co
 3. Elastic webhook 必须验签，避免外部伪造任务完成事件。
 4. 文件接口必须校验当前用户是否有权限访问该 `task_id`。
 5. chat 修改接口必须校验任务归属，并记录操作用户。
-6. stream-config 返回的 JWT token 必须绑定 `task_id` 和 `user_id`，Audiobook Agent Service 侧需要验证。
 
 ## 10. 接口变化与输入输出总表
 
@@ -1762,7 +1672,7 @@ ELASTIC_AGENT_OSS_ENDPOINT=                    # 如 oss-cn-shanghai.aliyuncs.co
 
 ### 10.1 前端调用本项目后端的接口
 
-前端只调用本项目后端，不直接调用 Audiobook Agent Service，也不直接访问 OSS（WS stream-config 直连例外）。
+前端只调用本项目后端，不直接调用 Audiobook Agent Service，也不直接访问 OSS。
 
 | 前端动作 | 本项目接口 | 方法 | 入参 | 返回 | 后端数据来源 |
 | --- | --- | --- | --- | --- | --- |
@@ -1780,7 +1690,7 @@ ELASTIC_AGENT_OSS_ENDPOINT=                    # 如 oss-cn-shanghai.aliyuncs.co
 | 导出交付包 | `/api/tasks/{task_id}/script-production/export` | GET | `task_id` | zip 文件或预签名 URL | OSS `delivery/audiobook_delivery.zip` |
 | 发送修改指令 | `/api/tasks/{task_id}/script-production/chat` | POST | `message`、`idempotency_key` 可选 | `edit_run_id`、状态 | Audiobook Agent Service chat |
 | 查看聊天历史 | `/api/tasks/{task_id}/script-production/chat/history` | GET | `task_id` | 历史消息 | OSS `logs/*.ndjson` |
-| 获取 WS 直连配置 | `/api/tasks/{task_id}/script-production/stream-config` | GET | `task_id` | `ws_url`、`token`、`expires_at` | Audiobook Agent Service stream-config |
+| 增量轮询聊天 | `/api/tasks/{task_id}/script-production/chat/live` | GET | `task_id`、`offset` | offset 之后的新行 | OSS `logs/*.ndjson` |
 
 ### 10.2 创建任务接口的字段变化
 
@@ -1926,14 +1836,12 @@ Task.current_step = elastic_queued
 | 重试生产 | `/api/tasks/{external_task_id}/retry` | POST | from_phase、reason、operator | success、status、message |
 | 发送修改指令 | `/api/tasks/{external_task_id}/chat` | POST | message、idempotency_key、operator | edit_run_id、status |
 | 强制同步文件 | `/api/tasks/{external_task_id}/files/sync` | POST | path | synced_at、manifest_key |
-| 获取 stream 配置 | `/api/tasks/{external_task_id}/stream-config` | GET | user_id | ws_url、token、expires_at |
 
 说明：
 
 1. 正常状态更新优先靠 webhook。
 2. `GET status` 只作为页面刷新和 webhook 丢失时的兜底。
 3. `files/sync` 仅在前端传 `force_sync=true` 且 Worker 在线时使用。
-4. `stream-config` 用于前端直连 WS，避免双重代理。
 
 ### 10.5 Audiobook Agent Service 输出如何获取
 
@@ -2071,7 +1979,7 @@ backend/alembic/versions/xxxx_add_script_generation_backend_and_elastic_runs.py
 新增接口：
 
 ```text
-GET  /api/tasks/{task_id}/script-production/stream-config    # 前端直连 WS token
+GET  /api/tasks/{task_id}/script-production/chat/live        # 增量轮询聊天数据
 POST /api/elastic-agent/webhook                              # Audiobook Agent Service 回调
 ```
 
@@ -2097,4 +2005,3 @@ frontend/src/stores/taskListStore.ts
 | 线上误选未稳定 backend | 默认关闭 Elastic，按用户或管理员权限灰度开放 |
 | 取消任务语义不一致 | MVP 映射为 `FAILED + [用户取消]` 前缀，后续可新增 `CANCELLED` 状态 |
 | Webhook 丢失导致状态不一致 | 5 分钟定时轮询 + 页面打开时刷新 + sequence gap 检测触发补偿 |
-| Stream-token 安全 | JWT 短期有效（5 分钟）、绑定 task_id + user_id、Audiobook Agent Service 侧验证 |

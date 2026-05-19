@@ -19,10 +19,10 @@ audio_book_echo_editor          Audiobook Agent Service          Worker (Elastic
         │   (状态/完成/失败事件)          │                                │
         │                                │                                │
         │   OSS 读取 ◀─── OSS 写入 ◀────│────── FileSyncManager ─────────│
-        │   (manifest/文件)              │                                │
+        │   (manifest/文件/聊天日志)      │                                │
         │                                │                                │
-        │──── WS Token ─────────────────│                                │
-        │     (前端直连 chat stream)      ├── WebSocket (Runtime) ─────▶│
+        ├── REST/WS ───────────────────▶│                                │
+        │   (聊天轮询/实时通知)           ├── WebSocket (Runtime) ─────▶│
         │                                │   (命令/日志/心跳/文件事件)     │
         └────────────────────────────────┘                                │
 ```
@@ -253,23 +253,31 @@ POST /api/tasks/{task_id}/chat
 | 429 | 修改槽位已满（含 `retry_after` 秒数） |
 | 503 | Worker 离线 |
 
-### 2.8 获取聊天流 Token
+### 2.8 实时聊天轮询
 
 ```
-GET /api/tasks/{task_id}/chat/stream-config
+GET /api/tasks/{task_id}/chat/live?offset={byte_offset}
 ```
+
+从 OSS 的 `logs/production.ndjson` 增量读取新行。
+
+**参数：**
+- `offset`: 上次读取到的字节偏移（首次传 0）
 
 **响应（200）：**
 
 ```json
 {
-  "ws_url": "wss://agent-service.example.com/api/external/tasks/123/chat/stream",
-  "token": "eyJhbGciOi...",
-  "expires_at": "2026-05-18T10:25:00Z"
+  "lines": [
+    {"data": "{\"type\":\"assistant\",...}", "parsed": {"type": "assistant"}, "offset": 1234}
+  ],
+  "next_offset": 5678,
+  "has_more": false,
+  "synced_at": "2026-05-18T10:20:05Z"
 }
 ```
 
-前端使用此 URL + token 直连 Audiobook Agent Service 的 WebSocket。
+前端每 2-3 秒轮询一次。收到 `task.file.synced` webhook 后可立即轮询。
 
 ### 2.9 强制文件同步
 
@@ -839,7 +847,7 @@ Audiobook Agent Service 解析 `phase` 字段（**数字**）来确定当前进�
 
 | 类型 | 字段 | 说明 |
 |------|------|------|
-| `FILE_SYNCED` | `{task_id, path, oss_key, synced_at, md5}` | 文件同步完成通知（比 FILE_CHANGE 多了 oss_key） |
+| `FILE_SYNCED` | `{task_id, path, oss_key, synced_at, md5}` | 文件同步完成通知，用于触发外部 Webhook（`FILE_CHANGE` 仅框架内部使用，不对外暴露） |
 | `LOG` | `{task_id, stream, data, timestamp, parsed?}` | parsed 为可选的 NDJSON 结构化解析结果 |
 
 `parsed` 字段（当 `data` 是合法 Claude Code stream-json 时自动填充）：

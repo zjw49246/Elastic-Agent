@@ -163,7 +163,7 @@
 - [ ] **A-033** [ABS] POST /api/tasks/{id}/continue — 续跑任务  `05 §2.5`
 - [ ] **A-034** [ABS] POST /api/tasks/{id}/retry — 重试任务  `05 §2.6`
 - [ ] **A-035** [ABS] POST /api/tasks/{id}/chat — 发送修改指令  `05 §2.7`
-- [ ] **A-036** [ABS] GET /api/tasks/{id}/chat/stream-config — WS 直连 token  `05 §2.8`
+- [ ] **A-036** [ABS] GET /api/tasks/{id}/chat/live — 实时聊天轮询（从 OSS logs 增量读取）  `05 §2.8`
 - [ ] **A-037** [ABS] GET /api/tasks/{id}/chat/history — 聊天历史（从 OSS logs 解析）  `05 §4.5`
 - [ ] **A-038** [ABS] POST /api/tasks/{id}/files/sync — 强制文件同步  `05 §2.9`
 - [ ] **A-039** [ABS] GET /api/workers — Worker 列表 + 槽位状态  `05 §2.10`
@@ -196,7 +196,7 @@
 - [ ] **A-112** [ABS] 多 Worker 队列分发：3 Worker + 5 任务 → 负载均衡 → 全部完成
 - [ ] **A-113** [ABS] Webhook 发送 + 重试：正常发送 / 目标 503 重试 / 死信队列
 - [ ] **A-117** [ABS] Audiobook Agent Service 崩溃恢复：重启 → SessionRegistry 重建 → 任务继续
-- [ ] **A-118** [ABS] API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/stream-config/history/files-sync/workers）
+- [ ] **A-118** [ABS] API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/chat-live/history/files-sync/workers）
 - [ ] **A-119** [ABS] 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成
 - [ ] **A-120** [ABS] 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister
 
@@ -235,7 +235,7 @@
 - [ ] **B-026** [ABE] POST /api/tasks/{id}/script-production/retry  `03 §5.4`
 - [ ] **B-027** [ABE] POST /api/tasks/{id}/script-production/chat  `03 §5.5`
 - [ ] **B-028** [ABE] GET /api/tasks/{id}/script-production/chat/history  `03 §5.5`
-- [ ] **B-029** [ABE] GET /api/tasks/{id}/script-production/stream-config  `03 §5.11`
+- [ ] **B-029** [ABE] GET /api/tasks/{id}/script-production/chat/live — 聊天轮询（从 OSS 增量读取）  `03 §5.11`
 - [ ] **B-030** [ABE] GET /api/tasks/{id}/script-production/files  `03 §5.6`
 - [ ] **B-031** [ABE] GET /api/tasks/{id}/script-production/files/{path}  `03 §5.6`
 - [ ] **B-032** [ABE] GET /api/tasks/{id}/script-production/manuscript  `03 §5.6`
@@ -482,7 +482,6 @@ oss:
 | `ABS_OSS_ACCESS_KEY_ID` | OSS 写入凭证 | `LTAI5t...` |
 | `ABS_OSS_ACCESS_KEY_SECRET` | OSS 写入凭证 | `HBYwH...` |
 | `ABS_WEBHOOK_SECRETS` | Webhook 验签密钥映射（JSON） | `{"default": "hmac-secret-xxx"}` |
-| `ABS_STREAM_TOKEN_SECRET` | 前端 WS 直连 JWT 签名密钥 | `jwt-secret-xxx` |
 
 ### 5.3 audio_book_echo_editor [ABE]
 
@@ -494,7 +493,6 @@ oss:
 | `ELASTIC_AGENT_MANAGER_URL` | (必填) | Audiobook Agent Service 地址 |
 | `ELASTIC_AGENT_API_KEY` | (必填) | 调用 Agent Service 的 Bearer Token |
 | `ELASTIC_AGENT_WEBHOOK_SECRET` | (必填) | 验证 Webhook 签名的密钥 |
-| `ELASTIC_AGENT_STREAM_SECRET` | (必填) | 前端 WS 直连 JWT 验签密钥（与 ABS 共享） |
 | `ELASTIC_AGENT_DEFAULT_PERSONA` | `nonfiction_default` | 默认 Audiobook persona |
 | `ELASTIC_AGENT_DEFAULT_TARGET_PCT` | `12` | 默认压缩比例 |
 | `ELASTIC_AGENT_REQUEST_TIMEOUT_SECONDS` | `30` | 调用 Agent Service 超时 |
