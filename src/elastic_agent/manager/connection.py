@@ -21,6 +21,7 @@ from typing import Any
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from elastic_agent.core.auth import verify_token_constant_time
 from elastic_agent.core.protocols.messages import (
     AuthMessage,
     AuthResultMessage,
@@ -190,7 +191,7 @@ class WorkerConnectionManager:
     async def _verify_token(self, token: str, claimed_worker_id: str | None) -> str | None:
         nodes = await self._registry.list_all()
         for node in nodes:
-            if node.auth_token == token:
+            if node.auth_token and verify_token_constant_time(token, node.auth_token):
                 if claimed_worker_id and claimed_worker_id != node.node_id:
                     continue
                 return node.node_id
