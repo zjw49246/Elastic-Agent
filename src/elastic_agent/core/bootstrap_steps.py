@@ -126,6 +126,40 @@ def harness_code_step(
     )
 
 
+def credential_login_deps_step(
+    login_dependencies: list[str] | None = None,
+    timeout: int = 600,
+) -> BootstrapStep:
+    """T-042: Install auto-login dependencies (Playwright, mitmproxy, Chrome, Xvfb)."""
+    deps = login_dependencies or [
+        "playwright", "playwright-stealth", "mitmproxy", "chrome"
+    ]
+
+    install_cmds = []
+    for dep in deps:
+        if dep == "chrome":
+            install_cmds.append(
+                "apt-get install -y -qq xvfb && "
+                "pip3 install -q playwright playwright-stealth && "
+                "playwright install chromium --with-deps"
+            )
+        elif dep == "mitmproxy":
+            install_cmds.append("pip3 install -q mitmproxy")
+        elif dep in ("playwright", "playwright-stealth"):
+            install_cmds.append(f"pip3 install -q {dep}")
+        else:
+            install_cmds.append(f"pip3 install -q {dep}")
+
+    cmd = " && ".join(install_cmds)
+    return BootstrapStep(
+        name="credential-login-deps",
+        command=cmd,
+        timeout=timeout,
+        retry_count=1,
+        description="Install auto-login dependencies (Playwright, mitmproxy, Chrome)",
+    )
+
+
 def build_default_bootstrap_steps(
     manager_url: str,
     auth_token: str,
@@ -135,9 +169,11 @@ def build_default_bootstrap_steps(
     runtime_port: int = 8080,
     heartbeat_interval: int = 30,
     system_packages: list[str] | None = None,
+    include_login_deps: bool = False,
+    login_dependencies: list[str] | None = None,
 ) -> list[BootstrapStep]:
-    """Build the standard 4-step bootstrap sequence."""
-    return [
+    """Build the standard bootstrap sequence (4 or 5 steps depending on login deps)."""
+    steps = [
         system_init_step(packages=system_packages),
         agent_install_step(agent_install_command=agent_install_command),
         runtime_deploy_step(
@@ -149,3 +185,6 @@ def build_default_bootstrap_steps(
         ),
         harness_code_step(repo_url=repo_url),
     ]
+    if include_login_deps:
+        steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
+    return steps

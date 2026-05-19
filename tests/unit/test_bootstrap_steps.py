@@ -7,6 +7,7 @@ import pytest
 from elastic_agent.core.bootstrap_steps import (
     agent_install_step,
     build_default_bootstrap_steps,
+    credential_login_deps_step,
     harness_code_step,
     runtime_deploy_step,
     system_init_step,
@@ -116,3 +117,41 @@ class TestBuildDefaultSteps:
             agent_install_command="pip install custom-agent",
         )
         assert "custom-agent" in steps[1].command
+
+    def test_with_login_deps(self) -> None:
+        steps = build_default_bootstrap_steps(
+            manager_url="ws://10.0.0.1:8000/ws/runtime",
+            auth_token="token",
+            worker_id="w1",
+            include_login_deps=True,
+        )
+        assert len(steps) == 5
+        assert steps[4].name == "credential-login-deps"
+
+    def test_without_login_deps(self) -> None:
+        steps = build_default_bootstrap_steps(
+            manager_url="ws://10.0.0.1:8000/ws/runtime",
+            auth_token="token",
+            worker_id="w1",
+            include_login_deps=False,
+        )
+        assert len(steps) == 4
+
+
+class TestCredentialLoginDepsStep:
+    def test_default_deps(self) -> None:
+        step = credential_login_deps_step()
+        assert step.name == "credential-login-deps"
+        assert "playwright" in step.command
+        assert "mitmproxy" in step.command
+        assert "xvfb" in step.command
+        assert step.timeout == 600
+        assert step.retry_count == 1
+
+    def test_custom_deps(self) -> None:
+        step = credential_login_deps_step(login_dependencies=["mitmproxy"])
+        assert "mitmproxy" in step.command
+
+    def test_custom_timeout(self) -> None:
+        step = credential_login_deps_step(timeout=900)
+        assert step.timeout == 900
