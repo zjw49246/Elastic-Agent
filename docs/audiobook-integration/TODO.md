@@ -132,11 +132,11 @@
 
 ### 测试工具（`elastic_agent.testing` 导出，供下游仓库使用）
 
-- [ ] **T-200** [EA] DryRunProvider 实现（模拟云 API，内存实例生命周期）  `06 §2.1`
-- [ ] **T-201** [EA] MockWorker 实现（模拟 Worker Runtime WS 连接，可配置 NDJSON 输出）  `06 §2.1`
-- [ ] **T-202** [EA] MockOAuthServer 实现（模拟 171mail + Anthropic OAuth + Usage API）  `06 §2.1`
-- [ ] **T-203** [EA] MockOSS 实现（本地文件系统模拟 OSS PutObject/GetObject）  `06 §2.1`
-- [ ] **T-204** [EA] create_test_manager() 工厂函数（一键创建带全部 Mock 的测试 Manager）  `06 §2.1`
+- [x] **T-200** [EA] DryRunProvider 实现（模拟云 API，内存实例生命周期）  `06 §2.1`
+- [x] **T-201** [EA] MockWorker 实现（模拟 Worker Runtime WS 连接，可配置 NDJSON 输出）  `06 §2.1`
+- [x] **T-202** [EA] MockOAuthServer 实现（模拟 171mail + Anthropic OAuth + Usage API）  `06 §2.1`
+- [x] **T-203** [EA] MockOSS 实现（本地文件系统模拟 OSS PutObject/GetObject）  `06 §2.1`
+- [x] **T-204** [EA] create_test_manager() 工厂函数（一键创建带全部 Mock 的测试 Manager）  `06 §2.1`
 - [ ] **T-205** [EA] LocalWorkerProcess（本地启动真实 Worker Runtime 进程用于 L3+ 测试）  `06 §5.2`
 - [ ] **T-206** [EA] 测试级别框架（conftest.py: 环境变量驱动的 provider/worker/oss fixture 切换）  `06 §5.2`
 - [ ] **T-207** [EA] pytest marker 注册（level0 ~ level6，CI 按凭证可用性选择执行范围）  `06 §8`
