@@ -1,7 +1,8 @@
-"""Unit tests for NodeRegistry — CRUD, persistence, crash recovery."""
+"""Unit tests for NodeRegistry — CRUD, persistence, crash recovery, concurrency (T-101)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -125,3 +126,89 @@ async def test_atomic_write(registry_path: Path) -> None:
     await reg.add(_make_record())
     assert registry_path.exists()
     assert not registry_path.with_suffix(".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency safety tests (T-101)
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_add(registry: NodeRegistry) -> None:
+    """Multiple concurrent adds should not lose data."""
+    async def add_node(i: int):
+        await registry.add(_make_record(f"node-{i}", instance_id=f"inst-{i}"))
+
+    await asyncio.gather(*[add_node(i) for i in range(20)])
+
+    assert await registry.count() == 20
+    for i in range(20):
+        assert await registry.get(f"node-{i}") is not None
+
+
+async def test_concurrent_update(registry: NodeRegistry) -> None:
+    """Concurrent updates to different nodes should all succeed."""
+    for i in range(10):
+        await registry.add(_make_record(f"n-{i}", instance_id=f"inst-{i}"))
+
+    async def update_node(i: int):
+        await registry.update(f"n-{i}", status=NodeStatus.READY)
+
+    await asyncio.gather(*[update_node(i) for i in range(10)])
+
+    for i in range(10):
+        rec = await registry.get(f"n-{i}")
+        assert rec is not None
+        assert rec.status == NodeStatus.READY
+
+
+async def test_concurrent_add_remove(registry: NodeRegistry) -> None:
+    """Concurrent add and remove should not corrupt state."""
+    for i in range(10):
+        await registry.add(_make_record(f"n-{i}", instance_id=f"inst-{i}"))
+
+    async def remove_even(i: int):
+        if i % 2 == 0:
+            await registry.remove(f"n-{i}")
+
+    async def add_new(i: int):
+        await registry.add(_make_record(f"new-{i}", instance_id=f"inst-new-{i}"))
+
+    tasks = [remove_even(i) for i in range(10)] + [add_new(i) for i in range(5)]
+    await asyncio.gather(*tasks)
+
+    remaining = await registry.list_all()
+    ids = {r.node_id for r in remaining}
+    for i in range(10):
+        if i % 2 == 0:
+            assert f"n-{i}" not in ids
+        else:
+            assert f"n-{i}" in ids
+    for i in range(5):
+        assert f"new-{i}" in ids
+
+
+async def test_concurrent_persistence(registry_path: Path) -> None:
+    """Concurrent operations should produce consistent file on disk."""
+    reg = NodeRegistry(registry_path)
+
+    async def add_and_update(i: int):
+        await reg.add(_make_record(f"n-{i}", instance_id=f"inst-{i}"))
+        await reg.update(f"n-{i}", status=NodeStatus.READY)
+
+    await asyncio.gather(*[add_and_update(i) for i in range(10)])
+
+    reg2 = NodeRegistry(registry_path)
+    await reg2.load()
+    assert await reg2.count() == 10
+    for i in range(10):
+        rec = await reg2.get(f"n-{i}")
+        assert rec is not None
+        assert rec.status == NodeStatus.READY
+
+
+async def test_list_all_ids(registry: NodeRegistry) -> None:
+    await registry.add(_make_record("a"))
+    await registry.add(_make_record("b"))
+    await registry.add(_make_record("c"))
+    ids = await registry.list_all_ids()
+    assert ids == {"a", "b", "c"}
