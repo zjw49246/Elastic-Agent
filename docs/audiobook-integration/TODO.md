@@ -84,16 +84,16 @@
 
 ### 测试 — 单元测试
 
-- [ ] **T-100** [EA] CloudProvider mock：create/terminate/list/wait_until_running 接口行为
-- [ ] **T-101** [EA] NodeRegistry CRUD + 并发安全 + JSON 持久化 + 崩溃恢复
-- [ ] **T-102** [EA] Protocol 消息序列化/反序列化（全部消息类型）
-- [ ] **T-103** [EA] Bootstrap 状态机：步骤成功/失败/超时/重试/回滚
-- [ ] **T-104** [EA] Drain 状态机：draining→等待完成→终止、超时强制终止
-- [ ] **T-105** [EA] CloudReconciler：孤儿检测、幽灵清理、状态不一致修复
-- [ ] **T-106** [EA] 轨迹缓冲：per-task 写入/读取/溢出/释放
-- [ ] **T-107** [EA] EventBus：fan-out 分发、subscribe/unsubscribe、事件过滤
-- [ ] **T-108** [EA] CredentialPool：分配/回收/轮换/额度检查/分组（high_quota/standard）
-- [ ] **T-109** [EA] Config 加载：config.yaml 解析 + 环境变量覆盖 + Pydantic 校验
+- [x] **T-100** [EA] CloudProvider mock：create/terminate/list/wait_until_running 接口行为
+- [x] **T-101** [EA] NodeRegistry CRUD + 并发安全 + JSON 持久化 + 崩溃恢复
+- [x] **T-102** [EA] Protocol 消息序列化/反序列化（全部消息类型）
+- [x] **T-103** [EA] Bootstrap 状态机：步骤成功/失败/超时/重试/回滚
+- [x] **T-104** [EA] Drain 状态机：draining→等待完成→终止、超时强制终止
+- [x] **T-105** [EA] CloudReconciler：孤儿检测、幽灵清理、状态不一致修复
+- [x] **T-106** [EA] 轨迹缓冲：per-task 写入/读取/溢出/释放
+- [x] **T-107** [EA] EventBus：fan-out 分发、subscribe/unsubscribe、事件过滤
+- [x] **T-108** [EA] CredentialPool：分配/回收/轮换/额度检查/分组（high_quota/standard）
+- [x] **T-109** [EA] Config 加载：config.yaml 解析 + 环境变量覆盖 + Pydantic 校验
 - [ ] **T-119** [EA] FileSyncManager：防抖逻辑 + 同步清单生成 + 大小文件分流
 - [ ] **T-121** [EA] Worker 日志落盘：正常退出/崩溃退出场景下文件完整性
 - [ ] **T-123** [EA] TaskSyncMapper：注册/注销映射、路径匹配、多任务并存
