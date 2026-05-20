@@ -94,14 +94,14 @@
 - [x] **T-107** [EA] EventBus：fan-out 分发、subscribe/unsubscribe、事件过滤
 - [x] **T-108** [EA] CredentialPool：分配/回收/轮换/额度检查/分组（high_quota/standard）
 - [x] **T-109** [EA] Config 加载：config.yaml 解析 + 环境变量覆盖 + Pydantic 校验
-- [ ] **T-119** [EA] FileSyncManager：防抖逻辑 + 同步清单生成 + 大小文件分流
-- [ ] **T-121** [EA] Worker 日志落盘：正常退出/崩溃退出场景下文件完整性
-- [ ] **T-123** [EA] TaskSyncMapper：注册/注销映射、路径匹配、多任务并存
-- [ ] **T-124** [EA] LOG 事件结构化解析：各 type 正确提取 parsed 字段、非 JSON 行容错
-- [ ] **T-125** [EA] Manager 操作日志：日志格式、轮转、各操作类别正确记录
-- [ ] **T-126** [EA] Worker 断线重连：指数退避、日志缓冲、重连后回放
-- [ ] **T-127** [EA] 外部 API 认证：有效/无效/过期 API Key
-- [ ] **T-128** [EA] Spot/抢占式实例处理：回收事件检测 + 状态更新
+- [x] **T-119** [EA] FileSyncManager：防抖逻辑 + 同步清单生成 + 大小文件分流
+- [x] **T-121** [EA] Worker 日志落盘：正常退出/崩溃退出场景下文件完整性
+- [x] **T-123** [EA] TaskSyncMapper：注册/注销映射、路径匹配、多任务并存
+- [x] **T-124** [EA] LOG 事件结构化解析：各 type 正确提取 parsed 字段、非 JSON 行容错
+- [x] **T-125** [EA] Manager 操作日志：日志格式、轮转、各操作类别正确记录
+- [x] **T-126** [EA] Worker 断线重连：指数退避、日志缓冲、重连后回放
+- [x] **T-127** [EA] 外部 API 认证：有效/无效/过期 API Key
+- [x] **T-128** [EA] Spot/抢占式实例处理：回收事件检测 + 状态更新
 - [ ] **T-132** [EA] CredentialPool：accounts.json 加载 / 分组 / 分配 / 回收 / pool_status 持久化
 - [ ] **T-133** [EA] QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复
 - [ ] **T-134** [EA] 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理
