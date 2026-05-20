@@ -210,19 +210,19 @@
 
 ### 测试 — 集成测试
 
-- [ ] **A-110** [ABS] 单 Worker 端到端做书（DryRunProvider）：produce → 执行 → 完成 → Webhook
-- [ ] **A-111** [ABS] 修改模式：produce → 完成 → chat → --resume → 文件同步 → Webhook
-- [ ] **A-112** [ABS] 多 Worker 队列分发：3 Worker + 5 任务 → 负载均衡 → 全部完成
-- [ ] **A-113** [ABS] Webhook 发送 + 重试：正常发送 / 目标 503 重试 / 死信队列
-- [ ] **A-117** [ABS] Audiobook Agent Service 崩溃恢复：重启 → 框架 TaskRegistry 自动恢复 → 任务继续
-- [ ] **A-118** [ABS] API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/chat-live/history/files-sync/workers）
-- [ ] **A-119** [ABS] 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成
-- [ ] **A-120** [ABS] 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister
+- [x] **A-110** [ABS] 单 Worker 端到端做书（DryRunProvider）：produce → 执行 → 完成 → Webhook
+- [x] **A-111** [ABS] 修改模式：produce → 完成 → chat → --resume → 文件同步 → Webhook
+- [x] **A-112** [ABS] 多 Worker 队列分发：3 Worker + 5 任务 → 负载均衡 → 全部完成
+- [x] **A-113** [ABS] Webhook 发送 + 重试：正常发送 / 目标 503 重试 / 死信队列
+- [x] **A-117** [ABS] Audiobook Agent Service 崩溃恢复：重启 → 框架 TaskRegistry 自动恢复 → 任务继续
+- [x] **A-118** [ABS] API 端点完整测试：10 个端点全覆盖（produce/status/cancel/continue/retry/chat/chat-live/history/files-sync/workers）
+- [x] **A-119** [ABS] 从指定 Phase 重试 E2E：retry from_phase=3 → 清理 → /continue-book → 完成
+- [x] **A-120** [ABS] 修改流程 sync mapping 生命周期：production → unregister → edit → re-register → edit complete → unregister
 
 ### 测试工具（`audiobook_agent_service.testing` 导出）
 
-- [ ] **A-200** [ABS] MockClaudeOutput 实现（预录 NDJSON 序列：成功/失败/卡住/修改等场景）  `06 §3.1`
-- [ ] **A-201** [ABS] WebhookCatcher 实现（捕获 Webhook 事件，支持 wait_for_event + assert_sequence）  `06 §3.1`
+- [x] **A-200** [ABS] MockClaudeOutput 实现（预录 NDJSON 序列：成功/失败/卡住/修改等场景）  `06 §3.1`
+- [x] **A-201** [ABS] WebhookCatcher 实现（捕获 Webhook 事件，支持 wait_for_event + assert_sequence）  `06 §3.1`
 
 ---
 
