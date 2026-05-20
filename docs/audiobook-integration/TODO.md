@@ -102,14 +102,14 @@
 - [x] **T-126** [EA] Worker 断线重连：指数退避、日志缓冲、重连后回放
 - [x] **T-127** [EA] 外部 API 认证：有效/无效/过期 API Key
 - [x] **T-128** [EA] Spot/抢占式实例处理：回收事件检测 + 状态更新
-- [ ] **T-132** [EA] CredentialPool：accounts.json 加载 / 分组 / 分配 / 回收 / pool_status 持久化
-- [ ] **T-133** [EA] QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复
-- [ ] **T-134** [EA] 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理
-- [ ] **T-137** [EA] 账号-Worker 绑定：互斥分配 / 亲和复用（Step 1-3）/ Worker 下线清理 / max_accounts_per_worker
-- [ ] **T-138** [EA] TaskRegistry：CRUD + 持久化 + 崩溃恢复 + Worker 下线清理
-- [ ] **T-139** [EA] TaskScheduler：容量检查 + 多 Worker 选择 + 无空闲返回 None
-- [ ] **T-140** [EA] TaskRouter：路由到正确 Worker + --resume 自动组装 + Worker 离线错误
-- [ ] **T-141** [EA] WebhookEmitter：HMAC 签名 + 重试延迟 + 死信队列 + 幂等
+- [x] **T-132** [EA] CredentialPool：accounts.json 加载 / 分组 / 分配 / 回收 / pool_status 持久化
+- [x] **T-133** [EA] QuotaMonitor：阈值检测 / QUOTA_WARNING 事件 / 冷却恢复
+- [x] **T-134** [EA] 自动轮换逻辑：查找替代账号 / 等待任务完成 / 凭证切换 / 所有账号耗尽处理
+- [x] **T-137** [EA] 账号-Worker 绑定：互斥分配 / 亲和复用（Step 1-3）/ Worker 下线清理 / max_accounts_per_worker
+- [x] **T-138** [EA] TaskRegistry：CRUD + 持久化 + 崩溃恢复 + Worker 下线清理
+- [x] **T-139** [EA] TaskScheduler：容量检查 + 多 Worker 选择 + 无空闲返回 None
+- [x] **T-140** [EA] TaskRouter：路由到正确 Worker + --resume 自动组装 + Worker 离线错误
+- [x] **T-141** [EA] WebhookEmitter：HMAC 签名 + 重试延迟 + 死信队列 + 幂等
 
 ### 测试 — 集成测试
 
