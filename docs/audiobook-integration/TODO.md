@@ -176,21 +176,21 @@
 
 ### API 端点
 
-- [ ] **A-030** [ABS] POST /api/tasks/produce — 提交做书请求  `05 §2.2`
-- [ ] **A-031** [ABS] GET /api/tasks/{id}/status — 查询任务状态  `05 §2.3`
-- [ ] **A-032** [ABS] POST /api/tasks/{id}/cancel — 取消任务  `05 §2.4`
-- [ ] **A-033** [ABS] POST /api/tasks/{id}/continue — 续跑任务  `05 §2.5`
-- [ ] **A-034** [ABS] POST /api/tasks/{id}/retry — 重试任务  `05 §2.6`
-- [ ] **A-035** [ABS] POST /api/tasks/{id}/chat — 发送修改指令  `05 §2.7`
-- [ ] **A-036** [ABS] GET /api/tasks/{id}/chat/live — 实时聊天轮询（从 OSS logs 增量读取）  `05 §2.8`
-- [ ] **A-037** [ABS] GET /api/tasks/{id}/chat/history — 聊天历史（从 OSS logs 解析）  `05 §4.5`
-- [ ] **A-038** [ABS] POST /api/tasks/{id}/files/sync — 强制文件同步  `05 §2.9`
-- [ ] **A-039** [ABS] GET /api/workers — Worker 列表 + 槽位状态  `05 §2.10`
+- [x] **A-030** [ABS] POST /api/tasks/produce — 提交做书请求  `05 §2.2`
+- [x] **A-031** [ABS] GET /api/tasks/{id}/status — 查询任务状态  `05 §2.3`
+- [x] **A-032** [ABS] POST /api/tasks/{id}/cancel — 取消任务  `05 §2.4`
+- [x] **A-033** [ABS] POST /api/tasks/{id}/continue — 续跑任务  `05 §2.5`
+- [x] **A-034** [ABS] POST /api/tasks/{id}/retry — 重试任务  `05 §2.6`
+- [x] **A-035** [ABS] POST /api/tasks/{id}/chat — 发送修改指令  `05 §2.7`
+- [x] **A-036** [ABS] GET /api/tasks/{id}/chat/live — 实时聊天轮询（从 OSS logs 增量读取）  `05 §2.8`
+- [x] **A-037** [ABS] GET /api/tasks/{id}/chat/history — 聊天历史（从 OSS logs 解析）  `05 §4.5`
+- [x] **A-038** [ABS] POST /api/tasks/{id}/files/sync — 强制文件同步  `05 §2.9`
+- [x] **A-039** [ABS] GET /api/workers — Worker 列表 + 槽位状态  `05 §2.10`
 
 ### 配置
 
-- [ ] **A-050** [ABS] Audiobook Agent Service config.yaml 定义（见本文件 §5）
-- [ ] **A-051** [ABS] 敏感配置环境变量定义（见本文件 §5）
+- [x] **A-050** [ABS] Audiobook Agent Service config.yaml 定义（见本文件 §5）
+- [x] **A-051** [ABS] 敏感配置环境变量定义（见本文件 §5）
 
 ### 测试 — 单元测试
 
