@@ -156,14 +156,14 @@
 
 ### 核心模块
 
-- [ ] **A-003** [ABS] FastAPI 应用入口（main.py: 组装 ElasticAgentManager + 挂载 Audiobook 路由）  `02 §0.2`
-- [ ] **A-010** [ABS] AudiobookHarness — 实现 Harness 接口  `02 §4.1`
-- [ ] **A-011** [ABS] Bootstrap 步骤定义（Node.js/Claude Code/凭证/插件/Runtime）  `02 §4.1`
-- [ ] **A-012** [ABS] BookQueue — 做书请求排队 + 优先级调度  `02 §3.2`
+- [x] **A-003** [ABS] FastAPI 应用入口（main.py: 组装 ElasticAgentManager + 挂载 Audiobook 路由）  `02 §0.2`
+- [x] **A-010** [ABS] AudiobookHarness — 实现 Harness 接口  `02 §4.1`
+- [x] **A-011** [ABS] Bootstrap 步骤定义（Node.js/Claude Code/凭证/插件/Runtime）  `02 §4.1`
+- [x] **A-012** [ABS] BookQueue — 做书请求排队 + 优先级调度  `02 §3.2`
 - ~~**A-013**~~ 已移至框架: EA T-050 (TaskRegistry)
 - ~~**A-014**~~ 已移至框架: EA T-051 (TaskScheduler)
 - ~~**A-015**~~ 已移至框架: EA T-052 (TaskRouter)
-- [ ] **A-016** [ABS] TaskSyncMapper 映射推送 — 注册/注销同步映射到 Worker  `02 §3.4`
+- [x] **A-016** [ABS] TaskSyncMapper 映射推送 — 注册/注销同步映射到 Worker  `02 §3.4`
 - ~~**A-017**~~ 已移至框架: EA T-053 (WebhookEmitter)
 - [ ] **A-018** [ABS] 进度超时检测 — 30 分钟无 LOG/FILE 事件标记 stalled  `02 §5.7`
 - [ ] **A-019** [ABS] Session ID fallback — 框架提取失败时从 state.json 读取（源 A+B 在框架 T-017）  `02 §5.8`
