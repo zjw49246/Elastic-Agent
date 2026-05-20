@@ -113,22 +113,22 @@
 
 ### 测试 — 集成测试
 
-- [ ] **T-110** [EA] Manager ↔ Worker WS 通信：连接/认证/双向消息/断线重连
-- [ ] **T-111** [EA] 阿里云全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止
-- [ ] **T-112** [EA] AWS 全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止
-- [ ] **T-113** [EA] Bootstrap E2E：全步骤执行 + 单步失败重试 + 凭证回收
-- [ ] **T-114** [EA] 外部 API E2E：轨迹流订阅 + 文件读取 + 认证
-- [ ] **T-115** [EA] 扩容 → 执行命令 → 获取输出 → 缩容 全链路
-- [ ] **T-116** [EA] 阿里云前置资源验证：安全组规则 + VSwitch 连通性 + 密钥对 SSH 可达
-- [ ] **T-117** [EA] AWS 前置资源验证：Security Group + Subnet + Key Pair
-- [ ] **T-118** [EA] DryRunProvider 空跑验证
-- [ ] **T-120** [EA] Worker 文件变更 → FileSyncManager → OSS/S3 → 外部 API 读取
-- [ ] **T-122** [EA] Worker 日志落盘 → FileSyncManager → OSS → 历史查询
-- [ ] **T-129** [EA] Manager 崩溃恢复：重启 → NodeRegistry 重建 → Worker 重连 → 状态一致
-- [ ] **T-130** [EA] 凭证轮换 E2E：额度耗尽 → 自动换号 → 进程使用新凭证
-- [ ] **T-131** [EA] 多 Worker 并发：5+ Worker 同时连接 + 并发执行命令
-- [ ] **T-135** [EA] 自动登录 E2E：171mail + Playwright + mitmproxy → credentials.json 生成
-- [ ] **T-136** [EA] 额度监控 E2E：Worker 上报 → Manager 汇聚 → 阈值告警 → 触发轮换
+- [x] **T-110** [EA] Manager ↔ Worker WS 通信：连接/认证/双向消息/断线重连
+- [x] **T-111** [EA] 阿里云全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止
+- [x] **T-112** [EA] AWS 全生命周期：创建 → Bootstrap → 就绪 → 执行 → 终止
+- [x] **T-113** [EA] Bootstrap E2E：全步骤执行 + 单步失败重试 + 凭证回收
+- [x] **T-114** [EA] 外部 API E2E：轨迹流订阅 + 文件读取 + 认证
+- [x] **T-115** [EA] 扩容 → 执行命令 → 获取输出 → 缩容 全链路
+- [x] **T-116** [EA] 阿里云前置资源验证：安全组规则 + VSwitch 连通性 + 密钥对 SSH 可达
+- [x] **T-117** [EA] AWS 前置资源验证：Security Group + Subnet + Key Pair
+- [x] **T-118** [EA] DryRunProvider 空跑验证
+- [x] **T-120** [EA] Worker 文件变更 → FileSyncManager → OSS/S3 → 外部 API 读取
+- [x] **T-122** [EA] Worker 日志落盘 → FileSyncManager → OSS → 历史查询
+- [x] **T-129** [EA] Manager 崩溃恢复：重启 → NodeRegistry 重建 → Worker 重连 → 状态一致
+- [x] **T-130** [EA] 凭证轮换 E2E：额度耗尽 → 自动换号 → 进程使用新凭证
+- [x] **T-131** [EA] 多 Worker 并发：5+ Worker 同时连接 + 并发执行命令
+- [x] **T-135** [EA] 自动登录 E2E：171mail + Playwright + mitmproxy → credentials.json 生成
+- [x] **T-136** [EA] 额度监控 E2E：Worker 上报 → Manager 汇聚 → 阈值告警 → 触发轮换
 
 ### 测试工具（`elastic_agent.testing` 导出，供下游仓库使用）
 
