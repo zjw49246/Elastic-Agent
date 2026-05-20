@@ -312,9 +312,9 @@
 
 ### 测试工具（`tests/mocks/`）
 
-- [ ] **B-200** [ABE] MockAgentService 实现（模拟 ABS 全部 API 端点，可配置返回值）  `06 §4.1`
-- [ ] **B-201** [ABE] WebhookSimulator 实现（向 ABE 发送带签名的模拟 Webhook 事件）  `06 §4.1`
-- [ ] **B-202** [ABE] MockOSSReader 实现（预置 manifest + 文件内容，模拟 OSS 读取）  `06 §4.1`
+- [x] **B-200** [ABE] MockAgentService 实现（模拟 ABS 全部 API 端点，可配置返回值）  `06 §4.1`
+- [x] **B-201** [ABE] WebhookSimulator 实现（向 ABE 发送带签名的模拟 Webhook 事件）  `06 §4.1`
+- [x] **B-202** [ABE] MockOSSReader 实现（预置 manifest + 文件内容，模拟 OSS 读取）  `06 §4.1`
 
 ---
 
