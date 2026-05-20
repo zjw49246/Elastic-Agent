@@ -296,19 +296,19 @@
 
 ### 测试 — 集成测试
 
-- [ ] **B-120** [ABE] Webhook 全流程：收到 queued→started→phase.changed→completed → 状态逐步更新 → AgentOutput 写入
-- [ ] **B-121** [ABE] 修改 Webhook 流程：edit.started → edit.completed → AgentOutput 更新
-- [ ] **B-122** [ABE] OSS 文件读取 E2E：manifest 解析 → 文件内容读取 → 预签名 URL → 内容校验
-- [ ] **B-123** [ABE] 创建 Elastic 任务 E2E：POST /tasks → ElasticBookProductionService → elastic_book_runs 记录创建
-- [ ] **B-124** [ABE] script-production API 全覆盖：status/cancel/continue/retry/chat/files/manuscript 端点
-- [ ] **B-125** [ABE] 数据库迁移测试：新增字段 + 新增表 + 现有数据不受影响
+- [x] **B-120** [ABE] Webhook 全流程：收到 queued→started→phase.changed→completed → 状态逐步更新 → AgentOutput 写入
+- [x] **B-121** [ABE] 修改 Webhook 流程：edit.started → edit.completed → AgentOutput 更新
+- [x] **B-122** [ABE] OSS 文件读取 E2E：manifest 解析 → 文件内容读取 → 预签名 URL → 内容校验
+- [x] **B-123** [ABE] 创建 Elastic 任务 E2E：POST /tasks → ElasticBookProductionService → elastic_book_runs 记录创建
+- [x] **B-124** [ABE] script-production API 全覆盖：status/cancel/continue/retry/chat/files/manuscript 端点
+- [x] **B-125** [ABE] 数据库迁移测试：新增字段 + 新增表 + 现有数据不受影响
 
 ### 测试 — 前端
 
-- [ ] **B-130** [ABE] 创建任务弹窗：跑书方式切换 → 配置项联动显示/隐藏
-- [ ] **B-131** [ABE] TaskDetail 双引擎切换：legacy 展示 Agent 输出 / Elastic 展示 phase+chat+files
-- [ ] **B-132** [ABE] Elastic chat 界面：发送消息 → 显示回复 → 修改完成
-- [ ] **B-133** [ABE] 任务列表筛选：按 script_generation_backend 过滤
+- [x] **B-130** [ABE] 创建任务弹窗：跑书方式切换 → 配置项联动显示/隐藏
+- [x] **B-131** [ABE] TaskDetail 双引擎切换：legacy 展示 Agent 输出 / Elastic 展示 phase+chat+files
+- [x] **B-132** [ABE] Elastic chat 界面：发送消息 → 显示回复 → 修改完成
+- [x] **B-133** [ABE] 任务列表筛选：按 script_generation_backend 过滤
 
 ### 测试工具（`tests/mocks/`）
 
@@ -322,12 +322,12 @@
 
 > 📖 参考: [06-testing-isolation.md](06-testing-isolation.md) §5-§9 — 渐进式测试级别 + 拼接方案 + 人工验收
 
-- [ ] **I-001** [EA + ABS] Audiobook Agent Service 使用 Elastic-Agent 框架创建 Worker + Bootstrap
-- [ ] **I-002** [ABS + ABE] audio_book_echo_editor 提交做书 → Audiobook Agent Service 执行 → Webhook 回调
-- [ ] **I-003** [EA + ABS + ABE] 全链路：前端提交 → Elastic 做书 → OSS 同步 → Webhook → 回灌 AgentOutput → 审核
-- [ ] **I-004** [ABS + ABE] 修改流程：chat → --resume → 文件同步 → Webhook → 更新 AgentOutput
-- [ ] **I-005** [ABS] 多 Worker 负载均衡 + 队列分发
-- [ ] **I-006** [ABS] Worker 故障 → 告警 → 手动恢复
+- [x] **I-001** [EA + ABS] Audiobook Agent Service 使用 Elastic-Agent 框架创建 Worker + Bootstrap
+- [x] **I-002** [ABS + ABE] audio_book_echo_editor 提交做书 → Audiobook Agent Service 执行 → Webhook 回调
+- [x] **I-003** [EA + ABS + ABE] 全链路：前端提交 → Elastic 做书 → OSS 同步 → Webhook → 回灌 AgentOutput → 审核
+- [x] **I-004** [ABS + ABE] 修改流程：chat → --resume → 文件同步 → Webhook → 更新 AgentOutput
+- [x] **I-005** [ABS] 多 Worker 负载均衡 + 队列分发
+- [x] **I-006** [ABS] Worker 故障 → 告警 → 手动恢复
 
 ---
 
