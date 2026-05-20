@@ -77,6 +77,7 @@ def runtime_deploy_step(
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        "EnvironmentFile=-/etc/elastic-agent/storage.env\n"
         f"ExecStart=/usr/bin/python3 -m elastic_agent.worker.runtime --config /etc/elastic-agent/runtime.yaml\n"
         "Restart=always\n"
         "RestartSec=5\n"

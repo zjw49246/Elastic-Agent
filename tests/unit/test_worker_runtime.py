@@ -441,3 +441,65 @@ class TestMessageInput:
 
         error_msgs = [json.loads(m) for m in sent_messages if '"no_process"' in m]
         assert len(error_msgs) == 1
+
+
+class TestSyncMappingStorageBackend:
+    @pytest.mark.asyncio
+    async def test_register_sync_mapping_uses_env_storage_type(self, runtime, monkeypatch):
+        """Worker Runtime creates OSSBackend when STORAGE_TYPE=oss is set."""
+        from elastic_agent.core.protocols.messages import RegisterSyncMappingMessage
+        from elastic_agent.worker.file_sync import OSSBackend
+
+        monkeypatch.setenv("STORAGE_TYPE", "oss")
+        monkeypatch.setenv("OSS_BUCKET", "test-bucket")
+        monkeypatch.setenv("OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+        monkeypatch.setenv("OSS_ACCESS_KEY_ID", "ak")
+        monkeypatch.setenv("OSS_ACCESS_KEY_SECRET", "sk")
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = RegisterSyncMappingMessage(
+            task_id="t1",
+            book_slug="book-1",
+            oss_prefix="tasks/t1",
+            watch_paths=["/tmp/nonexistent"],
+            session_path_hash="abc",
+        )
+        await runtime._handle_register_sync_mapping(msg)
+
+        assert runtime._file_sync_manager is not None
+        assert isinstance(runtime._file_sync_manager._storage, OSSBackend)
+        await runtime._file_sync_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_register_sync_mapping_defaults_to_local(self, runtime, monkeypatch):
+        """Worker Runtime falls back to LocalBackend when STORAGE_TYPE is not set."""
+        from elastic_agent.core.protocols.messages import RegisterSyncMappingMessage
+        from elastic_agent.worker.file_sync import LocalBackend
+
+        monkeypatch.delenv("STORAGE_TYPE", raising=False)
+
+        sent_messages: list[str] = []
+
+        async def mock_send_event(msg):
+            sent_messages.append(msg.model_dump_json())
+
+        runtime._send_event = mock_send_event
+
+        msg = RegisterSyncMappingMessage(
+            task_id="t2",
+            book_slug="book-2",
+            oss_prefix="tasks/t2",
+            watch_paths=["/tmp/nonexistent"],
+            session_path_hash="def",
+        )
+        await runtime._handle_register_sync_mapping(msg)
+
+        assert runtime._file_sync_manager is not None
+        assert isinstance(runtime._file_sync_manager._storage, LocalBackend)
+        await runtime._file_sync_manager.stop()

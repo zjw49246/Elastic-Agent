@@ -69,6 +69,14 @@ class TestRuntimeDeployStep:
         )
         assert "9090" in step.command
 
+    def test_environment_file_for_storage_env(self) -> None:
+        step = runtime_deploy_step(
+            manager_url="ws://10.0.0.1:8000/ws/runtime",
+            auth_token="token",
+            worker_id="w1",
+        )
+        assert "EnvironmentFile=-/etc/elastic-agent/storage.env" in step.command
+
 
 class TestHarnessCodeStep:
     def test_with_repo(self) -> None:

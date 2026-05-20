@@ -316,8 +316,14 @@ class LocalBackend(StorageBackend):
         return None
 
 
-def create_storage_backend(storage_type: str = "local", **kwargs) -> StorageBackend:
-    """Factory for storage backends. Reads credentials from env if not provided."""
+def create_storage_backend(storage_type: str | None = None, **kwargs) -> StorageBackend:
+    """Factory for storage backends.
+
+    Reads STORAGE_TYPE from env when storage_type is not explicitly provided
+    (set by cloud_storage_credentials_step during Bootstrap). Falls back to "local".
+    """
+    if storage_type is None:
+        storage_type = os.environ.get("STORAGE_TYPE", "local")
     if storage_type == "oss":
         return OSSBackend(
             bucket_name=kwargs.get("bucket_name", os.environ.get("OSS_BUCKET", "")),

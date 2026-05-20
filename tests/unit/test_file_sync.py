@@ -206,6 +206,10 @@ class TestCreateStorageBackend:
         backend = create_storage_backend("local", base_dir="/tmp/test-sync")
         assert isinstance(backend, LocalBackend)
 
+    def test_no_args_defaults_to_local(self):
+        backend = create_storage_backend()
+        assert isinstance(backend, LocalBackend)
+
     def test_oss_backend(self):
         from elastic_agent.worker.file_sync import OSSBackend
         backend = create_storage_backend(
@@ -221,6 +225,33 @@ class TestCreateStorageBackend:
         from elastic_agent.worker.file_sync import S3Backend
         backend = create_storage_backend("s3", bucket_name="test-bucket", region="us-east-1")
         assert isinstance(backend, S3Backend)
+
+    def test_reads_storage_type_from_env_oss(self, monkeypatch):
+        from elastic_agent.worker.file_sync import OSSBackend
+        monkeypatch.setenv("STORAGE_TYPE", "oss")
+        monkeypatch.setenv("OSS_BUCKET", "my-bucket")
+        monkeypatch.setenv("OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+        monkeypatch.setenv("OSS_ACCESS_KEY_ID", "ak")
+        monkeypatch.setenv("OSS_ACCESS_KEY_SECRET", "sk")
+        backend = create_storage_backend()
+        assert isinstance(backend, OSSBackend)
+
+    def test_reads_storage_type_from_env_s3(self, monkeypatch):
+        from elastic_agent.worker.file_sync import S3Backend
+        monkeypatch.setenv("STORAGE_TYPE", "s3")
+        monkeypatch.setenv("S3_BUCKET", "my-bucket")
+        backend = create_storage_backend()
+        assert isinstance(backend, S3Backend)
+
+    def test_explicit_type_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("STORAGE_TYPE", "s3")
+        backend = create_storage_backend("local", base_dir="/tmp/test")
+        assert isinstance(backend, LocalBackend)
+
+    def test_env_fallback_to_local_when_unset(self, monkeypatch):
+        monkeypatch.delenv("STORAGE_TYPE", raising=False)
+        backend = create_storage_backend()
+        assert isinstance(backend, LocalBackend)
 
 
 # ---------------------------------------------------------------------------
