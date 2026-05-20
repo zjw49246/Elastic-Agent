@@ -677,133 +677,168 @@ ABS_TEST_LEVEL=6 ABE_WEBHOOK_URL=https://test.audiobook.example.com/api/elastic-
 
 ---
 
-## 9. 人工验收清单
+## 9. 手动功能验收
 
-> 以下是自动化测试**无法覆盖**、必须由人来判断的验收项。
-> 每个模块独立验收通过后，再拼接做全链路验收。
+> 各模块负责人在自己的开发环境中，**用 Mock 依赖**跑通核心功能链路，亲眼确认行为正确。
+> 每个模块独立验收通过后，再拼接做联合验收。
 
-### 9.1 EA 框架人工验收
+### 9.1 EA 框架负责人验收
 
-前提：L4 自动化测试全部通过。
+环境：`EA_TEST_LEVEL=1`（DryRunProvider + MockWorker，零云成本）
 
-**云资源清理确认**
+**核心链路 1：创建 Worker → Bootstrap → 就绪**
 
-自动化测试会创建和销毁实例，但"真的没有遗漏"只能人去云控制台看。
+```bash
+# 启动 Manager（DryRun 模式）
+EA_PROVIDER=dryrun uvicorn elastic_agent.manager:app
+```
 
-- [ ] 登录阿里云 ECS 控制台，筛选标签 `ManagedBy=elastic-agent`，确认 0 个实例残留
-- [ ] 登录 AWS EC2 控制台，同样确认 0 个残留
-- [ ] 检查 EIP（弹性 IP）没有未释放的孤儿 EIP 在计费
+- [ ] 调用 `POST /api/nodes/scale-out?count=1` → 返回 instance_id
+- [ ] 启动一个 MockWorker 连接 Manager → Manager 日志显示 `worker_connected`
+- [ ] MockWorker 发送 AUTH 消息 → Manager 日志显示 `auth_success`
+- [ ] 检查 NodeRegistry JSON 文件 → 节点状态为 READY
 
-**凭证安全检查**
+**核心链路 2：远程执行命令 → 日志回传**
 
-自动化测试验证凭证能用，但不验证凭证是否泄露。
+- [ ] 调用 Manager API 发送 EXECUTE 命令到 MockWorker
+- [ ] MockWorker 返回预录 NDJSON LOG 事件 → Manager EventBus 收到
+- [ ] 检查轨迹缓冲 → 能按 task_id 查询到 LOG 事件
+- [ ] MockWorker 发送 PROCESS_EXIT → Manager 更新 TaskRegistry 状态
 
-- [ ] `git log --all -p | grep -i "sk-ant\|refreshToken\|accessToken\|credentials"` — 确认 token 未被提交到 git 历史
-- [ ] 检查 Manager 的操作日志（operations.log）中不包含 accessToken 明文
-- [ ] 检查 Worker 的 NDJSON 日志中不包含 `.credentials.json` 的内容
-- [ ] 确认 External API 的 traces 端点不泄露凭证信息（用浏览器连 WS 看实际输出）
+**核心链路 3：文件同步通知**
 
-**网络隔离确认**
+- [ ] MockWorker 发送 FILE_SYNCED 事件 → Manager EventBus 收到
+- [ ] WebhookEmitter 向测试 URL 发送 Webhook → 检查 HMAC 签名正确
+- [ ] 模拟 Webhook 目标返回 503 → 确认重试触发（查看 operations.log）
 
-自动化测试在 VPC 内部运行，但 VPC 配置是否正确需要人确认。
+**核心链路 4：TaskRegistry + TaskScheduler + TaskRouter**
 
-- [ ] 从公网尝试连接 Worker 的 8080 端口 — 应超时（Worker 不开入站）
-- [ ] 从公网尝试连接 Manager 的 WS 端点 — 确认是否符合预期（如果 Manager 在公网则应有 API Key 认证）
-- [ ] 检查安全组规则正确（没有人手动加了 0.0.0.0/0 的入站规则）
+- [ ] 注册一个 task 到 TaskRegistry → 确认 JSON 持久化文件更新
+- [ ] 调用 TaskScheduler 查找有容量的 Worker → 返回 MockWorker 的 ID
+- [ ] 通过 TaskRouter 发送 follow-up 命令 → MockWorker 收到 EXECUTE
+- [ ] 杀掉 Manager 进程 → 重启 → TaskRegistry 从 JSON 恢复 → 数据一致
 
-**操作日志可读性**
+**核心链路 5：凭证管理（MockOAuthServer）**
 
-operations.log 的结构化日志是给运维看的。自动化测试验证格式正确，但"人能不能看懂"只有人知道。
+- [ ] 启动 MockOAuthServer（模拟 171mail + Anthropic API）
+- [ ] 触发 CREDENTIAL_LOGIN → MockOAuthServer 收到请求 → 返回 mock token
+- [ ] Worker 上报 QUOTA_STATUS（模拟 85%）→ Manager 发出 QUOTA_WARNING
+- [ ] 模拟额度 95% → 触发自动轮换 → 确认新账号被分配
 
-- [ ] 读 10 条 bootstrap 日志，能否快速判断每步花了多久、哪步失败了
-- [ ] 读凭证轮换日志，能否理解"为什么换了号"、"换到了哪个号"
-- [ ] 读对账日志，能否理解"发现了几个孤儿"、"做了什么处理"
+### 9.2 ABS 负责人验收
 
-### 9.2 ABS Agent Service 人工验收
+环境：`pip install elastic-agent` 后，用框架的 `create_test_manager(worker_count=1)` + MockClaudeOutput
 
-前提：L3 自动化测试全部通过（真实 Claude Code 跑完一本短书）。
+**核心链路 1：提交做书 → MockWorker 执行 → 完成**
 
-**做书产物质量**
+```bash
+# 启动 ABS（框架用 DryRun + MockWorker）
+ABS_TEST_MODE=mock uvicorn audiobook_agent_service.main:app
+```
 
-自动化测试验证"文件存在且格式正确"，但"讲稿内容是否合理"只有人能判断。
+- [ ] `POST /api/tasks/produce` 提交一本书 → 返回 `status: queued`
+- [ ] 确认 BookQueue 入队 → TaskScheduler 选中 MockWorker → EXECUTE 发出
+- [ ] MockWorker 返回 MockClaudeOutput（预录 10 Phase NDJSON）→ 确认 LOG 事件到达 Manager
+- [ ] PROCESS_EXIT → 确认 session_id 被提取并写入 TaskRegistry
+- [ ] 确认 Webhook 按顺序发出：queued → started → phase.changed(×N) → completed
 
-- [ ] 阅读 `delivery/audiobook_manuscript.md`，判断：讲稿是否完整、是否有明显的逻辑断层、压缩比是否在目标范围
-- [ ] 如果有合规处理（Phase 8），对比 `manuscript_final.md` 和 `manuscript_compliant.md`，确认合规修改合理
-- [ ] 检查 `state.json` 中的 `phases_completed` 是否为 `[0,1,2,...,9]`（无跳过）
+**核心链路 2：聊天轮询（chat/live）**
 
-**`--resume` 修改质量**
+- [ ] 做书进行中，调用 `GET /api/tasks/{id}/chat/live?offset=0` → 返回 NDJSON 行
+- [ ] 再次调用（传上次的 next_offset）→ 返回新行，不重复
 
-自动化测试验证"--resume 能启动且返回结果"，但"修改是否真的改对了"只有人能判断。
+**核心链路 3：修改请求 → --resume**
 
-- [ ] 对已完成的书发送一个明确的修改请求（如"把第一段改成问句开头"），检查修改后的讲稿该段确实变了
-- [ ] 对已完成的书发送一个模糊的修改请求（如"整体再活泼一点"），检查 Claude 是否做了合理的全局调整而不是无意义改动
-- [ ] 做完修改后，重新发送另一个修改请求 — 确认第二次修改能基于第一次修改后的版本进行（session 上下文连续）
+- [ ] 做书完成后，`POST /api/tasks/{id}/chat` 发送修改请求 → 返回 `edit_run_id`
+- [ ] 确认 TaskRouter 向 MockWorker 发送了带 `--resume {session_id}` 的 EXECUTE
+- [ ] MockWorker 返回修改的 NDJSON → 确认 edit.completed Webhook 发出
+- [ ] 再次发送修改 → 确认 session_id 更新（第二次用新 session）
 
-**Webhook 到达时机**
+**核心链路 4：同一任务并发修改互斥**
 
-自动化测试验证"Webhook 最终到达"，但"是否及时到达"需要人感受。
+- [ ] 第一个修改正在进行中，再发一个 → 返回 409 "modification already in progress"
 
-- [ ] 生产过程中观察 phase.changed 事件 — 是否在 Phase 实际切换后几秒内收到（不是几分钟后才收到）
-- [ ] 生产完成后 production.completed 事件 — 从 Claude Code 进程退出到 Webhook 到达的延迟是否 < 10 秒
+**核心链路 5：Phase 检测 + Webhook**
 
-**额度耗尽时的行为**
+- [ ] MockWorker 写出 state.json（phase=4）→ FILE_SYNCED 事件到达
+- [ ] ABS 读取 state.json → 检测到 phase 变化 → Webhook 发出 `task.phase.changed {phase: "phase_04_draft", progress_pct: 40}`
 
-自动化测试可以 Mock 额度耗尽，但用真实账号打满额度的行为只能人来验证。
+**核心链路 6：重试 from Phase**
 
-- [ ] 连续跑 2-3 本书直到 5h 额度接近 85% — 确认 QUOTA_WARNING 事件正确发出
-- [ ] 继续跑到触发自动切号 — 确认新账号能正常工作、正在运行的任务不被中断
-- [ ] 等待旧账号 5h 窗口到期 — 确认自动恢复为 available
+- [ ] `POST /api/tasks/{id}/retry {from_phase: 3}` → 返回 `status: queued`
+- [ ] 确认 MockWorker 收到的命令是 `/continue-book`（不是 `/audiobook`）
 
-### 9.3 ABE 做书前后端人工验收
+### 9.3 ABE 负责人验收
 
-前提：L1 自动化测试全部通过。
+环境：MockAgentService + MockOSSReader + WebhookSimulator，不需要启动真实 ABS
 
-**前端 UI 交互**
+**核心链路 1：创建 Elastic 任务**
 
-自动化测试验证"API 返回正确"，但页面是否好用只有人知道。
+```bash
+# 启动 MockAgentService（模拟 ABS 全部 API）
+python -m tests.mocks.agent_service
+```
 
-- [ ] 创建任务弹窗：选择 "Elastic-Agent" 引擎后，legacy 的 Agent 配置/Prompt 版本控件是否正确隐藏
-- [ ] 创建任务弹窗：切回 "现有 AI Service" 后，Elastic 的 persona/target_pct 控件是否正确隐藏
-- [ ] 任务详情页（Elastic 任务）：Phase 进度条是否随 Webhook 事件实时更新
-- [ ] 任务详情页（Legacy 任务）：确认原有的 Agent 输出/步骤重跑功能不受影响
-- [ ] 任务列表：按跑书方式筛选后，两种引擎的任务不混淆
+- [ ] 在 ABE 后端调用 `POST /api/tasks/` 传 `script_generation_backend=elastic_agent`
+- [ ] 确认创建了 `elastic_book_runs` 记录（status=pending）
+- [ ] 确认调用了 MockAgentService 的 `/api/tasks/produce` 端点
+- [ ] 确认 `elastic_book_runs` 更新为 status=queued
 
-**AgentOutput 兼容性**
+**核心链路 2：Webhook 接收 → 状态更新**
 
-这是最关键的验收——Elastic 产物回灌后，下游的 TTS/BGM/审核是否正常。
+- [ ] WebhookSimulator 发送 `task.production.started` → 检查 `elastic_book_runs.status` 更新
+- [ ] 发送 `task.phase.changed` (phase_04) → 检查 `current_step` 更新为 `elastic_phase_04_draft`
+- [ ] 发送 `task.production.completed` → 检查:
+  - `elastic_book_runs.status = completed`
+  - `Task.status = REVIEWING`
+  - `Task.script_status = PENDING_REVIEW`
+- [ ] 检查 `AgentOutput(agent_name="final_proofreading")` 被写入（内容来自 MockOSSReader）
 
-- [ ] Elastic 做书完成 → WebhookService 回灌 `final_proofreading` AgentOutput → 打开任务详情 → 讲稿内容显示正确
-- [ ] 点击"完成讲稿审核" → 进入音频生成 → TTS 能正常读取讲稿文本并生成音频
-- [ ] 音频生成完成后 → BGM 推荐功能正常
-- [ ] 审核流程（初审/终审）正常走通
+**核心链路 3：Webhook 验签 + 幂等**
 
-**修改后的回灌更新**
+- [ ] WebhookSimulator 发送签名错误的事件 → ABE 返回 401
+- [ ] 发送同一 event_id 两次 → 第二次返回 200 但不重复写入数据库
+- [ ] 发送 sequence=5 后再发 sequence=3 → 乱序事件被忽略
 
-- [ ] Elastic 修改完成 → `final_proofreading` AgentOutput 被覆盖更新（不是新增一条）
-- [ ] 更新后：TTS 如果已生成 → 应该提示需要重新生成（因为讲稿变了）
+**核心链路 4：OSS 文件读取**
 
-### 9.4 拼接后的全链路人工验收
+- [ ] MockOSSReader 预置 manifest + manuscript → 调用 `GET /api/tasks/{id}/script-production/files` → 返回文件列表
+- [ ] 调用 `GET /api/tasks/{id}/script-production/manuscript` → 返回最终稿内容
+- [ ] 确认优先级：delivery > compliant > final
 
-前提：三个模块各自验收通过，拼接 3 的自动化测试通过。
+**核心链路 5：聊天轮询代理**
 
-**完整做书流程（黄金路径）**
+- [ ] 调用 `GET /api/tasks/{id}/script-production/chat/live?offset=0` → ABE 后端读 MockOSSReader 的 logs/production.ndjson → 返回增量行
 
-- [ ] 在 ABE 前端选一本真实的书（非虚构，10 万字以上），选择 Elastic-Agent 引擎，提交
-- [ ] 观察前端实时聊天流 — 能看到 Claude 的思考过程和工具调用
-- [ ] 观察 Phase 进度条 — 从 0% 跑到 100%
-- [ ] 做书完成（约 1-2 小时）— 前端显示"待审核"
-- [ ] 阅读最终讲稿 — 质量至少与 legacy Pipeline 产出相当
-- [ ] 完成审核 → TTS → 试听音频 → BGM → 全流程走通
+**核心链路 6：前端三栏布局**
 
-**修改流程**
+- [ ] 打开 Elastic 任务详情 → 确认三栏布局（左 Chat / 中文件目录 / 右文件预览）
+- [ ] 中栏顶部显示 "Phase N · 阶段名称"
+- [ ] 点击中栏文件名 → 右栏切换预览内容
+- [ ] 底部输入框显示 "当前正在生产，请生产完成后发送"（disabled 状态）
+- [ ] legacy 任务详情 → 确认原有 UI 不受影响
 
-- [ ] 在已完成的 Elastic 任务上发送修改请求
-- [ ] 观察修改过程的聊天流
-- [ ] 修改完成后查看讲稿变化
-- [ ] 确认讲稿审核状态正确更新
+### 9.4 联合验收（模块拼接后）
 
-**故障场景（在测试环境中手动触发）**
+前提：9.1 / 9.2 / 9.3 各自通过。逐步替换 Mock 为真实服务。
 
-- [ ] 做书进行到一半时，手动 kill Worker 上的 Claude Code 进程 — ABS 应检测到 PROCESS_EXIT(非零) 并发出 task.production.failed Webhook — ABE 应显示失败状态
-- [ ] 使用"续跑"功能恢复失败的任务 — 从中断的 Phase 继续而非从头开始
-- [ ] 做书进行中 stop Worker Runtime 进程 — Manager 应在 90s 内检测到 unhealthy — 发出 worker.unhealthy Webhook
+**拼接 1：EA + ABS（DryRun 云 + MockWorker）**
+
+- [ ] ABS 使用真实 EA 框架（DryRunProvider + MockWorker）→ produce 端到端走通
+- [ ] Webhook 到达 WebhookCatcher → 事件序列正确
+
+**拼接 2：EA + ABS + 真实 Claude Code（DryRun 云 + 本地 Worker）**
+
+- [ ] 本地启动真实 Worker Runtime → 连接 Manager
+- [ ] 提交一本短书（几千字）→ 真实 Claude Code 执行 /audiobook
+- [ ] 确认 NDJSON 日志文件生成 → FileSyncManager 同步到 MockOSS
+- [ ] 确认 session_id 提取成功 → --resume 可用
+
+**拼接 3：全链路（EA + ABS + ABE，DryRun 云）**
+
+- [ ] ABE 真实后端 → ABS 真实服务（DryRun + MockWorker）
+- [ ] 在 ABE 前端创建 Elastic 任务 → 做书 → Webhook → 回灌 → 审核页面显示
+
+**拼接 4：全真实（阿里云 ECS + Claude Code + OSS + ABE 测试环境）**
+
+- [ ] 端到端：ABE 前端选书 → ABS 调度到真实 ECS Worker → Claude Code 做书 → OSS 同步 → Webhook → ABE 回灌 → 审核 → TTS
