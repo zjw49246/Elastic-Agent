@@ -1,0 +1,83 @@
+"""Tests for Web UI (T-029)."""
+
+from __future__ import annotations
+
+import os
+from unittest.mock import patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from elastic_agent.testing import create_test_manager
+
+
+@pytest.fixture
+async def ui_client():
+    result = create_test_manager()
+    from elastic_agent.api.app import create_app
+    app = create_app(result.manager)
+    with patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            yield client, result
+
+
+class TestDashboardEndpoint:
+    @pytest.mark.asyncio
+    async def test_root_returns_html(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "Elastic-Agent Dashboard" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_alias(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/dashboard")
+        assert resp.status_code == 200
+        assert "Elastic-Agent Dashboard" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_html_contains_key_elements(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/")
+        html = resp.text
+        assert "Scale Out" in html
+        assert "nodeGrid" in html
+        assert "statTotal" in html
+        assert "refreshNodes" in html
+        assert "drainNode" in html
+        assert "removeNode" in html
+        assert "scaleInNode" in html
+
+    @pytest.mark.asyncio
+    async def test_no_auth_required_for_ui(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/")
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_html_contains_api_calls(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/")
+        html = resp.text
+        assert "'/api'" in html or '"/api"' in html
+        assert "/nodes" in html
+        assert "/scale-out" in html
+        assert "/scale-in" in html
+
+
+class TestDashboardIntegration:
+    @pytest.mark.asyncio
+    async def test_ui_and_api_coexist(self, ui_client):
+        client, _ = ui_client
+        ui_resp = await client.get("/")
+        assert ui_resp.status_code == 200
+        api_resp = await client.get(
+            "/api/nodes",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert api_resp.status_code == 200
