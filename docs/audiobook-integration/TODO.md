@@ -194,19 +194,19 @@
 
 ### 测试 — 单元测试
 
-- [ ] **A-100** [ABS] BookQueue：入队/出队/优先级排序/持久化/空队列
+- [x] **A-100** [ABS] BookQueue：入队/出队/优先级排序/持久化/空队列
 - ~~**A-101**~~ 已移至框架: EA T-138 (TaskRegistry 测试)
 - ~~**A-102**~~ 已移至框架: EA T-139 (TaskScheduler 测试)
 - ~~**A-103**~~ 已移至框架: EA T-141 (WebhookEmitter 测试)
-- [ ] **A-104** [ABS] Session ID 多源提取：stream-json parsed / 目录扫描 / state.json 回退
-- [ ] **A-105** [ABS] 并发修改互斥：同一 task 二次修改返回 409
+- [x] **A-104** [ABS] Session ID 多源提取：stream-json parsed / 目录扫描 / state.json 回退
+- [x] **A-105** [ABS] 并发修改互斥：同一 task 二次修改返回 409
 - ~~**A-106**~~ 已移至框架: EA T-140 (TaskRouter 测试)
-- [ ] **A-107** [ABS] 进度超时检测：正常任务不告警 / 超时任务标记 stalled / 自动 SIGINT
-- [ ] **A-108** [ABS] Retry/Continue 编排：Phase 清理逻辑 / OSS workspace 恢复 / state.json 回退
-- [ ] **A-109** [ABS] 凭证隔离：CLAUDE_CONFIG_DIR 按 slot 分配 / 修改流程重注册 sync mapping
-- [ ] **A-114** [ABS] 配置加载：config.yaml 解析 + 环境变量覆盖 + 必填校验
-- [ ] **A-115** [ABS] Phase 检测：state.json phase 数字 → Webhook phase 字符串映射
-- [ ] **A-116** [ABS] Worker 目录清理：磁盘阈值触发 / 不活跃天数归档 / 手动清理 API
+- [x] **A-107** [ABS] 进度超时检测：正常任务不告警 / 超时任务标记 stalled / 自动 SIGINT
+- [x] **A-108** [ABS] Retry/Continue 编排：Phase 清理逻辑 / OSS workspace 恢复 / state.json 回退
+- [x] **A-109** [ABS] 凭证隔离：CLAUDE_CONFIG_DIR 按 slot 分配 / 修改流程重注册 sync mapping
+- [x] **A-114** [ABS] 配置加载：config.yaml 解析 + 环境变量覆盖 + 必填校验
+- [x] **A-115** [ABS] Phase 检测：state.json phase 数字 → Webhook phase 字符串映射
+- [x] **A-116** [ABS] Worker 目录清理：磁盘阈值触发 / 不活跃天数归档 / 手动清理 API
 
 ### 测试 — 集成测试
 
