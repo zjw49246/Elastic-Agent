@@ -80,7 +80,7 @@
 - [x] **T-024** [EA] Worker 多层健康检查（L1 VM + L2 Runtime + L3 Agent 进程）  `01 §3.5`
 - [x] **T-025** [EA] 优雅缩容 Drain  `01 §3.5`
 - [x] **T-028** [EA] 手动扩缩容 API（scale_out / scale_in / remove_node）  `01 §6`
-- [ ] **T-029** [EA] 基础 Web UI（节点列表、状态卡片、手动操作）  `01 §6`
+- [x] **T-029** [EA] 基础 Web UI（节点列表、状态卡片、手动操作）  `01 §6`
 
 ### 测试 — 单元测试
 
@@ -137,10 +137,10 @@
 - [x] **T-202** [EA] MockOAuthServer 实现（模拟 171mail + Anthropic OAuth + Usage API）  `06 §2.1`
 - [x] **T-203** [EA] MockOSS 实现（本地文件系统模拟 OSS PutObject/GetObject）  `06 §2.1`
 - [x] **T-204** [EA] create_test_manager() 工厂函数（一键创建带全部 Mock 的测试 Manager）  `06 §2.1`
-- [ ] **T-205** [EA] LocalWorkerProcess（本地启动真实 Worker Runtime 进程用于 L3+ 测试）  `06 §5.2`
-- [ ] **T-206** [EA] 测试级别框架（conftest.py: 环境变量驱动的 provider/worker/oss fixture 切换）  `06 §5.2`
-- [ ] **T-207** [EA] pytest marker 注册（level0 ~ level6，CI 按凭证可用性选择执行范围）  `06 §8`
-- [ ] **T-208** [EA] `elastic_agent.testing` 包导出（__init__.py 统一导出全部 Mock 工具）  `06 §2.3`
+- [x] **T-205** [EA] LocalWorkerProcess（本地启动真实 Worker Runtime 进程用于 L3+ 测试）  `06 §5.2`
+- [x] **T-206** [EA] 测试级别框架（conftest.py: 环境变量驱动的 provider/worker/oss fixture 切换）  `06 §5.2`
+- [x] **T-207** [EA] pytest marker 注册（level0 ~ level6，CI 按凭证可用性选择执行范围）  `06 §8`
+- [x] **T-208** [EA] `elastic_agent.testing` 包导出（__init__.py 统一导出全部 Mock 工具）  `06 §2.3`
 
 ---
 
