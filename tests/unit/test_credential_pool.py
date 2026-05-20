@@ -487,3 +487,272 @@ async def test_allocate_disabled_account(
 
     acct = await pool.allocate("worker-1", "production", "high_quota")
     assert acct is None
+
+
+# ===========================================================================
+# T-132: CredentialPool extended — accounts.json loading, grouping,
+#        allocation, reclaim, pool_status persistence
+# ===========================================================================
+
+
+class TestT132AccountsJsonLoading:
+    """T-132: accounts.json loading and group handling."""
+
+    async def test_load_multi_group_accounts(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts = (
+            _make_accounts(2, "high_quota")
+            + [
+                {"id": "std-1", "email": "s1@test.com", "email_token": "st1", "group": "standard", "enabled": True},
+                {"id": "std-2", "email": "s2@test.com", "email_token": "st2", "group": "standard", "enabled": True},
+                {"id": "low-1", "email": "l1@test.com", "email_token": "lt1", "group": "low_priority", "enabled": True},
+            ]
+        )
+        groups = {
+            "high_quota": {"description": "Primary"},
+            "standard": {"description": "Secondary"},
+            "low_priority": {"description": "Overflow"},
+        }
+        _write_accounts(accounts_path, accounts, groups)
+        pool = CredentialPool(config)
+        await pool.load()
+        summary = pool.pool_summary()
+        assert summary["total"] == 5
+        assert summary["groups"]["high_quota"]["total"] == 2
+        assert summary["groups"]["standard"]["total"] == 2
+        assert summary["groups"]["low_priority"]["total"] == 1
+
+    async def test_load_corrupted_accounts_json(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts_path.write_text("{ invalid json !", encoding="utf-8")
+        pool = CredentialPool(config)
+        await pool.load()
+        summary = pool.pool_summary()
+        assert summary["total"] == 0
+
+    async def test_load_missing_accounts_json(self, config: CredentialConfig) -> None:
+        pool = CredentialPool(config)
+        await pool.load()
+        summary = pool.pool_summary()
+        assert summary["total"] == 0
+
+    async def test_load_empty_accounts_list(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, [], {"standard": {"description": "Empty"}})
+        pool = CredentialPool(config)
+        await pool.load()
+        assert pool.pool_summary()["total"] == 0
+
+    async def test_load_accounts_disabled_mixed(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts = [
+            {"id": "e-1", "email": "e1@t.com", "email_token": "et1", "group": "standard", "enabled": True},
+            {"id": "d-1", "email": "d1@t.com", "email_token": "dt1", "group": "standard", "enabled": False},
+            {"id": "e-2", "email": "e2@t.com", "email_token": "et2", "group": "standard", "enabled": True},
+        ]
+        _write_accounts(accounts_path, accounts)
+        pool = CredentialPool(config)
+        await pool.load()
+        available = pool.list_available("standard")
+        assert len(available) == 2
+        acct = await pool.allocate("w1", "production", "standard")
+        assert acct is not None
+        assert acct.id != "d-1"
+
+    async def test_load_accounts_without_groups_key(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        data = {"accounts": _make_accounts(2, "standard")}
+        accounts_path.write_text(json.dumps(data), encoding="utf-8")
+        pool = CredentialPool(config)
+        await pool.load()
+        assert pool.pool_summary()["total"] == 2
+
+
+class TestT132Grouping:
+    """T-132: Group-based allocation and queries."""
+
+    async def test_allocate_from_specific_group_only(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts = _make_accounts(2, "high_quota") + [
+            {"id": "std-1", "email": "s@t.com", "email_token": "s", "group": "standard", "enabled": True},
+        ]
+        _write_accounts(accounts_path, accounts)
+        pool = CredentialPool(config)
+        await pool.load()
+        acct = await pool.allocate("w1", "production", "standard")
+        assert acct is not None
+        assert acct.id == "std-1"
+        assert acct.group == "standard"
+
+    async def test_group_summary_after_operations(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts = _make_accounts(3, "high_quota") + [
+            {"id": "std-1", "email": "s@t.com", "email_token": "s", "group": "standard", "enabled": True},
+        ]
+        _write_accounts(accounts_path, accounts, {
+            "high_quota": {"description": "HQ"}, "standard": {"description": "STD"},
+        })
+        pool = CredentialPool(config)
+        await pool.load()
+        await pool.allocate("w1", "production", "high_quota")
+        await pool.update_quota("prod-2", 90.0, 50.0)
+        summary = pool.pool_summary()
+        hq = summary["groups"]["high_quota"]
+        assert hq["assigned"] == 1
+        assert hq["exhausted"] == 1
+        assert hq["available"] == 1
+        std = summary["groups"]["standard"]
+        assert std["available"] == 1
+        assert std["assigned"] == 0
+
+    async def test_list_available_across_groups(
+        self, config: CredentialConfig, accounts_path: Path
+    ) -> None:
+        accounts = _make_accounts(2, "high_quota") + [
+            {"id": "std-1", "email": "s@t.com", "email_token": "s", "group": "standard", "enabled": True},
+        ]
+        _write_accounts(accounts_path, accounts)
+        pool = CredentialPool(config)
+        await pool.load()
+        assert len(pool.list_available()) == 3
+        assert len(pool.list_available("high_quota")) == 2
+
+
+class TestT132AllocationReclaim:
+    """T-132: Allocation and reclaim edge cases."""
+
+    async def test_release_and_reallocate_to_different_worker(
+        self, pool: CredentialPool
+    ) -> None:
+        await pool.load()
+        acct = await pool.allocate("worker-1", "production", "high_quota")
+        assert acct is not None
+        await pool.release(acct.id)
+        acct2 = await pool.allocate("worker-2", "edit", "high_quota")
+        assert acct2 is not None
+        status = pool.get_status(acct2.id)
+        assert status.assigned_to == "worker-2"
+        assert status.slot_type == "edit"
+
+    async def test_exhaust_then_release_one_and_reallocate(
+        self, pool: CredentialPool
+    ) -> None:
+        await pool.load()
+        ids = []
+        for i in range(3):
+            acct = await pool.allocate(f"w-{i}", "production", "high_quota")
+            assert acct is not None
+            ids.append(acct.id)
+        assert await pool.allocate("w-new", "production", "high_quota") is None
+        await pool.release(ids[1])
+        realloc = await pool.allocate("w-new", "production", "high_quota")
+        assert realloc is not None
+        assert realloc.id == ids[1]
+
+    async def test_release_worker_then_reallocate(
+        self, pool: CredentialPool
+    ) -> None:
+        await pool.load()
+        a1 = await pool.allocate("w1", "production", "high_quota")
+        a2 = await pool.allocate("w1", "edit", "high_quota")
+        assert a1 is not None and a2 is not None
+        await pool.release_worker("w1")
+        assert len(pool.list_available("high_quota")) == 3
+        new = await pool.allocate("w2", "production", "high_quota")
+        assert new is not None
+
+    async def test_allocate_assigns_last_used(self, pool: CredentialPool) -> None:
+        await pool.load()
+        acct = await pool.allocate("w1", "production", "high_quota")
+        assert acct is not None
+        status = pool.get_status(acct.id)
+        assert status.last_used is not None
+
+
+class TestT132PoolStatusPersistence:
+    """T-132: pool_status.json persistence edge cases."""
+
+    async def test_multiple_save_reload_cycles(
+        self, config: CredentialConfig, accounts_path: Path, status_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, _make_accounts(3, "high_quota"))
+        pool = CredentialPool(config)
+        await pool.load()
+        await pool.allocate("w1", "production", "high_quota")
+        await pool.save_status()
+        await pool.update_quota("prod-2", 70.0, 30.0)
+        await pool.save_status()
+        pool2 = CredentialPool(config)
+        await pool2.load()
+        assert pool2.get_status("prod-1").assigned_to == "w1"
+        assert pool2.get_status("prod-2").five_hour.utilization == 70.0
+
+    async def test_corrupted_pool_status_recovery(
+        self, config: CredentialConfig, accounts_path: Path, status_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, _make_accounts(2, "high_quota"))
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text("{{bad json}}", encoding="utf-8")
+        pool = CredentialPool(config)
+        await pool.load()
+        assert pool.pool_summary()["total"] == 2
+        for i in range(1, 3):
+            s = pool.get_status(f"prod-{i}")
+            assert s is not None
+            assert s.assigned_to is None
+
+    async def test_quota_with_reset_times_persists(
+        self, config: CredentialConfig, accounts_path: Path, status_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, _make_accounts(2, "high_quota"))
+        pool = CredentialPool(config)
+        await pool.load()
+        reset_time = _utcnow() + timedelta(hours=3)
+        await pool.update_quota("prod-1", 75.0, 45.0,
+                                five_hour_resets_at=reset_time,
+                                seven_day_resets_at=_utcnow() + timedelta(days=5))
+        await pool.save_status()
+        pool2 = CredentialPool(config)
+        await pool2.load()
+        s = pool2.get_status("prod-1")
+        assert s.five_hour.utilization == 75.0
+        assert s.seven_day.utilization == 45.0
+        assert s.five_hour.resets_at is not None
+
+    async def test_new_account_added_after_reload(
+        self, config: CredentialConfig, accounts_path: Path, status_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, _make_accounts(2, "high_quota"))
+        pool = CredentialPool(config)
+        await pool.load()
+        await pool.allocate("w1", "production", "high_quota")
+        await pool.save_status()
+        _write_accounts(accounts_path, _make_accounts(3, "high_quota"))
+        pool2 = CredentialPool(config)
+        await pool2.load()
+        assert pool2.get_status("prod-1").assigned_to == "w1"
+        s3 = pool2.get_status("prod-3")
+        assert s3 is not None
+        assert s3.assigned_to is None
+
+    async def test_login_status_persists(
+        self, config: CredentialConfig, accounts_path: Path, status_path: Path
+    ) -> None:
+        _write_accounts(accounts_path, _make_accounts(2, "high_quota"))
+        pool = CredentialPool(config)
+        await pool.load()
+        await pool.update_login_status("prod-1", "logged_in")
+        await pool.update_login_status("prod-2", "failed", error="timeout")
+        await pool.save_status()
+        pool2 = CredentialPool(config)
+        await pool2.load()
+        assert pool2.get_status("prod-1").login_status == "logged_in"
+        assert pool2.get_status("prod-2").login_status == "failed"
+        assert pool2.get_status("prod-2").error == "timeout"

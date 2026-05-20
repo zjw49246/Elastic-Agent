@@ -407,3 +407,213 @@ class TestCooldownRecovery:
             s = tmp_pool.get_status(acct_id)
             assert s.backoff_until is None
             assert s.available
+
+
+# ===========================================================================
+# T-134: Auto-rotation extended — find replacement, wait for task, credential
+#        switch, all accounts exhausted
+# ===========================================================================
+
+
+class TestT134FindReplacement:
+    """T-134: Finding replacement account logic."""
+
+    @pytest.mark.asyncio
+    async def test_replacement_from_same_group(self, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+
+        rotator = CredentialRotator(tmp_pool, binding, event_bus)
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+        new_status = tmp_pool.get_status(result.new_account_id)
+        assert new_status.group == "standard"
+
+    @pytest.mark.asyncio
+    async def test_replacement_prefers_least_used(self, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+
+        await tmp_pool.update_quota("prod-2", 60.0, 30.0)
+        await tmp_pool.update_quota("prod-3", 10.0, 5.0)
+
+        rotator = CredentialRotator(tmp_pool, binding, event_bus)
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+        assert result.new_account_id == "prod-3"
+
+    @pytest.mark.asyncio
+    async def test_replacement_tries_cooldown_before_failing(self, tmp_path, binding, event_bus):
+        accounts_data = {
+            "accounts": [
+                {"id": "a1", "email": "a1@t.com", "email_token": "t1", "group": "standard"},
+                {"id": "a2", "email": "a2@t.com", "email_token": "t2", "group": "standard"},
+            ],
+            "groups": {"standard": {"description": "STD"}},
+        }
+        af = tmp_path / "accounts.json"
+        af.write_text(json.dumps(accounts_data))
+        config = CredentialConfig(
+            accounts_file=str(af),
+            pool_status_file=str(tmp_path / "ps.json"),
+            quota_threshold=0.85,
+        )
+        pool = CredentialPool(config)
+        await pool.load()
+        await pool.allocate("w1", "production", "standard")
+        await binding.bind("a1", "w1")
+        status2 = pool.get_status("a2")
+        status2.backoff_until = datetime.now(timezone.utc) - timedelta(hours=1)
+        status2.available = False
+        status2.five_hour.utilization = 5.0
+
+        rotator = CredentialRotator(pool, binding, event_bus)
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", "a1", "quota_exceeded")
+        assert result.success
+        assert result.new_account_id == "a2"
+
+
+class TestT134WaitForTask:
+    """T-134: Wait for task completion during rotation."""
+
+    @pytest.mark.asyncio
+    async def test_wait_called_with_correct_worker(self, rotator, tmp_pool, binding):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+
+        calls = []
+        rotator.wait_for_task_completion = AsyncMock(
+            side_effect=lambda wid: calls.append(wid)
+        )
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert calls == ["w1"]
+
+    @pytest.mark.asyncio
+    async def test_wait_timeout_does_not_block_rotation(self, rotator, tmp_pool, binding):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+
+        rotator.wait_for_task_completion = AsyncMock(
+            side_effect=asyncio.TimeoutError("timed out")
+        )
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+
+
+class TestT134CredentialSwitch:
+    """T-134: Credential switch updates pool and binding correctly."""
+
+    @pytest.mark.asyncio
+    async def test_old_account_released_and_cooled(self, rotator, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+
+        old = tmp_pool.get_status(a1.id)
+        assert old.assigned_to is None
+        assert old.backoff_until is not None
+        assert not old.available
+
+    @pytest.mark.asyncio
+    async def test_new_account_bound_to_worker(self, rotator, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+        assert binding.is_bound(result.new_account_id)
+        assert binding.get_worker(result.new_account_id) == "w1"
+        assert not binding.is_bound(a1.id)
+
+    @pytest.mark.asyncio
+    async def test_rotation_emits_event(self, rotator, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        events = []
+        event_bus.subscribe("CREDENTIAL_ROTATED", lambda et, wid, data: events.append(data))
+
+        result = await rotator.rotate("w1", a1.id, "quota_exceeded")
+        assert result.success
+        await asyncio.sleep(0.01)
+        assert len(events) >= 1
+        assert events[0]["old_id"] == a1.id
+        assert events[0]["new_id"] == result.new_account_id
+
+
+class TestT134AllAccountsExhausted:
+    """T-134: All accounts exhausted handling."""
+
+    @pytest.mark.asyncio
+    async def test_all_exhausted_emits_event(self, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+
+        for i, aid in enumerate(["prod-1", "prod-2", "prod-3"]):
+            a = await tmp_pool.allocate(f"w{i}", "production", "standard")
+            if a:
+                await binding.bind(a.id, f"w{i}")
+
+        rotator = CredentialRotator(tmp_pool, binding, event_bus)
+        events = []
+        event_bus.subscribe("CREDENTIAL_EXHAUSTED", lambda et, wid, data: events.append(data))
+
+        result = await rotator.rotate("w0", "prod-1", "quota_exceeded")
+        assert not result.success
+        await asyncio.sleep(0.01)
+        assert len(events) >= 1
+        assert events[0]["reason"] == "no_replacement_available"
+
+    @pytest.mark.asyncio
+    async def test_handle_exhausted_event(self, rotator, event_bus):
+        events = []
+        event_bus.subscribe("CREDENTIAL_EXHAUSTED", lambda et, wid, data: events.append(data))
+        await rotator.handle_exhausted("w1", "prod-1", "all_used_up")
+        assert len(events) == 1
+        assert events[0]["account_id"] == "prod-1"
+        assert events[0]["reason"] == "all_used_up"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_rotation_serialized(self, tmp_pool, binding, event_bus):
+        await tmp_pool.load()
+        a1 = await tmp_pool.allocate("w1", "production", "standard")
+        await binding.bind(a1.id, "w1")
+
+        rotator = CredentialRotator(tmp_pool, binding, event_bus)
+        rotator.send_credential = AsyncMock(return_value=True)
+
+        async def slow_wait(wid):
+            await asyncio.sleep(0.05)
+
+        rotator.wait_for_task_completion = slow_wait
+
+        r1, r2 = await asyncio.gather(
+            rotator.rotate("w1", a1.id, "r1"),
+            rotator.rotate("w1", a1.id, "r2"),
+        )
+
+        successes = sum(1 for r in [r1, r2] if r.success)
+        assert successes >= 1

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.registry import NodeRegistry
 from elastic_agent.core.task_registry import TaskRegistry, TaskStatus
-from elastic_agent.manager.connection import WorkerConnectionManager
+
+if TYPE_CHECKING:
+    from elastic_agent.manager.connection import WorkerConnectionManager
 
 logger = logging.getLogger(__name__)
 

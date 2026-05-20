@@ -354,3 +354,202 @@ class TestCooldownLoop:
         assert recovered.backoff_until is None
 
         await monitor.stop()
+
+
+# ===========================================================================
+# T-133: QuotaMonitor extended — threshold detection, QUOTA_WARNING events,
+#        cooldown recovery
+# ===========================================================================
+
+
+def _pool_available(pool, account_id):
+    s = pool.get_status(account_id)
+    return s.available if s else None
+
+
+class TestT133ThresholdDetection:
+    """T-133: Threshold detection edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_exactly_at_threshold_triggers_warning(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        await monitor.start()
+
+        warnings = []
+        event_bus.subscribe("QUOTA_WARNING", lambda et, wid, data: warnings.append(data))
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "prod-1",
+            "five_hour_pct": 85.0,
+            "seven_day_pct": 30.0,
+        })
+
+        assert len(warnings) == 1
+        assert warnings[0]["reason"] == "quota_warning"
+        await monitor.stop()
+
+    @pytest.mark.asyncio
+    async def test_just_below_threshold_no_warning(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        await monitor.start()
+
+        warnings = []
+        event_bus.subscribe("QUOTA_WARNING", lambda et, wid, data: warnings.append(data))
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "prod-1",
+            "five_hour_pct": 84.9,
+            "seven_day_pct": 30.0,
+        })
+
+        assert len(warnings) == 0
+        await monitor.stop()
+
+    @pytest.mark.asyncio
+    async def test_critical_95_triggers_rotation(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        rotation_calls = []
+        monitor.on_rotation_needed = AsyncMock(
+            side_effect=lambda w, a, r: rotation_calls.append((w, a, r))
+        )
+        await monitor.start()
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "prod-1",
+            "five_hour_pct": 95.0,
+            "seven_day_pct": 30.0,
+        })
+
+        assert len(rotation_calls) == 1
+        assert rotation_calls[0][2] == "quota_exceeded"
+        await monitor.stop()
+
+    @pytest.mark.asyncio
+    async def test_multiple_accounts_threshold(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        await monitor.start()
+
+        warnings = []
+        event_bus.subscribe("QUOTA_WARNING", lambda et, wid, data: warnings.append(data))
+
+        for i in range(1, 4):
+            await event_bus.emit("QUOTA_STATUS", f"worker-{i}", {
+                "account_id": f"prod-{i}",
+                "five_hour_pct": 86.0 + i,
+                "seven_day_pct": 30.0,
+            })
+
+        assert len(warnings) == 3
+        acct_ids = {w["account_id"] for w in warnings}
+        assert acct_ids == {"prod-1", "prod-2", "prod-3"}
+        await monitor.stop()
+
+    @pytest.mark.asyncio
+    async def test_unknown_account_no_crash(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        await monitor.start()
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "nonexistent",
+            "five_hour_pct": 50.0,
+            "seven_day_pct": 30.0,
+        })
+        await monitor.stop()
+
+
+class TestT133QuotaWarningPayload:
+    """T-133: QUOTA_WARNING event payload validation."""
+
+    @pytest.mark.asyncio
+    async def test_warning_payload_has_required_fields(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        await monitor.start()
+
+        warnings = []
+        event_bus.subscribe("QUOTA_WARNING", lambda et, wid, data: warnings.append((wid, data)))
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "prod-1",
+            "five_hour_pct": 87.5,
+            "seven_day_pct": 30.0,
+        })
+
+        assert len(warnings) == 1
+        wid, data = warnings[0]
+        assert wid == "worker-1"
+        assert data["account_id"] == "prod-1"
+        assert data["usage_pct"] == 87.5
+        assert data["reason"] in ("quota_warning", "quota_critical")
+        await monitor.stop()
+
+    @pytest.mark.asyncio
+    async def test_critical_warning_emits_before_rotation(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        monitor = QuotaMonitor(tmp_pool, event_bus, config)
+        event_order = []
+
+        async def on_rotation(w, a, r):
+            event_order.append("rotation")
+
+        async def on_warning(et, wid, data):
+            event_order.append("warning")
+
+        monitor.on_rotation_needed = on_rotation
+        event_bus.subscribe("QUOTA_WARNING", on_warning)
+        await monitor.start()
+
+        await event_bus.emit("QUOTA_STATUS", "worker-1", {
+            "account_id": "prod-1",
+            "five_hour_pct": 96.0,
+            "seven_day_pct": 30.0,
+        })
+
+        assert event_order == ["warning", "rotation"]
+        await monitor.stop()
+
+
+class TestT133CooldownRecoveryExtended:
+    """T-133: Cooldown recovery integration."""
+
+    @pytest.mark.asyncio
+    async def test_cooldown_recovery_makes_account_allocatable(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+
+        acct = await tmp_pool.allocate("w1", "production", "standard")
+        await tmp_pool.release(acct.id)
+        await tmp_pool.mark_cooldown(acct.id)
+        assert _pool_available(tmp_pool, acct.id) is False
+
+        status = tmp_pool.get_status(acct.id)
+        status.backoff_until = datetime.now(timezone.utc) - timedelta(hours=1)
+        status.five_hour.utilization = 0.0
+
+        await tmp_pool.check_cooldown_recovery()
+
+        assert _pool_available(tmp_pool, acct.id) is True
+        re_alloc = await tmp_pool.allocate("w2", "production", "standard")
+        assert re_alloc is not None
+        assert re_alloc.id == acct.id
+
+    @pytest.mark.asyncio
+    async def test_cooldown_not_recovered_while_quota_high(self, tmp_pool, event_bus, config):
+        await tmp_pool.load()
+        acct = await tmp_pool.allocate("w1", "production", "standard")
+        await tmp_pool.release(acct.id)
+        await tmp_pool.update_quota(acct.id, 90.0, 50.0)
+        await tmp_pool.mark_cooldown(acct.id)
+
+        status = tmp_pool.get_status(acct.id)
+        status.backoff_until = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        await tmp_pool.check_cooldown_recovery()
+
+        status = tmp_pool.get_status(acct.id)
+        assert status.backoff_until is None
+        assert status.available is False

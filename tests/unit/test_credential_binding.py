@@ -148,3 +148,139 @@ class TestCredentialBinding:
     async def test_unbind_worker_nonexistent(self, binding: CredentialBinding):
         released = await binding.unbind_worker("no-such-worker")
         assert released == []
+
+
+# ===========================================================================
+# T-137: Account-Worker binding extended — mutual exclusion, affinity reuse
+#        (Step 1-3), worker offline cleanup, max_accounts_per_worker
+# ===========================================================================
+
+
+class TestT137MutualExclusion:
+    """T-137: Mutual exclusion enforcement."""
+
+    async def test_same_account_different_workers_rejected(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        assert await binding.bind("acct-1", "worker-A") is True
+        assert await binding.bind("acct-1", "worker-B") is False
+        assert binding.get_worker("acct-1") == "worker-A"
+
+    async def test_different_accounts_same_worker_allowed(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        assert await binding.bind("acct-1", "worker-A") is True
+        assert await binding.bind("acct-2", "worker-A") is True
+        assert binding.get_accounts("worker-A") == {"acct-1", "acct-2"}
+
+    async def test_rebind_after_unbind_to_different_worker(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        await binding.unbind("acct-1")
+        assert await binding.bind("acct-1", "worker-B") is True
+        assert binding.get_worker("acct-1") == "worker-B"
+
+
+class TestT137AffinityReuse:
+    """T-137: Step 1-3 affinity reuse pattern."""
+
+    async def test_step1_bind_creates_affinity(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        assert binding.get_preferred_worker("acct-1") == "worker-A"
+
+    async def test_step2_unbind_preserves_affinity(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        await binding.unbind("acct-1")
+        assert not binding.is_bound("acct-1")
+        assert binding.get_preferred_worker("acct-1") == "worker-A"
+
+    async def test_step3_rebind_prefers_affinity_worker(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        await binding.unbind("acct-1")
+        preferred = binding.get_preferred_worker("acct-1")
+        assert preferred == "worker-A"
+        await binding.bind("acct-1", preferred)
+        assert binding.get_worker("acct-1") == "worker-A"
+
+    async def test_affinity_updates_to_most_recent(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        await binding.unbind("acct-1")
+        await asyncio.sleep(0.01)
+        await binding.record_affinity("acct-1", "worker-B")
+        assert binding.get_preferred_worker("acct-1") == "worker-B"
+
+    async def test_multiple_accounts_affinity(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("acct-1", "worker-A")
+        await binding.bind("acct-2", "worker-B")
+        assert binding.get_preferred_worker("acct-1") == "worker-A"
+        assert binding.get_preferred_worker("acct-2") == "worker-B"
+
+    async def test_no_affinity_returns_none(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        assert binding.get_preferred_worker("never-bound") is None
+
+
+class TestT137WorkerOfflineCleanup:
+    """T-137: Worker offline cleanup."""
+
+    async def test_unbind_worker_releases_all_accounts(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("a1", "w1")
+        await binding.bind("a2", "w1")
+        await binding.bind("a3", "w1")
+        released = await binding.unbind_worker("w1")
+        assert set(released) == {"a1", "a2", "a3"}
+        assert binding.worker_account_count("w1") == 0
+        for aid in ["a1", "a2", "a3"]:
+            assert not binding.is_bound(aid)
+
+    async def test_cleanup_allows_rebinding(self):
+        binding = CredentialBinding(max_accounts_per_worker=2)
+        await binding.bind("a1", "w1")
+        await binding.bind("a2", "w1")
+        assert not binding.can_bind("w1")
+        await binding.unbind_worker("w1")
+        assert binding.can_bind("w1")
+        assert await binding.bind("a3", "w1") is True
+
+    async def test_cleanup_preserves_other_workers(self):
+        binding = CredentialBinding(max_accounts_per_worker=4)
+        await binding.bind("a1", "w1")
+        await binding.bind("a2", "w2")
+        await binding.unbind_worker("w1")
+        assert binding.is_bound("a2")
+        assert binding.get_worker("a2") == "w2"
+
+
+class TestT137MaxAccountsPerWorker:
+    """T-137: max_accounts_per_worker enforcement."""
+
+    async def test_max_1(self):
+        binding = CredentialBinding(max_accounts_per_worker=1)
+        assert await binding.bind("a1", "w1") is True
+        assert await binding.bind("a2", "w1") is False
+
+    async def test_max_large(self):
+        binding = CredentialBinding(max_accounts_per_worker=100)
+        for i in range(50):
+            assert await binding.bind(f"a{i}", "w1") is True
+        assert binding.worker_account_count("w1") == 50
+        assert binding.can_bind("w1") is True
+
+    async def test_max_reached_then_unbind_one(self):
+        binding = CredentialBinding(max_accounts_per_worker=2)
+        await binding.bind("a1", "w1")
+        await binding.bind("a2", "w1")
+        assert await binding.bind("a3", "w1") is False
+        await binding.unbind("a1")
+        assert await binding.bind("a3", "w1") is True
+        assert binding.worker_account_count("w1") == 2
+
+    async def test_idempotent_bind_does_not_increase_count(self):
+        binding = CredentialBinding(max_accounts_per_worker=2)
+        await binding.bind("a1", "w1")
+        await binding.bind("a1", "w1")
+        assert binding.worker_account_count("w1") == 1
