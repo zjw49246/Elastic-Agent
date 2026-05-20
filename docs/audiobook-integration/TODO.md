@@ -279,20 +279,20 @@
 
 ### 测试 — 单元测试
 
-- [ ] **B-100** [ABE] ElasticAgentClient：produce/cancel/retry/continue/chat/status 全接口 mock 测试
-- [ ] **B-101** [ABE] WebhookService 验签：有效签名通过 / 无效签名拒绝 / 过期时间戳拒绝
-- [ ] **B-102** [ABE] WebhookService 幂等：同一 event_id 重复处理返回 200 不重复写入
-- [ ] **B-103** [ABE] WebhookService 状态映射：每种 event_type → Task.status / script_status / current_step 正确映射
-- [ ] **B-104** [ABE] WebhookService sequence 排序：乱序事件忽略 / gap 检测触发补偿
-- [ ] **B-105** [ABE] OssFileService manifest 解析：正常解析 / 空 manifest / 字段缺失容错
-- [ ] **B-106** [ABE] OssFileService 最终稿选择：delivery > compliant > final 优先级 / role 匹配 / path 回退
-- [ ] **B-107** [ABE] OssFileService 预签名 URL 生成：path 必须在 manifest 中（防越权）
-- [ ] **B-108** [ABE] AgentOutput 回灌：elastic_audiobook + final_proofreading 双写 / 重复回灌 update 不 insert
-- [ ] **B-109** [ABE] ElasticBookProductionService：从 Task+Book 组装请求体 / book_slug 生成 / 大文本走 OSS URI
-- [ ] **B-110** [ABE] 创建任务分叉：legacy_ai_service → TaskService / elastic_agent → ElasticBookProductionService
-- [ ] **B-111** [ABE] 轮询补偿：running 状态 > 5min 无事件 → 触发状态查询 → 更新本地状态
-- [ ] **B-112** [ABE] 状态映射完整性：Elastic queued/dispatching/running/completed/failed/cancelled → Task 状态正确映射
-- [ ] **B-113** [ABE] TaskService 防御：elastic_agent 任务误入 legacy pipeline 抛异常
+- [x] **B-100** [ABE] ElasticAgentClient：produce/cancel/retry/continue/chat/status 全接口 mock 测试
+- [x] **B-101** [ABE] WebhookService 验签：有效签名通过 / 无效签名拒绝 / 过期时间戳拒绝
+- [x] **B-102** [ABE] WebhookService 幂等：同一 event_id 重复处理返回 200 不重复写入
+- [x] **B-103** [ABE] WebhookService 状态映射：每种 event_type → Task.status / script_status / current_step 正确映射
+- [x] **B-104** [ABE] WebhookService sequence 排序：乱序事件忽略 / gap 检测触发补偿
+- [x] **B-105** [ABE] OssFileService manifest 解析：正常解析 / 空 manifest / 字段缺失容错
+- [x] **B-106** [ABE] OssFileService 最终稿选择：delivery > compliant > final 优先级 / role 匹配 / path 回退
+- [x] **B-107** [ABE] OssFileService 预签名 URL 生成：path 必须在 manifest 中（防越权）
+- [x] **B-108** [ABE] AgentOutput 回灌：elastic_audiobook + final_proofreading 双写 / 重复回灌 update 不 insert
+- [x] **B-109** [ABE] ElasticBookProductionService：从 Task+Book 组装请求体 / book_slug 生成 / 大文本走 OSS URI
+- [x] **B-110** [ABE] 创建任务分叉：legacy_ai_service → TaskService / elastic_agent → ElasticBookProductionService
+- [x] **B-111** [ABE] 轮询补偿：running 状态 > 5min 无事件 → 触发状态查询 → 更新本地状态
+- [x] **B-112** [ABE] 状态映射完整性：Elastic queued/dispatching/running/completed/failed/cancelled → Task 状态正确映射
+- [x] **B-113** [ABE] TaskService 防御：elastic_agent 任务误入 legacy pipeline 抛异常
 
 ### 测试 — 集成测试
 
