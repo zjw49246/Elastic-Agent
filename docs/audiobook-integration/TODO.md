@@ -165,14 +165,14 @@
 - ~~**A-015**~~ 已移至框架: EA T-052 (TaskRouter)
 - [x] **A-016** [ABS] TaskSyncMapper 映射推送 — 注册/注销同步映射到 Worker  `02 §3.4`
 - ~~**A-017**~~ 已移至框架: EA T-053 (WebhookEmitter)
-- [ ] **A-018** [ABS] 进度超时检测 — 30 分钟无 LOG/FILE 事件标记 stalled  `02 §5.7`
-- [ ] **A-019** [ABS] Session ID fallback — 框架提取失败时从 state.json 读取（源 A+B 在框架 T-017）  `02 §5.8`
-- [ ] **A-020** [ABS] Retry/Continue 编排（OSS 恢复 workspace、清理 Phase 产物、重跑）  `02 §5`
-- [ ] **A-021** [ABS] Worker 目录生命周期管理（磁盘监控 + 过期清理 + 手动清理 API）  `02 §5.6`
-- [ ] **A-022** [ABS] state.json 解析适配 — 在 ABS 侧读取插件的 state.json，提取 session_id（插件不改）  `02 §5`
-- [ ] **A-023** [ABS] delivery/ 目录适配 — 识别插件实际输出的文件名，映射到 manifest role  `02 §5`
-- [ ] **A-024** [ABS] /audiobook 命令组装 — 将 produce 请求参数转为 Claude Code CLI 命令  `02 §4.1`
-- [ ] **A-025** [ABS] Phase 映射 — state.json phase 数字 → Webhook phase 字符串枚举  `05 §4.4`
+- [x] **A-018** [ABS] 进度超时检测 — 30 分钟无 LOG/FILE 事件标记 stalled  `02 §5.7`
+- [x] **A-019** [ABS] Session ID fallback — 框架提取失败时从 state.json 读取（源 A+B 在框架 T-017）  `02 §5.8`
+- [x] **A-020** [ABS] Retry/Continue 编排（OSS 恢复 workspace、清理 Phase 产物、重跑）  `02 §5`
+- [x] **A-021** [ABS] Worker 目录生命周期管理（磁盘监控 + 过期清理 + 手动清理 API）  `02 §5.6`
+- [x] **A-022** [ABS] state.json 解析适配 — 在 ABS 侧读取插件的 state.json，提取 session_id（插件不改）  `02 §5`
+- [x] **A-023** [ABS] delivery/ 目录适配 — 识别插件实际输出的文件名，映射到 manifest role  `02 §5`
+- [x] **A-024** [ABS] /audiobook 命令组装 — 将 produce 请求参数转为 Claude Code CLI 命令  `02 §4.1`
+- [x] **A-025** [ABS] Phase 映射 — state.json phase 数字 → Webhook phase 字符串枚举  `05 §4.4`
 
 ### API 端点
 
