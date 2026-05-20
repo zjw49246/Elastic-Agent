@@ -247,21 +247,21 @@
 
 ### API 端点
 
-- [ ] **B-020** [ABE] GET /api/tasks/script-generation-backends  `03 §5.1`
-- [ ] **B-021** [ABE] POST /api/tasks/ — 增加 script_generation_backend 字段  `03 §5.2`
-- [ ] **B-022** [ABE] POST /api/tasks/batch — 增加 script_generation_backend 字段  `03 §5.2`
-- [ ] **B-023** [ABE] GET /api/tasks/{id}/script-production — 统一状态查询  `03 §5.3`
-- [ ] **B-024** [ABE] POST /api/tasks/{id}/script-production/cancel  `03 §5.4`
-- [ ] **B-025** [ABE] POST /api/tasks/{id}/script-production/continue  `03 §5.4`
-- [ ] **B-026** [ABE] POST /api/tasks/{id}/script-production/retry  `03 §5.4`
-- [ ] **B-027** [ABE] POST /api/tasks/{id}/script-production/chat  `03 §5.5`
-- [ ] **B-028** [ABE] GET /api/tasks/{id}/script-production/chat/history  `03 §5.5`
-- [ ] **B-029** [ABE] GET /api/tasks/{id}/script-production/chat/live — 聊天轮询（从 OSS 增量读取）  `03 §5.11`
-- [ ] **B-030** [ABE] GET /api/tasks/{id}/script-production/files  `03 §5.6`
-- [ ] **B-031** [ABE] GET /api/tasks/{id}/script-production/files/{path}  `03 §5.6`
-- [ ] **B-032** [ABE] GET /api/tasks/{id}/script-production/manuscript  `03 §5.6`
-- [ ] **B-033** [ABE] POST /api/elastic-agent/webhook — 接收回调  `03 §5.7`
-- [ ] **B-034** [ABE] 创建任务后按 backend 分叉调度  `03 §6.1`
+- [x] **B-020** [ABE] GET /api/tasks/script-generation-backends  `03 §5.1`
+- [x] **B-021** [ABE] POST /api/tasks/ — 增加 script_generation_backend 字段  `03 §5.2`
+- [x] **B-022** [ABE] POST /api/tasks/batch — 增加 script_generation_backend 字段  `03 §5.2`
+- [x] **B-023** [ABE] GET /api/tasks/{id}/script-production — 统一状态查询  `03 §5.3`
+- [x] **B-024** [ABE] POST /api/tasks/{id}/script-production/cancel  `03 §5.4`
+- [x] **B-025** [ABE] POST /api/tasks/{id}/script-production/continue  `03 §5.4`
+- [x] **B-026** [ABE] POST /api/tasks/{id}/script-production/retry  `03 §5.4`
+- [x] **B-027** [ABE] POST /api/tasks/{id}/script-production/chat  `03 §5.5`
+- [x] **B-028** [ABE] GET /api/tasks/{id}/script-production/chat/history  `03 §5.5`
+- [x] **B-029** [ABE] GET /api/tasks/{id}/script-production/chat/live — 聊天轮询（从 OSS 增量读取）  `03 §5.11`
+- [x] **B-030** [ABE] GET /api/tasks/{id}/script-production/files  `03 §5.6`
+- [x] **B-031** [ABE] GET /api/tasks/{id}/script-production/files/{path}  `03 §5.6`
+- [x] **B-032** [ABE] GET /api/tasks/{id}/script-production/manuscript  `03 §5.6`
+- [x] **B-033** [ABE] POST /api/elastic-agent/webhook — 接收回调  `03 §5.7`
+- [x] **B-034** [ABE] 创建任务后按 backend 分叉调度  `03 §6.1`
 
 ### 前端
 
