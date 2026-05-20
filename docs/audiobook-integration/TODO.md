@@ -265,13 +265,13 @@
 
 ### 前端
 
-- [ ] **B-040** [ABE] 创建任务弹窗 — 增加跑书方式选择  `03 §7.1`
-- [ ] **B-041** [ABE] TaskDetail — Elastic 模式三栏布局（左 Chat + 中文件目录 + 右文件预览）  `03 §7.3`
-- [ ] **B-042** [ABE] Elastic Phase 指示器（顶栏 "Phase N · 阶段名称" 文字格式）  `03 §7.3`
-- [ ] **B-043** [ABE] Elastic 文件列表 + 预览  `03 §7.3`
-- [ ] **B-044** [ABE] Elastic chat 修改界面  `03 §7.3`
-- [ ] **B-045** [ABE] 任务列表 — 增加 backend 筛选  `03 §7.4`
-- [ ] **B-046** [ABE] API SDK 增加 Elastic 相关方法  `03 §7.2`
+- [x] **B-040** [ABE] 创建任务弹窗 — 增加跑书方式选择  `03 §7.1`
+- [x] **B-041** [ABE] TaskDetail — Elastic 模式三栏布局（左 Chat + 中文件目录 + 右文件预览）  `03 §7.3`
+- [x] **B-042** [ABE] Elastic Phase 指示器（顶栏 "Phase N · 阶段名称" 文字格式）  `03 §7.3`
+- [x] **B-043** [ABE] Elastic 文件列表 + 预览  `03 §7.3`
+- [x] **B-044** [ABE] Elastic chat 修改界面  `03 §7.3`
+- [x] **B-045** [ABE] 任务列表 — 增加 backend 筛选  `03 §7.4`
+- [x] **B-046** [ABE] API SDK 增加 Elastic 相关方法  `03 §7.2`
 
 ### 配置
 
