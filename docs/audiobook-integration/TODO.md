@@ -232,18 +232,18 @@
 
 ### 数据模型
 
-- [ ] **B-001** [ABE] Task 表增加 script_generation_backend 字段 + 迁移  `03 §4.1`
-- [ ] **B-002** [ABE] 新增 elastic_book_runs 表 + 迁移  `03 §4.2`
-- [ ] **B-003** [ABE] 新增 elastic_book_run_events 表 + 迁移  `03 §4.3`
+- [x] **B-001** [ABE] Task 表增加 script_generation_backend 字段 + 迁移  `03 §4.1`
+- [x] **B-002** [ABE] 新增 elastic_book_runs 表 + 迁移  `03 §4.2`
+- [x] **B-003** [ABE] 新增 elastic_book_run_events 表 + 迁移  `03 §4.3`
 
 ### 后端服务
 
-- [ ] **B-010** [ABE] ElasticAgentClient — HTTP 客户端封装  `03 §5.8`
-- [ ] **B-011** [ABE] ElasticBookProductionService — 组装请求 + 提交 Elastic  `03 §5.8`
-- [ ] **B-012** [ABE] WebhookService — 验签、幂等、状态更新、回灌 AgentOutput  `03 §5.7`
-- [ ] **B-013** [ABE] OssFileService — 读取 manifest、最终稿、预签名 URL  `03 §5.6`
-- [ ] **B-014** [ABE] AgentOutput 回灌 — elastic_audiobook + final_proofreading 双写  `03 §4.4`
-- [ ] **B-015** [ABE] 轮询补偿 — 定时扫描 running 状态的 elastic_book_runs  `03 §5.10.5`
+- [x] **B-010** [ABE] ElasticAgentClient — HTTP 客户端封装  `03 §5.8`
+- [x] **B-011** [ABE] ElasticBookProductionService — 组装请求 + 提交 Elastic  `03 §5.8`
+- [x] **B-012** [ABE] WebhookService — 验签、幂等、状态更新、回灌 AgentOutput  `03 §5.7`
+- [x] **B-013** [ABE] OssFileService — 读取 manifest、最终稿、预签名 URL  `03 §5.6`
+- [x] **B-014** [ABE] AgentOutput 回灌 — elastic_audiobook + final_proofreading 双写  `03 §4.4`
+- [x] **B-015** [ABE] 轮询补偿 — 定时扫描 running 状态的 elastic_book_runs  `03 §5.10.5`
 
 ### API 端点
 
@@ -275,7 +275,7 @@
 
 ### 配置
 
-- [ ] **B-050** [ABE] backend config.py 增加 ELASTIC_AGENT_* 配置  `03 §8`
+- [x] **B-050** [ABE] backend config.py 增加 ELASTIC_AGENT_* 配置  `03 §8`
 
 ### 测试 — 单元测试
 
