@@ -14,9 +14,9 @@
 
 > 📖 参考: [00-overview.md](00-overview.md) §2 仓库架构
 
-- [ ] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
-- [ ] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），通过 `uv add git+https://github.com/zjw49246/Elastic-Agent.git` 引入框架
-- [ ] **S-003** [ABS] 更新 CLAUDE.md / 编写 README.md，引用本方案文档
+- [x] **S-001** [ABS] 清理现有 audio_book_echo_agent 仓库的旧代码（backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock），保留 CLAUDE.md 和 .gitignore
+- [x] **S-002** [ABS] 新建项目脚手架（pyproject.toml、目录结构、CI 基础），通过 `uv add git+https://github.com/zjw49246/Elastic-Agent.git` 引入框架
+- [x] **S-003** [ABS] 更新 CLAUDE.md / 编写 README.md，引用本方案文档
 
 ---
 
@@ -150,9 +150,9 @@
 
 ### 仓库初始化
 
-- [ ] **A-000** [ABS] 清理旧代码（删除 audio_book_echo_agent 仓库中旧文件：backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock，保留 CLAUDE.md、.git/ 和 .gitignore）
-- [ ] **A-001** [ABS] 项目脚手架（新建 pyproject.toml（依赖 elastic-agent），src/ 目录结构，CI 配置）
-- [ ] **A-002** [ABS] 配置模型（AudiobookServiceConfig Pydantic 模型，环境变量 + config.yaml 支持）
+- [x] **A-000** [ABS] 清理旧代码（删除 audio_book_echo_agent 仓库中旧文件：backend/、frontend/、worker/、tests/、infra/、README.md、SOLUTION.md、TEST.md、TODO.md、claude-auto-account-switching.md、pyproject.toml、uv.lock，保留 CLAUDE.md、.git/ 和 .gitignore）
+- [x] **A-001** [ABS] 项目脚手架（新建 pyproject.toml（依赖 elastic-agent），src/ 目录结构，CI 配置）
+- [x] **A-002** [ABS] 配置模型（AudiobookServiceConfig Pydantic 模型，环境变量 + config.yaml 支持）
 
 ### 核心模块
 
