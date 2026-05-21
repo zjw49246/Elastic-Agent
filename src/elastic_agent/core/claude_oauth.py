@@ -272,8 +272,9 @@ class ClaudeOAuthProvider:
             body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
             logger.info("After magic link — URL: %s, body: %s", url[:80], body[:120])
 
-            # Check if magic link auto-logged us in (redirected to chat interface)
-            session_established = "login" not in url and ("new" in url or "chat" in url or "claude.ai" in url)
+            # Check if magic link auto-logged us in (redirected away from magic-link/login page)
+            parsed_path = urlparse(url).path.rstrip("/")
+            session_established = parsed_path in ("/new", "/chat", "/recents", "") and "magic-link" not in url
 
             if not session_established:
                 # Magic link showed verification code — need to enter it on login page
