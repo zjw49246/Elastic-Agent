@@ -91,6 +91,14 @@ class Harness(ABC):
     def get_scaling_signal(self) -> ScalingSignal | None:
         return None
 
+    def get_credential_slots(self) -> list[dict[str, str]]:
+        """Return credential slot definitions for auto-login after bootstrap.
+
+        Each slot is a dict with 'slot_type' and 'config_dir'.
+        Override in subclass to enable auto-login. Empty list disables it.
+        """
+        return []
+
     def get_file_sync_config(self) -> FileSyncConfig:
         return FileSyncConfig(enabled=False)
 
