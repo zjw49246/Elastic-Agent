@@ -1,10 +1,15 @@
-"""ClaudeOAuthProvider — 14-step OAuth auto-login on Worker via 171mail + Playwright + mitmproxy.
+"""ClaudeOAuthProvider — OAuth auto-login on Worker via 171mail + Chrome CDP + xdotool.
 
-T-041: Executes the full OAuth login flow on a Worker to obtain Claude CLI credentials.
-Triggered during Bootstrap, token expiration, or manual restart.
+Uses real Chrome + CDP for navigation/JS + xdotool for Cloudflare checkbox.
+Calls authorize API directly via CDP fetch(), bypassing Turnstile entirely.
 
-Worker dependencies (installed during Bootstrap):
-- Python 3.11+, Playwright + playwright-stealth, Chrome, Xvfb, mitmproxy, Node.js + Claude Code CLI
+Flow:
+  1. 171mail: trigger magic link email → poll for magic link URL
+  2. Chrome CDP: visit magic link → xdotool clicks CF checkbox → get 6-digit code
+  3. Chrome CDP: login page → enter email + code → establish session
+  4. CLI: launch `claude auth login` → extract OAuth URL
+  5. Chrome CDP: navigate to OAuth URL → xdotool clicks CF → call authorize API → code#state
+  6. Feed code#state to CLI stdin → credentials written
 """
 
 from __future__ import annotations
@@ -12,12 +17,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -30,35 +36,76 @@ ANTHROPIC_ACCOUNT_URL = "https://claude.ai/api/account"
 MAGIC_LINK_POLL_INTERVAL = 2.0
 MAGIC_LINK_TIMEOUT = 90.0
 
-MITMPROXY_ADDON_SCRIPT = '''
-"""mitmproxy addon: fix Claude CLI OAuth redirect_uri bug."""
+CDP_PORT = 9222
+CHROME_PROFILE_DIR = "/tmp/chrome-cdp-oauth"
 
-from mitmproxy import http
-import urllib.parse
+# Cloudflare "Verify you are human" checkbox position at 1365x900
+CF_CHECKBOX_X = 257
+CF_CHECKBOX_Y = 476
 
-class ClaudeOAuthFixer:
-    def request(self, flow: http.HTTPFlow) -> None:
-        if flow.request.pretty_url.endswith("/v1/oauth/token") and flow.request.method == "POST":
-            body = flow.request.get_text()
-            if body:
-                params = urllib.parse.parse_qs(body)
-                changed = False
-                if "redirect_uri" in params:
-                    params["redirect_uri"] = ["https://platform.claude.com/oauth/code/callback"]
-                    changed = True
-                if "code" in params:
-                    codes = params["code"]
-                    fixed = [c.split("#")[0] for c in codes]
-                    if fixed != codes:
-                        params["code"] = fixed
-                        changed = True
-                if changed:
-                    flow.request.set_text(urllib.parse.urlencode(
-                        {k: v[0] for k, v in params.items()}
-                    ))
+# JS to extract org UUID from React fiber tree
+_JS_EXTRACT_ORG_UUID = """(function(){
+var btn=[...document.querySelectorAll("button")].find(b=>b.textContent.trim()==="Authorize");
+if(!btn)return null;
+var fk=Object.keys(btn).find(k=>k.startsWith("__reactFiber"));
+if(!fk)return null;
+var c=btn[fk];
+for(var i=0;i<30&&c;i++){
+  if(c.memoizedState){
+    var s=c.memoizedState;var x=0;
+    while(s&&x<20){
+      var v=s.memoizedState;
+      if(v&&Array.isArray(v)){
+        for(var it of v){
+          if(it&&it.email_address)return(it.memberships&&it.memberships[0]&&it.memberships[0].organization)?it.memberships[0].organization.uuid:null;
+          if(Array.isArray(it)){for(var sub of it){if(sub&&sub.email_address)return(sub.memberships&&sub.memberships[0]&&sub.memberships[0].organization)?sub.memberships[0].organization.uuid:null;}}
+        }
+      }
+      s=s.next;x++;
+    }
+  }
+  c=c.return;
+}
+return null;
+})()"""
 
-addons = [ClaudeOAuthFixer()]
-'''
+# JS to set an input value via React-compatible dispatch
+_JS_SET_INPUT = """(function(){{
+var inputs=[...document.querySelectorAll('input[type={type}]')].filter(i=>i.offsetParent!==null);
+if(!inputs.length)return 'no {type} input';
+var inp=inputs[0];
+var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+s.call(inp,'{value}');
+inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+return 'set';
+}})()"""
+
+# JS to click a button by text content
+_JS_CLICK_BTN = """(function(){{
+var btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent!==null);
+for(var b of btns){{var t=b.textContent.trim();if({condition}){{b.click();return 'clicked:'+t}}}}
+return 'no match';
+}})()"""
+
+# JS to enter 6-digit verification code
+_JS_ENTER_CODE = """(function(){{
+var code="{code}";
+var inputs=[...document.querySelectorAll('input')].filter(i=>i.offsetParent!==null);
+if(inputs.length>=6){{
+  for(var i=0;i<code.length&&i<inputs.length;i++){{
+    inputs[i].focus();
+    var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+    s.call(inputs[i],code[i]);
+    inputs[i].dispatchEvent(new Event('input',{{bubbles:true}}));
+    inputs[i].dispatchEvent(new Event('change',{{bubbles:true}}));
+  }}
+  return 'entered '+code.length+' digits';
+}}
+var inp=inputs.find(i=>i.type!=='email')||inputs[0];
+if(inp){{var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(inp,code);inp.dispatchEvent(new Event('input',{{bubbles:true}}));return 'entered single'}}
+return 'no inputs';
+}})()"""
 
 
 @dataclass
@@ -85,26 +132,83 @@ class OAuthConfig:
     mitm_port: int = 8765
 
 
+class _CDPClient:
+    """Minimal async Chrome DevTools Protocol client over WebSocket."""
+
+    def __init__(self, ws_url: str):
+        self._ws_url = ws_url
+        self._ws = None
+        self._session = None
+        self._id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task = None
+
+    async def connect(self):
+        import aiohttp
+        self._session = aiohttp.ClientSession()
+        self._ws = await self._session.ws_connect(self._ws_url, max_msg_size=10 * 1024 * 1024)
+        self._reader_task = asyncio.create_task(self._reader())
+
+    async def _reader(self):
+        import aiohttp
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    mid = data.get("id")
+                    if mid and mid in self._pending:
+                        self._pending[mid].set_result(data)
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except Exception:
+            pass
+
+    async def send(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
+        self._id += 1
+        msg_id = self._id
+        future = asyncio.get_event_loop().create_future()
+        self._pending[msg_id] = future
+        await self._ws.send_json({"id": msg_id, "method": method, "params": params or {}})
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending.pop(msg_id, None)
+
+    async def evaluate(self, expression: str, timeout: float = 30) -> Any:
+        """Evaluate JS expression and return the result value."""
+        r = await self.send("Runtime.evaluate", {
+            "expression": expression,
+            "awaitPromise": True,
+            "returnByValue": True,
+        }, timeout=timeout)
+        exc = r.get("result", {}).get("exceptionDetails")
+        if exc:
+            logger.debug("CDP eval exception: %s", str(exc)[:200])
+            return None
+        return r.get("result", {}).get("result", {}).get("value")
+
+    async def navigate(self, url: str) -> dict:
+        return await self.send("Page.navigate", {"url": url})
+
+    async def close(self):
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._ws:
+            await self._ws.close()
+        if self._session:
+            await self._session.close()
+
+
 class ClaudeOAuthProvider:
-    """Executes the 14-step OAuth login flow on a Worker.
+    """Executes OAuth login flow on a Worker.
 
-    This class is designed to run ON the Worker machine. The Manager sends
-    a CREDENTIAL_LOGIN command, and the Worker Runtime invokes this provider.
-
-    Flow:
-    1. File lock (per-account concurrency control)
-    2. 171mail API: trigger magic link
-    3. Poll 171mail inbox for magic link (2s intervals, 90s timeout)
-    4. Verify magic link (returns session cookie + sessionKey)
-    5. Start mitmproxy (fix redirect_uri bug)
-    6. Launch Claude CLI auth login
-    7. Extract OAuth authorize URL from CLI stdout
-    8. Playwright: inject cookie, navigate, authorize
-    9. Capture callback code+state
-    10. Send code+state to CLI callback port
-    11. CLI writes .credentials.json
-    12. Verify with claude auth status
-    13-14. Cleanup (Playwright, mitmproxy, file lock)
+    Uses real Chrome + CDP for navigation/JS evaluation,
+    xdotool for Cloudflare checkbox clicks,
+    and direct authorize API call to bypass Turnstile.
     """
 
     def __init__(self, http_client: Any | None = None):
@@ -112,14 +216,13 @@ class ClaudeOAuthProvider:
         self._lock_files: dict[str, Any] = {}
 
     async def login(self, config: OAuthConfig) -> LoginResult:
-        """Execute the full 14-step OAuth login flow."""
+        """Execute the full OAuth login flow."""
         account_id = config.account_id
         logger.info("ClaudeOAuthProvider: starting login for %s", account_id)
 
-        mitm_process = None
+        chrome_process = None
         cli_process = None
-        browser = None
-        context = None
+        cdp = None
         lock_path = None
 
         try:
@@ -130,17 +233,15 @@ class ClaudeOAuthProvider:
 
             # Step 2: Trigger magic link via 171mail
             send_result = await self._send_magic_link(config.email)
-            if not send_result.get("success"):
+            if send_result.get("code") != 200:
                 return LoginResult(
                     success=False,
                     account_id=account_id,
-                    error=f"Failed to send magic link: {send_result.get('error', 'unknown')}",
+                    error=f"Failed to send magic link: {send_result.get('message', 'unknown')}",
                 )
+            logger.info("Magic link email triggered for %s", config.email)
 
-            device_id = send_result.get("deviceId", "")
-            client_sha = send_result.get("clientSha", "")
-
-            # Step 3: Poll for magic link
+            # Step 3: Poll for magic link URL
             magic_link = await self._poll_magic_link(config.email_token)
             if magic_link is None:
                 return LoginResult(
@@ -148,70 +249,131 @@ class ClaudeOAuthProvider:
                     account_id=account_id,
                     error="Timed out waiting for magic link",
                 )
+            logger.info("Got magic link: %s...", magic_link[:60])
 
-            # Step 4: Verify magic link
-            verify_result = await self._verify_magic_link(
-                magic_link, device_id, client_sha, config.email
-            )
-            if not verify_result.get("success"):
+            # Step 4: Launch Chrome with CDP
+            chrome_process = await self._launch_chrome(account_id)
+            cdp = await self._connect_cdp()
+            await cdp.send("Page.enable")
+            logger.info("Chrome + CDP connected")
+
+            # Step 5: Visit magic link → click CF checkbox → get verification code
+            await cdp.navigate(magic_link)
+            await asyncio.sleep(3)
+            cf_passed = await self._handle_cloudflare(cdp, "magic link")
+            if not cf_passed:
                 return LoginResult(
-                    success=False,
-                    account_id=account_id,
-                    error=f"Magic link verification failed: {verify_result.get('error', 'unknown')}",
+                    success=False, account_id=account_id,
+                    error="Cloudflare challenge failed on magic link page",
                 )
 
-            session_cookie = verify_result.get("cookie", "")
-            session_key = verify_result.get("sessionKey", "")
+            await asyncio.sleep(5)
+            url = await cdp.evaluate("document.location.href") or ""
+            body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
+            logger.info("After magic link — URL: %s, body: %s", url[:80], body[:120])
 
-            # Step 5: Start mitmproxy
-            mitm_process = await self._start_mitmproxy(config.mitm_port)
+            # Check if magic link auto-logged us in (redirected to chat interface)
+            session_established = "login" not in url and ("new" in url or "chat" in url or "claude.ai" in url)
 
-            # Step 6: Launch Claude CLI auth login
+            if not session_established:
+                # Magic link showed verification code — need to enter it on login page
+                verify_code = None
+                m = re.search(r'(\d{6})', body)
+                if m:
+                    verify_code = m.group(1)
+                if not verify_code:
+                    return LoginResult(
+                        success=False, account_id=account_id,
+                        error="No 6-digit verification code on magic link page",
+                    )
+                logger.info("Verification code: %s", verify_code)
+
+                # Navigate to login page
+                await cdp.navigate("https://claude.ai/login")
+                await asyncio.sleep(3)
+                await self._handle_cloudflare(cdp, "login")
+                await asyncio.sleep(5)
+
+                # Enter email
+                r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
+                logger.info("Email input: %s", r)
+                await asyncio.sleep(0.5)
+
+                r = await cdp.evaluate(
+                    _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
+                )
+                logger.info("Email button: %s", r)
+                await asyncio.sleep(2)
+
+                r = await cdp.evaluate(
+                    _JS_CLICK_BTN.format(condition="b.type==='submit'||t.includes('Continue')")
+                )
+                logger.info("Submit: %s", r)
+                await asyncio.sleep(8)
+
+                url = await cdp.evaluate("document.location.href") or ""
+                body = await cdp.evaluate("document.body?.innerText?.substring(0, 200)") or ""
+                logger.info("After email submit — URL: %s, body: %s", url[:80], body[:80])
+
+                # Enter verification code if on code page
+                if any(w in body.lower() for w in ("verification", "code", "check")):
+                    r = await cdp.evaluate(_JS_ENTER_CODE.format(code=verify_code))
+                    logger.info("Code entry: %s", r)
+                    await asyncio.sleep(1)
+
+                    r = await cdp.evaluate(
+                        _JS_CLICK_BTN.format(
+                            condition="!t.includes('Google')&&!t.includes('SSO')&&(t.includes('Verify')||t.includes('Continue')||t.includes('Submit')||b.type==='submit')"
+                        )
+                    )
+                    logger.info("Verify button: %s", r)
+                    await asyncio.sleep(10)
+            else:
+                logger.info("Magic link auto-login succeeded, session already established")
+
+            # Step 7: Launch CLI auth login
             cli_process = await self._launch_cli_auth(config)
 
-            # Step 7: Extract OAuth authorize URL
+            # Step 8: Extract OAuth authorize URL
             authorize_url = await self._extract_authorize_url(cli_process, timeout=30)
             if authorize_url is None:
                 return LoginResult(
-                    success=False,
-                    account_id=account_id,
+                    success=False, account_id=account_id,
                     error="Failed to extract OAuth authorize URL from CLI",
                 )
+            logger.info("OAuth URL: %s...", authorize_url[:80])
 
-            # Step 8: Playwright browser automation
-            callback_url = await self._playwright_authorize(
-                authorize_url, session_cookie, session_key, config.email
-            )
-            if callback_url is None:
+            # Step 9: Navigate to OAuth URL → click CF → call authorize API
+            await cdp.navigate(authorize_url)
+            await asyncio.sleep(3)
+            await self._handle_cloudflare(cdp, "OAuth")
+            await asyncio.sleep(8)
+
+            body = await cdp.evaluate("document.body?.innerText?.substring(0, 100)")
+            logger.info("OAuth page: %s", (body or "")[:80])
+
+            # Step 10: Extract org UUID and call authorize API directly
+            code_state = await self._cdp_authorize(cdp, authorize_url)
+            if code_state is None:
                 return LoginResult(
-                    success=False,
-                    account_id=account_id,
-                    error="Playwright authorization failed",
+                    success=False, account_id=account_id,
+                    error="CDP authorize failed",
                 )
+            logger.info("Got code#state (%d chars)", len(code_state))
 
-            # Step 9: Extract code+state from callback URL
-            code, state = self._extract_code_state(callback_url)
-            if not code:
-                return LoginResult(
-                    success=False,
-                    account_id=account_id,
-                    error="Failed to extract code/state from callback",
-                )
+            # Step 11: Feed code#state to CLI stdin
+            cli_process.stdin.write(f"{code_state}\n".encode())
+            await cli_process.stdin.drain()
+            cli_process.stdin.close()
 
-            # Step 10: Send code+state to CLI callback port
-            cli_port = self._extract_cli_port(authorize_url)
-            if cli_port:
-                await self._send_callback(cli_port, code, state)
-
-            # Step 11: Wait for CLI to complete and write credentials
+            # Step 12: Wait for CLI to complete
             await self._wait_cli_complete(cli_process, timeout=30)
 
-            # Step 12: Verify login
+            # Step 13: Verify login
             creds = self._read_credentials(config.config_dir)
             if creds is None:
                 return LoginResult(
-                    success=False,
-                    account_id=account_id,
+                    success=False, account_id=account_id,
                     error="credentials.json not found after login",
                 )
 
@@ -226,95 +388,209 @@ class ClaudeOAuthProvider:
 
         except asyncio.TimeoutError:
             return LoginResult(
-                success=False,
-                account_id=account_id,
-                error="Login timed out",
+                success=False, account_id=account_id, error="Login timed out",
             )
         except Exception as e:
             logger.exception("ClaudeOAuthProvider: login failed for %s", account_id)
             return LoginResult(
-                success=False,
-                account_id=account_id,
-                error=str(e),
+                success=False, account_id=account_id, error=str(e),
             )
         finally:
-            # Steps 13-14: Cleanup
+            if cdp:
+                await cdp.close()
             if cli_process:
                 await self._kill_process(cli_process)
-            if mitm_process:
-                await self._kill_process(mitm_process)
+            if chrome_process:
+                await self._kill_chrome(chrome_process)
             if lock_path:
                 await self._release_lock(lock_path)
 
-    # -- Step helpers -------------------------------------------------------
+    # -- 171mail helpers ----------------------------------------------------
 
     async def _send_magic_link(self, email: str) -> dict[str, Any]:
-        """Step 2: POST to 171mail to trigger magic link email."""
+        """Trigger magic link email via 171mail."""
         return await self._http_post(
             f"{MAIL_API_BASE}/claude/send",
             json_body={"email": email},
         )
 
     async def _poll_magic_link(self, email_token: str) -> str | None:
-        """Step 3: Poll 171mail inbox for magic link."""
+        """Poll 171mail inbox for magic link URL."""
         start = time.monotonic()
         while time.monotonic() - start < MAGIC_LINK_TIMEOUT:
             result = await self._http_get(
                 f"{MAIL_API_BASE}/getClaudeMessage",
                 params={"token": email_token},
             )
-            link = result.get("link") or result.get("magicLink")
-            if link:
-                return link
+            result_data = result.get("data") or {}
+            raw = result_data.get("code") or result_data.get("link") or result_data.get("magicLink") or ""
+
+            if raw.startswith("https://"):
+                return raw
+            body = result_data.get("body") or raw
+            match = re.search(r'https://claude\.ai/magic-link#\S+', body)
+            if match:
+                return match.group(0)
+
             await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
         return None
 
-    async def _verify_magic_link(
-        self, link: str, device_id: str, client_sha: str, email: str
-    ) -> dict[str, Any]:
-        """Step 4: Verify magic link with 171mail."""
-        return await self._http_post(
-            f"{MAIL_API_BASE}/claude/verify",
-            json_body={
-                "link": link,
-                "info": {
-                    "deviceId": device_id,
-                    "clientSha": client_sha,
-                    "email": email,
-                },
-            },
-        )
+    # -- Chrome + CDP methods -----------------------------------------------
 
-    async def _start_mitmproxy(self, port: int) -> asyncio.subprocess.Process:
-        """Step 5: Start mitmproxy with the OAuth fixer addon."""
-        addon_file = Path(tempfile.mktemp(suffix="_mitm_addon.py"))
-        addon_file.write_text(MITMPROXY_ADDON_SCRIPT)
+    async def _launch_chrome(self, account_id: str) -> asyncio.subprocess.Process:
+        """Launch real Chrome with remote debugging port."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", f"chrome.*{CDP_PORT}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(1)
+        except Exception:
+            pass
 
-        process = await asyncio.create_subprocess_exec(
-            "mitmdump",
-            "--listen-port", str(port),
-            "--set", "ssl_insecure=true",
-            "-s", str(addon_file),
-            "--quiet",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        profile_dir = f"{CHROME_PROFILE_DIR}-{account_id}"
+        os.makedirs(profile_dir, exist_ok=True)
+
+        chrome = await asyncio.create_subprocess_exec(
+            "google-chrome",
+            "--no-sandbox", "--disable-gpu", "--disable-software-rasterizer",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-component-extensions-with-background-pages",
+            "--window-size=1365,900",
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={profile_dir}",
+            "about:blank",
+            env={**os.environ, "DISPLAY": ":99"},
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        await asyncio.sleep(2)
-        return process
+        await asyncio.sleep(4)
+        return chrome
+
+    async def _connect_cdp(self) -> _CDPClient:
+        """Connect to Chrome via CDP WebSocket."""
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(10):
+                try:
+                    async with session.get(f"http://127.0.0.1:{CDP_PORT}/json") as resp:
+                        tabs = await resp.json()
+                    page_tab = next((t for t in tabs if t.get("type") == "page"), None)
+                    if page_tab:
+                        ws_url = page_tab["webSocketDebuggerUrl"]
+                        cdp = _CDPClient(ws_url)
+                        await cdp.connect()
+                        return cdp
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        raise RuntimeError("Could not connect to Chrome CDP")
+
+    async def _handle_cloudflare(self, cdp: _CDPClient, context: str, timeout: int = 30) -> bool:
+        """Detect and handle Cloudflare challenge by clicking checkbox with xdotool."""
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            title = await cdp.evaluate("document.title") or ""
+            body_snippet = await cdp.evaluate("document.body?.innerText?.substring(0, 100)") or ""
+
+            if "just a moment" not in title.lower() and "security verification" not in body_snippet.lower():
+                logger.info("CF cleared for %s", context)
+                return True
+
+            logger.info("CF challenge detected on %s, clicking checkbox at (%d,%d)...",
+                        context, CF_CHECKBOX_X, CF_CHECKBOX_Y)
+            await self._xdotool_click(CF_CHECKBOX_X, CF_CHECKBOX_Y)
+            await asyncio.sleep(5)
+
+        logger.error("CF challenge did not clear for %s within %ds", context, timeout)
+        return False
+
+    async def _xdotool_click(self, x: int, y: int) -> None:
+        """Click at screen coordinates using xdotool."""
+        proc = await asyncio.create_subprocess_exec(
+            "xdotool", "mousemove", str(x), str(y), "click", "1",
+            env={**os.environ, "DISPLAY": ":99"},
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+    async def _cdp_authorize(self, cdp: _CDPClient, authorize_url: str) -> str | None:
+        """Extract org UUID and call authorize API directly via CDP fetch()."""
+        # Parse OAuth URL parameters
+        parsed = urlparse(authorize_url.replace("claude.com/cai/", "claude.ai/"))
+        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+        # Extract org UUID from React fiber tree
+        org_uuid = await cdp.evaluate(_JS_EXTRACT_ORG_UUID)
+        logger.info("Org UUID: %s", org_uuid)
+
+        if not org_uuid:
+            logger.error("Could not extract org UUID")
+            return None
+
+        # Build authorize API request
+        scope = " ".join(
+            s for s in params.get("scope", "").split(" ")
+            if s != "org:create_api_key"
+        )
+        api_body = json.dumps({
+            "response_type": params.get("response_type", "code"),
+            "client_id": params.get("client_id", OAUTH_CLIENT_ID),
+            "organization_uuid": org_uuid,
+            "redirect_uri": params.get("redirect_uri", ""),
+            "scope": scope,
+            "state": params.get("state", ""),
+            "code_challenge": params.get("code_challenge", ""),
+            "code_challenge_method": params.get("code_challenge_method", "S256"),
+        })
+
+        # Call authorize API from Chrome context (uses Chrome's session cookies)
+        js_fetch = f"""(async function(){{
+var r=await fetch("/v1/oauth/{org_uuid}/authorize",{{
+  method:"POST",
+  headers:{{"Content-Type":"application/json","Accept":"application/json"}},
+  credentials:"include",
+  body:{json.dumps(api_body)}
+}});
+return r.status+" | "+await r.text()
+}})()"""
+
+        api_result = await cdp.evaluate(js_fetch)
+        logger.info("Authorize API: %s", (api_result or "")[:150])
+
+        if not api_result or not api_result.startswith("200"):
+            logger.error("Authorize API failed: %s", api_result)
+            return None
+
+        try:
+            _, response_text = api_result.split(" | ", 1)
+            response_data = json.loads(response_text)
+            redirect_uri = response_data.get("redirect_uri", "")
+            cb = urlparse(redirect_uri)
+            cb_params = parse_qs(cb.query)
+            code = cb_params.get("code", [""])[0]
+            state = cb_params.get("state", [""])[0]
+            if code and state:
+                return f"{code}#{state}"
+            logger.error("Missing code/state in redirect_uri: %s", redirect_uri[:100])
+        except Exception as e:
+            logger.error("Failed to parse authorize response: %s", e)
+
+        return None
+
+    # -- CLI methods --------------------------------------------------------
 
     async def _launch_cli_auth(self, config: OAuthConfig) -> asyncio.subprocess.Process:
-        """Step 6: Launch Claude CLI with auth login."""
+        """Launch Claude CLI with auth login, stdin piped for code#state delivery."""
         env = {
             "CLAUDE_CONFIG_DIR": config.config_dir,
-            "HTTPS_PROXY": f"http://127.0.0.1:{config.mitm_port}",
-            "HTTP_PROXY": f"http://127.0.0.1:{config.mitm_port}",
-            "NODE_TLS_REJECT_UNAUTHORIZED": "0",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "HOME": str(Path.home()),
         }
         process = await asyncio.create_subprocess_exec(
-            "claude", "auth", "login", "--email", config.email,
+            "claude", "auth", "login",
             env=env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -323,7 +599,7 @@ class ClaudeOAuthProvider:
     async def _extract_authorize_url(
         self, process: asyncio.subprocess.Process, timeout: int = 30
     ) -> str | None:
-        """Step 7: Read CLI stdout for the OAuth authorize URL."""
+        """Read CLI stdout for the OAuth authorize URL."""
         assert process.stdout is not None
         start = time.monotonic()
         buffer = ""
@@ -337,163 +613,50 @@ class ClaudeOAuthProvider:
             if not chunk:
                 break
             buffer += chunk.decode("utf-8", errors="replace")
-            match = re.search(r"(https://claude\.com/cai/oauth/authorize\S+)", buffer)
+            match = re.search(r"(https://claude\.(?:ai|com)/\S*oauth/authorize\S+)", buffer)
             if match:
                 return match.group(1)
         return None
 
-    async def _playwright_authorize(
-        self,
-        authorize_url: str,
-        session_cookie: str,
-        session_key: str,
-        email: str,
-    ) -> str | None:
-        """Step 8: Use Playwright to navigate and authorize the OAuth request."""
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            logger.error("Playwright not installed — cannot perform OAuth authorization")
-            return None
-
-        callback_url = None
-
-        try:
-            pw = await async_playwright().start()
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context()
-
-            # Inject session cookie
-            if session_cookie:
-                cookies = self._parse_session_cookie(session_cookie)
-                if cookies:
-                    await context.add_cookies(cookies)
-
-            page = await context.new_page()
-
-            # Intercept the callback redirect to capture code+state
-            captured: dict[str, str | None] = {"url": None}
-
-            async def handle_route(route):
-                captured["url"] = route.request.url
-                await route.abort()
-
-            await page.route("**/oauth/code/callback*", handle_route)
-
-            # 8a: Verify account identity
-            try:
-                resp = await page.goto(ANTHROPIC_ACCOUNT_URL)
-                if resp and resp.ok:
-                    body = await resp.json()
-                    account_email = body.get("email", "")
-                    if account_email and account_email != email:
-                        logger.warning(
-                            "Account email mismatch: expected %s, got %s",
-                            email, account_email,
-                        )
-            except Exception:
-                logger.debug("Account verification skipped (non-critical)")
-
-            # 8c: Navigate to OAuth URL
-            await page.goto(authorize_url, wait_until="domcontentloaded")
-
-            # 8d: Wait for potential Cloudflare challenge
-            await page.wait_for_timeout(3000)
-
-            # 8e: Click Authorize button
-            try:
-                authorize_btn = page.locator("button:has-text('Authorize')")
-                if await authorize_btn.count() > 0:
-                    await authorize_btn.click()
-                    await page.wait_for_timeout(3000)
-            except Exception:
-                logger.debug("No Authorize button found or click failed")
-
-            callback_url = captured.get("url")
-
-            await context.close()
-            await browser.close()
-            await pw.stop()
-
-        except Exception as e:
-            logger.exception("Playwright authorization failed: %s", e)
-            return None
-
-        return callback_url
-
-    def _extract_code_state(self, callback_url: str) -> tuple[str, str]:
-        """Step 9: Extract code and state from callback URL."""
-        from urllib.parse import urlparse, parse_qs
-
-        parsed = urlparse(callback_url)
-        params = parse_qs(parsed.query)
-        code = params.get("code", [""])[0]
-        state = params.get("state", [""])[0]
-        # Strip #state suffix if present
-        if "#" in code:
-            code = code.split("#")[0]
-        return code, state
-
-    def _extract_cli_port(self, authorize_url: str) -> int | None:
-        """Extract the localhost callback port from the authorize URL's redirect_uri."""
-        from urllib.parse import urlparse, parse_qs
-
-        parsed = urlparse(authorize_url)
-        params = parse_qs(parsed.query)
-        redirect_uri = params.get("redirect_uri", [""])[0]
-        match = re.search(r":(\d+)", redirect_uri)
-        if match:
-            return int(match.group(1))
-        return None
-
-    async def _send_callback(self, port: int, code: str, state: str) -> None:
-        """Step 10: Send code+state to CLI's localhost callback port."""
-        url = f"http://127.0.0.1:{port}/callback?code={code}&state={state}"
-        try:
-            await self._http_get_raw(url)
-        except Exception:
-            logger.debug("Callback send completed (may redirect or close)")
-
     async def _wait_cli_complete(
         self, process: asyncio.subprocess.Process, timeout: int = 30
     ) -> None:
-        """Step 11: Wait for CLI to finish writing credentials."""
+        """Wait for CLI to finish writing credentials."""
         try:
             await asyncio.wait_for(process.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("CLI process did not exit within %ds", timeout)
 
     def _read_credentials(self, config_dir: str) -> dict[str, Any] | None:
-        """Step 12: Read the generated .credentials.json file."""
+        """Read the generated .credentials.json file."""
         cred_path = Path(config_dir) / ".credentials.json"
         if not cred_path.exists():
             return None
         try:
             data = json.loads(cred_path.read_text())
-            oauth = data.get("claudeAiOauth", {})
-            return oauth
+            return data.get("claudeAiOauth", {})
         except Exception:
             logger.exception("Failed to read credentials.json")
             return None
 
-    def _parse_session_cookie(self, cookie_str: str) -> list[dict[str, Any]]:
-        """Parse a Set-Cookie string into Playwright cookie format."""
-        cookies = []
-        for domain in ["claude.ai", ".claude.ai", "anthropic.com", ".anthropic.com"]:
-            cookies.append({
-                "name": "sessionKey",
-                "value": cookie_str,
-                "domain": domain,
-                "path": "/",
-            })
-        return cookies
+    # -- Chrome cleanup -----------------------------------------------------
+
+    async def _kill_chrome(self, chrome_process: asyncio.subprocess.Process) -> None:
+        """Kill Chrome process and leftovers."""
+        await self._kill_process(chrome_process)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", f"chrome.*{CDP_PORT}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:
+            pass
 
     # -- Lock helpers -------------------------------------------------------
 
     async def _acquire_lock(self, path: Path) -> None:
-        """Acquire a file-based lock (non-blocking retry with timeout)."""
         import fcntl
-
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = open(path, "w")
         start = time.monotonic()
@@ -507,7 +670,6 @@ class ClaudeOAuthProvider:
         raise TimeoutError(f"Could not acquire lock: {path}")
 
     async def _release_lock(self, path: Path) -> None:
-        """Release a file-based lock."""
         fd = self._lock_files.pop(str(path), None)
         if fd:
             try:
@@ -518,7 +680,6 @@ class ClaudeOAuthProvider:
                 pass
 
     async def _kill_process(self, process: asyncio.subprocess.Process) -> None:
-        """Gracefully terminate a process."""
         if process.returncode is not None:
             return
         try:
@@ -531,50 +692,41 @@ class ClaudeOAuthProvider:
         except Exception:
             pass
 
-    # -- HTTP helpers (abstracted for testability) --------------------------
+    # -- HTTP helpers -------------------------------------------------------
 
     async def _http_post(self, url: str, json_body: dict) -> dict[str, Any]:
-        """POST request returning JSON dict. Override for testing."""
         if self._http_client:
             return await self._http_client.post(url, json_body)
         import aiohttp
-
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=json_body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 return await resp.json()
 
     async def _http_get(self, url: str, params: dict | None = None) -> dict[str, Any]:
-        """GET request returning JSON dict. Override for testing."""
         if self._http_client:
             return await self._http_client.get(url, params)
         import aiohttp
-
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 return await resp.json()
 
     async def _http_get_raw(self, url: str) -> str:
-        """GET request returning raw text."""
         if self._http_client:
             return await self._http_client.get_raw(url)
         import aiohttp
-
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 return await resp.text()
 
 
-# -- Token refresh helper (used by quota checker) ----------------------------
+# -- Token refresh helper ---------------------------------------------------
 
 
 async def refresh_access_token(
     refresh_token: str,
     http_client: Any | None = None,
 ) -> dict[str, Any] | None:
-    """Refresh an access token using the refresh_token grant.
-
-    Returns dict with accessToken, refreshToken, expiresAt on success, None on failure.
-    """
+    """Refresh an access token using the refresh_token grant."""
     import urllib.parse
 
     body = urllib.parse.urlencode({
