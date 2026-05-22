@@ -565,11 +565,31 @@ class WorkerRuntime:
     async def _start_quota_checker(self) -> None:
         from elastic_agent.worker.quota_checker import QuotaChecker
 
+        initial_slots = self._discover_credential_slots()
         self._quota_checker = QuotaChecker(
-            active_slots=[],
+            active_slots=initial_slots,
             on_quota_status=self._on_quota_status,
         )
         await self._quota_checker.start()
+
+    def _discover_credential_slots(self) -> list[dict[str, str]]:
+        """Scan well-known credential dirs for existing valid credentials."""
+        from elastic_agent.core.claude_oauth import read_credentials
+
+        slots: list[dict[str, str]] = []
+        candidate_dirs = [
+            "/root/.claude-prod",
+            *[f"/root/.claude-edit-{i}" for i in range(1, 10)],
+        ]
+        for config_dir in candidate_dirs:
+            if not Path(config_dir).is_dir():
+                continue
+            creds = read_credentials(config_dir)
+            if creds and creds.get("accessToken"):
+                account_id = creds.get("account_id", Path(config_dir).name)
+                slots.append({"account_id": account_id, "config_dir": config_dir})
+                logger.info("QuotaChecker: discovered slot %s at %s", account_id, config_dir)
+        return slots
 
     async def _on_quota_status(self, status: dict) -> None:
         await self._send_event(QuotaStatusMessage(
@@ -582,13 +602,13 @@ class WorkerRuntime:
         ))
 
     async def _handle_credential_login(self, msg: CredentialLoginMessage) -> None:
+        from elastic_agent.core.claude_oauth import write_credentials
+
         config_dir = msg.config_dir
         credentials = msg.credentials
         account_id = credentials.get("account_id", f"slot-{msg.slot_index}")
 
-        Path(config_dir).mkdir(parents=True, exist_ok=True)
-        creds_path = Path(config_dir) / "credentials.json"
-        creds_path.write_text(json.dumps(credentials, ensure_ascii=False))
+        write_credentials(config_dir, credentials)
         logger.info("Wrote credentials for %s to %s", account_id, config_dir)
 
         if self._quota_checker:

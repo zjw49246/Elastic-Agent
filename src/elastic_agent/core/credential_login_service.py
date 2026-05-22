@@ -112,6 +112,7 @@ class CredentialLoginService:
                     account.id, worker_id,
                 )
                 await self._pool.update_login_status(account.id, "logged_in")
+                await self._notify_worker_credential_ready(worker_id, account.id)
                 return [LoginResult(success=True, account_id=account.id)]
 
         accounts_for_login = [
@@ -130,6 +131,9 @@ class CredentialLoginService:
             worker_id, success_count, len(self._slots),
         )
 
+        if success_count > 0:
+            await self._notify_worker_credential_ready(worker_id, account.id)
+
         return results
 
     async def release_worker(self, worker_id: str) -> None:
@@ -137,6 +141,17 @@ class CredentialLoginService:
         await self._binding.unbind_worker(worker_id)
         await self._pool.release_worker(worker_id)
         logger.info("Released all credentials for worker %s", worker_id)
+
+    async def _notify_worker_credential_ready(self, worker_id: str, account_id: str) -> None:
+        """Emit CREDENTIAL_READY event so the Worker's QuotaChecker can pick up active slots."""
+        slot_info = [
+            {"account_id": account_id, "config_dir": slot.config_dir, "slot_type": slot.slot_type}
+            for slot in self._slots
+        ]
+        await self._event_bus.emit("CREDENTIAL_READY", worker_id, {
+            "account_id": account_id,
+            "slots": slot_info,
+        })
 
     # -- affinity allocation -------------------------------------------------
 
