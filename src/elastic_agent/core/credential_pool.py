@@ -279,6 +279,46 @@ class CredentialPool:
             )
             return chosen_def
 
+    async def allocate_specific(
+        self, account_id: str, worker_id: str, slot_type: str
+    ) -> AccountDefinition | None:
+        """Allocate a specific account to a worker (used for affinity reuse).
+
+        Returns the AccountDefinition if the account is available and allocation
+        succeeds, or None if the account is unavailable (assigned elsewhere,
+        disabled, in backoff, or quota-exceeded).
+        """
+        async with self._lock:
+            self._ensure_loaded()
+
+            if self._count_assigned_to_worker(worker_id) >= self._config.max_accounts_per_worker:
+                return None
+
+            acct_def = self._account_def(account_id)
+            if acct_def is None:
+                return None
+
+            status = self._pool_status.accounts.get(account_id)
+            if status is None:
+                return None
+
+            if not self._is_available(acct_def, status):
+                return None
+
+            status.assigned_to = worker_id
+            status.slot_type = slot_type
+            status.last_used = _utcnow()
+            status.available = False
+
+            self._flush_sync()
+            logger.info(
+                "CredentialPool: allocated_specific %s to worker %s (slot=%s)",
+                account_id,
+                worker_id,
+                slot_type,
+            )
+            return acct_def
+
     # -- release -------------------------------------------------------------
 
     async def release(self, account_id: str) -> None:

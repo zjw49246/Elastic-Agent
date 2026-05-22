@@ -1,22 +1,26 @@
-"""Credential login service — orchestrates auto-login on Workers after bootstrap.
+"""Credential login service — orchestrates auto-login on Workers with affinity.
 
-Listens for BOOTSTRAP_COMPLETED events, allocates ONE account per Worker from
-CredentialPool, then logs that account into all credential slots (session
-isolation via separate CLAUDE_CONFIG_DIRs) using CredentialLoginStep.
+Listens for BOOTSTRAP_COMPLETED and WORKER_CONNECTED events. On each:
+1. Check affinity — try to re-allocate the same account this Worker had before
+2. If affinity account unavailable, allocate any available account (least-used-first)
+3. Check if existing credentials on Worker are still valid (skip OAuth if so)
+4. If credentials expired or missing, run full OAuth login into all slots
 
-Harness provides slot configuration via get_credential_slots().
+On WORKER_DISCONNECTED: unbind and release credentials back to pool.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
 
 from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, LoginResult
 from elastic_agent.core.config import CredentialConfig
+from elastic_agent.core.credential_binding import CredentialBinding
 from elastic_agent.core.credential_login_step import CredentialLoginStep
-from elastic_agent.core.credential_pool import CredentialPool
+from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
 from elastic_agent.core.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
@@ -36,20 +40,29 @@ class CredentialLoginService:
     Each Worker gets ONE account from the pool. That account is logged into
     multiple session slots (each with its own CLAUDE_CONFIG_DIR) so the Worker
     can run concurrent tasks under the same account.
+
+    Affinity: When a Worker reconnects, we try to give it back the same account
+    it had before. If that account is taken, we fall back to normal allocation.
     """
 
     def __init__(
         self,
         credential_pool: CredentialPool,
         credential_config: CredentialConfig,
+        credential_binding: CredentialBinding,
         event_bus: EventBus,
         slots: list[CredentialSlot] | None = None,
         oauth_provider: ClaudeOAuthProvider | None = None,
+        ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem",
+        ssh_user: str = "root",
     ) -> None:
         self._pool = credential_pool
         self._config = credential_config
+        self._binding = credential_binding
         self._event_bus = event_bus
         self._slots = slots or []
+        self._ssh_key_path = ssh_key_path
+        self._ssh_user = ssh_user
         self._login_step = CredentialLoginStep(
             pool=credential_pool,
             oauth_provider=oauth_provider,
@@ -61,20 +74,42 @@ class CredentialLoginService:
 
     def register_event_handlers(self) -> None:
         self._event_bus.subscribe("BOOTSTRAP_COMPLETED", self._on_bootstrap_completed)
+        self._event_bus.subscribe("WORKER_CONNECTED", self._on_worker_connected)
         self._event_bus.subscribe("WORKER_DISCONNECTED", self._on_worker_disconnected)
 
-    async def login_worker(self, worker_id: str) -> list[LoginResult]:
-        """Allocate one account and log it into all session slots on a Worker."""
+    # -- public API ----------------------------------------------------------
+
+    async def login_worker(
+        self, worker_id: str, *, skip_validity_check: bool = False
+    ) -> list[LoginResult]:
+        """Allocate account (with affinity preference) and login all slots.
+
+        Args:
+            worker_id: The Worker node ID (e.g. "aliyun:i-bp1xxx" or IP).
+            skip_validity_check: If True, always do full OAuth (used after bootstrap).
+        """
         if not self._slots:
             logger.warning("No credential slots configured — skipping login for %s", worker_id)
             return []
 
-        account = await self._pool.allocate(worker_id, "production", "standard")
+        account = await self._allocate_with_affinity(worker_id)
         if account is None:
             logger.warning("No available account for worker %s", worker_id)
             return []
 
         logger.info("Allocated account %s to worker %s", account.id, worker_id)
+
+        await self._binding.bind(account.id, worker_id)
+
+        if not skip_validity_check:
+            host = self._extract_host(worker_id)
+            if host and await self._check_credentials_valid(host, self._slots[0].config_dir):
+                logger.info(
+                    "Credentials for account %s still valid on worker %s — skipping OAuth",
+                    account.id, worker_id,
+                )
+                await self._pool.update_login_status(account.id, "logged_in")
+                return [LoginResult(success=True, account_id=account.id)]
 
         accounts_for_login = [
             (account, slot.config_dir, slot.slot_type)
@@ -95,18 +130,108 @@ class CredentialLoginService:
         return results
 
     async def release_worker(self, worker_id: str) -> None:
-        """Release all accounts allocated to a Worker."""
+        """Unbind and release all accounts allocated to a Worker."""
+        await self._binding.unbind_worker(worker_id)
         await self._pool.release_worker(worker_id)
         logger.info("Released all credentials for worker %s", worker_id)
+
+    # -- affinity allocation -------------------------------------------------
+
+    async def _allocate_with_affinity(self, worker_id: str) -> AccountDefinition | None:
+        """Try affinity-based allocation first, then fall back to normal allocation."""
+        preferred_account_id = self._get_affinity_account(worker_id)
+
+        if preferred_account_id:
+            logger.info(
+                "Affinity: worker %s previously used account %s — trying allocate_specific",
+                worker_id, preferred_account_id,
+            )
+            account = await self._pool.allocate_specific(
+                preferred_account_id, worker_id, "production"
+            )
+            if account is not None:
+                logger.info("Affinity allocation succeeded: %s -> %s", preferred_account_id, worker_id)
+                return account
+            logger.info(
+                "Affinity allocation failed for %s (unavailable) — falling back to normal",
+                preferred_account_id,
+            )
+
+        return await self._pool.allocate(worker_id, "production", "standard")
+
+    def _get_affinity_account(self, worker_id: str) -> str | None:
+        """Find the account that was most recently bound to this worker."""
+        best_account: str | None = None
+        best_time = None
+        for (aid, wid), ts in self._binding._affinity.items():
+            if wid == worker_id:
+                if best_time is None or ts > best_time:
+                    best_time = ts
+                    best_account = aid
+        return best_account
+
+    # -- credential validity check -------------------------------------------
+
+    async def _check_credentials_valid(self, host: str, config_dir: str) -> bool:
+        """SSH into Worker and check if Claude credentials are valid.
+
+        Runs `claude auth status` with the given config_dir. Returns True if
+        the credentials file exists and the auth check passes.
+        """
+        try:
+            ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "ConnectTimeout=10"]
+            cmd = (
+                f"CLAUDE_CONFIG_DIR={config_dir} claude auth status 2>&1 | "
+                f"grep -q 'Logged in' && echo VALID || echo INVALID"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", *ssh_opts, "-i", self._ssh_key_path,
+                f"{self._ssh_user}@{host}", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            output = stdout.decode().strip()
+            return "VALID" in output
+        except Exception as e:
+            logger.debug("Credential validity check failed for %s: %s", host, e)
+            return False
+
+    # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _extract_host(worker_id: str) -> str | None:
+        """Extract SSH-reachable host from worker_id.
+
+        worker_id formats:
+        - IP address directly: "47.237.202.0"
+        - Prefixed: "aliyun:47.237.202.0"
+        """
+        if ":" in worker_id:
+            return worker_id.split(":", 1)[1]
+        return worker_id
+
+    # -- event handlers ------------------------------------------------------
 
     async def _on_bootstrap_completed(
         self, event_type: str, worker_id: str, data: dict[str, Any]
     ) -> None:
         logger.info("Bootstrap completed for worker %s — starting credential login", worker_id)
         try:
-            await self.login_worker(worker_id)
+            await self.login_worker(worker_id, skip_validity_check=True)
         except Exception:
             logger.exception("Credential login failed for worker %s", worker_id)
+
+    async def _on_worker_connected(
+        self, event_type: str, worker_id: str, data: dict[str, Any]
+    ) -> None:
+        """Worker reconnected — try to restore previous account with validity check."""
+        logger.info("Worker %s connected — checking credential state", worker_id)
+        try:
+            await self.login_worker(worker_id, skip_validity_check=False)
+        except Exception:
+            logger.exception("Credential login failed for reconnected worker %s", worker_id)
 
     async def _on_worker_disconnected(
         self, event_type: str, worker_id: str, data: dict[str, Any]
