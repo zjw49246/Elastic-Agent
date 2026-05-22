@@ -22,6 +22,7 @@ from elastic_agent.core.credential_binding import CredentialBinding
 from elastic_agent.core.credential_login_step import CredentialLoginStep
 from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
 from elastic_agent.core.event_bus import EventBus
+from elastic_agent.core.registry import NodeRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class CredentialLoginService:
         credential_config: CredentialConfig,
         credential_binding: CredentialBinding,
         event_bus: EventBus,
+        node_registry: NodeRegistry | None = None,
         slots: list[CredentialSlot] | None = None,
         oauth_provider: ClaudeOAuthProvider | None = None,
         ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem",
@@ -60,6 +62,7 @@ class CredentialLoginService:
         self._config = credential_config
         self._binding = credential_binding
         self._event_bus = event_bus
+        self._registry = node_registry
         self._slots = slots or []
         self._ssh_key_path = ssh_key_path
         self._ssh_user = ssh_user
@@ -102,7 +105,7 @@ class CredentialLoginService:
         await self._binding.bind(account.id, worker_id)
 
         if not skip_validity_check:
-            host = self._extract_host(worker_id)
+            host = await self._resolve_host(worker_id)
             if host and await self._check_credentials_valid(host, self._slots[0].config_dir):
                 logger.info(
                     "Credentials for account %s still valid on worker %s — skipping OAuth",
@@ -200,17 +203,23 @@ class CredentialLoginService:
 
     # -- helpers -------------------------------------------------------------
 
-    @staticmethod
-    def _extract_host(worker_id: str) -> str | None:
-        """Extract SSH-reachable host from worker_id.
+    async def _resolve_host(self, worker_id: str) -> str | None:
+        """Resolve SSH-reachable host (IP) from worker_id via NodeRegistry."""
+        if self._registry:
+            node = await self._registry.get(worker_id)
+            if node and node.public_ip:
+                return node.public_ip
+            if node and node.private_ip:
+                return node.private_ip
 
-        worker_id formats:
-        - IP address directly: "47.237.202.0"
-        - Prefixed: "aliyun:47.237.202.0"
-        """
+        # Fallback: if worker_id looks like an IP or contains one after ":"
         if ":" in worker_id:
-            return worker_id.split(":", 1)[1]
-        return worker_id
+            suffix = worker_id.split(":", 1)[1]
+            if suffix[0].isdigit():
+                return suffix
+        elif worker_id[0].isdigit():
+            return worker_id
+        return None
 
     # -- event handlers ------------------------------------------------------
 
