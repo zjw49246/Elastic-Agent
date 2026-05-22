@@ -1,13 +1,15 @@
 """Worker Bootstrap login step — execute auto-login for each assigned credential slot.
 
-T-042: For each credential slot assigned to a Worker during Bootstrap, execute
-the 14-step OAuth login flow serially. On failure, rollback (release) already-logged-in
-accounts.
+T-042: First slot runs the full OAuth flow. Remaining slots for the same account
+reuse the credentials via file copy (no duplicate OAuth round-trips).
+On failure, rollback (release) already-logged-in accounts.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, LoginResult, OAuthConfig
@@ -17,9 +19,27 @@ logger = logging.getLogger(__name__)
 
 LoginCallback = Callable[[str, int, LoginResult], Awaitable[None]]
 
+_CREDENTIAL_FILES = (".credentials.json", ".claude.json")
+
+
+def _copy_credentials(src_dir: str, dst_dir: str) -> bool:
+    """Copy credential files from one config_dir to another."""
+    dst = Path(dst_dir)
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = False
+    for fname in _CREDENTIAL_FILES:
+        src_file = Path(src_dir) / fname
+        if src_file.exists():
+            shutil.copy2(src_file, dst / fname)
+            copied = True
+    return copied
+
 
 class CredentialLoginStep:
     """Orchestrates serial credential login across multiple slots on a single Worker.
+
+    When multiple slots use the same account, only the first slot runs the full
+    OAuth flow. Subsequent slots copy the credential files directly.
 
     Usage during Bootstrap:
         step = CredentialLoginStep(pool, oauth_provider, login_timeout=240)
@@ -46,7 +66,10 @@ class CredentialLoginStep:
         worker_id: str,
         accounts: list[tuple[AccountDefinition, str, str]],
     ) -> list[LoginResult]:
-        """Execute serial login for each account slot.
+        """Execute login for each account slot.
+
+        For the same account across multiple slots, only the first slot runs the
+        full OAuth flow. Remaining slots copy credentials from the first.
 
         Args:
             worker_id: The Worker node ID.
@@ -59,24 +82,43 @@ class CredentialLoginStep:
         """
         results: list[LoginResult] = []
         logged_in_accounts: list[str] = []
+        # Track which account has already been OAuth'd and where
+        oauth_done: dict[str, str] = {}  # account_id -> first successful config_dir
 
         for slot_index, (acct, config_dir, slot_type) in enumerate(accounts):
             logger.info(
-                "CredentialLoginStep: logging in account %s (slot %d/%d) on worker %s",
-                acct.id, slot_index + 1, len(accounts), worker_id,
+                "CredentialLoginStep: logging in account %s (slot %d/%d, type=%s) on worker %s",
+                acct.id, slot_index + 1, len(accounts), slot_type, worker_id,
             )
 
             await self._pool.update_login_status(acct.id, "logging_in")
 
-            config = OAuthConfig(
-                account_id=acct.id,
-                email=acct.email,
-                email_token=acct.email_token,
-                config_dir=config_dir,
-                login_timeout=self._login_timeout,
-            )
+            if acct.id in oauth_done:
+                # Same account already logged in — copy credentials
+                src_dir = oauth_done[acct.id]
+                ok = _copy_credentials(src_dir, config_dir)
+                if ok:
+                    result = LoginResult(success=True, account_id=acct.id)
+                    logger.info(
+                        "CredentialLoginStep: copied credentials from %s to %s (slot %d)",
+                        src_dir, config_dir, slot_index,
+                    )
+                else:
+                    result = LoginResult(
+                        success=False, account_id=acct.id,
+                        error=f"Failed to copy credentials from {src_dir}",
+                    )
+            else:
+                # First slot for this account — run full OAuth
+                config = OAuthConfig(
+                    account_id=acct.id,
+                    email=acct.email,
+                    email_token=acct.email_token,
+                    config_dir=config_dir,
+                    login_timeout=self._login_timeout,
+                )
+                result = await self._oauth.login(config)
 
-            result = await self._oauth.login(config)
             results.append(result)
 
             if self._on_login_result:
@@ -85,6 +127,8 @@ class CredentialLoginStep:
             if result.success:
                 await self._pool.update_login_status(acct.id, "logged_in")
                 logged_in_accounts.append(acct.id)
+                if acct.id not in oauth_done:
+                    oauth_done[acct.id] = config_dir
                 logger.info(
                     "CredentialLoginStep: account %s logged in successfully (slot %d)",
                     acct.id, slot_index,
@@ -97,7 +141,6 @@ class CredentialLoginStep:
                     "CredentialLoginStep: account %s login failed: %s — rolling back",
                     acct.id, result.error,
                 )
-                # Rollback: release all already-logged-in accounts
                 await self._rollback(logged_in_accounts, worker_id)
                 break
 
