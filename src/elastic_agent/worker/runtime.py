@@ -586,7 +586,11 @@ class WorkerRuntime:
                 continue
             creds = read_credentials(config_dir)
             if creds and creds.get("accessToken"):
-                account_id = creds.get("account_id", Path(config_dir).name)
+                account_id_file = Path(config_dir) / ".account_id"
+                if account_id_file.exists():
+                    account_id = account_id_file.read_text().strip()
+                else:
+                    account_id = Path(config_dir).name
                 slots.append({"account_id": account_id, "config_dir": config_dir})
                 logger.info("QuotaChecker: discovered slot %s at %s", account_id, config_dir)
         return slots

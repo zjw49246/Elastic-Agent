@@ -112,6 +112,7 @@ class CredentialLoginService:
                     account.id, worker_id,
                 )
                 await self._pool.update_login_status(account.id, "logged_in")
+                await self._write_account_markers(host, account.id)
                 await self._notify_worker_credential_ready(worker_id, account.id)
                 return [LoginResult(success=True, account_id=account.id)]
 
@@ -132,6 +133,9 @@ class CredentialLoginService:
         )
 
         if success_count > 0:
+            host = await self._resolve_host(worker_id)
+            if host:
+                await self._write_account_markers(host, account.id)
             await self._notify_worker_credential_ready(worker_id, account.id)
 
         return results
@@ -141,6 +145,24 @@ class CredentialLoginService:
         await self._binding.unbind_worker(worker_id)
         await self._pool.release_worker(worker_id)
         logger.info("Released all credentials for worker %s", worker_id)
+
+    async def _write_account_markers(self, host: str, account_id: str) -> None:
+        """Write account_id marker files to Worker config dirs via SSH."""
+        for slot in self._slots:
+            config_dir = slot.config_dir
+            try:
+                ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "ConnectTimeout=10"]
+                cmd = f"echo '{account_id}' > {config_dir}/.account_id"
+                proc = await asyncio.create_subprocess_exec(
+                    "ssh", *ssh_opts, "-i", self._ssh_key_path,
+                    f"{self._ssh_user}@{host}", cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+            except Exception:
+                logger.debug("Failed to write account_id marker to %s on %s", config_dir, host)
 
     async def _notify_worker_credential_ready(self, worker_id: str, account_id: str) -> None:
         """Emit CREDENTIAL_READY event so the Worker's QuotaChecker can pick up active slots."""
