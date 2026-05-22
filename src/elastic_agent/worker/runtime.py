@@ -27,6 +27,8 @@ import websockets.exceptions
 from elastic_agent.core.protocols.messages import (
     AuthMessage,
     AuthResultMessage,
+    CredentialLoginMessage,
+    CredentialLoginResultMessage,
     ErrorMessage,
     ExecuteMessage,
     FileChangeMessage,
@@ -37,6 +39,7 @@ from elastic_agent.core.protocols.messages import (
     LogMessage,
     Message,
     ProcessExitMessage,
+    QuotaStatusMessage,
     ReadFileMessage,
     RegisterSyncMappingMessage,
     SendInputMessage,
@@ -86,6 +89,7 @@ class WorkerRuntime:
         self._reconnect_event = asyncio.Event()
 
         self._file_sync_manager: Any = None
+        self._quota_checker: Any = None
 
     @property
     def connected(self) -> bool:
@@ -116,6 +120,8 @@ class WorkerRuntime:
 
                     self._authenticated = True
                     logger.info("Connected and authenticated to Manager at %s", self._manager_url)
+
+                    await self._start_quota_checker()
 
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     sender_task = asyncio.create_task(self._sender_loop())
@@ -156,6 +162,8 @@ class WorkerRuntime:
     async def stop(self) -> None:
         """Gracefully shut down: stop all processes, close connection."""
         self._running = False
+        if self._quota_checker:
+            await self._quota_checker.stop()
         if self._file_sync_manager:
             await self._file_sync_manager.stop()
         for task_id in list(self._processes.keys()):
@@ -211,6 +219,7 @@ class WorkerRuntime:
             "UNWATCH": self._handle_unwatch,
             "REGISTER_SYNC_MAPPING": self._handle_register_sync_mapping,
             "UNREGISTER_SYNC_MAPPING": self._handle_unregister_sync_mapping,
+            "CREDENTIAL_LOGIN": self._handle_credential_login,
         }
         handler = handlers.get(msg.type)
         if handler:
@@ -549,6 +558,46 @@ class WorkerRuntime:
         await self._send_event(FileChangeMessage(
             path=path,
             event=event_type,
+        ))
+
+    # ---- Quota checking ----
+
+    async def _start_quota_checker(self) -> None:
+        from elastic_agent.worker.quota_checker import QuotaChecker
+
+        self._quota_checker = QuotaChecker(
+            active_slots=[],
+            on_quota_status=self._on_quota_status,
+        )
+        await self._quota_checker.start()
+
+    async def _on_quota_status(self, status: dict) -> None:
+        await self._send_event(QuotaStatusMessage(
+            task_id="",
+            account_id=status.get("account_id", ""),
+            usage_percent=max(status.get("five_hour_pct", 0), status.get("seven_day_pct", 0)),
+            five_hour_pct=status.get("five_hour_pct", 0.0),
+            seven_day_pct=status.get("seven_day_pct", 0.0),
+            available=status.get("available", True),
+        ))
+
+    async def _handle_credential_login(self, msg: CredentialLoginMessage) -> None:
+        config_dir = msg.config_dir
+        credentials = msg.credentials
+        account_id = credentials.get("account_id", f"slot-{msg.slot_index}")
+
+        Path(config_dir).mkdir(parents=True, exist_ok=True)
+        creds_path = Path(config_dir) / "credentials.json"
+        creds_path.write_text(json.dumps(credentials, ensure_ascii=False))
+        logger.info("Wrote credentials for %s to %s", account_id, config_dir)
+
+        if self._quota_checker:
+            self._quota_checker.add_slot(account_id, config_dir)
+
+        await self._send_event(CredentialLoginResultMessage(
+            account_id=account_id,
+            slot_index=msg.slot_index,
+            success=True,
         ))
 
     # ---- Heartbeat ----
