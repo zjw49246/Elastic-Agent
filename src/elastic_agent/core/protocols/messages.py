@@ -93,6 +93,11 @@ class UnregisterSyncMappingMessage(Message):
     task_id: str
 
 
+class ForceSyncMessage(Message):
+    type: Literal["FORCE_SYNC"] = "FORCE_SYNC"
+    task_id: str
+
+
 class CredentialLoginMessage(Message):
     type: Literal["CREDENTIAL_LOGIN"] = "CREDENTIAL_LOGIN"
     task_id: str
@@ -172,6 +177,14 @@ class FileSyncedMessage(Message):
     md5: str
 
 
+class ForceSyncResultMessage(Message):
+    type: Literal["FORCE_SYNC_RESULT"] = "FORCE_SYNC_RESULT"
+    task_id: str
+    files_synced: int
+    success: bool
+    error: str | None = None
+
+
 class QuotaStatusMessage(Message):
     type: Literal["QUOTA_STATUS"] = "QUOTA_STATUS"
     task_id: str
@@ -238,6 +251,7 @@ ManagerToWorkerMessage = Annotated[
         SendInputMessage,
         RegisterSyncMappingMessage,
         UnregisterSyncMappingMessage,
+        ForceSyncMessage,
         CredentialLoginMessage,
         CredentialRotateMessage,
         AuthResultMessage,
@@ -255,6 +269,7 @@ WorkerToManagerMessage = Annotated[
         HeartbeatMessage,
         ErrorMessage,
         FileSyncedMessage,
+        ForceSyncResultMessage,
         QuotaStatusMessage,
         CredentialLoginResultMessage,
         CredentialExhaustedMessage,
@@ -275,6 +290,7 @@ AnyMessage = Annotated[
         SendInputMessage,
         RegisterSyncMappingMessage,
         UnregisterSyncMappingMessage,
+        ForceSyncMessage,
         CredentialLoginMessage,
         CredentialRotateMessage,
         AuthResultMessage,
@@ -286,6 +302,7 @@ AnyMessage = Annotated[
         HeartbeatMessage,
         ErrorMessage,
         FileSyncedMessage,
+        ForceSyncResultMessage,
         QuotaStatusMessage,
         CredentialLoginResultMessage,
         CredentialExhaustedMessage,

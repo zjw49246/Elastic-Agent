@@ -219,6 +219,7 @@ class WorkerRuntime:
             "UNWATCH": self._handle_unwatch,
             "REGISTER_SYNC_MAPPING": self._handle_register_sync_mapping,
             "UNREGISTER_SYNC_MAPPING": self._handle_unregister_sync_mapping,
+            "FORCE_SYNC": self._handle_force_sync,
             "CREDENTIAL_LOGIN": self._handle_credential_login,
         }
         handler = handlers.get(msg.type)
@@ -542,6 +543,37 @@ class WorkerRuntime:
     async def _handle_unregister_sync_mapping(self, msg: UnregisterSyncMappingMessage) -> None:
         if self._file_sync_manager:
             await self._file_sync_manager.unregister_mapping(msg.task_id)
+
+    async def _handle_force_sync(self, msg) -> None:
+        from elastic_agent.core.protocols.messages import ForceSyncResultMessage
+
+        task_id = msg.task_id
+        if not self._file_sync_manager:
+            await self._send_event(ForceSyncResultMessage(
+                task_id=task_id, files_synced=0, success=False,
+                error="FileSyncManager not initialized",
+            ))
+            return
+
+        if task_id not in self._file_sync_manager._mappings:
+            await self._send_event(ForceSyncResultMessage(
+                task_id=task_id, files_synced=0, success=False,
+                error=f"No sync mapping registered for task {task_id}",
+            ))
+            return
+
+        try:
+            count = await self._file_sync_manager.force_sync(task_id)
+            logger.info("Force-synced %d files for task %s", count, task_id)
+            await self._send_event(ForceSyncResultMessage(
+                task_id=task_id, files_synced=count, success=True,
+            ))
+        except Exception as exc:
+            logger.exception("Force sync failed for task %s", task_id)
+            await self._send_event(ForceSyncResultMessage(
+                task_id=task_id, files_synced=0, success=False,
+                error=str(exc),
+            ))
 
     async def _on_file_synced(
         self, task_id: str, path: str, oss_key: str, synced_at: str, md5: str

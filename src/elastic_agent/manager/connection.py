@@ -29,6 +29,7 @@ from elastic_agent.core.protocols.messages import (
     HealthCheckMessage,
     Message,
     ReadFileMessage,
+    ForceSyncMessage,
     RegisterSyncMappingMessage,
     SendInputMessage,
     StopMessage,
@@ -296,6 +297,9 @@ class WorkerConnectionManager:
 
     async def unregister_sync_mapping(self, worker_id: str, task_id: str) -> None:
         await self.send_command(worker_id, UnregisterSyncMappingMessage(task_id=task_id))
+
+    async def force_sync(self, worker_id: str, task_id: str) -> None:
+        await self.send_command(worker_id, ForceSyncMessage(task_id=task_id))
 
     async def broadcast(self, msg: Message) -> dict[str, bool]:
         """Send a message to all connected Workers. Returns {worker_id: success}."""
