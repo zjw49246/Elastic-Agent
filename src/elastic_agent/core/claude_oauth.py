@@ -130,6 +130,9 @@ class OAuthConfig:
     config_dir: str
     login_timeout: int = 240
     mitm_port: int = 8765
+    worker_host: str | None = None
+    ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem"
+    ssh_user: str = "root"
 
 
 class _CDPClient:
@@ -214,22 +217,31 @@ class ClaudeOAuthProvider:
     def __init__(self, http_client: Any | None = None):
         self._http_client = http_client
         self._lock_files: dict[str, Any] = {}
+        self._current_config: OAuthConfig | None = None
 
     async def login(self, config: OAuthConfig) -> LoginResult:
         """Execute the full OAuth login flow."""
         account_id = config.account_id
         logger.info("ClaudeOAuthProvider: starting login for %s", account_id)
 
+        self._current_config = config
         chrome_process = None
         cli_process = None
         cdp = None
         lock_path = None
 
         try:
-            # Step 1: File lock
-            lock_path = Path(config.config_dir) / f".login_lock_{account_id}"
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            await self._acquire_lock(lock_path)
+            # Step 1: File lock (remote if worker_host set)
+            if config.worker_host:
+                await self._ssh_exec(
+                    config,
+                    f"mkdir -p {config.config_dir}",
+                    timeout=10,
+                )
+            else:
+                lock_path = Path(config.config_dir) / f".login_lock_{account_id}"
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                await self._acquire_lock(lock_path)
 
             # Step 2: Trigger magic link via 171mail
             send_result = await self._send_magic_link(config.email)
@@ -251,8 +263,8 @@ class ClaudeOAuthProvider:
                 )
             logger.info("Got magic link: %s...", magic_link[:60])
 
-            # Step 4: Launch Chrome with CDP
-            chrome_process = await self._launch_chrome(account_id)
+            # Step 4: Launch Chrome with CDP (on Worker if remote)
+            chrome_process = await self._launch_chrome(config)
             cdp = await self._connect_cdp()
             await cdp.send("Page.enable")
             logger.info("Chrome + CDP connected")
@@ -371,7 +383,7 @@ class ClaudeOAuthProvider:
             await self._wait_cli_complete(cli_process, timeout=30)
 
             # Step 13: Verify login
-            creds = self._read_credentials(config.config_dir)
+            creds = await self._read_credentials(config)
             if creds is None:
                 return LoginResult(
                     success=False, account_id=account_id,
@@ -405,6 +417,7 @@ class ClaudeOAuthProvider:
                 await self._kill_chrome(chrome_process)
             if lock_path:
                 await self._release_lock(lock_path)
+            self._current_config = None
 
     # -- 171mail helpers ----------------------------------------------------
 
@@ -438,35 +451,111 @@ class ClaudeOAuthProvider:
 
     # -- Chrome + CDP methods -----------------------------------------------
 
-    async def _launch_chrome(self, account_id: str) -> asyncio.subprocess.Process:
-        """Launch real Chrome with remote debugging port."""
+    def _ssh_opts(self, config: OAuthConfig) -> list[str]:
+        """Common SSH options for connecting to Worker."""
+        return [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+            "-o", "LogLevel=ERROR",
+            "-i", config.ssh_key_path,
+        ]
+
+    async def _ssh_exec(self, config: OAuthConfig, cmd: str, timeout: int = 30) -> str:
+        """Run a command on the Worker via SSH and return stdout."""
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", *self._ssh_opts(config),
+            f"{config.ssh_user}@{config.worker_host}", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return stdout.decode().strip()
+
+    async def _launch_chrome(self, config: OAuthConfig) -> asyncio.subprocess.Process:
+        """Launch Chrome on the Worker via SSH and set up a CDP port tunnel."""
+        host = config.worker_host
+        account_id = config.account_id
+
+        # Stop any existing Chrome service on the Worker
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "pkill", "-f", f"chrome.*{CDP_PORT}",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            await self._ssh_exec(
+                config,
+                "systemctl stop chrome-oauth 2>/dev/null; systemctl reset-failed chrome-oauth 2>/dev/null; pkill -x chrome 2>/dev/null; true",
+                timeout=10,
             )
-            await proc.wait()
-            await asyncio.sleep(1)
         except Exception:
             pass
 
         profile_dir = f"{CHROME_PROFILE_DIR}-{account_id}"
-        os.makedirs(profile_dir, exist_ok=True)
 
-        chrome = await asyncio.create_subprocess_exec(
-            "google-chrome",
-            "--no-sandbox", "--disable-gpu", "--disable-software-rasterizer",
-            "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions", "--disable-component-extensions-with-background-pages",
-            "--window-size=1365,900",
-            f"--remote-debugging-port={CDP_PORT}",
-            f"--user-data-dir={profile_dir}",
-            "about:blank",
-            env={**os.environ, "DISPLAY": ":99"},
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        # Write systemd service file for Chrome on the Worker
+        service_content = (
+            "[Unit]\n"
+            "Description=Chrome CDP for OAuth\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "Environment=DISPLAY=:99\n"
+            "Environment=HOME=/root\n"
+            f"ExecStart=/usr/bin/google-chrome "
+            f"--no-sandbox --disable-gpu --disable-software-rasterizer "
+            f"--no-first-run --no-default-browser-check "
+            f"--disable-extensions --disable-component-extensions-with-background-pages "
+            f"--window-size=1365,900 "
+            f"--remote-debugging-port={CDP_PORT} "
+            f"--user-data-dir={profile_dir} "
+            f"about:blank\n"
+            "Restart=no\n"
         )
-        await asyncio.sleep(4)
-        return chrome
+        # SCP the service file to Worker, then start it
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".service", delete=False) as f:
+            f.write(service_content)
+            tmp_path = f.name
+
+        try:
+            scp_proc = await asyncio.create_subprocess_exec(
+                "scp", *self._ssh_opts(config),
+                tmp_path,
+                f"{config.ssh_user}@{host}:/etc/systemd/system/chrome-oauth.service",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(scp_proc.wait(), timeout=15)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        launch_cmd = (
+            f"mkdir -p {profile_dir} && "
+            f"systemctl daemon-reload && "
+            f"systemctl start chrome-oauth && "
+            f"sleep 4 && "
+            f"curl -s http://127.0.0.1:{CDP_PORT}/json >/dev/null 2>&1 && echo CHROME_OK || echo CHROME_FAIL"
+        )
+        result = await self._ssh_exec(config, launch_cmd, timeout=30)
+        logger.info("Chrome launch on Worker %s: %s", host, result)
+
+        # Free local port if occupied by previous tunnel
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "fuser", "-k", f"{CDP_PORT}/tcp",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+        # Set up SSH tunnel: local CDP_PORT → Worker CDP_PORT
+        tunnel = await asyncio.create_subprocess_exec(
+            "ssh", *self._ssh_opts(config),
+            "-N", "-L", f"{CDP_PORT}:127.0.0.1:{CDP_PORT}",
+            f"{config.ssh_user}@{host}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.sleep(2)
+        logger.info("SSH tunnel established: localhost:%d → %s:%d", CDP_PORT, host, CDP_PORT)
+        return tunnel
 
     async def _connect_cdp(self) -> _CDPClient:
         """Connect to Chrome via CDP WebSocket."""
@@ -507,13 +596,20 @@ class ClaudeOAuthProvider:
         return False
 
     async def _xdotool_click(self, x: int, y: int) -> None:
-        """Click at screen coordinates using xdotool."""
-        proc = await asyncio.create_subprocess_exec(
-            "xdotool", "mousemove", str(x), str(y), "click", "1",
-            env={**os.environ, "DISPLAY": ":99"},
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
+        """Click at screen coordinates using xdotool on the Worker."""
+        if self._current_config and self._current_config.worker_host:
+            await self._ssh_exec(
+                self._current_config,
+                f"DISPLAY=:99 xdotool mousemove {x} {y} click 1",
+                timeout=10,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "mousemove", str(x), str(y), "click", "1",
+                env={**os.environ, "DISPLAY": ":99"},
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
 
     async def _cdp_authorize(self, cdp: _CDPClient, authorize_url: str) -> str | None:
         """Extract org UUID and call authorize API directly via CDP fetch()."""
@@ -582,19 +678,29 @@ return r.status+" | "+await r.text()
     # -- CLI methods --------------------------------------------------------
 
     async def _launch_cli_auth(self, config: OAuthConfig) -> asyncio.subprocess.Process:
-        """Launch Claude CLI with auth login, stdin piped for code#state delivery."""
-        env = {
-            "CLAUDE_CONFIG_DIR": config.config_dir,
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(Path.home()),
-        }
-        process = await asyncio.create_subprocess_exec(
-            "claude", "auth", "login",
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        """Launch Claude CLI auth login on the Worker via SSH."""
+        if config.worker_host:
+            process = await asyncio.create_subprocess_exec(
+                "ssh", *self._ssh_opts(config),
+                f"{config.ssh_user}@{config.worker_host}",
+                f"CLAUDE_CONFIG_DIR={config.config_dir} claude auth login",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            env = {
+                "CLAUDE_CONFIG_DIR": config.config_dir,
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "HOME": str(Path.home()),
+            }
+            process = await asyncio.create_subprocess_exec(
+                "claude", "auth", "login",
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         return process
 
     async def _extract_authorize_url(
@@ -628,31 +734,55 @@ return r.status+" | "+await r.text()
         except asyncio.TimeoutError:
             logger.warning("CLI process did not exit within %ds", timeout)
 
-    def _read_credentials(self, config_dir: str) -> dict[str, Any] | None:
-        """Read the generated .credentials.json file."""
-        cred_path = Path(config_dir) / ".credentials.json"
-        if not cred_path.exists():
-            return None
-        try:
-            data = json.loads(cred_path.read_text())
-            return data.get("claudeAiOauth", {})
-        except Exception:
-            logger.exception("Failed to read credentials.json")
-            return None
+    async def _read_credentials(self, config: OAuthConfig) -> dict[str, Any] | None:
+        """Read the generated .credentials.json file from the Worker."""
+        cred_path = f"{config.config_dir}/.credentials.json"
+        if config.worker_host:
+            try:
+                raw = await self._ssh_exec(
+                    config, f"cat {cred_path} 2>/dev/null", timeout=10
+                )
+                if not raw:
+                    return None
+                data = json.loads(raw)
+                return data.get("claudeAiOauth", {})
+            except Exception:
+                logger.exception("Failed to read credentials from Worker")
+                return None
+        else:
+            p = Path(cred_path)
+            if not p.exists():
+                return None
+            try:
+                data = json.loads(p.read_text())
+                return data.get("claudeAiOauth", {})
+            except Exception:
+                logger.exception("Failed to read credentials.json")
+                return None
 
     # -- Chrome cleanup -----------------------------------------------------
 
     async def _kill_chrome(self, chrome_process: asyncio.subprocess.Process) -> None:
-        """Kill Chrome process and leftovers."""
+        """Kill Chrome on Worker and close SSH tunnel."""
         await self._kill_process(chrome_process)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pkill", "-f", f"chrome.*{CDP_PORT}",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception:
-            pass
+        if self._current_config and self._current_config.worker_host:
+            try:
+                await self._ssh_exec(
+                    self._current_config,
+                    f"systemctl stop chrome-oauth 2>/dev/null; pkill -x chrome 2>/dev/null; true",
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "pkill", "-f", f"chrome.*{CDP_PORT}",
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            except Exception:
+                pass
 
     # -- Lock helpers -------------------------------------------------------
 

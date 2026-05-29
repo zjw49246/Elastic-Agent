@@ -48,12 +48,18 @@ class CredentialLoginStep:
         self,
         worker_id: str,
         accounts: list[tuple[AccountDefinition, str, str]],
+        worker_host: str | None = None,
+        ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem",
+        ssh_user: str = "root",
     ) -> list[LoginResult]:
         """Execute serial OAuth login for each slot independently.
 
         Args:
             worker_id: The Worker node ID.
             accounts: List of (AccountDefinition, config_dir, slot_type) tuples.
+            worker_host: SSH-reachable IP of the Worker (Chrome runs there).
+            ssh_key_path: Path to SSH private key.
+            ssh_user: SSH user.
 
         Returns:
             List of LoginResult for each account (same order as input).
@@ -77,6 +83,9 @@ class CredentialLoginStep:
                 email_token=acct.email_token,
                 config_dir=config_dir,
                 login_timeout=self._login_timeout,
+                worker_host=worker_host,
+                ssh_key_path=ssh_key_path,
+                ssh_user=ssh_user,
             )
 
             result = await self._oauth.login(config)

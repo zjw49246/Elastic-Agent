@@ -128,6 +128,9 @@ class CredentialLoginService:
         results = await self._login_step.execute(
             worker_id=worker_id,
             accounts=accounts_for_login,
+            worker_host=host,
+            ssh_key_path=self._ssh_key_path,
+            ssh_user=self._ssh_user,
         )
 
         success_count = sum(1 for r in results if r.success)
