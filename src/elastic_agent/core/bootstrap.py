@@ -281,7 +281,7 @@ class BootstrapPipeline:
             stderr=stderr,
             duration_seconds=duration,
             attempt=attempt,
-            error=stderr.strip()[-500:] if stderr else f"exit code {exit_code}",
+            error=f"stdout: {stdout.strip()[-300:]}\nstderr: {stderr.strip()[-200:]}" if stdout or stderr else f"exit code {exit_code}",
         )
 
     def _find_resume_index(self, previous_results: list[StepResult]) -> int:
