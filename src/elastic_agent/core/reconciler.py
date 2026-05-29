@@ -28,7 +28,7 @@ _CLOUD_STATE_TO_NODE_STATUS = {
     "pending": NodeStatus.CREATING,
     "starting": NodeStatus.CREATING,
     "stopping": NodeStatus.DRAINING,
-    "stopped": NodeStatus.TERMINATED,
+    "stopped": NodeStatus.STOPPED,
     "terminated": NodeStatus.TERMINATED,
 }
 
@@ -111,10 +111,10 @@ class CloudReconciler:
                     result.state_conflicts_resolved.append(nid)
                     logger.warning("Reconciler: cloud says %s is terminated, updated registry", nid)
             elif inst.state.value == "stopped":
-                if rec.status not in (NodeStatus.TERMINATED, NodeStatus.DRAINING):
-                    await self._registry.update(nid, status=NodeStatus.TERMINATED)
+                if rec.status not in (NodeStatus.STOPPED, NodeStatus.DRAINING):
+                    await self._registry.update(nid, status=NodeStatus.STOPPED)
                     result.state_conflicts_resolved.append(nid)
-                    logger.warning("Reconciler: cloud says %s is stopped, marked terminated", nid)
+                    logger.warning("Reconciler: cloud says %s is stopped, marked stopped", nid)
             else:
                 if inst.public_ip and inst.public_ip != rec.public_ip:
                     await self._registry.update(nid, public_ip=inst.public_ip)

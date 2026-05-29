@@ -23,6 +23,7 @@ class NodeStatus(str, enum.Enum):
     DRAINING = "draining"
     FAILED = "failed"
     UNHEALTHY = "unhealthy"
+    STOPPED = "stopped"
     TERMINATED = "terminated"
 
 

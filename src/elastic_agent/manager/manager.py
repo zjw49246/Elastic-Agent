@@ -183,6 +183,29 @@ class ElasticAgentManager:
                 terminated.append(nid)
         return terminated
 
+    async def resume_node(self, node_id: str) -> NodeRecord | None:
+        """Start a stopped ECS instance and mark it as CREATING.
+
+        The Worker's systemd service (Restart=always) will auto-reconnect
+        once the instance is running, so no bootstrap is needed.
+        """
+        node = await self.registry.get(node_id)
+        if node is None:
+            logger.warning("resume_node: node %s not found", node_id)
+            return None
+        if node.status != NodeStatus.STOPPED:
+            logger.warning("resume_node: node %s is %s, not stopped", node_id, node.status)
+            return None
+        try:
+            await self.provider.start_instance(node.instance_id)
+        except Exception:
+            logger.exception("resume_node: failed to start instance %s", node.instance_id)
+            return None
+        await self.registry.update(node_id, status=NodeStatus.CREATING)
+        await self.event_bus.emit("NODE_RESUMING", node_id, {"instance_id": node.instance_id})
+        logger.info("resume_node: started stopped instance %s (node %s)", node.instance_id, node_id)
+        return await self.registry.get(node_id)
+
     async def drain_node(self, node_id: str) -> bool:
         node = await self.registry.get(node_id)
         if node is None:

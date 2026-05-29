@@ -78,6 +78,7 @@ class AccountStatus(BaseModel):
     last_login_at: datetime | None = None
     last_quota_check: datetime | None = None
     last_used: datetime | None = None
+    last_assigned_to: str | None = None
 
 
 class PoolStatus(BaseModel):
@@ -322,12 +323,14 @@ class CredentialPool:
     # -- release -------------------------------------------------------------
 
     async def release(self, account_id: str) -> None:
-        """Release a single account (unassign)."""
+        """Release a single account (unassign). Saves last_assigned_to for affinity."""
         async with self._lock:
             self._ensure_loaded()
             status = self._pool_status.accounts.get(account_id)
             if status is None:
                 return
+            if status.assigned_to:
+                status.last_assigned_to = status.assigned_to
             status.assigned_to = None
             status.slot_type = None
             status.config_dir = None
@@ -347,6 +350,7 @@ class CredentialPool:
             released = []
             for acct_id, status in self._pool_status.accounts.items():
                 if status.assigned_to == worker_id:
+                    status.last_assigned_to = worker_id
                     status.assigned_to = None
                     status.slot_type = None
                     status.config_dir = None
@@ -497,6 +501,23 @@ class CredentialPool:
             for status in self._pool_status.accounts.values()
             if status.assigned_to == worker_id
         ]
+
+    def get_idle_accounts(self, group: str | None = None) -> list[tuple[str, AccountStatus]]:
+        """Return idle accounts with their IDs, optionally filtered by group.
+
+        Each entry is (account_id, AccountStatus) where assigned_to is None.
+        Useful for auto-scaling: check last_assigned_to for worker affinity.
+        """
+        result: list[tuple[str, AccountStatus]] = []
+        for acct_def in self._accounts_config.accounts:
+            if group is not None and acct_def.group != group:
+                continue
+            status = self._pool_status.accounts.get(acct_def.id)
+            if status is None:
+                continue
+            if self._is_available(acct_def, status):
+                result.append((acct_def.id, status))
+        return result
 
     def pool_summary(self) -> dict[str, Any]:
         """Summary stats: total, available, assigned, exhausted per group."""
