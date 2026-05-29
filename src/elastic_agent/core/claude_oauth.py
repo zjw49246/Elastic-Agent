@@ -220,7 +220,6 @@ class ClaudeOAuthProvider:
         self._http_client = http_client
         self._lock_files: dict[str, Any] = {}
         self._current_config: OAuthConfig | None = None
-        self._local_cdp_port: int = CDP_PORT
 
     async def login(self, config: OAuthConfig) -> LoginResult:
         """Execute the full OAuth login flow."""
@@ -267,8 +266,8 @@ class ClaudeOAuthProvider:
             logger.info("Got magic link: %s...", magic_link[:60])
 
             # Step 4: Launch Chrome with CDP (on Worker if remote)
-            chrome_process = await self._launch_chrome(config)
-            cdp = await self._connect_cdp()
+            chrome_process, local_port = await self._launch_chrome(config)
+            cdp = await self._connect_cdp(local_port)
             await cdp.send("Page.enable")
             logger.info("Chrome + CDP connected")
 
@@ -475,8 +474,11 @@ class ClaudeOAuthProvider:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return stdout.decode().strip()
 
-    async def _launch_chrome(self, config: OAuthConfig) -> asyncio.subprocess.Process:
-        """Launch Chrome on the Worker via SSH and set up a CDP port tunnel."""
+    async def _launch_chrome(self, config: OAuthConfig) -> tuple[asyncio.subprocess.Process, int]:
+        """Launch Chrome on the Worker via SSH and set up a CDP port tunnel.
+
+        Returns (tunnel_process, local_cdp_port).
+        """
         host = config.worker_host
         account_id = config.account_id
 
@@ -537,24 +539,24 @@ class ClaudeOAuthProvider:
         result = await self._ssh_exec(config, launch_cmd, timeout=30)
         logger.info("Chrome launch on Worker %s: %s", host, result)
 
-        self._local_cdp_port = next(_LOCAL_PORT_COUNTER)
+        local_port = next(_LOCAL_PORT_COUNTER)
 
-        # Set up SSH tunnel: local _local_cdp_port → Worker CDP_PORT
+        # Set up SSH tunnel: local local_port → Worker CDP_PORT
         tunnel = await asyncio.create_subprocess_exec(
             "ssh", *self._ssh_opts(config),
-            "-N", "-L", f"{self._local_cdp_port}:127.0.0.1:{CDP_PORT}",
+            "-N", "-L", f"{local_port}:127.0.0.1:{CDP_PORT}",
             f"{config.ssh_user}@{host}",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.sleep(2)
-        logger.info("SSH tunnel established: localhost:%d → %s:%d", self._local_cdp_port, host, CDP_PORT)
-        return tunnel
+        logger.info("SSH tunnel established: localhost:%d → %s:%d", local_port, host, CDP_PORT)
+        return tunnel, local_port
 
-    async def _connect_cdp(self) -> _CDPClient:
+    async def _connect_cdp(self, local_port: int = CDP_PORT) -> _CDPClient:
         """Connect to Chrome via CDP WebSocket."""
         import aiohttp
-        port = self._local_cdp_port
+        port = local_port
         async with aiohttp.ClientSession() as session:
             for attempt in range(10):
                 try:
