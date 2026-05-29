@@ -233,7 +233,7 @@ class CredentialLoginService:
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = stdout.decode().strip()
-            return "VALID" in output
+            return output == "VALID"
         except Exception as e:
             logger.debug("Credential validity check failed for %s: %s", host, e)
             return False
