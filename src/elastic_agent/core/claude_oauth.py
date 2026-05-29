@@ -15,11 +15,11 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
 import re
-import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +38,7 @@ MAGIC_LINK_POLL_INTERVAL = 2.0
 MAGIC_LINK_TIMEOUT = 90.0
 
 CDP_PORT = 9222
+_LOCAL_PORT_COUNTER = itertools.count(19222)
 CHROME_PROFILE_DIR = "/tmp/chrome-cdp-oauth"
 
 # Cloudflare "Verify you are human" checkbox position at 1365x900
@@ -536,11 +537,7 @@ class ClaudeOAuthProvider:
         result = await self._ssh_exec(config, launch_cmd, timeout=30)
         logger.info("Chrome launch on Worker %s: %s", host, result)
 
-        # Allocate a free local port for the SSH tunnel to avoid conflicts
-        # when multiple login flows run concurrently
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            self._local_cdp_port = s.getsockname()[1]
+        self._local_cdp_port = next(_LOCAL_PORT_COUNTER)
 
         # Set up SSH tunnel: local _local_cdp_port → Worker CDP_PORT
         tunnel = await asyncio.create_subprocess_exec(
