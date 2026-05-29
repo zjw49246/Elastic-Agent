@@ -116,6 +116,10 @@ class CredentialLoginService:
                 await self._notify_worker_credential_ready(worker_id, account.id)
                 return [LoginResult(success=True, account_id=account.id)]
 
+        host = await self._resolve_host(worker_id)
+        if host:
+            await self._ensure_display_server(host)
+
         accounts_for_login = [
             (account, slot.config_dir, slot.slot_type)
             for slot in self._slots
@@ -209,6 +213,39 @@ class CredentialLoginService:
                     best_time = ts
                     best_account = aid
         return best_account
+
+    # -- display server (Xvfb) check ----------------------------------------
+
+    async def _ensure_display_server(self, host: str) -> None:
+        """SSH into Worker and ensure Xvfb + openbox are running before OAuth."""
+        try:
+            ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "ConnectTimeout=10"]
+            cmd = (
+                "if systemctl is-active --quiet xvfb.service 2>/dev/null; then "
+                "  echo XVFB_OK; "
+                "else "
+                "  if command -v systemctl >/dev/null && [ -f /etc/systemd/system/xvfb.service ]; then "
+                "    systemctl start xvfb.service openbox.service && echo XVFB_STARTED; "
+                "  else "
+                "    ( pgrep -x Xvfb || (Xvfb :99 -screen 0 1365x900x24 -ac +extension GLX +render -noreset >/dev/null 2>&1 &) ) && "
+                "    sleep 1 && "
+                "    ( pgrep openbox || (DISPLAY=:99 openbox --sm-disable >/dev/null 2>&1 &) ) && "
+                "    echo XVFB_STARTED_MANUAL; "
+                "  fi; "
+                "fi"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", *ssh_opts, "-i", self._ssh_key_path,
+                f"{self._ssh_user}@{host}", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            output = stdout.decode().strip()
+            logger.info("Display server check on %s: %s", host, output)
+        except Exception as e:
+            logger.warning("Failed to ensure display server on %s: %s", host, e)
 
     # -- credential validity check -------------------------------------------
 
