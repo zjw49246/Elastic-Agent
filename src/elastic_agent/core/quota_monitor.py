@@ -48,6 +48,7 @@ class QuotaMonitor:
         self._running = False
 
         self.on_rotation_needed: RotationCallback | None = None
+        self.on_rate_limited: Callable[[str], None] | None = None
         self.on_relogin_needed: Callable[[str, str], Awaitable[None]] | None = None
 
     async def start(self) -> None:
@@ -105,24 +106,30 @@ class QuotaMonitor:
         # 2. 5h window threshold detection
         threshold_pct = self._config.quota_threshold * 100
 
-        if five_hour_pct >= 95 or data.get("error") == "rate_limited":
-            # Critical: trigger rotation
+        if data.get("error") == "rate_limited":
+            # Immediate: already limited, swap now
             logger.warning(
-                "QuotaMonitor: account %s quota critical (%.1f%%) — triggering rotation",
-                account_id, five_hour_pct,
+                "QuotaMonitor: account %s rate-limited — triggering immediate rotation",
+                account_id,
             )
             await self._emit_warning(worker_id, account_id, five_hour_pct, "quota_critical")
+            # Signal any in-progress graceful rotation to stop waiting
+            if self.on_rate_limited:
+                self.on_rate_limited(worker_id)
             if self.on_rotation_needed:
-                await self.on_rotation_needed(worker_id, account_id, "quota_exceeded")
+                await self.on_rotation_needed(worker_id, account_id, "rate_limited")
             return
 
         if five_hour_pct >= threshold_pct:
-            # Warning: approaching limit
+            # 95%+: graceful rotation — wait for task then swap
             logger.warning(
-                "QuotaMonitor: account %s quota warning (%.1f%% >= %.1f%%)",
+                "QuotaMonitor: account %s quota high (%.1f%% >= %.1f%%) — triggering graceful rotation",
                 account_id, five_hour_pct, threshold_pct,
             )
             await self._emit_warning(worker_id, account_id, five_hour_pct, "quota_warning")
+            if self.on_rotation_needed:
+                await self.on_rotation_needed(worker_id, account_id, "quota_exceeded")
+            return
 
         # 3. 7d window budget management
         if self._config.weekly_reserve_per_day > 0:

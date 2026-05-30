@@ -1,25 +1,22 @@
 """Auto-rotation — wait for task completion, allocate new account, login, restore slot.
 
 T-045: When QuotaMonitor detects an exhausted account, the CredentialRotator:
-1. Waits for the current task to complete (non-interrupting)
-2. Finds a replacement account from the pool
-3. Handles login (skip if already logged in, refresh if expired, full OAuth if needed)
-4. Distributes new credentials to Worker
-5. Updates pool status
-
-T-046: Cooldown recovery is handled by QuotaMonitor's periodic loop calling
-CredentialPool.check_cooldown_recovery(). When resets_at passes, accounts
-are automatically marked available again.
+1. Blocks new task dispatch (on_rotation_started callback)
+2. Waits for the current task to complete OR interrupts on timeout/rate-limit
+3. Finds a replacement account from the pool
+4. Handles login (skip if already logged in, refresh if expired, full OAuth if needed)
+5. Distributes new credentials to Worker
+6. Updates pool status
+7. Resumes interrupted task with new account if needed
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from elastic_agent.core.credential_pool import AccountDefinition, AccountStatus, CredentialPool
+from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
 from elastic_agent.core.credential_binding import CredentialBinding
 from elastic_agent.core.event_bus import EventBus
 
@@ -31,14 +28,12 @@ SendCredentialCallback = Callable[[str, str, dict[str, str], str], Awaitable[boo
 class CredentialRotator:
     """Manages credential rotation when accounts are exhausted.
 
-    Coordinates between CredentialPool, CredentialBinding, and Worker communication
-    to perform non-interrupting credential rotation.
-
-    Usage:
-        rotator = CredentialRotator(pool, binding, event_bus)
-        rotator.send_credential = async_callback  # (worker_id, account_id, creds, config_dir) -> success
-        rotator.execute_login = async_callback  # (worker_id, account_def) -> LoginResult
-        await rotator.rotate(worker_id="w1", old_account_id="prod-1", reason="quota_exceeded")
+    Supports two rotation paths:
+    - **Graceful (95%+)**: block new tasks → wait up to 30 min for current task →
+      if task finishes: normal swap; if timeout or rate-limited during wait:
+      interrupt task → swap → resume with new account.
+    - **Immediate (rate_limited/100%)**: block new tasks → interrupt task →
+      swap → resume with new account.
     """
 
     def __init__(
@@ -50,12 +45,22 @@ class CredentialRotator:
         self._pool = pool
         self._binding = binding
         self._bus = event_bus
-        self._pending_rotations: dict[str, asyncio.Event] = {}
         self._rotation_lock = asyncio.Lock()
+        self._interrupt_events: dict[str, asyncio.Event] = {}
 
         self.send_credential: SendCredentialCallback | None = None
         self.execute_login: Callable[..., Awaitable[Any]] | None = None
-        self.wait_for_task_completion: Callable[[str], Awaitable[None]] | None = None
+        self.wait_for_task_completion: Callable[[str], Awaitable[bool]] | None = None
+        self.on_rotation_started: Callable[[str], Awaitable[None]] | None = None
+        self.interrupt_task: Callable[[str], Awaitable[dict | None]] | None = None
+        self.resume_task: Callable[[str, dict], Awaitable[None]] | None = None
+
+    def signal_rate_limited(self, worker_id: str) -> None:
+        """Signal a waiting rotation to stop waiting and proceed immediately."""
+        evt = self._interrupt_events.get(worker_id)
+        if evt:
+            evt.set()
+            logger.info("CredentialRotator: rate-limit signal sent for worker %s", worker_id)
 
     async def rotate(
         self,
@@ -63,10 +68,7 @@ class CredentialRotator:
         old_account_id: str,
         reason: str = "quota_exceeded",
     ) -> RotationResult:
-        """Execute credential rotation for a Worker slot.
-
-        Non-interrupting: waits for current task to complete before switching.
-        """
+        """Execute credential rotation for a Worker slot."""
         async with self._rotation_lock:
             return await self._do_rotate(worker_id, old_account_id, reason)
 
@@ -76,7 +78,6 @@ class CredentialRotator:
         old_account_id: str,
         reason: str,
     ) -> RotationResult:
-        """Internal rotation logic."""
         logger.info(
             "CredentialRotator: starting rotation for account %s on worker %s (reason: %s)",
             old_account_id, worker_id, reason,
@@ -90,28 +91,49 @@ class CredentialRotator:
                 error="Account not found in pool",
             )
 
+        # Guard: skip if this account was already rotated out (e.g. by a prior call)
+        if old_status.assigned_to != worker_id:
+            logger.info(
+                "CredentialRotator: account %s no longer assigned to %s, skipping",
+                old_account_id, worker_id,
+            )
+            return RotationResult(
+                success=True,
+                old_account_id=old_account_id,
+                error="Already rotated",
+            )
+
         slot_type = old_status.slot_type or "production"
         config_dir = old_status.config_dir or ""
         group = old_status.group
 
-        # Step 1: Wait for current task to complete (non-interrupting)
-        if self.wait_for_task_completion:
-            try:
-                logger.info(
-                    "CredentialRotator: waiting for task completion on worker %s",
-                    worker_id,
-                )
-                await self.wait_for_task_completion(worker_id)
-            except Exception:
-                logger.warning(
-                    "CredentialRotator: wait_for_task_completion failed, proceeding anyway"
-                )
+        # Step 1: Block new tasks immediately
+        if self.on_rotation_started:
+            await self.on_rotation_started(worker_id)
 
-        # Step 2: Find replacement account
+        # Step 2: Wait for task or interrupt
+        task_info: dict | None = None
+        needs_resume = False
+
+        if reason == "rate_limited":
+            # Immediate: don't wait, interrupt right away
+            logger.info("CredentialRotator: rate-limited, interrupting task immediately on %s", worker_id)
+            if self.interrupt_task:
+                task_info = await self.interrupt_task(worker_id)
+                needs_resume = task_info is not None
+        else:
+            # Graceful: wait up to 30 min, interruptible by rate-limit signal
+            task_completed = await self._wait_or_interrupt(worker_id)
+            if not task_completed:
+                logger.info("CredentialRotator: wait expired/interrupted on %s, interrupting task", worker_id)
+                if self.interrupt_task:
+                    task_info = await self.interrupt_task(worker_id)
+                    needs_resume = task_info is not None
+
+        # Step 3: Find replacement account
         new_account = await self._pool.allocate(worker_id, slot_type, group)
 
         if new_account is None:
-            # No replacement available — check for cooled-down accounts
             await self._pool.check_cooldown_recovery()
             new_account = await self._pool.allocate(worker_id, slot_type, group)
 
@@ -127,6 +149,7 @@ class CredentialRotator:
                     "worker_id": worker_id,
                     "account_id": old_account_id,
                     "reason": "no_replacement_available",
+                    "interrupted_task": task_info,
                 },
             )
             return RotationResult(
@@ -135,14 +158,9 @@ class CredentialRotator:
                 error="No replacement account available",
             )
 
-        # Step 3: Handle login for new account
+        # Step 4: Login new account
         new_status = self._pool.get_status(new_account.id)
-        login_needed = True
-
-        if new_status and new_status.login_status == "logged_in":
-            login_needed = False
-        elif new_status and new_status.login_status in ("unknown", "login_failed"):
-            login_needed = True
+        login_needed = not (new_status and new_status.login_status == "logged_in")
 
         if login_needed and self.execute_login:
             try:
@@ -164,7 +182,7 @@ class CredentialRotator:
                     error=f"Login error: {e}",
                 )
 
-        # Step 4: Distribute new credentials to Worker
+        # Step 5: Send credential notification to Worker
         if self.send_credential:
             creds = {
                 "account_id": new_account.id,
@@ -181,16 +199,13 @@ class CredentialRotator:
                     error="Failed to send credentials to Worker",
                 )
 
-        # Step 5: Update pool status
-        # Release old account and mark cooldown
+        # Step 6: Update pool status
         await self._binding.unbind(old_account_id)
         await self._pool.release(old_account_id)
         await self._pool.mark_cooldown(old_account_id)
-
-        # Bind new account
         await self._binding.bind(new_account.id, worker_id)
 
-        # Emit rotation event
+        # Step 7: Emit rotation event
         await self._bus.emit(
             "CREDENTIAL_ROTATED",
             worker_id,
@@ -199,6 +214,7 @@ class CredentialRotator:
                 "old_id": old_account_id,
                 "new_id": new_account.id,
                 "reason": reason,
+                "task_resumed": needs_resume,
             },
         )
 
@@ -207,11 +223,56 @@ class CredentialRotator:
             old_account_id, new_account.id, worker_id, reason,
         )
 
+        # Step 8: Resume interrupted task with new account
+        if needs_resume and task_info and self.resume_task:
+            logger.info(
+                "CredentialRotator: resuming interrupted task on worker %s with new account %s",
+                worker_id, new_account.id,
+            )
+            try:
+                await self.resume_task(worker_id, task_info)
+            except Exception:
+                logger.exception("CredentialRotator: failed to resume task on worker %s", worker_id)
+
         return RotationResult(
             success=True,
             old_account_id=old_account_id,
             new_account_id=new_account.id,
         )
+
+    async def _wait_or_interrupt(self, worker_id: str) -> bool:
+        """Wait for task completion, interruptible by rate-limit signal.
+
+        Returns True if the task completed naturally, False if interrupted or timed out.
+        """
+        evt = asyncio.Event()
+        self._interrupt_events[worker_id] = evt
+
+        try:
+            if self.wait_for_task_completion:
+                wait_task = asyncio.create_task(self.wait_for_task_completion(worker_id))
+                interrupt_task = asyncio.create_task(evt.wait())
+
+                done, pending = await asyncio.wait(
+                    [wait_task, interrupt_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for p in pending:
+                    p.cancel()
+                    try:
+                        await p
+                    except asyncio.CancelledError:
+                        pass
+
+                if wait_task in done:
+                    result = wait_task.result()
+                    return result if isinstance(result, bool) else True
+                # Interrupted by rate-limit signal
+                return False
+            return True
+        finally:
+            self._interrupt_events.pop(worker_id, None)
 
     async def handle_exhausted(
         self, worker_id: str, account_id: str, reason: str
