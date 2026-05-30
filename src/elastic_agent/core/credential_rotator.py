@@ -167,6 +167,7 @@ class CredentialRotator:
                 login_result = await self.execute_login(worker_id, new_account, config_dir)
                 if not getattr(login_result, "success", False):
                     await self._pool.release(new_account.id)
+                    await self._cleanup_old_account(old_account_id, worker_id)
                     return RotationResult(
                         success=False,
                         old_account_id=old_account_id,
@@ -175,6 +176,7 @@ class CredentialRotator:
                     )
             except Exception as e:
                 await self._pool.release(new_account.id)
+                await self._cleanup_old_account(old_account_id, worker_id)
                 return RotationResult(
                     success=False,
                     old_account_id=old_account_id,
@@ -192,6 +194,7 @@ class CredentialRotator:
             sent = await self.send_credential(worker_id, new_account.id, creds, config_dir)
             if not sent:
                 await self._pool.release(new_account.id)
+                await self._cleanup_old_account(old_account_id, worker_id)
                 return RotationResult(
                     success=False,
                     old_account_id=old_account_id,
@@ -239,6 +242,21 @@ class CredentialRotator:
             old_account_id=old_account_id,
             new_account_id=new_account.id,
         )
+
+    async def _cleanup_old_account(self, old_account_id: str, worker_id: str) -> None:
+        """Release and cooldown the old account when rotation fails."""
+        try:
+            await self._binding.unbind(old_account_id)
+            await self._pool.release(old_account_id)
+            await self._pool.mark_cooldown(old_account_id)
+            logger.info(
+                "CredentialRotator: cleaned up old account %s from worker %s after rotation failure",
+                old_account_id, worker_id,
+            )
+        except Exception:
+            logger.exception(
+                "CredentialRotator: failed to clean up old account %s", old_account_id,
+            )
 
     async def _wait_or_interrupt(self, worker_id: str) -> bool:
         """Wait for task completion, interruptible by rate-limit signal.

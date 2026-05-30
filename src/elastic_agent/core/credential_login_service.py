@@ -144,6 +144,13 @@ class CredentialLoginService:
             if host:
                 await self._write_account_markers(host, account.id)
             await self._notify_worker_credential_ready(worker_id, account.id)
+        else:
+            logger.error(
+                "All credential slots failed for worker %s (account %s) — releasing account",
+                worker_id, account.id,
+            )
+            await self._binding.unbind(account.id)
+            await self._pool.release(account.id)
 
         return results
 
