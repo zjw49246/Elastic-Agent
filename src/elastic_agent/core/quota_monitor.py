@@ -121,7 +121,7 @@ class QuotaMonitor:
             return
 
         if five_hour_pct >= threshold_pct:
-            # 95%+: graceful rotation — wait for task then swap
+            # Threshold reached: graceful rotation — wait for task then swap
             logger.warning(
                 "QuotaMonitor: account %s quota high (%.1f%% >= %.1f%%) — triggering graceful rotation",
                 account_id, five_hour_pct, threshold_pct,
