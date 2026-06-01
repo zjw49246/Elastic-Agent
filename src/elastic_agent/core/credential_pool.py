@@ -213,7 +213,7 @@ class CredentialPool:
             return False
         if status.assigned_to is not None:
             return False
-        if status.login_status in ("failed", "logging_in"):
+        if status.login_status in ("failed", "login_failed", "logging_in"):
             return False
         if status.backoff_until is not None and _utcnow() < status.backoff_until:
             return False
@@ -467,6 +467,9 @@ class CredentialPool:
             for acct_id, status in self._pool_status.accounts.items():
                 if status.backoff_until is not None and now >= status.backoff_until:
                     status.backoff_until = None
+                    if status.login_status in ("failed", "login_failed"):
+                        status.login_status = "unknown"
+                        status.error = None
                     acct_def = self._account_def(acct_id)
                     if acct_def is not None and status.assigned_to is None:
                         status.available = self._is_available(acct_def, status)
