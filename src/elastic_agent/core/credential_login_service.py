@@ -140,6 +140,7 @@ class CredentialLoginService:
         )
 
         if success_count > 0:
+            await self._pool.update_login_status(account.id, "logged_in")
             host = await self._resolve_host(worker_id)
             if host:
                 await self._write_account_markers(host, account.id)
