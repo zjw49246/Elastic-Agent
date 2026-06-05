@@ -3,13 +3,16 @@
 Uses real Chrome + CDP for navigation/JS + xdotool for Cloudflare checkbox.
 Calls authorize API directly via CDP fetch(), bypassing Turnstile entirely.
 
-Flow:
-  1. 171mail: trigger magic link email → poll for magic link URL
-  2. Chrome CDP: visit magic link → xdotool clicks CF checkbox → get 6-digit code
-  3. Chrome CDP: login page → enter email + code → establish session
-  4. CLI: launch `claude auth login` → extract OAuth URL
-  5. Chrome CDP: navigate to OAuth URL → xdotool clicks CF → call authorize API → code#state
-  6. Feed code#state to CLI stdin → credentials written
+Flow (Chrome-first to establish CF cookies before magic link):
+  1. Chrome CDP: visit login page → xdotool clicks CF checkbox → cookies set
+  2. Detect already-logged-in (edit slots reusing session) → skip to step 7
+  3. Enter email on login page → click "Continue with email"
+  4. 171mail: trigger magic link email → poll for magic link URL
+  5. Chrome CDP: navigate to magic link (CF cookies already set) → get 6-digit code
+  6. Chrome CDP: login page → re-enter email + code → establish session
+  7. CLI: launch `claude auth login` → extract OAuth URL
+  8. Chrome CDP: navigate to OAuth URL → call authorize API → code#state
+  9. Feed code#state to CLI stdin → credentials written
 """
 
 from __future__ import annotations
@@ -130,7 +133,7 @@ class OAuthConfig:
     email: str
     email_token: str
     config_dir: str
-    login_timeout: int = 240
+    login_timeout: int = 480
     mitm_port: int = 8765
     worker_host: str | None = None
     ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem"
@@ -222,7 +225,11 @@ class ClaudeOAuthProvider:
         self._current_config: OAuthConfig | None = None
 
     async def login(self, config: OAuthConfig) -> LoginResult:
-        """Execute the full OAuth login flow."""
+        """Execute the full OAuth login flow.
+
+        Flow: Chrome → login page → CF cookies → detect already-logged-in →
+        (if not) email + magic link → verification code → session → CLI OAuth.
+        """
         account_id = config.account_id
         logger.info("ClaudeOAuthProvider: starting login for %s", account_id)
 
@@ -230,6 +237,7 @@ class ClaudeOAuthProvider:
         chrome_process = None
         cli_process = None
         cdp = None
+        local_port = None
         lock_path = None
 
         try:
@@ -245,111 +253,164 @@ class ClaudeOAuthProvider:
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 await self._acquire_lock(lock_path)
 
-            # Step 2: Trigger magic link via 171mail
-            send_result = await self._send_magic_link(config.email)
-            if send_result.get("code") != 200:
-                return LoginResult(
-                    success=False,
-                    account_id=account_id,
-                    error=f"Failed to send magic link: {send_result.get('message', 'unknown')}",
-                )
-            logger.info("Magic link email triggered for %s", config.email)
-
-            # Step 3: Poll for magic link URL
-            magic_link = await self._poll_magic_link(config.email_token)
-            if magic_link is None:
-                return LoginResult(
-                    success=False,
-                    account_id=account_id,
-                    error="Timed out waiting for magic link",
-                )
-            logger.info("Got magic link: %s...", magic_link[:60])
-
-            # Step 4: Launch Chrome with CDP (on Worker if remote)
+            # Step 2: Launch Chrome first, visit login page to establish CF cookies
             chrome_process, local_port = await self._launch_chrome(config)
             cdp = await self._connect_cdp(local_port)
             await cdp.send("Page.enable")
             logger.info("Chrome + CDP connected")
 
-            # Step 5: Visit magic link → click CF checkbox → get verification code
-            await cdp.navigate(magic_link)
+            # Step 3: Visit login page and pass CF challenge
+            await cdp.navigate("https://claude.ai/login")
             await asyncio.sleep(3)
-            cf_passed = await self._handle_cloudflare(cdp, "magic link")
+            cf_passed = await self._handle_cloudflare(cdp, "login page", config=config)
             if not cf_passed:
                 return LoginResult(
                     success=False, account_id=account_id,
-                    error="Cloudflare challenge failed on magic link page",
+                    error="Cloudflare challenge failed on login page",
                 )
+            await asyncio.sleep(2)
 
-            await asyncio.sleep(5)
-            url = await cdp.evaluate("document.location.href") or ""
-            body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
-            logger.info("After magic link — URL: %s, body: %s", url[:80], body[:120])
+            # Check if already logged in (e.g. edit slot reusing browser session)
+            current_url = await cdp.evaluate("document.location.href") or ""
+            current_path = urlparse(current_url).path.rstrip("/")
+            already_logged_in = current_path in ("/new", "/chat", "/recents", "")
 
-            # Check if magic link auto-logged us in (redirected away from magic-link/login page)
-            parsed_path = urlparse(url).path.rstrip("/")
-            session_established = parsed_path in ("/new", "/chat", "/recents", "") and "magic-link" not in url
+            if already_logged_in:
+                logger.info("Already logged in at %s, skipping email+magic link", current_url[:80])
+            else:
+                # Step 4: Enter email with retry
+                email_entered = False
+                for attempt in range(5):
+                    r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
+                    logger.info("Email input (attempt %d): %s", attempt + 1, r)
+                    if r and r != "no email input":
+                        email_entered = True
+                        break
+                    await asyncio.sleep(2)
 
-            if not session_established:
-                # Magic link showed verification code — need to enter it on login page
-                verify_code = None
-                m = re.search(r'(\d{6})', body)
-                if m:
-                    verify_code = m.group(1)
-                if not verify_code:
+                if not email_entered:
                     return LoginResult(
                         success=False, account_id=account_id,
-                        error="No 6-digit verification code on magic link page",
+                        error="Email input field not found after retries",
                     )
-                logger.info("Verification code: %s", verify_code)
 
-                # Navigate to login page
-                await cdp.navigate("https://claude.ai/login")
-                await asyncio.sleep(3)
-                await self._handle_cloudflare(cdp, "login")
-                await asyncio.sleep(5)
-
-                # Enter email
-                r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
-                logger.info("Email input: %s", r)
                 await asyncio.sleep(0.5)
-
                 r = await cdp.evaluate(
                     _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
                 )
                 logger.info("Email button: %s", r)
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
-                r = await cdp.evaluate(
-                    _JS_CLICK_BTN.format(condition="b.type==='submit'||t.includes('Continue')")
-                )
-                logger.info("Submit: %s", r)
-                await asyncio.sleep(8)
-
-                url = await cdp.evaluate("document.location.href") or ""
-                body = await cdp.evaluate("document.body?.innerText?.substring(0, 200)") or ""
-                logger.info("After email submit — URL: %s, body: %s", url[:80], body[:80])
-
-                # Enter verification code if on code page
-                if any(w in body.lower() for w in ("verification", "code", "check")):
-                    r = await cdp.evaluate(_JS_ENTER_CODE.format(code=verify_code))
-                    logger.info("Code entry: %s", r)
-                    await asyncio.sleep(1)
-
-                    r = await cdp.evaluate(
-                        _JS_CLICK_BTN.format(
-                            condition="!t.includes('Google')&&!t.includes('SSO')&&(t.includes('Verify')||t.includes('Continue')||t.includes('Submit')||b.type==='submit')"
-                        )
+                # Step 5: Trigger magic link via 171mail API
+                send_result = await self._send_magic_link(config.email)
+                if send_result.get("code") != 200:
+                    return LoginResult(
+                        success=False, account_id=account_id,
+                        error=f"Failed to send magic link: {send_result.get('message', 'unknown')}",
                     )
-                    logger.info("Verify button: %s", r)
-                    await asyncio.sleep(10)
-            else:
-                logger.info("Magic link auto-login succeeded, session already established")
+                logger.info("Magic link email triggered for %s", config.email)
 
-            # Step 7: Launch CLI auth login
+                # Step 6: Poll for magic link URL
+                magic_link = await self._poll_magic_link(config.email_token)
+                if magic_link is None:
+                    return LoginResult(
+                        success=False, account_id=account_id,
+                        error="Timed out waiting for magic link",
+                    )
+                logger.info("Got magic link: %s...", magic_link[:60])
+
+                # Step 7: Navigate to magic link (CF cookies already established)
+                try:
+                    await cdp.navigate(magic_link)
+                except Exception:
+                    logger.warning("CDP connection lost during magic link nav, reconnecting...")
+                    await cdp.close()
+                    cdp = await self._connect_cdp(local_port)
+                    await cdp.send("Page.enable")
+                    await cdp.navigate(magic_link)
+
+                await asyncio.sleep(3)
+                await self._handle_cloudflare(cdp, "magic link", config=config)
+
+                # Poll for verification code or auto-redirect
+                verify_code = None
+                session_established = False
+                for poll_attempt in range(10):
+                    await asyncio.sleep(3)
+                    url = await cdp.evaluate("document.location.href") or ""
+                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
+                    logger.info("Magic link poll %d — URL: %s, body: %s",
+                                poll_attempt + 1, url[:80], body[:120])
+
+                    parsed_path = urlparse(url).path.rstrip("/")
+                    if parsed_path in ("/new", "/chat", "/recents", "") and "magic-link" not in url:
+                        session_established = True
+                        break
+
+                    m = re.search(r'(\d{6})', body)
+                    if m:
+                        verify_code = m.group(1)
+                        break
+
+                    if "loading" not in body.lower() and body.strip():
+                        break
+
+                if not session_established and not verify_code:
+                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
+                    m = re.search(r'(\d{6})', body)
+                    if m:
+                        verify_code = m.group(1)
+                    else:
+                        return LoginResult(
+                            success=False, account_id=account_id,
+                            error="No verification code or auto-login after magic link",
+                        )
+
+                if not session_established:
+                    logger.info("Verification code: %s", verify_code)
+
+                    # Navigate back to login page to enter code
+                    await cdp.navigate("https://claude.ai/login")
+                    await asyncio.sleep(3)
+                    await self._handle_cloudflare(cdp, "login return", config=config)
+                    await asyncio.sleep(3)
+
+                    for attempt in range(5):
+                        r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
+                        if r and r != "no email input":
+                            break
+                        await asyncio.sleep(2)
+
+                    await asyncio.sleep(0.5)
+                    r = await cdp.evaluate(
+                        _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
+                    )
+                    logger.info("Email button re-click: %s", r)
+                    await asyncio.sleep(8)
+
+                    url = await cdp.evaluate("document.location.href") or ""
+                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 200)") or ""
+                    logger.info("After email re-submit — URL: %s, body: %s", url[:80], body[:80])
+
+                    if any(w in body.lower() for w in ("verification", "code", "check")):
+                        r = await cdp.evaluate(_JS_ENTER_CODE.format(code=verify_code))
+                        logger.info("Code entry: %s", r)
+                        await asyncio.sleep(1)
+
+                        r = await cdp.evaluate(
+                            _JS_CLICK_BTN.format(
+                                condition="!t.includes('Google')&&!t.includes('SSO')&&(t.includes('Verify')||t.includes('Continue')||t.includes('Submit')||b.type==='submit')"
+                            )
+                        )
+                        logger.info("Verify button: %s", r)
+                        await asyncio.sleep(10)
+                else:
+                    logger.info("Magic link auto-login succeeded, session already established")
+
+            # Step 8: Launch CLI auth login
             cli_process = await self._launch_cli_auth(config)
 
-            # Step 8: Extract OAuth authorize URL
+            # Step 9: Extract OAuth authorize URL
             authorize_url = await self._extract_authorize_url(cli_process, timeout=30)
             if authorize_url is None:
                 return LoginResult(
@@ -358,16 +419,16 @@ class ClaudeOAuthProvider:
                 )
             logger.info("OAuth URL: %s...", authorize_url[:80])
 
-            # Step 9: Navigate to OAuth URL → click CF → call authorize API
+            # Step 10: Navigate to OAuth URL → click CF → call authorize API
             await cdp.navigate(authorize_url)
             await asyncio.sleep(3)
-            await self._handle_cloudflare(cdp, "OAuth")
+            await self._handle_cloudflare(cdp, "OAuth", config=config)
             await asyncio.sleep(8)
 
             body = await cdp.evaluate("document.body?.innerText?.substring(0, 100)")
             logger.info("OAuth page: %s", (body or "")[:80])
 
-            # Step 10: Extract org UUID and call authorize API directly
+            # Step 11: Extract org UUID and call authorize API directly
             code_state = await self._cdp_authorize(cdp, authorize_url)
             if code_state is None:
                 return LoginResult(
@@ -376,15 +437,15 @@ class ClaudeOAuthProvider:
                 )
             logger.info("Got code#state (%d chars)", len(code_state))
 
-            # Step 11: Feed code#state to CLI stdin
+            # Step 12: Feed code#state to CLI stdin
             cli_process.stdin.write(f"{code_state}\n".encode())
             await cli_process.stdin.drain()
             cli_process.stdin.close()
 
-            # Step 12: Wait for CLI to complete
+            # Step 13: Wait for CLI to complete
             await self._wait_cli_complete(cli_process, timeout=30)
 
-            # Step 13: Verify login
+            # Step 14: Verify login
             creds = await self._read_credentials(config)
             if creds is None:
                 return LoginResult(
@@ -416,7 +477,7 @@ class ClaudeOAuthProvider:
             if cli_process:
                 await self._kill_process(cli_process)
             if chrome_process:
-                await self._kill_chrome(chrome_process)
+                await self._kill_chrome(chrome_process, config=config)
             if lock_path:
                 await self._release_lock(lock_path)
             self._current_config = None
@@ -575,7 +636,10 @@ class ClaudeOAuthProvider:
                 await asyncio.sleep(1)
         raise RuntimeError("Could not connect to Chrome CDP")
 
-    async def _handle_cloudflare(self, cdp: _CDPClient, context: str, timeout: int = 30) -> bool:
+    async def _handle_cloudflare(
+        self, cdp: _CDPClient, context: str, timeout: int = 60,
+        config: OAuthConfig | None = None,
+    ) -> bool:
         """Detect and handle Cloudflare challenge by clicking checkbox with xdotool."""
         start = time.monotonic()
         while time.monotonic() - start < timeout:
@@ -588,17 +652,20 @@ class ClaudeOAuthProvider:
 
             logger.info("CF challenge detected on %s, clicking checkbox at (%d,%d)...",
                         context, CF_CHECKBOX_X, CF_CHECKBOX_Y)
-            await self._xdotool_click(CF_CHECKBOX_X, CF_CHECKBOX_Y)
+            await self._xdotool_click(CF_CHECKBOX_X, CF_CHECKBOX_Y, config=config)
             await asyncio.sleep(5)
 
         logger.error("CF challenge did not clear for %s within %ds", context, timeout)
         return False
 
-    async def _xdotool_click(self, x: int, y: int) -> None:
+    async def _xdotool_click(
+        self, x: int, y: int, config: OAuthConfig | None = None,
+    ) -> None:
         """Click at screen coordinates using xdotool on the Worker."""
-        if self._current_config and self._current_config.worker_host:
+        cfg = config or self._current_config
+        if cfg and cfg.worker_host:
             await self._ssh_exec(
-                self._current_config,
+                cfg,
                 f"DISPLAY=:99 xdotool mousemove {x} {y} click 1",
                 timeout=10,
             )
@@ -761,13 +828,17 @@ return r.status+" | "+await r.text()
 
     # -- Chrome cleanup -----------------------------------------------------
 
-    async def _kill_chrome(self, chrome_process: asyncio.subprocess.Process) -> None:
+    async def _kill_chrome(
+        self, chrome_process: asyncio.subprocess.Process,
+        config: OAuthConfig | None = None,
+    ) -> None:
         """Kill Chrome on Worker and close SSH tunnel."""
         await self._kill_process(chrome_process)
-        if self._current_config and self._current_config.worker_host:
+        cfg = config or self._current_config
+        if cfg and cfg.worker_host:
             try:
                 await self._ssh_exec(
-                    self._current_config,
+                    cfg,
                     f"systemctl stop chrome-oauth 2>/dev/null; pkill -x chrome 2>/dev/null; true",
                     timeout=10,
                 )

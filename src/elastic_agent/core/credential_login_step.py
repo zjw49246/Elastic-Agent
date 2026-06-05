@@ -36,7 +36,7 @@ class CredentialLoginStep:
         self,
         pool: CredentialPool,
         oauth_provider: ClaudeOAuthProvider | None = None,
-        login_timeout: int = 240,
+        login_timeout: int = 480,
         on_login_result: LoginCallback | None = None,
     ) -> None:
         self._pool = pool
