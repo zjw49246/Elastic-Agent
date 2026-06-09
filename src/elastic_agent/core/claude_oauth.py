@@ -495,19 +495,26 @@ class ClaudeOAuthProvider:
         """Poll 171mail inbox for magic link URL."""
         start = time.monotonic()
         while time.monotonic() - start < MAGIC_LINK_TIMEOUT:
-            result = await self._http_get(
-                f"{MAIL_API_BASE}/getClaudeMessage",
-                params={"token": email_token},
-            )
-            result_data = result.get("data") or {}
-            raw = result_data.get("code") or result_data.get("link") or result_data.get("magicLink") or ""
+            try:
+                result = await self._http_get(
+                    f"{MAIL_API_BASE}/getClaudeMessage",
+                    params={"token": email_token},
+                )
+                if not isinstance(result, dict):
+                    logger.warning("171mail returned non-dict: %s", type(result))
+                    await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
+                    continue
+                result_data = result.get("data") or {}
+                raw = result_data.get("code") or result_data.get("link") or result_data.get("magicLink") or ""
 
-            if raw.startswith("https://"):
-                return raw
-            body = result_data.get("body") or raw
-            match = re.search(r'https://claude\.ai/magic-link#\S+', body)
-            if match:
-                return match.group(0)
+                if raw.startswith("https://"):
+                    return raw
+                body = result_data.get("body") or raw
+                match = re.search(r'https://claude\.ai/magic-link#\S+', body)
+                if match:
+                    return match.group(0)
+            except Exception as e:
+                logger.warning("171mail poll error (will retry): %s", e)
 
             await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
         return None
@@ -543,11 +550,11 @@ class ClaudeOAuthProvider:
         host = config.worker_host
         account_id = config.account_id
 
-        # Stop any existing Chrome service on the Worker
+        # Stop any existing Chrome/Chromium on the Worker
         try:
             await self._ssh_exec(
                 config,
-                "systemctl stop chrome-oauth 2>/dev/null; systemctl reset-failed chrome-oauth 2>/dev/null; pkill -x chrome 2>/dev/null; true",
+                "pkill -f 'chrome.*remote-debugging-port' 2>/dev/null; sleep 1; true",
                 timeout=10,
             )
         except Exception:
@@ -555,49 +562,47 @@ class ClaudeOAuthProvider:
 
         profile_dir = f"{CHROME_PROFILE_DIR}-{account_id}"
 
-        # Write systemd service file for Chrome on the Worker
-        service_content = (
-            "[Unit]\n"
-            "Description=Chrome CDP for OAuth\n"
-            "[Service]\n"
-            "Type=simple\n"
-            "Environment=DISPLAY=:99\n"
-            "Environment=HOME=/root\n"
-            f"ExecStart=/usr/bin/google-chrome "
+        # Find Chrome/Chromium binary on the Worker
+        find_cmd = (
+            "command -v google-chrome 2>/dev/null || "
+            "command -v chromium-browser 2>/dev/null || "
+            "command -v chromium 2>/dev/null || "
+            "find /home -path '*/ms-playwright/*/chrome' -type f 2>/dev/null | head -1"
+        )
+        chrome_bin = await self._ssh_exec(config, find_cmd, timeout=10)
+        if not chrome_bin:
+            raise RuntimeError("No Chrome/Chromium binary found on Worker")
+        logger.info("Using browser binary: %s", chrome_bin)
+
+        # Launch Chrome via a fire-and-forget SSH command (-f flag for background)
+        await self._ssh_exec(
+            config,
+            f"mkdir -p {profile_dir}",
+            timeout=10,
+        )
+        # Start Chrome in background using ssh -f (fork to background after auth)
+        bg_proc = await asyncio.create_subprocess_exec(
+            "ssh", *self._ssh_opts(config), "-f",
+            f"{config.ssh_user}@{host}",
+            f"DISPLAY=:99 {chrome_bin} "
             f"--no-sandbox --disable-gpu --disable-software-rasterizer "
             f"--no-first-run --no-default-browser-check "
             f"--disable-extensions --disable-component-extensions-with-background-pages "
             f"--window-size=1365,900 "
             f"--remote-debugging-port={CDP_PORT} "
             f"--user-data-dir={profile_dir} "
-            f"about:blank\n"
-            "Restart=no\n"
+            f"about:blank > /tmp/chrome-oauth.log 2>&1",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        # SCP the service file to Worker, then start it
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".service", delete=False) as f:
-            f.write(service_content)
-            tmp_path = f.name
-
-        try:
-            scp_proc = await asyncio.create_subprocess_exec(
-                "scp", *self._ssh_opts(config),
-                tmp_path,
-                f"{config.ssh_user}@{host}:/etc/systemd/system/chrome-oauth.service",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(scp_proc.wait(), timeout=15)
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-
-        launch_cmd = (
-            f"mkdir -p {profile_dir} && "
-            f"systemctl daemon-reload && "
-            f"systemctl start chrome-oauth && "
-            f"sleep 4 && "
-            f"curl -s http://127.0.0.1:{CDP_PORT}/json >/dev/null 2>&1 && echo CHROME_OK || echo CHROME_FAIL"
+        await asyncio.wait_for(bg_proc.wait(), timeout=10)
+        await asyncio.sleep(4)
+        # Verify Chrome is up
+        result = await self._ssh_exec(
+            config,
+            f"curl -s http://127.0.0.1:{CDP_PORT}/json >/dev/null 2>&1 && echo CHROME_OK || echo CHROME_FAIL",
+            timeout=10,
         )
-        result = await self._ssh_exec(config, launch_cmd, timeout=30)
         logger.info("Chrome launch on Worker %s: %s", host, result)
 
         local_port = next(_LOCAL_PORT_COUNTER)
@@ -909,7 +914,7 @@ return r.status+" | "+await r.text()
         import aiohttp
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                return await resp.json()
+                return await resp.json(content_type=None)
 
     async def _http_get_raw(self, url: str) -> str:
         if self._http_client:
