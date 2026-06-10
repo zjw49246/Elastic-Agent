@@ -213,7 +213,7 @@ class CredentialPool:
             return False
         if status.assigned_to is not None:
             return False
-        if status.login_status in ("failed", "login_failed", "logging_in"):
+        if status.login_status == "logging_in":
             return False
         if status.backoff_until is not None and _utcnow() < status.backoff_until:
             return False
