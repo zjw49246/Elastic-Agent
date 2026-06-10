@@ -168,6 +168,14 @@ class AliyunProvider(CloudProvider):
         await asyncio.to_thread(self._client.start_instance, req)
         logger.info("Started Aliyun instance %s", native_id)
 
+    async def reboot_instance(self, instance_id: str) -> None:
+        from alibabacloud_ecs20140526.models import RebootInstanceRequest
+
+        native_id = self._native_id(instance_id)
+        req = RebootInstanceRequest(instance_id=native_id, force_stop=True)
+        await asyncio.to_thread(self._client.reboot_instance, req)
+        logger.info("Rebooted Aliyun instance %s", native_id)
+
     async def stop_instance(self, instance_id: str) -> None:
         from alibabacloud_ecs20140526.models import StopInstanceRequest
 

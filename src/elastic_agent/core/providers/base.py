@@ -78,5 +78,9 @@ class CloudProvider(ABC):
         ...
 
     @abstractmethod
+    async def reboot_instance(self, instance_id: str) -> None:
+        ...
+
+    @abstractmethod
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:
         ...
