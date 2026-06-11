@@ -680,3 +680,34 @@ class TestRootSandboxEnv:
             agent_params={"prompt": "x"}, env={"IS_SANDBOX": "0"},
         ))
         assert fake.launches[0]["env_overrides"]["IS_SANDBOX"] == "0"
+
+
+@pty_required
+class TestTurnErrorSemantics:
+    @pytest.mark.asyncio
+    async def test_tool_result_error_not_fatal(self, tmp_path):
+        # The exact production bug: one failed tool_result mid-run marked a
+        # fully delivered book as failed.
+        backend = _make_backend(tmp_path)
+        await backend.on_event("t1", {
+            "event_type": "tool_result", "is_error": True,
+            "tool_output": "Agent type 'x' not found",
+            "raw_json": json.dumps({"type": "user", "message": {}}),
+            "session_id": "sess-1",
+        })
+        await backend.on_exit("t1", 0)
+        result_msg = backend._runtime._send_event.call_args[0][0]
+        obj = json.loads(result_msg.data)
+        assert obj["subtype"] == "success"
+        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("etype", ["system_event", "message", "result"])
+    async def test_session_level_errors_stay_fatal(self, tmp_path, etype):
+        backend = _make_backend(tmp_path)
+        await backend.on_event("t1", {
+            "event_type": etype, "is_error": True,
+            "content": "usage limit reached", "session_id": "sess-1",
+        })
+        await backend.on_exit("t1", 0)
+        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 1)

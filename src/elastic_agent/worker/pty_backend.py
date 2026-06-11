@@ -165,7 +165,16 @@ if PTY_AVAILABLE:
             sid = event_dict.get("session_id")
             if sid:
                 self._task_session_ids[task_id] = sid
-            if event_dict.get("is_error"):
+            # Only session-level errors are turn-fatal: API errors, rate
+            # limits, response timeouts (claude-pty emits those as
+            # system_event/message/result with is_error). A failed
+            # tool_result is normal agent life — the model recovers and the
+            # turn can still deliver; it must not poison the synthesized
+            # result (a real book once finished 100% but was reported
+            # failed because of one mid-run tool error).
+            if event_dict.get("is_error") and event_dict.get("event_type") in (
+                "system_event", "message", "result",
+            ):
                 self._turn_errors[task_id] = event_dict.get("content") or "PTY turn error"
             if event_dict.get("event_type") == "result":
                 self._saw_result.add(task_id)
