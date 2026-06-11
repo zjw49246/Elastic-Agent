@@ -27,8 +27,13 @@ worker = [
     "watchdog>=5.0.0",
     "oss2>=2.18.0",
 ]
+# PTY-hosted execution (worker-side). Pinned via uv.lock — when the PTY
+# framework updates, run: uv lock --upgrade-package claude-pty && uv sync
+pty = [
+    "claude-pty",
+]
 all = [
-    "elastic-agent[aliyun,aws,worker]",
+    "elastic-agent[aliyun,aws,worker,pty]",
 ]
 dev = [
     "pytest>=8.0",
@@ -64,3 +69,6 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+
+[tool.uv.sources]
+claude-pty = { git = "https://github.com/zjw49246/Claude-Code-PTY" }
