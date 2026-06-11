@@ -91,13 +91,20 @@ class WorkerRuntime:
         self._file_sync_manager: Any = None
         self._quota_checker: Any = None
 
+        # PTY-hosted execution (claude-pty); created lazily on first use.
+        self._pty_backend: Any = None
+        self._pty_timeouts: dict[str, asyncio.Task] = {}
+
     @property
     def connected(self) -> bool:
         return self._ws is not None and self._authenticated
 
     @property
     def active_processes(self) -> list[str]:
-        return list(self._processes.keys())
+        tasks = list(self._processes.keys())
+        if self._pty_backend is not None:
+            tasks.extend(self._pty_backend.active_tasks)
+        return tasks
 
     async def run(self) -> None:
         """Main loop: connect, authenticate, handle messages. Reconnect on failure."""
@@ -168,6 +175,12 @@ class WorkerRuntime:
             await self._file_sync_manager.stop()
         for task_id in list(self._processes.keys()):
             await self._stop_process(task_id, "SIGTERM")
+        if self._pty_backend is not None:
+            for timer in self._pty_timeouts.values():
+                timer.cancel()
+            self._pty_timeouts.clear()
+            await self._pty_backend.shutdown()
+            self._pty_backend = None
         if self._ws:
             await self._ws.close()
 
@@ -240,13 +253,23 @@ class WorkerRuntime:
 
     async def _handle_execute(self, msg: ExecuteMessage) -> None:
         task_id = msg.task_id
-        if task_id in self._processes:
+        if task_id in self._processes or (
+            self._pty_backend is not None and self._pty_backend.has_task(task_id)
+        ):
             await self._send_event(ErrorMessage(
                 error_type="duplicate_task",
                 message=f"Process already running for task {task_id}",
                 recoverable=True,
             ))
             return
+
+        if msg.agent_params:
+            if await self._try_execute_pty(msg):
+                return
+            logger.warning(
+                "agent_params present but claude-pty unavailable; "
+                "falling back to subprocess for task %s", task_id,
+            )
 
         log_path = self._log_dir / f"{task_id}.ndjson"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,6 +352,77 @@ class WorkerRuntime:
 
             await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=exit_code))
 
+    # ---- PTY-hosted execution (claude-pty) ----
+
+    async def _try_execute_pty(self, msg: ExecuteMessage) -> bool:
+        """Run the task in a PTY session. Returns False if claude-pty is missing."""
+        from elastic_agent.worker.pty_backend import PTY_AVAILABLE
+
+        if not PTY_AVAILABLE:
+            return False
+
+        if self._pty_backend is None:
+            from elastic_agent.worker.pty_backend import ElasticPTYBackend
+            self._pty_backend = ElasticPTYBackend(self, log_dir=self._log_dir)
+
+        params = msg.agent_params or {}
+        task_id = msg.task_id
+        config_dir = params.get("config_dir") or msg.env.get("CLAUDE_CONFIG_DIR")
+        env_overrides = {k: v for k, v in msg.env.items() if k != "CLAUDE_CONFIG_DIR"}
+
+        try:
+            session_id = await self._pty_backend.launch(
+                key=task_id,
+                prompt=params.get("prompt", ""),
+                cwd=msg.cwd or os.getcwd(),
+                resume_session_id=params.get("resume_session_id"),
+                model=params.get("model"),
+                config_dir=config_dir,
+                env_overrides=env_overrides or None,
+            )
+        except Exception as exc:
+            logger.exception("PTY launch failed for task %s", task_id)
+            await self._send_event(ErrorMessage(
+                error_type="execute_failed",
+                message=f"Failed to start PTY session: {exc}",
+                recoverable=True,
+            ))
+            await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=-1))
+            return True
+
+        logger.info("Started PTY session %s for task %s", session_id, task_id)
+
+        if msg.timeout:
+            self._pty_timeouts[task_id] = asyncio.create_task(
+                self._pty_timeout_watch(task_id, msg.timeout)
+            )
+        return True
+
+    async def _pty_timeout_watch(self, task_id: str, timeout: int) -> None:
+        await asyncio.sleep(timeout)
+        logger.warning("PTY task %s timed out after %ds, stopping session", task_id, timeout)
+        try:
+            await self._pty_backend.stop(task_id)
+        except Exception:
+            logger.exception("Failed to stop timed-out PTY task %s", task_id)
+
+    async def _on_pty_exit(self, task_id: str, exit_code: int) -> None:
+        """Called by ElasticPTYBackend when a PTY turn/session finishes."""
+        timer = self._pty_timeouts.pop(task_id, None)
+        if timer and not timer.done():
+            timer.cancel()
+
+        logger.info("PTY task %s finished with exit code %d", task_id, exit_code)
+
+        if self._file_sync_manager:
+            try:
+                synced = await self._file_sync_manager.force_sync(task_id)
+                logger.info("Force-synced %d files for PTY task %s on exit", synced, task_id)
+            except Exception:
+                logger.exception("Failed to force-sync files for PTY task %s", task_id)
+
+        await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=exit_code))
+
     async def _read_stream(
         self,
         task_id: str,
@@ -387,6 +481,13 @@ class WorkerRuntime:
 
     async def _handle_stop(self, msg: StopMessage) -> None:
         sig_name = msg.signal or "SIGTERM"
+        if self._pty_backend is not None and self._pty_backend.has_task(msg.task_id):
+            # PTY sessions interrupt via Esc + teardown; signals don't apply.
+            try:
+                await self._pty_backend.stop(msg.task_id)
+            except Exception:
+                logger.exception("Failed to stop PTY task %s", msg.task_id)
+            return
         await self._stop_process(msg.task_id, sig_name)
 
     async def _stop_process(self, task_id: str, sig_name: str) -> None:

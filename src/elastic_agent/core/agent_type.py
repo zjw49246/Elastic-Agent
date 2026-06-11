@@ -62,6 +62,27 @@ class AgentType(ABC):
         """Convenience wrapper — launch with an existing session_id."""
         return self.get_launch_command(prompt, session_id=session_id, config_dir=config_dir)
 
+    def get_launch_params(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        config_dir: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Structured launch params for PTY-hosted execution (ExecuteMessage.agent_params).
+
+        Workers with claude-pty installed use these instead of exec'ing the
+        command line. Default implementation works for any agent.
+        """
+        params: dict[str, Any] = {"agent": self.name, "prompt": prompt}
+        if session_id:
+            params["resume_session_id"] = session_id
+        if config_dir:
+            params["config_dir"] = config_dir
+        if model:
+            params["model"] = model
+        return params
+
 
 class ClaudeCodeAgentType(AgentType):
     """Concrete implementation for Claude Code (Node.js CLI).

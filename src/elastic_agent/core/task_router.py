@@ -43,11 +43,16 @@ class TaskRouter:
         node_registry: NodeRegistry,
         connection_manager: WorkerConnectionManager,
         agent_type: AgentType | None = None,
+        use_pty: bool = False,
     ) -> None:
         self._task_registry = task_registry
         self._node_registry = node_registry
         self._connection_manager = connection_manager
         self._agent_type = agent_type
+        # When True, EXECUTE messages carry structured agent_params so
+        # Workers with claude-pty installed host the agent in a persistent
+        # PTY session. `command` is still sent as the subprocess fallback.
+        self._use_pty = use_pty
 
     async def send_command(
         self,
@@ -56,6 +61,7 @@ class TaskRouter:
         env: dict[str, str] | None = None,
         cwd: str = ".",
         timeout: int | None = None,
+        agent_params: dict | None = None,
     ) -> str:
         """Send a command to the Worker running a task.
 
@@ -85,6 +91,7 @@ class TaskRouter:
             cwd=cwd,
             env=env or {},
             timeout=timeout,
+            agent_params=agent_params,
         )
 
         logger.info(
@@ -137,10 +144,19 @@ class TaskRouter:
 
         env = self._agent_type.get_env_overrides(config_dir=config_dir)
 
+        agent_params = None
+        if self._use_pty:
+            agent_params = self._agent_type.get_launch_params(
+                prompt=message,
+                session_id=record.session_id,
+                config_dir=config_dir,
+            )
+
         return await self.send_command(
             task_id=task_id,
             command=command,
             env=env,
             cwd=cwd,
             timeout=timeout,
+            agent_params=agent_params,
         )

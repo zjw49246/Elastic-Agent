@@ -17,6 +17,7 @@ Elastic-Agent is a Python library that provides:
 - **Task scheduling** — Capacity-aware task distribution with pluggable Harness interface
 - **File sync** — Automatic file synchronization from Workers to OSS/S3
 - **Credential management** — Account pool with auto-login, quota monitoring, and rotation
+- **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
 
 ## Usage
 
@@ -35,6 +36,30 @@ manager = ElasticAgentManager(
 )
 app = manager.create_app()
 ```
+
+## PTY mode (claude-pty)
+
+When enabled, Workers host Claude Code in a persistent interactive PTY session:
+prompts are delivered via MCP channel injection (stdin fallback), output is read
+from the session JSONL, and follow-ups can reuse the warm session. Rate limits
+surface as non-zero exits, so credential rotation keeps working unchanged.
+
+Enable in three places:
+
+1. **Bootstrap** — install claude-pty on Workers:
+   `build_default_bootstrap_steps(..., include_pty=True)`
+2. **Manager** — attach structured launch params to EXECUTE messages:
+   `TaskRouter(..., agent_type=ClaudeCodeAgentType(), use_pty=True)`
+3. **Worker** — nothing to configure; if `ExecuteMessage.agent_params` is set
+   and claude-pty is importable, the runtime uses a PTY session and falls back
+   to subprocess execution otherwise. `command` is always sent as fallback.
+
+Protocol notes:
+- Events with the original session-JSONL line are forwarded verbatim as stdout
+  NDJSON, so Manager-side parsers see native Claude Code types.
+- Interactive sessions emit no `result` line; the Worker synthesizes one at
+  turn end (`synthesized_by: "pty_backend"`) carrying the session_id.
+  `cost_usd` is not available in PTY mode.
 
 ## Development
 

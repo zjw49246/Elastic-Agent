@@ -161,6 +161,20 @@ def credential_login_deps_step(
     )
 
 
+def pty_install_step(
+    pty_package: str = "git+https://github.com/zjw49246/Claude-Code-PTY.git",
+    timeout: int = 300,
+) -> BootstrapStep:
+    """Install claude-pty so the Worker can host agents in PTY sessions."""
+    return BootstrapStep(
+        name="pty-install",
+        command=f"pip3 install -q {pty_package}",
+        timeout=timeout,
+        retry_count=1,
+        description="Install claude-pty for PTY-hosted agent execution",
+    )
+
+
 def build_default_bootstrap_steps(
     manager_url: str,
     auth_token: str,
@@ -172,6 +186,8 @@ def build_default_bootstrap_steps(
     system_packages: list[str] | None = None,
     include_login_deps: bool = False,
     login_dependencies: list[str] | None = None,
+    include_pty: bool = False,
+    pty_package: str | None = None,
 ) -> list[BootstrapStep]:
     """Build the standard bootstrap sequence (4 or 5 steps depending on login deps)."""
     steps = [
@@ -186,6 +202,8 @@ def build_default_bootstrap_steps(
         ),
         harness_code_step(repo_url=repo_url),
     ]
+    if include_pty:
+        steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
     if include_login_deps:
         steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps

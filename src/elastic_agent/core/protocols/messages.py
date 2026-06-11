@@ -35,6 +35,12 @@ class ExecuteMessage(Message):
     cwd: str
     env: dict[str, str] = Field(default_factory=dict)
     timeout: int | None = None
+    # Structured agent params for PTY-hosted execution (claude-pty).
+    # When set and the worker has claude-pty installed, the worker hosts the
+    # agent in a persistent PTY session instead of spawning `command`.
+    # `command` remains the subprocess fallback. Keys: prompt,
+    # resume_session_id, config_dir, model.
+    agent_params: dict | None = None
 
 
 class StopMessage(Message):
