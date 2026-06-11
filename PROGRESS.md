@@ -17,3 +17,14 @@
 **测试**：tests/unit/test_pty_backend.py（31 个用例）+ 真实 claude 端到端冒烟（assistant 原行透传、合成 result 带 session_id、exit 0 验证通过）。
 
 **Commit**: 见 git log（task-pty-support 合入 main 的 commit）。
+
+## 2026-06-11 PTY Phase 2：热会话 follow-up + 注入串话修复（验证）
+
+**结论**：elastic-agent 侧零代码改动。`BasePTYBackend.launch(resume_session_id=...)` → pool `get_or_create` 命中存活会话即热复用；本仓库的 `on_exit` 只清 task 级映射、不动 pool，会话保持温热。
+
+**验证**（真 claude 双 turn 冒烟）：
+- turn 1 冷启动 14s；turn 2 同 session/同 PID 注入新 turn，5s 完成
+- 两个 turn 都走 channel 注入（无 stdin fallback），合成 result 带 session_id，exit 0
+- 串话不再出现——修复在 PTY 仓库（commit aa23aab）：inject 端口 OS 分配 + /inject 校验 session_id（不匹配 409）+ bind 失败不崩 MCP
+
+**注意**：worker 需要 claude-pty >= aa23aab；旧版在同机多宿主下有注入串话风险（消息可能漏进别的会话且发送方以为成功）。

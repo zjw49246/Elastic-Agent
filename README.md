@@ -54,6 +54,15 @@ Enable in three places:
    and claude-pty is importable, the runtime uses a PTY session and falls back
    to subprocess execution otherwise. `command` is always sent as fallback.
 
+Warm-session follow-ups: when a follow-up EXECUTE carries
+`resume_session_id` and the Worker's session pool still holds that live
+session, the prompt is injected into the warm session as a new turn — no
+process respawn, no cold `--resume` (verified: ~3x faster turnaround).
+A STOP tears the session down; the next resume is cold.
+
+Requires claude-pty >= commit aa23aab (cross-host inject isolation: OS-assigned
+inject ports + session_id validation on /inject).
+
 Protocol notes:
 - Events with the original session-JSONL line are forwarded verbatim as stdout
   NDJSON, so Manager-side parsers see native Claude Code types.
