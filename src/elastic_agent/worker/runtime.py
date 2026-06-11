@@ -748,6 +748,16 @@ class WorkerRuntime:
         write_credentials(config_dir, credentials)
         logger.info("Wrote credentials for %s to %s", account_id, config_dir)
 
+        # Credential swap is in-place: warm PTY sessions on this config_dir
+        # still run under the OLD account and must not be hot-reused.
+        if self._pty_backend is not None:
+            try:
+                await self._pty_backend.recycle_config_dir(config_dir)
+            except Exception:
+                logger.exception(
+                    "Failed to recycle PTY sessions for %s", config_dir
+                )
+
         if self._quota_checker:
             self._quota_checker.add_slot(account_id, config_dir)
 

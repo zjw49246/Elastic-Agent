@@ -63,6 +63,12 @@ A STOP tears the session down; the next resume is cold.
 Requires claude-pty >= commit aa23aab (cross-host inject isolation: OS-assigned
 inject ports + session_id validation on /inject).
 
+Credential rotation: account swaps are in-place (new tokens written into the
+same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
+bound to that config_dir — warm sessions authenticated under the old account
+must not be hot-reused; the next EXECUTE cold-resumes with the new
+credentials.
+
 Protocol notes:
 - Events with the original session-JSONL line are forwarded verbatim as stdout
   NDJSON, so Manager-side parsers see native Claude Code types.

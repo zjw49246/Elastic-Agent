@@ -185,6 +185,48 @@ if PTY_AVAILABLE:
 
             await self._runtime._on_pty_exit(task_id, ec)
 
+        async def recycle_config_dir(self, config_dir: str | None) -> int:
+            """Stop every session bound to config_dir. Returns the count.
+
+            Credential rotation swaps the account's credentials *in place*
+            (new tokens written into the same config_dir). A warm PTY session
+            keeps running under the OLD account it authenticated with at
+            spawn — follow-ups injected into it would keep burning the
+            exhausted account. Recycle them; the next EXECUTE cold-resumes
+            and picks up the new credentials.
+            """
+            recycled = 0
+            # Sessions with an active task (keyed): full stop — interrupt,
+            # teardown, pool removal; the consumer's on_exit notifies the
+            # Manager via PROCESS_EXIT.
+            for key, session in list(self._sessions.items()):
+                if session.config.config_dir == config_dir:
+                    try:
+                        await self.stop(key)
+                        recycled += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to recycle PTY session for task %s", key
+                        )
+            # Warm sessions whose task already finished live only in the
+            # pool — exactly the dangerous ones (idle, old account, waiting
+            # to be hot-reused).
+            for sid, session in list(self._pool._sessions.items()):
+                if session.config.config_dir == config_dir:
+                    try:
+                        await self._pool.remove(sid)
+                        recycled += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to recycle warm PTY session %s", sid
+                        )
+            if recycled:
+                logger.info(
+                    "Recycled %d PTY session(s) for config_dir %s after "
+                    "credential swap", recycled, config_dir,
+                )
+            return recycled
+
         async def shutdown(self) -> None:
             await super().shutdown()
             self._bridge.stop()

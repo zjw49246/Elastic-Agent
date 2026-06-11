@@ -475,3 +475,123 @@ class TestPTYBootstrap:
         names = [s.name for s in steps]
         assert "pty-install" in names
         assert names.index("pty-install") < names.index("runtime-deploy")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: credential rotation recycles warm sessions
+# ---------------------------------------------------------------------------
+
+
+class _FakeSession:
+    def __init__(self, config_dir):
+        self.config = MagicMock()
+        self.config.config_dir = config_dir
+
+
+class _FakePool:
+    def __init__(self):
+        self._sessions = {}
+        self.removed = []
+
+    async def remove(self, sid):
+        self.removed.append(sid)
+        self._sessions.pop(sid, None)
+
+
+@pty_required
+class TestRecycleConfigDir:
+    def _backend(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend._pool = _FakePool()
+        backend.stopped = []
+
+        async def fake_stop(key):
+            backend.stopped.append(key)
+            backend._sessions.pop(key, None)
+
+        backend.stop = fake_stop
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_recycles_matching_keyed_and_warm_sessions(self, tmp_path):
+        backend = self._backend(tmp_path)
+        backend._sessions["task:A"] = _FakeSession("/root/.claude-edit-1")
+        backend._sessions["task:B"] = _FakeSession("/root/.claude-edit-2")
+        backend._pool._sessions["sess-warm"] = _FakeSession("/root/.claude-edit-1")
+        backend._pool._sessions["sess-other"] = _FakeSession("/root/.claude-edit-2")
+
+        recycled = await backend.recycle_config_dir("/root/.claude-edit-1")
+
+        assert recycled == 2
+        assert backend.stopped == ["task:A"]
+        assert backend._pool.removed == ["sess-warm"]
+        # Other config_dir untouched
+        assert "task:B" in backend._sessions
+        assert "sess-other" in backend._pool._sessions
+
+    @pytest.mark.asyncio
+    async def test_none_config_dir_matches_default_sessions(self, tmp_path):
+        backend = self._backend(tmp_path)
+        backend._pool._sessions["sess-default"] = _FakeSession(None)
+        backend._pool._sessions["sess-slot"] = _FakeSession("/root/.claude-edit-1")
+        recycled = await backend.recycle_config_dir(None)
+        assert recycled == 1
+        assert backend._pool.removed == ["sess-default"]
+
+    @pytest.mark.asyncio
+    async def test_no_match_is_noop(self, tmp_path):
+        backend = self._backend(tmp_path)
+        backend._pool._sessions["sess-1"] = _FakeSession("/root/.claude-edit-2")
+        assert await backend.recycle_config_dir("/root/.claude-edit-9") == 0
+
+
+class TestCredentialLoginRecyclesPTY:
+    @pytest.mark.asyncio
+    async def test_login_triggers_recycle(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import CredentialLoginMessage
+
+        backend = MagicMock()
+        backend.recycle_config_dir = AsyncMock(return_value=1)
+        runtime._pty_backend = backend
+        runtime._send_event = AsyncMock()
+
+        config_dir = str(tmp_path / "claude-edit-1")
+        await runtime._handle_credential_login(CredentialLoginMessage(
+            task_id="", slot_index=1,
+            credentials={"account_id": "acc-2", "accessToken": "tok"},
+            config_dir=config_dir,
+        ))
+        backend.recycle_config_dir.assert_awaited_once_with(config_dir)
+        # Login result still reported
+        sent = runtime._send_event.call_args[0][0]
+        assert sent.type == "CREDENTIAL_LOGIN_RESULT"
+        assert sent.success is True
+
+    @pytest.mark.asyncio
+    async def test_login_without_backend_unaffected(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import CredentialLoginMessage
+
+        runtime._send_event = AsyncMock()
+        await runtime._handle_credential_login(CredentialLoginMessage(
+            task_id="", slot_index=1,
+            credentials={"account_id": "acc-2", "accessToken": "tok"},
+            config_dir=str(tmp_path / "claude-edit-1"),
+        ))
+        sent = runtime._send_event.call_args[0][0]
+        assert sent.success is True
+
+    @pytest.mark.asyncio
+    async def test_recycle_failure_does_not_break_login(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import CredentialLoginMessage
+
+        backend = MagicMock()
+        backend.recycle_config_dir = AsyncMock(side_effect=RuntimeError("boom"))
+        runtime._pty_backend = backend
+        runtime._send_event = AsyncMock()
+        await runtime._handle_credential_login(CredentialLoginMessage(
+            task_id="", slot_index=1,
+            credentials={"account_id": "acc-2", "accessToken": "tok"},
+            config_dir=str(tmp_path / "claude-edit-1"),
+        ))
+        sent = runtime._send_event.call_args[0][0]
+        assert sent.success is True

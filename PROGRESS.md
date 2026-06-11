@@ -28,3 +28,15 @@
 - 串话不再出现——修复在 PTY 仓库（commit aa23aab）：inject 端口 OS 分配 + /inject 校验 session_id（不匹配 409）+ bind 失败不崩 MCP
 
 **注意**：worker 需要 claude-pty >= aa23aab；旧版在同机多宿主下有注入串话风险（消息可能漏进别的会话且发送方以为成功）。
+
+## 2026-06-11 PTY Phase 3：凭证轮换 × 温热会话（recycle_config_dir）
+
+**缺口**：轮换是原地换凭证（新账号 token 写进同一 config_dir）。subprocess 路径每任务新进程重读凭证没问题；PTY 温热会话是旧账号启动的、一直带着旧凭证活着——follow-up 热复用会继续烧已耗尽的账号。
+
+**解决**：`ElasticPTYBackend.recycle_config_dir(config_dir)`——回收该 config_dir 上所有会话（有任务的走 stop()，Manager 收到 PROCESS_EXIT；纯温热的直接 pool.remove）。worker 在 `_handle_credential_login` 写完新凭证后调用；回收失败不影响登录结果上报。
+
+**验证**：6 个新单元测试 + 真 claude 冒烟（turn1 温热 → recycle → turn2 resume 冷恢复新 PID、干净完成）。
+
+**附带发现**：冒烟首跑因 API 529 overloaded_error 失败（CC 内部重试 10 次未过）——`system/api_error` 是 CC 的重试事件（带 retryAttempt/maxRetries），不带 isApiErrorMessage，turn 未被掐断，等待即可恢复。区别于 isApiErrorMessage:true（turn 被终止、无哨兵）。
+
+**Commit**: 见本节合入 main 的 commit。
