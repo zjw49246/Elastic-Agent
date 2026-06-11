@@ -595,3 +595,57 @@ class TestCredentialLoginRecyclesPTY:
         ))
         sent = runtime._send_event.call_args[0][0]
         assert sent.success is True
+
+
+# ---------------------------------------------------------------------------
+# Per-task response timeout (long production turns)
+# ---------------------------------------------------------------------------
+
+
+@pty_required
+class TestResponseTimeoutPlumbing:
+    def test_build_config_sets_response_timeout(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        config = backend.build_config(response_timeout=7200)
+        assert config.response_timeout == 7200.0
+
+    def test_build_config_default_unchanged(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        config = backend.build_config()
+        assert config.response_timeout == 1800.0
+
+
+class TestRuntimePassesResponseTimeout:
+    @pytest.mark.asyncio
+    async def test_msg_timeout_becomes_response_timeout(self, runtime):
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"agent": "claude-code", "prompt": "build it"},
+            timeout=7200,
+        ))
+        assert fake.launches[0]["response_timeout"] == 7200
+        # Hard watchdog runs behind the graceful PTY timeout
+        assert "t1:abc" in runtime._pty_timeouts
+        runtime._pty_timeouts["t1:abc"].cancel()
+
+    @pytest.mark.asyncio
+    async def test_agent_params_override_wins(self, runtime):
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"agent": "claude-code", "prompt": "x",
+                          "response_timeout": 3600},
+            timeout=7200,
+        ))
+        assert fake.launches[0]["response_timeout"] == 3600
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_leaves_default(self, runtime):
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"agent": "claude-code", "prompt": "x"},
+        ))
+        assert fake.launches[0]["response_timeout"] is None
+        assert runtime._pty_timeouts == {}

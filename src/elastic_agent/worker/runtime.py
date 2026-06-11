@@ -379,6 +379,9 @@ class WorkerRuntime:
                 model=params.get("model"),
                 config_dir=config_dir,
                 env_overrides=env_overrides or None,
+                # The turn must be allowed to run as long as the task itself
+                # (PTYConfig default is 30 min — too short for long builds).
+                response_timeout=params.get("response_timeout") or msg.timeout,
             )
         except Exception as exc:
             logger.exception("PTY launch failed for task %s", task_id)
@@ -393,8 +396,11 @@ class WorkerRuntime:
         logger.info("Started PTY session %s for task %s", session_id, task_id)
 
         if msg.timeout:
+            # Hard backstop only: claude-pty's own response_timeout (set to
+            # the same task timeout above) fires first and ends the turn
+            # gracefully; the watchdog covers a wedged session.
             self._pty_timeouts[task_id] = asyncio.create_task(
-                self._pty_timeout_watch(task_id, msg.timeout)
+                self._pty_timeout_watch(task_id, msg.timeout + 60)
             )
         return True
 

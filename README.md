@@ -69,6 +69,11 @@ bound to that config_dir — warm sessions authenticated under the old account
 must not be hot-reused; the next EXECUTE cold-resumes with the new
 credentials.
 
+Timeouts: `ExecuteMessage.timeout` (or `agent_params.response_timeout`) is
+plumbed into the PTY session's turn timeout, so long production turns are not
+cut off by claude-pty's 30-minute default. The runtime keeps a hard watchdog
+at timeout+60s as backstop.
+
 Protocol notes:
 - Events with the original session-JSONL line are forwarded verbatim as stdout
   NDJSON, so Manager-side parsers see native Claude Code types.

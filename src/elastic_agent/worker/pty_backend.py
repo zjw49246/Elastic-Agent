@@ -114,6 +114,19 @@ if PTY_AVAILABLE:
             self._turn_errors: dict[str, str | None] = {}
             self._saw_result: set[str] = set()
 
+        def build_config(self, **kwargs):
+            """Extend the base config with a per-task response timeout.
+
+            PTYConfig.response_timeout defaults to 30 min; long production
+            turns (e.g. 2 h audiobook builds) need the task's own timeout,
+            otherwise claude-pty aborts the turn long before the task limit.
+            """
+            config = super().build_config(**kwargs)
+            response_timeout = kwargs.get("response_timeout")
+            if response_timeout:
+                config.response_timeout = float(response_timeout)
+            return config
+
         def has_task(self, task_id: str) -> bool:
             return task_id in self._sessions
 
