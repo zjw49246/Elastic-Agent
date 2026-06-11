@@ -649,3 +649,34 @@ class TestRuntimePassesResponseTimeout:
         ))
         assert fake.launches[0]["response_timeout"] is None
         assert runtime._pty_timeouts == {}
+
+
+class TestRootSandboxEnv:
+    @pytest.mark.asyncio
+    async def test_root_gets_is_sandbox(self, runtime, monkeypatch):
+        import os as _os
+        monkeypatch.setattr(_os, "geteuid", lambda: 0)
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(agent_params={"prompt": "x"}))
+        assert fake.launches[0]["env_overrides"]["IS_SANDBOX"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_non_root_unchanged(self, runtime, monkeypatch):
+        import os as _os
+        monkeypatch.setattr(_os, "geteuid", lambda: 1000)
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(agent_params={"prompt": "x"}))
+        assert fake.launches[0]["env_overrides"] is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_env_not_overridden(self, runtime, monkeypatch):
+        import os as _os
+        monkeypatch.setattr(_os, "geteuid", lambda: 0)
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"prompt": "x"}, env={"IS_SANDBOX": "0"},
+        ))
+        assert fake.launches[0]["env_overrides"]["IS_SANDBOX"] == "0"

@@ -370,6 +370,12 @@ class WorkerRuntime:
         config_dir = params.get("config_dir") or msg.env.get("CLAUDE_CONFIG_DIR")
         env_overrides = {k: v for k, v in msg.env.items() if k != "CLAUDE_CONFIG_DIR"}
 
+        # Workers run as root; claude refuses --dangerously-skip-permissions
+        # under root unless it believes it's sandboxed. Cloud workers are
+        # single-purpose VMs, so this is the intended unattended setup.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            env_overrides.setdefault("IS_SANDBOX", "1")
+
         try:
             session_id = await self._pty_backend.launch(
                 key=task_id,
