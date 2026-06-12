@@ -196,7 +196,7 @@ REMOTE=$(git ls-remote "$URL" refs/heads/main 2>/dev/null | awk '{print $1}')
 [ -z "$REMOTE" ] && exit 0
 if [ "$INSTALLED" != "$REMOTE" ]; then
   echo "claude-pty: $INSTALLED -> $REMOTE"
-  pip3 install -q --force-reinstall --no-deps "git+$URL@$REMOTE" || exit 0
+  pip3 install -q --break-system-packages --force-reinstall --no-deps "git+$URL@$REMOTE" || exit 0
 fi
 """
 
