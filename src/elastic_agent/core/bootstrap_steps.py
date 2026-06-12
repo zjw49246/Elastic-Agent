@@ -67,7 +67,7 @@ def runtime_deploy_step(
     )
 
     cmd = (
-        "pip3 install -q elastic-agent && "
+        "pip3 install -q --break-system-packages elastic-agent && "
         "mkdir -p /etc/elastic-agent && "
         f"echo -e '{config_content}' > /etc/elastic-agent/runtime.yaml && "
         "cat > /etc/systemd/system/elastic-agent-runtime.service << 'UNIT'\n"
@@ -141,15 +141,15 @@ def credential_login_deps_step(
         if dep == "chrome":
             install_cmds.append(
                 "apt-get install -y -qq xvfb && "
-                "pip3 install -q playwright playwright-stealth && "
+                "pip3 install -q --break-system-packages playwright playwright-stealth && "
                 "playwright install chromium --with-deps"
             )
         elif dep == "mitmproxy":
-            install_cmds.append("pip3 install -q mitmproxy")
+            install_cmds.append("pip3 install -q --break-system-packages mitmproxy")
         elif dep in ("playwright", "playwright-stealth"):
-            install_cmds.append(f"pip3 install -q {dep}")
+            install_cmds.append(f"pip3 install -q --break-system-packages {dep}")
         else:
-            install_cmds.append(f"pip3 install -q {dep}")
+            install_cmds.append(f"pip3 install -q --break-system-packages {dep}")
 
     cmd = " && ".join(install_cmds)
     return BootstrapStep(
@@ -168,7 +168,7 @@ def pty_install_step(
     """Install claude-pty so the Worker can host agents in PTY sessions."""
     return BootstrapStep(
         name="pty-install",
-        command=f"pip3 install -q {pty_package}",
+        command=f"pip3 install -q --break-system-packages {pty_package}",
         timeout=timeout,
         retry_count=1,
         description="Install claude-pty for PTY-hosted agent execution",

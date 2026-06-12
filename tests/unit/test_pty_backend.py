@@ -505,6 +505,23 @@ class TestPTYBootstrap:
         assert "{pty_repo_url}" not in step.command
         assert "Claude-Code-PTY" in step.command
 
+    def test_all_pip_installs_break_system_packages(self):
+        # PEP 668 (Ubuntu 24.04 images) rejects system pip3 installs without
+        # --break-system-packages — first real include_pty scale-out failed at
+        # pty-install because of this (2026-06-12 21:45 prod incident)
+        import re
+
+        from elastic_agent.core import bootstrap_steps as bs
+
+        steps = bs.build_default_bootstrap_steps(
+            "ws://m", "tok", "w1", include_pty=True, include_login_deps=True
+        )
+        for step in steps:
+            for m in re.finditer(r"pip3 install[^&\n]*", step.command):
+                assert "--break-system-packages" in m.group(0), (
+                    f"step {step.name!r}: {m.group(0)}"
+                )
+
     def test_pty_refresh_step_custom_repo(self):
         from elastic_agent.core.bootstrap_steps import pty_refresh_step
 
