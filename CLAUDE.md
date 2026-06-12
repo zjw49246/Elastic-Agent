@@ -18,7 +18,8 @@ Claude-Code-PTY (claude-pty)  ←  elastic-agent[pty]  ←  下游 harness（aud
 ```
 
 - claude-pty 通过 `[project.optional-dependencies] pty` + `[tool.uv.sources]` 声明，**版本 pin 在 uv.lock**
-- **上游（PTY）更新后**，本仓库必须级联：`uv lock --upgrade-package claude-pty && uv sync`，提交 uv.lock 并 push
+- **机制保证（优先）**：`scripts/refresh_deps.sh` 自动对比已装 claude-pty commit 与 PTY main HEAD，落后即刷新 lock + 重装——部署/启动流程必须包含它（推荐挂 systemd `ExecStartPre`），`git pull` 本仓库后跑一次即与上游一致
+- 手动级联（脚本不可用时）：`uv lock --upgrade-package claude-pty && uv sync`，提交 uv.lock 并 push
 - **本仓库更新后**，提醒/级联下游 harness：`uv lock --upgrade-package elastic-agent && uv sync`
 - **任务生命周期补充**：领取任务时（步骤 1）先检查上游是否有新版本（`uv lock --upgrade-package claude-pty --dry-run` 或对比 PTY main HEAD 与 lock 中 pin 的 rev）；若本次改动涉及 PTY 接口适配，必须同步 bump lock
 - worker 侧 claude-pty 由 bootstrap `pty_install_step` 安装——下游应传入与其 lock 一致的 pinned URL（`pty_package="git+https://github.com/zjw49246/Claude-Code-PTY@<rev>"`）
