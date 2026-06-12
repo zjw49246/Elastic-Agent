@@ -66,6 +66,7 @@ class CredentialLoginService:
         self._slots = slots or []
         self._ssh_key_path = ssh_key_path
         self._ssh_user = ssh_user
+        self._oauth_provider = oauth_provider
         self._login_step = CredentialLoginStep(
             pool=credential_pool,
             oauth_provider=oauth_provider,
@@ -154,6 +155,64 @@ class CredentialLoginService:
             await self._pool.release(account.id)
 
         return results
+
+    async def retry_failed_accounts(self, worker_id: str) -> int:
+        """Re-attempt accounts stuck in login_failed (verification login).
+
+        CF flakiness can mark a healthy account login_failed, and nothing
+        retries it until rotation happens to allocate it — the pool quietly
+        loses capacity. After a worker finishes its normal login (Chrome is
+        free), re-verify each failed unassigned account against a scratch
+        config_dir on that worker and flip the pool state back on success.
+        Returns the number of recovered accounts.
+        """
+        failed = [
+            a for a in self._pool._accounts_config.accounts
+            if (s := self._pool.get_status(a.id)) is not None
+            and s.login_status == "login_failed"
+            and not s.assigned_to
+        ]
+        if not failed:
+            return 0
+
+        host = await self._resolve_host(worker_id)
+        if not host:
+            return 0
+        await self._ensure_display_server(host)
+
+        from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, OAuthConfig
+
+        recovered = 0
+        for acct in failed:
+            logger.info(
+                "Retrying login_failed account %s (verification login on %s)",
+                acct.id, worker_id,
+            )
+            provider = self._oauth_provider or ClaudeOAuthProvider()
+            try:
+                result = await provider.login(OAuthConfig(
+                    account_id=acct.id,
+                    email=acct.email,
+                    email_token=acct.email_token,
+                    # Scratch dir on a disposable worker VM; never a real slot
+                    config_dir=f"/tmp/claude-verify-{acct.id}",
+                    login_timeout=self._config.login_timeout,
+                    worker_host=host,
+                    ssh_key_path=self._ssh_key_path,
+                    ssh_user=self._ssh_user,
+                ))
+            except Exception:
+                logger.exception("Verification login errored for account %s", acct.id)
+                continue
+            if result.success:
+                await self._pool.update_login_status(acct.id, "logged_in")
+                recovered += 1
+                logger.info("Recovered login_failed account %s", acct.id)
+            else:
+                logger.warning(
+                    "Account %s still failing login: %s", acct.id, result.error
+                )
+        return recovered
 
     async def release_worker(self, worker_id: str) -> None:
         """Unbind and release all accounts allocated to a Worker."""
@@ -326,6 +385,12 @@ class CredentialLoginService:
             await self.login_worker(worker_id, skip_validity_check=False)
         except Exception:
             logger.exception("Credential login failed for reconnected worker %s", worker_id)
+        # Chrome on this worker is free now — opportunistically recover
+        # accounts that a flaky CF challenge left stuck in login_failed.
+        try:
+            await self.retry_failed_accounts(worker_id)
+        except Exception:
+            logger.exception("login_failed retry errored on worker %s", worker_id)
 
     async def _on_worker_disconnected(
         self, event_type: str, worker_id: str, data: dict[str, Any]

@@ -1,0 +1,170 @@
+"""Tests for the logged-in redirect race fix and login_failed auto-retry."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, LoginResult, OAuthConfig
+from elastic_agent.core.credential_login_service import CredentialLoginService, CredentialSlot
+
+
+class _SentinelReached(Exception):
+    pass
+
+
+class _FakeCDP:
+    """CDP stub: email input never renders; URL flips to /new mid-retry.
+
+    Reproduces the production race — slot N>1 logs in via the browser's
+    existing session, /login redirects to /new only after the initial
+    already_logged_in check has run.
+    """
+
+    def __init__(self):
+        self.url_calls = 0
+
+    async def send(self, *a, **k):
+        return {}
+
+    async def navigate(self, *a, **k):
+        return {}
+
+    async def close(self):
+        pass
+
+    async def evaluate(self, expr):
+        if "document.location.href" in expr:
+            self.url_calls += 1
+            # First check (pre-email): still on /login (redirect in flight)
+            return "https://claude.ai/login" if self.url_calls == 1 else "https://claude.ai/new"
+        if "input" in expr.lower() or "email" in expr.lower():
+            return "no email input"
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_logged_in_redirect_during_email_retry_recovers():
+    provider = ClaudeOAuthProvider()
+    config = OAuthConfig(
+        account_id="acc-1", email="a@b.c", email_token="tok",
+        config_dir="/tmp/x",
+    )
+    fake_cdp = _FakeCDP()
+
+    with patch.object(provider, "_launch_chrome", new=AsyncMock(return_value=(MagicMock(), 12345))), \
+         patch.object(provider, "_connect_cdp", new=AsyncMock(return_value=fake_cdp)), \
+         patch.object(provider, "_handle_cloudflare", new=AsyncMock(return_value=True)), \
+         patch.object(provider, "_launch_cli_auth", new=AsyncMock(side_effect=_SentinelReached("REACHED_CLI_AUTH"))), \
+         patch.object(provider, "_cleanup", new=AsyncMock(), create=True), \
+         patch("asyncio.sleep", new=AsyncMock()):
+        result = await provider.login(config)
+
+    # The race fix must carry us past the email step (no "Email input field
+    # not found" failure) all the way to the CLI-auth stage.
+    assert not result.success
+    assert "REACHED_CLI_AUTH" in (result.error or "")
+    assert "Email input" not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_email_failure_error_includes_page_diagnostics():
+    provider = ClaudeOAuthProvider()
+    config = OAuthConfig(
+        account_id="acc-1", email="a@b.c", email_token="tok",
+        config_dir="/tmp/x",
+    )
+
+    class _StuckCDP(_FakeCDP):
+        async def evaluate(self, expr):
+            if "document.location.href" in expr:
+                return "https://claude.ai/login"  # never redirects
+            if "document.title" in expr:
+                return "Just a moment..."
+            return "no email input"
+
+    with patch.object(provider, "_launch_chrome", new=AsyncMock(return_value=(MagicMock(), 12345))), \
+         patch.object(provider, "_connect_cdp", new=AsyncMock(return_value=_StuckCDP())), \
+         patch.object(provider, "_handle_cloudflare", new=AsyncMock(return_value=True)), \
+         patch("asyncio.sleep", new=AsyncMock()):
+        result = await provider.login(config)
+
+    assert not result.success
+    assert "Email input field not found" in result.error
+    # Diagnostics: where the page actually was
+    assert "claude.ai/login" in result.error
+    assert "Just a moment" in result.error
+
+
+def _make_service(provider, accounts, statuses):
+    pool = MagicMock()
+    pool._accounts_config.accounts = accounts
+    pool.get_status = lambda aid: statuses.get(aid)
+    pool.update_login_status = AsyncMock()
+    service = CredentialLoginService(
+        credential_pool=pool,
+        credential_config=SimpleNamespace(login_timeout=60),
+        credential_binding=MagicMock(),
+        event_bus=MagicMock(),
+        slots=[CredentialSlot(slot_type="production", config_dir="/root/.claude-prod")],
+        oauth_provider=provider,
+    )
+    service._resolve_host = AsyncMock(return_value="1.2.3.4")
+    service._ensure_display_server = AsyncMock()
+    return service, pool
+
+
+def _acct(aid):
+    return SimpleNamespace(id=aid, email=f"{aid}@x.c", email_token="tok")
+
+
+def _status(login_status, assigned=None):
+    return SimpleNamespace(login_status=login_status, assigned_to=assigned)
+
+
+class TestRetryFailedAccounts:
+    @pytest.mark.asyncio
+    async def test_recovers_failed_account(self):
+        provider = MagicMock()
+        provider.login = AsyncMock(return_value=LoginResult(success=True, account_id="a3"))
+        service, pool = _make_service(
+            provider,
+            accounts=[_acct("a2"), _acct("a3")],
+            statuses={"a2": _status("logged_in"), "a3": _status("login_failed")},
+        )
+        recovered = await service.retry_failed_accounts("w1")
+        assert recovered == 1
+        pool.update_login_status.assert_awaited_once_with("a3", "logged_in")
+        # Verification login used a scratch config_dir, not a real slot
+        cfg = provider.login.call_args[0][0]
+        assert cfg.config_dir == "/tmp/claude-verify-a3"
+
+    @pytest.mark.asyncio
+    async def test_skips_assigned_and_healthy(self):
+        provider = MagicMock()
+        provider.login = AsyncMock()
+        service, pool = _make_service(
+            provider,
+            accounts=[_acct("a1"), _acct("a2")],
+            statuses={
+                "a1": _status("login_failed", assigned="w9"),  # in use
+                "a2": _status("logged_in"),
+            },
+        )
+        assert await service.retry_failed_accounts("w1") == 0
+        provider.login.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_still_failing_account_not_flipped(self):
+        provider = MagicMock()
+        provider.login = AsyncMock(return_value=LoginResult(
+            success=False, account_id="a3", error="CF again"))
+        service, pool = _make_service(
+            provider,
+            accounts=[_acct("a3")],
+            statuses={"a3": _status("login_failed")},
+        )
+        assert await service.retry_failed_accounts("w1") == 0
+        pool.update_login_status.assert_not_awaited()

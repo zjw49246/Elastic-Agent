@@ -280,20 +280,42 @@ class ClaudeOAuthProvider:
             else:
                 # Step 4: Enter email with retry
                 email_entered = False
-                for attempt in range(5):
+                for attempt in range(8):
                     r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
                     logger.info("Email input (attempt %d): %s", attempt + 1, r)
                     if r and r != "no email input":
                         email_entered = True
                         break
+                    # All slots on a machine share one account and browser
+                    # profile, so /login redirects to /new when a previous
+                    # slot already logged in — and that redirect races the
+                    # already_logged_in check above (the slow CF path used
+                    # to mask it). Re-check the URL instead of hunting for
+                    # an email input that will never render.
+                    cur = await cdp.evaluate("document.location.href") or ""
+                    if urlparse(cur).path.rstrip("/") in ("/new", "/chat", "/recents", ""):
+                        already_logged_in = True
+                        logger.info(
+                            "Logged-in redirect landed at %s during email retry, "
+                            "skipping email+magic link", cur[:80],
+                        )
+                        break
                     await asyncio.sleep(2)
 
-                if not email_entered:
+                if not email_entered and not already_logged_in:
+                    # Dump where the page actually is — bare "input not
+                    # found" was undiagnosable (CF interstitial? redirect?).
+                    cur = await cdp.evaluate("document.location.href") or ""
+                    title = await cdp.evaluate("document.title") or ""
                     return LoginResult(
                         success=False, account_id=account_id,
-                        error="Email input field not found after retries",
+                        error=(
+                            "Email input field not found after retries "
+                            f"(url={cur[:120]}, title={title[:80]})"
+                        ),
                     )
 
+            if not already_logged_in:
                 await asyncio.sleep(0.5)
                 r = await cdp.evaluate(
                     _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
