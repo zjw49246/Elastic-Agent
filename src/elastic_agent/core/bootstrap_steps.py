@@ -175,6 +175,63 @@ def pty_install_step(
     )
 
 
+PTY_REFRESH_SCRIPT_PATH = "/usr/local/bin/claude-pty-refresh.sh"
+
+# Worker-side mechanical dep sync (CCM refresh_pty.sh pattern): on every runtime
+# start — including resume of a stopped instance, which skips bootstrap — compare
+# the installed claude-pty commit against the upstream main HEAD and reinstall if
+# behind. Offline / failure keeps the current install (ExecStartPre uses `-`).
+PTY_REFRESH_SCRIPT = """#!/bin/bash
+set -u
+export HOME="${HOME:-/root}"
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+URL="{pty_repo_url}"
+INSTALLED=$(python3 - <<'PYEOF'
+import glob, json
+g = glob.glob('/usr/local/lib/python3*/dist-packages/claude_pty-*.dist-info/direct_url.json')
+print(json.load(open(g[0]))['vcs_info']['commit_id'] if g else '')
+PYEOF
+)
+REMOTE=$(git ls-remote "$URL" refs/heads/main 2>/dev/null | awk '{print $1}')
+[ -z "$REMOTE" ] && exit 0
+if [ "$INSTALLED" != "$REMOTE" ]; then
+  echo "claude-pty: $INSTALLED -> $REMOTE"
+  pip3 install -q --force-reinstall --no-deps "git+$URL@$REMOTE" || exit 0
+fi
+"""
+
+
+def pty_refresh_step(
+    pty_repo_url: str = "https://github.com/zjw49246/Claude-Code-PTY",
+    timeout: int = 60,
+) -> BootstrapStep:
+    """Install the claude-pty refresh hook: script + ExecStartPre drop-in.
+
+    Closes the resume_node gap — started-from-stopped instances never
+    re-bootstrap, so without this they run a stale claude-pty forever.
+    """
+    script = PTY_REFRESH_SCRIPT.replace("{pty_repo_url}", pty_repo_url)
+    cmd = (
+        f"cat > {PTY_REFRESH_SCRIPT_PATH} << 'REFRESH'\n"
+        f"{script}"
+        "REFRESH\n"
+        f"chmod +x {PTY_REFRESH_SCRIPT_PATH} && "
+        "mkdir -p /etc/systemd/system/elastic-agent-runtime.service.d && "
+        "cat > /etc/systemd/system/elastic-agent-runtime.service.d/10-pty-refresh.conf << 'DROPIN'\n"
+        "[Service]\n"
+        f"ExecStartPre=-/bin/bash {PTY_REFRESH_SCRIPT_PATH}\n"
+        "DROPIN\n"
+        "systemctl daemon-reload"
+    )
+    return BootstrapStep(
+        name="pty-refresh-hook",
+        command=cmd,
+        timeout=timeout,
+        retry_count=1,
+        description="Install claude-pty auto-refresh on runtime start (mechanical dep sync)",
+    )
+
+
 def build_default_bootstrap_steps(
     manager_url: str,
     auth_token: str,
@@ -204,6 +261,8 @@ def build_default_bootstrap_steps(
     ]
     if include_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
+        # refresh hook must land after runtime_deploy_step writes the unit
+        steps.append(pty_refresh_step())
     if include_login_deps:
         steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps

@@ -476,6 +476,41 @@ class TestPTYBootstrap:
         assert "pty-install" in names
         assert names.index("pty-install") < names.index("runtime-deploy")
 
+    def test_include_pty_appends_refresh_hook(self):
+        # resume_node skips bootstrap, so the worker needs a self-refresh hook
+        steps = build_default_bootstrap_steps("ws://m", "tok", "w1", include_pty=True)
+        names = [s.name for s in steps]
+        assert "pty-refresh-hook" in names
+        # must run after runtime-deploy writes the unit it drops into
+        assert names.index("pty-refresh-hook") > names.index("runtime-deploy")
+
+    def test_default_steps_exclude_refresh_hook(self):
+        steps = build_default_bootstrap_steps("ws://m", "tok", "w1")
+        assert "pty-refresh-hook" not in [s.name for s in steps]
+
+    def test_pty_refresh_step_content(self):
+        from elastic_agent.core.bootstrap_steps import pty_refresh_step
+
+        step = pty_refresh_step()
+        # script compares installed direct_url commit vs upstream main HEAD
+        assert "direct_url.json" in step.command
+        assert "ls-remote" in step.command
+        assert "refs/heads/main" in step.command
+        assert "--force-reinstall" in step.command
+        # ExecStartPre with `-`: refresh failure must not block runtime start
+        assert "ExecStartPre=-/bin/bash /usr/local/bin/claude-pty-refresh.sh" in step.command
+        assert "10-pty-refresh.conf" in step.command
+        assert "daemon-reload" in step.command
+        # repo URL is templated in, no leftover placeholder
+        assert "{pty_repo_url}" not in step.command
+        assert "Claude-Code-PTY" in step.command
+
+    def test_pty_refresh_step_custom_repo(self):
+        from elastic_agent.core.bootstrap_steps import pty_refresh_step
+
+        step = pty_refresh_step(pty_repo_url="https://example.com/fork")
+        assert 'URL="https://example.com/fork"' in step.command
+
 
 # ---------------------------------------------------------------------------
 # Phase 3: credential rotation recycles warm sessions
