@@ -505,7 +505,7 @@ wheels = [
 [[package]]
 name = "claude-pty"
 version = "0.1.0"
-source = { git = "https://github.com/zjw49246/Claude-Code-PTY#7d1bbd13494bd4203f0d7c216f4a208750fff742" }
+source = { git = "https://github.com/zjw49246/Claude-Code-PTY#88b77ad5140b3f1478e28d343fd1d3a8571757a9" }
 
 [[package]]
 name = "click"
