@@ -113,6 +113,7 @@ if PTY_AVAILABLE:
             self._task_session_ids: dict[str, str] = {}
             self._turn_errors: dict[str, str | None] = {}
             self._saw_result: set[str] = set()
+            self._saw_claude_output: set[str] = set()
 
         def build_config(self, **kwargs):
             """Extend the base config with a per-task response timeout.
@@ -178,6 +179,8 @@ if PTY_AVAILABLE:
                 self._turn_errors[task_id] = event_dict.get("content") or "PTY turn error"
             if event_dict.get("event_type") == "result":
                 self._saw_result.add(task_id)
+            if event_dict.get("raw_json"):
+                self._saw_claude_output.add(task_id)
 
             line = event_to_log_line(event_dict)
             if line is None:
@@ -193,6 +196,16 @@ if PTY_AVAILABLE:
                 # (API error sentinel, response timeout) must still surface
                 # as a failed run on the Manager side.
                 ec = 1
+            if ec == 0 and task_id not in self._saw_claude_output:
+                # A PTY session can exit cleanly after prompt injection never
+                # reaches Claude (for example channel injection fails and the
+                # stdin fallback is ignored). Do not report that empty turn as
+                # a successful production run.
+                error = (
+                    "Claude PTY session produced no Claude output; "
+                    "prompt injection may have failed"
+                )
+                ec = 1
 
             if task_id not in self._saw_result:
                 await self._emit_log(task_id, synthesize_result_line(
@@ -201,6 +214,7 @@ if PTY_AVAILABLE:
                     error_message=error,
                 ))
             self._saw_result.discard(task_id)
+            self._saw_claude_output.discard(task_id)
             self._task_session_ids.pop(task_id, None)
             self._sessions.pop(task_id, None)
             self._consumers.pop(task_id, None)

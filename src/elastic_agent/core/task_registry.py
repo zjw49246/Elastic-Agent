@@ -41,6 +41,17 @@ class TaskRecord(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+TERMINAL_LOGICAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def is_record_active(record: TaskRecord) -> bool:
+    """Return True when a record should count against worker capacity."""
+    logical_status = (record.metadata or {}).get("logical_status")
+    if logical_status in TERMINAL_LOGICAL_STATUSES:
+        return False
+    return record.status == TaskStatus.RUNNING
+
+
 class TaskRegistry:
     """Thread-safe, JSON-file-backed task-to-worker mapping.
 
@@ -158,7 +169,7 @@ class TaskRegistry:
                 self._load_sync()
             return sum(
                 1 for r in self._tasks.values()
-                if r.worker_id == worker_id and r.status == TaskStatus.RUNNING
+                if r.worker_id == worker_id and is_record_active(r)
             )
 
     async def cleanup_worker(self, worker_id: str) -> list[TaskRecord]:
@@ -168,7 +179,7 @@ class TaskRegistry:
                 self._load_sync()
             affected: list[TaskRecord] = []
             for rec in self._tasks.values():
-                if rec.worker_id == worker_id and rec.status == TaskStatus.RUNNING:
+                if rec.worker_id == worker_id and is_record_active(rec):
                     rec.status = TaskStatus.WORKER_LOST
                     rec.updated_at = _utcnow()
                     affected.append(rec)
@@ -188,7 +199,7 @@ class TaskRegistry:
                 self._load_sync()
             affected: list[TaskRecord] = []
             for rec in self._tasks.values():
-                if rec.status == TaskStatus.RUNNING and rec.worker_id not in online_worker_ids:
+                if is_record_active(rec) and rec.worker_id not in online_worker_ids:
                     rec.status = TaskStatus.WORKER_LOST
                     rec.updated_at = _utcnow()
                     affected.append(rec)

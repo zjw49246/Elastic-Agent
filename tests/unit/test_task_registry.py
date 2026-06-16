@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
-from elastic_agent.core.task_registry import TaskRecord, TaskRegistry, TaskStatus
+from elastic_agent.core.task_registry import TaskRegistry, TaskStatus
 
 
 @pytest.fixture
@@ -124,6 +123,16 @@ async def test_count_active_by_worker(registry):
 
 
 @pytest.mark.asyncio
+async def test_count_active_by_worker_excludes_terminal_logical_status(registry):
+    await registry.register("t1", "w1")
+    await registry.register("t2", "w1", {"logical_status": "cancelled"})
+    await registry.register("t3", "w1", {"logical_status": "failed"})
+    await registry.register("t4", "w1", {"logical_status": "completed"})
+
+    assert await registry.count_active_by_worker("w1") == 1
+
+
+@pytest.mark.asyncio
 async def test_cleanup_worker(registry):
     await registry.register("t1", "w1")
     await registry.register("t2", "w1")
@@ -138,8 +147,17 @@ async def test_cleanup_worker(registry):
     t2 = await registry.get("t2")
     assert t2.status == TaskStatus.COMPLETED
 
-    t3 = await registry.get("t3")
-    assert t3.status == TaskStatus.RUNNING
+
+@pytest.mark.asyncio
+async def test_cleanup_worker_skips_terminal_logical_status(registry):
+    await registry.register("t1", "w1")
+    await registry.register("t2", "w1", {"logical_status": "cancelled"})
+
+    affected = await registry.cleanup_worker("w1")
+
+    assert [task.task_id for task in affected] == ["t1"]
+    t2 = await registry.get("t2")
+    assert t2.status == TaskStatus.RUNNING
 
 
 @pytest.mark.asyncio
@@ -240,7 +258,7 @@ class TestT138CRUD:
 
     @pytest.mark.asyncio
     async def test_register_overwrites_existing(self, registry):
-        rec1 = await registry.register("t1", "w1", {"v": 1})
+        await registry.register("t1", "w1", {"v": 1})
         rec2 = await registry.register("t1", "w2", {"v": 2})
         assert rec2.worker_id == "w2"
         assert rec2.metadata == {"v": 2}

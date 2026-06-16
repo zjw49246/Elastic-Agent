@@ -23,7 +23,6 @@ from elastic_agent.worker.pty_backend import (
 )
 from elastic_agent.worker.runtime import WorkerRuntime
 
-
 # ---------------------------------------------------------------------------
 # Protocol: ExecuteMessage.agent_params
 # ---------------------------------------------------------------------------
@@ -330,6 +329,7 @@ def _make_backend(tmp_path):
     backend._task_session_ids = {}
     backend._turn_errors = {}
     backend._saw_result = set()
+    backend._saw_claude_output = set()
     backend._sessions = {}
     backend._consumers = {}
     return backend
@@ -355,9 +355,13 @@ class TestElasticPTYBackendEvents:
         assert json.loads(log_lines[0])["data"] == raw
 
     @pytest.mark.asyncio
-    async def test_on_exit_synthesizes_result(self, tmp_path):
+    async def test_on_exit_synthesizes_success_after_claude_output(self, tmp_path):
         backend = _make_backend(tmp_path)
-        backend._task_session_ids["t1"] = "sess-1"
+        raw = json.dumps({"type": "assistant", "message": {"content": []}})
+        await backend.on_event("t1", {
+            "event_type": "message", "raw_json": raw, "session_id": "sess-1",
+        })
+        backend._runtime._send_event.reset_mock()
         await backend.on_exit("t1", 0)
         sent = backend._runtime._send_event.call_args[0][0]
         obj = json.loads(sent.data)
@@ -365,6 +369,18 @@ class TestElasticPTYBackendEvents:
         assert obj["subtype"] == "success"
         assert obj["session_id"] == "sess-1"
         backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 0)
+
+    @pytest.mark.asyncio
+    async def test_on_exit_empty_turn_forces_failure(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend._task_session_ids["t1"] = "sess-1"
+        await backend.on_exit("t1", 0)
+        sent = backend._runtime._send_event.call_args[0][0]
+        obj = json.loads(sent.data)
+        assert obj["type"] == "result"
+        assert obj["subtype"] == "error"
+        assert "produced no Claude output" in obj["error"]
+        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 1)
 
     @pytest.mark.asyncio
     async def test_on_exit_error_turn_forces_nonzero_exit(self, tmp_path):
@@ -401,7 +417,7 @@ class TestElasticPTYBackendEvents:
 class TestTaskRouterUsePty:
     @pytest.fixture
     def setup(self, tmp_path):
-        from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
+        from elastic_agent.core.registry import NodeRegistry
         from elastic_agent.core.task_registry import TaskRegistry
         from elastic_agent.manager.connection import WorkerConnectionManager
 
