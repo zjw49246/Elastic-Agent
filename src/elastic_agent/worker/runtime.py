@@ -659,33 +659,108 @@ class WorkerRuntime:
 
     async def _handle_force_sync(self, msg) -> None:
         from elastic_agent.core.protocols.messages import ForceSyncResultMessage
+        from elastic_agent.worker.file_sync import FileSyncManager, SyncMappingEntry, create_storage_backend
 
         task_id = msg.task_id
         if not self._file_sync_manager:
-            await self._send_event(ForceSyncResultMessage(
-                task_id=task_id, files_synced=0, success=False,
-                error="FileSyncManager not initialized",
-            ))
-            return
+            if not (getattr(msg, "oss_prefix", None) and (
+                getattr(msg, "watch_paths", None) or getattr(msg, "cwd", None) or getattr(msg, "book_slug", None)
+            )):
+                await self._send_event(ForceSyncResultMessage(
+                    task_id=task_id,
+                    request_id=getattr(msg, "request_id", None),
+                    files_synced=0,
+                    success=False,
+                    error="FileSyncManager not initialized",
+                ))
+                return
+            storage = create_storage_backend()
+            self._file_sync_manager = FileSyncManager(
+                worker_id=self._worker_id or "unknown",
+                storage=storage,
+                on_file_synced=self._on_file_synced,
+                on_file_changed=self._on_file_changed,
+            )
+            await self._file_sync_manager.start()
 
-        if task_id not in self._file_sync_manager._mappings:
+        mapping = self._file_sync_manager._mappings.get(task_id)
+        transient = False
+        if mapping is None:
+            watch_paths = list(getattr(msg, "watch_paths", None) or [])
+            cwd = getattr(msg, "cwd", None)
+            book_slug = getattr(msg, "book_slug", None) or ""
+            oss_prefix = getattr(msg, "oss_prefix", None) or ""
+            if not watch_paths:
+                if cwd:
+                    watch_paths.append(cwd)
+                elif book_slug:
+                    watch_paths.append(f"/root/books/{book_slug}/")
+            if not (book_slug and oss_prefix and watch_paths):
+                await self._send_event(ForceSyncResultMessage(
+                    task_id=task_id,
+                    request_id=getattr(msg, "request_id", None),
+                    files_synced=0,
+                    success=False,
+                    error=f"No sync mapping registered for task {task_id}",
+                ))
+                return
+            mapping = SyncMappingEntry(
+                task_id=task_id,
+                book_slug=book_slug,
+                oss_prefix=oss_prefix,
+                watch_paths=watch_paths,
+                session_path_hash="",
+            )
+            transient = bool(getattr(msg, "transient", False))
+
+        scan = self._file_sync_manager.scan_task_artifacts(
+            task_id,
+            mapping=mapping,
+            book_slug=getattr(msg, "book_slug", None),
+            cwd=getattr(msg, "cwd", None),
+            watch_paths=getattr(msg, "watch_paths", None),
+        )
+        manifest_key = f"{mapping.oss_prefix.rstrip('/')}/_sync_manifest.json"
+        if not scan.delivery_found:
             await self._send_event(ForceSyncResultMessage(
-                task_id=task_id, files_synced=0, success=False,
-                error=f"No sync mapping registered for task {task_id}",
+                task_id=task_id,
+                request_id=getattr(msg, "request_id", None),
+                files_synced=0,
+                files_attempted=0,
+                success=False,
+                error="delivery_not_found",
+                delivery_found=False,
+                manifest_key=manifest_key,
             ))
             return
 
         try:
-            count = await self._file_sync_manager.force_sync(task_id)
+            count = await self._file_sync_manager.force_sync_mapping(mapping, transient=transient)
             logger.info("Force-synced %d files for task %s", count, task_id)
             await self._send_event(ForceSyncResultMessage(
-                task_id=task_id, files_synced=count, success=True,
+                task_id=task_id,
+                request_id=getattr(msg, "request_id", None),
+                files_synced=count,
+                files_attempted=count,
+                success=True,
+                delivery_found=True,
+                delivery_path=scan.delivery_path,
+                manifest_key=manifest_key,
+                manuscript_path=scan.manuscript_path,
             ))
         except Exception as exc:
             logger.exception("Force sync failed for task %s", task_id)
             await self._send_event(ForceSyncResultMessage(
-                task_id=task_id, files_synced=0, success=False,
+                task_id=task_id,
+                request_id=getattr(msg, "request_id", None),
+                files_synced=0,
+                files_attempted=0,
+                success=False,
                 error=str(exc),
+                delivery_found=scan.delivery_found,
+                delivery_path=scan.delivery_path,
+                manifest_key=manifest_key,
+                manuscript_path=scan.manuscript_path,
             ))
 
     async def _on_file_synced(

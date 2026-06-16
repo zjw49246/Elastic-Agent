@@ -300,8 +300,27 @@ class WorkerConnectionManager:
     async def unregister_sync_mapping(self, worker_id: str, task_id: str) -> None:
         await self.send_command(worker_id, UnregisterSyncMappingMessage(task_id=task_id))
 
-    async def force_sync(self, worker_id: str, task_id: str) -> None:
-        await self.send_command(worker_id, ForceSyncMessage(task_id=task_id))
+    async def force_sync(
+        self,
+        worker_id: str,
+        task_id: str,
+        *,
+        request_id: str | None = None,
+        book_slug: str | None = None,
+        cwd: str | None = None,
+        oss_prefix: str | None = None,
+        watch_paths: list[str] | None = None,
+        transient: bool = False,
+    ) -> None:
+        await self.send_command(worker_id, ForceSyncMessage(
+            task_id=task_id,
+            request_id=request_id,
+            book_slug=book_slug,
+            cwd=cwd,
+            oss_prefix=oss_prefix,
+            watch_paths=watch_paths,
+            transient=transient,
+        ))
 
     async def broadcast(self, msg: Message) -> dict[str, bool]:
         """Send a message to all connected Workers. Returns {worker_id: success}."""

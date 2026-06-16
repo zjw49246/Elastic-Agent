@@ -113,6 +113,14 @@ class SyncManifest:
 
 
 @dataclass
+class ArtifactScanResult:
+    delivery_found: bool = False
+    delivery_path: str | None = None
+    manuscript_path: str | None = None
+    searched_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PendingUpload:
     local_path: str
     oss_key: str
@@ -361,8 +369,26 @@ def _file_md5(path: str) -> str:
     return h.hexdigest()
 
 
+def _is_delivery_manuscript_name(name: str) -> bool:
+    lower = name.lower()
+    return lower.endswith(".md") and lower not in {
+        "intro.md",
+        "audiobook_intro.md",
+        "intro_final.md",
+    }
+
+
 def _guess_role(filename: str, debounce_tiers: dict[str, float]) -> str:
-    name = os.path.basename(filename)
+    normalized = filename.replace("\\", "/")
+    name = os.path.basename(normalized).lower()
+    path_parts = set(normalized.split("/"))
+    if "delivery" in path_parts:
+        if name in ("intro.md", "audiobook_intro.md", "intro_final.md"):
+            return "delivery_intro"
+        if name in ("delivery.zip", "audiobook_delivery.zip") or name.endswith(".zip"):
+            return "delivery_export"
+        if _is_delivery_manuscript_name(name):
+            return "delivery_manuscript"
     if name in ("state.json",):
         return "state"
     if name in ("manifest.json", "_sync_manifest.json"):
@@ -497,6 +523,117 @@ class FileSyncManager:
             return 0
         return await self._sync_all_files(task_id, mapping)
 
+    async def force_sync_mapping(self, mapping: SyncMappingEntry, *, transient: bool = False) -> int:
+        """Force sync using a supplied mapping, optionally without keeping it active."""
+        task_id = mapping.task_id
+        had_mapping = task_id in self._mappings
+        had_manifest = task_id in self._manifests
+
+        if not had_mapping and not transient:
+            self.register_mapping(mapping)
+            return await self.force_sync(task_id)
+
+        if not had_mapping:
+            self._mappings[task_id] = mapping
+        if not had_manifest:
+            self._manifests[task_id] = SyncManifest(
+                task_id=task_id,
+                worker_id=self._worker_id,
+                status="idle",
+                updated_at=_utcnow().isoformat(),
+            )
+
+        try:
+            return await self._sync_all_files(task_id, mapping)
+        finally:
+            if transient and not had_mapping:
+                self._mappings.pop(task_id, None)
+            if transient and not had_manifest:
+                self._manifests.pop(task_id, None)
+
+    def scan_task_artifacts(
+        self,
+        task_id: str,
+        *,
+        mapping: SyncMappingEntry | None = None,
+        book_slug: str | None = None,
+        cwd: str | None = None,
+        watch_paths: list[str] | None = None,
+    ) -> ArtifactScanResult:
+        """Search likely task workspace roots for a delivery directory."""
+        active_mapping = mapping or self._mappings.get(task_id)
+        roots: list[str] = []
+        if watch_paths:
+            roots.extend(watch_paths)
+        if active_mapping:
+            roots.extend(active_mapping.watch_paths)
+            book_slug = book_slug or active_mapping.book_slug
+        if cwd:
+            roots.append(cwd)
+            if book_slug:
+                roots.append(os.path.join(cwd, ".work", book_slug))
+        if book_slug:
+            roots.append(f"/root/books/{book_slug}")
+            roots.append(f"/root/books/{book_slug}/.work/{book_slug}")
+            roots.append(f"/root/.work/{book_slug}")
+
+        normalized_roots: list[str] = []
+        seen: set[str] = set()
+        for root in roots:
+            root_norm = os.path.abspath(root.rstrip("/"))
+            if root_norm and root_norm not in seen:
+                seen.add(root_norm)
+                normalized_roots.append(root_norm)
+
+        delivery_dirs: list[Path] = []
+        searched: list[str] = []
+        for root in normalized_roots:
+            root_path = Path(root)
+            searched.append(str(root_path))
+            if not root_path.exists():
+                continue
+            if root_path.is_dir() and root_path.name == "delivery":
+                delivery_dirs.append(root_path)
+                continue
+            if root_path.is_dir():
+                for current_root, dirs, _files in os.walk(str(root_path)):
+                    for dirname in dirs:
+                        if dirname == "delivery":
+                            delivery_dirs.append(Path(current_root) / dirname)
+
+        def _delivery_score(path: Path) -> tuple[int, float]:
+            try:
+                children = list(path.iterdir())
+            except OSError:
+                children = []
+            has_manuscript = any(item.is_file() and _is_delivery_manuscript_name(item.name) for item in children)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (1 if has_manuscript else 0, mtime)
+
+        if not delivery_dirs:
+            return ArtifactScanResult(searched_paths=searched)
+
+        delivery_path = sorted(delivery_dirs, key=_delivery_score, reverse=True)[0]
+        manuscript_path = None
+        try:
+            delivery_children = sorted(delivery_path.iterdir())
+        except OSError:
+            delivery_children = []
+        for candidate in delivery_children:
+            if candidate.is_file() and _is_delivery_manuscript_name(candidate.name):
+                manuscript_path = str(candidate)
+                break
+
+        return ArtifactScanResult(
+            delivery_found=True,
+            delivery_path=str(delivery_path),
+            manuscript_path=manuscript_path,
+            searched_paths=searched,
+        )
+
     def on_file_event(self, path: str, event_type: str) -> None:
         """Called by watchdog handler (from thread) when a file changes."""
         if not self._running or not self._loop:
@@ -565,7 +702,7 @@ class FileSyncManager:
                 md5 = _file_md5(local_path)
                 size = os.path.getsize(local_path)
                 content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
-                role = _guess_role(local_path, self._debounce_tiers)
+                role = _guess_role(rel_path, self._debounce_tiers)
                 now = _utcnow()
 
                 async with self._lock:

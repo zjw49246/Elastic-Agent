@@ -102,6 +102,12 @@ class UnregisterSyncMappingMessage(Message):
 class ForceSyncMessage(Message):
     type: Literal["FORCE_SYNC"] = "FORCE_SYNC"
     task_id: str
+    request_id: str | None = None
+    book_slug: str | None = None
+    cwd: str | None = None
+    oss_prefix: str | None = None
+    watch_paths: list[str] | None = None
+    transient: bool = False
 
 
 class CredentialLoginMessage(Message):
@@ -186,9 +192,15 @@ class FileSyncedMessage(Message):
 class ForceSyncResultMessage(Message):
     type: Literal["FORCE_SYNC_RESULT"] = "FORCE_SYNC_RESULT"
     task_id: str
+    request_id: str | None = None
+    files_attempted: int = 0
     files_synced: int
     success: bool
     error: str | None = None
+    delivery_found: bool = False
+    delivery_path: str | None = None
+    manifest_key: str | None = None
+    manuscript_path: str | None = None
 
 
 class QuotaStatusMessage(Message):

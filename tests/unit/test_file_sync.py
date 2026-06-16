@@ -97,6 +97,13 @@ class TestHelperFunctions:
         assert _guess_role("manuscript_ch01.md", {}) == "manuscript"
         assert _guess_role("chapter.md", {}) == "manuscript"
 
+    def test_guess_role_delivery_files(self):
+        assert _guess_role("delivery/audiobook_manuscript.md", {}) == "delivery_manuscript"
+        assert _guess_role("delivery/manuscript.md", {}) == "delivery_manuscript"
+        assert _guess_role("delivery/custom_output.md", {}) == "delivery_manuscript"
+        assert _guess_role("delivery/intro_final.md", {}) == "delivery_intro"
+        assert _guess_role("delivery/custom.zip", {}) == "delivery_export"
+
     def test_guess_role_other(self):
         assert _guess_role("config.yaml", {}) == "other"
 
@@ -342,6 +349,53 @@ class TestFileSyncManager:
         try:
             count = await sync_manager.force_sync("nonexistent")
             assert count == 0
+        finally:
+            await sync_manager.stop()
+
+    async def test_scan_task_artifacts_prefers_delivery_with_custom_manuscript(self, sync_manager, watch_dir):
+        old_delivery = watch_dir / "old" / "delivery"
+        old_delivery.mkdir(parents=True)
+        (old_delivery / "notes.txt").write_text("not a manuscript")
+
+        new_delivery = watch_dir / "workspace" / "delivery"
+        new_delivery.mkdir(parents=True)
+        custom_manuscript = new_delivery / "custom_output.md"
+        custom_manuscript.write_text("final manuscript")
+
+        mapping = SyncMappingEntry(
+            task_id="task-1",
+            book_slug="test-book",
+            oss_prefix="tasks/task-1",
+            watch_paths=[str(watch_dir)],
+        )
+
+        scan = sync_manager.scan_task_artifacts("task-1", mapping=mapping)
+
+        assert scan.delivery_found is True
+        assert scan.delivery_path == str(new_delivery)
+        assert scan.manuscript_path == str(custom_manuscript)
+
+    async def test_force_sync_marks_custom_delivery_md_as_manuscript(self, sync_manager, watch_dir, sync_dir):
+        await sync_manager.start()
+        try:
+            delivery_dir = watch_dir / "delivery"
+            delivery_dir.mkdir()
+            (delivery_dir / "custom_output.md").write_text("final manuscript")
+
+            mapping = SyncMappingEntry(
+                task_id="task-1",
+                book_slug="test-book",
+                oss_prefix="tasks/task-1",
+                watch_paths=[str(watch_dir)],
+            )
+            sync_manager.register_mapping(mapping)
+
+            await sync_manager.force_sync("task-1")
+
+            manifest_path = sync_dir / "tasks" / "task-1" / "_sync_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            delivery_file = next(f for f in manifest["files"] if f["path"].endswith("custom_output.md"))
+            assert delivery_file["role"] == "delivery_manuscript"
         finally:
             await sync_manager.stop()
 
