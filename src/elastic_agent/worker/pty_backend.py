@@ -95,6 +95,17 @@ def synthesize_result_line(
     return json.dumps(obj, ensure_ascii=False)
 
 
+def classify_turn_error(content: str | None) -> tuple[str, str]:
+    message = content or "PTY turn error"
+    lower = message.lower()
+    if "response timed out" in lower or "response timeout" in lower:
+        return (
+            "runtime_timeout",
+            f"Worker runtime timed out and interrupted the Claude process ({message})",
+        )
+    return "pty_turn_error", message
+
+
 if PTY_AVAILABLE:
 
     class ElasticPTYBackend(BasePTYBackend):
@@ -190,8 +201,13 @@ if PTY_AVAILABLE:
             if event_dict.get("is_error") and event_dict.get("event_type") in (
                 "system_event", "message", "result",
             ):
-                self._turn_errors[task_id] = event_dict.get("content") or "PTY turn error"
-                self._turn_error_types.setdefault(task_id, "pty_turn_error")
+                error_type, error_message = classify_turn_error(event_dict.get("content"))
+                current_type = self._turn_error_types.get(task_id)
+                if current_type is None or (
+                    current_type == "pty_turn_error" and error_type == "runtime_timeout"
+                ):
+                    self._turn_errors[task_id] = error_message
+                    self._turn_error_types[task_id] = error_type
             if event_dict.get("event_type") == "result":
                 self._saw_result.add(task_id)
             if event_dict.get("raw_json"):

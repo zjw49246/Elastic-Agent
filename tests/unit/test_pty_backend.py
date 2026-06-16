@@ -20,6 +20,7 @@ from elastic_agent.worker.pty_backend import (
     PTY_AVAILABLE,
     event_to_log_line,
     synthesize_result_line,
+    classify_turn_error,
 )
 from elastic_agent.worker.runtime import WorkerRuntime
 
@@ -107,6 +108,12 @@ class TestEventToLogLine:
         parsed = WorkerRuntime._try_parse_ndjson(line)
         assert parsed is not None
         assert parsed["type"] == "system"
+
+    def test_response_timeout_classified_as_runtime_timeout(self):
+        error_type, message = classify_turn_error("Response timed out after 600s")
+        assert error_type == "runtime_timeout"
+        assert "Worker runtime timed out" in message
+        assert "Response timed out after 600s" in message
 
 
 class TestSynthesizeResultLine:
@@ -413,6 +420,27 @@ class TestElasticPTYBackendEvents:
         assert obj["error"] == "usage limit reached"
         backend._runtime._on_pty_exit.assert_awaited_once_with(
             "t1", 1, session_id="sess-1", error_type="pty_turn_error", error_message="usage limit reached"
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_exit_response_timeout_reports_runtime_timeout(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        await backend.on_event("t1", {
+            "event_type": "system_event", "content": "Response timed out after 600s",
+            "is_error": True, "session_id": "sess-1",
+        })
+        await backend.on_exit("t1", 0)
+        result_msg = backend._runtime._send_event.call_args[0][0]
+        obj = json.loads(result_msg.data)
+        assert obj["subtype"] == "error"
+        assert obj["error_type"] == "runtime_timeout"
+        assert "Worker runtime timed out" in obj["error"]
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1",
+            1,
+            session_id="sess-1",
+            error_type="runtime_timeout",
+            error_message="Worker runtime timed out and interrupted the Claude process (Response timed out after 600s)",
         )
 
     @pytest.mark.asyncio
