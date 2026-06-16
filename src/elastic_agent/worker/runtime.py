@@ -94,6 +94,7 @@ class WorkerRuntime:
         # PTY-hosted execution (claude-pty); created lazily on first use.
         self._pty_backend: Any = None
         self._pty_timeouts: dict[str, asyncio.Task] = {}
+        self._pty_session_ids: dict[str, str] = {}
 
     @property
     def connected(self) -> bool:
@@ -292,7 +293,12 @@ class WorkerRuntime:
                 message=f"Failed to start process: {exc}",
                 recoverable=True,
             ))
-            await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=-1))
+            await self._send_event(ProcessExitMessage(
+                task_id=task_id,
+                exit_code=-1,
+                error_type="execute_failed",
+                error_message=f"Failed to start process: {exc}",
+            ))
             return
 
         self._processes[task_id] = proc
@@ -386,7 +392,7 @@ class WorkerRuntime:
                 config_dir=config_dir,
                 env_overrides=env_overrides or None,
                 # The turn must be allowed to run as long as the task itself
-                # (PTYConfig default is 30 min — too short for long builds).
+                # instead of relying on claude-pty's shorter default.
                 response_timeout=params.get("response_timeout") or msg.timeout,
             )
         except Exception as exc:
@@ -396,10 +402,17 @@ class WorkerRuntime:
                 message=f"Failed to start PTY session: {exc}",
                 recoverable=True,
             ))
-            await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=-1))
+            await self._send_event(ProcessExitMessage(
+                task_id=task_id,
+                exit_code=-1,
+                error_type="execute_failed",
+                error_message=f"Failed to start PTY session: {exc}",
+            ))
             return True
 
         logger.info("Started PTY session %s for task %s", session_id, task_id)
+        if session_id:
+            self._pty_session_ids[task_id] = session_id
 
         if msg.timeout:
             # Hard backstop only: claude-pty's own response_timeout (set to
@@ -414,15 +427,31 @@ class WorkerRuntime:
         await asyncio.sleep(timeout)
         logger.warning("PTY task %s timed out after %ds, stopping session", task_id, timeout)
         try:
+            message = (
+                f"Worker runtime timed out after {timeout}s and interrupted "
+                "the Claude process"
+            )
+            if hasattr(self._pty_backend, "mark_task_error"):
+                self._pty_backend.mark_task_error(task_id, "runtime_timeout", message)
             await self._pty_backend.stop(task_id)
         except Exception:
             logger.exception("Failed to stop timed-out PTY task %s", task_id)
 
-    async def _on_pty_exit(self, task_id: str, exit_code: int) -> None:
+    async def _on_pty_exit(
+        self,
+        task_id: str,
+        exit_code: int,
+        *,
+        session_id: str | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
         """Called by ElasticPTYBackend when a PTY turn/session finishes."""
         timer = self._pty_timeouts.pop(task_id, None)
         if timer and not timer.done():
             timer.cancel()
+        session_id = session_id or self._pty_session_ids.pop(task_id, None)
+        self._pty_session_ids.pop(task_id, None)
 
         logger.info("PTY task %s finished with exit code %d", task_id, exit_code)
 
@@ -433,7 +462,13 @@ class WorkerRuntime:
             except Exception:
                 logger.exception("Failed to force-sync files for PTY task %s", task_id)
 
-        await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=exit_code))
+        await self._send_event(ProcessExitMessage(
+            task_id=task_id,
+            exit_code=exit_code,
+            session_id=session_id,
+            error_type=error_type,
+            error_message=error_message,
+        ))
 
     async def _read_stream(
         self,

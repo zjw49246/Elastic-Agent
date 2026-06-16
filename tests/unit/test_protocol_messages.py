@@ -220,6 +220,20 @@ class TestWorkerToManagerMessages:
         restored = parse_message(msg.model_dump_json())
         assert restored.exit_code == 137
 
+    def test_process_exit_with_failure_metadata(self):
+        msg = ProcessExitMessage(
+            task_id="t-3",
+            exit_code=1,
+            session_id="sess-123",
+            error_type="runtime_timeout",
+            error_message="Worker runtime timed out",
+        )
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, ProcessExitMessage)
+        assert restored.session_id == "sess-123"
+        assert restored.error_type == "runtime_timeout"
+        assert restored.error_message == "Worker runtime timed out"
+
     def test_file_content_roundtrip(self):
         msg = FileContentMessage(
             request_id="req-1",

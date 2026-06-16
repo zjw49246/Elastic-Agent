@@ -144,6 +144,9 @@ class ProcessExitMessage(Message):
     type: Literal["PROCESS_EXIT"] = "PROCESS_EXIT"
     task_id: str
     exit_code: int
+    session_id: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class FileContentMessage(Message):

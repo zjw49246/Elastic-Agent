@@ -141,6 +141,7 @@ class _FakeBackend:
     def __init__(self):
         self.launches = []
         self.stops = []
+        self.marked_error = None
         self._tasks: set[str] = set()
 
     def has_task(self, task_id):
@@ -158,6 +159,9 @@ class _FakeBackend:
     async def stop(self, key):
         self.stops.append(key)
         self._tasks.discard(key)
+
+    def mark_task_error(self, task_id, error_type, error_message):
+        self.marked_error = (task_id, error_type, error_message)
 
     async def shutdown(self):
         self._tasks.clear()
@@ -307,6 +311,9 @@ class TestRuntimePTYDispatch:
         runtime._pty_backend = fake
         await runtime._pty_timeout_watch("t1:abc", 0)
         assert fake.stops == ["t1:abc"]
+        assert fake.marked_error[0] == "t1:abc"
+        assert fake.marked_error[1] == "runtime_timeout"
+        assert "timed out" in fake.marked_error[2]
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +335,7 @@ def _make_backend(tmp_path):
     backend._log_dir = tmp_path / "logs"
     backend._task_session_ids = {}
     backend._turn_errors = {}
+    backend._turn_error_types = {}
     backend._saw_result = set()
     backend._saw_claude_output = set()
     backend._sessions = {}
@@ -368,7 +376,9 @@ class TestElasticPTYBackendEvents:
         assert obj["type"] == "result"
         assert obj["subtype"] == "success"
         assert obj["session_id"] == "sess-1"
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 0)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 0, session_id="sess-1", error_type=None, error_message=None
+        )
 
     @pytest.mark.asyncio
     async def test_on_exit_empty_turn_forces_failure(self, tmp_path):
@@ -380,7 +390,13 @@ class TestElasticPTYBackendEvents:
         assert obj["type"] == "result"
         assert obj["subtype"] == "error"
         assert "produced no Claude output" in obj["error"]
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 1)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1",
+            1,
+            session_id="sess-1",
+            error_type="no_claude_output",
+            error_message="Claude PTY session produced no Claude output; prompt injection may have failed",
+        )
 
     @pytest.mark.asyncio
     async def test_on_exit_error_turn_forces_nonzero_exit(self, tmp_path):
@@ -395,7 +411,9 @@ class TestElasticPTYBackendEvents:
         obj = json.loads(result_msg.data)
         assert obj["subtype"] == "error"
         assert obj["error"] == "usage limit reached"
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 1)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 1, session_id="sess-1", error_type="pty_turn_error", error_message="usage limit reached"
+        )
 
     @pytest.mark.asyncio
     async def test_on_exit_skips_result_if_real_one_seen(self, tmp_path):
@@ -406,7 +424,9 @@ class TestElasticPTYBackendEvents:
         await backend.on_exit("t1", 0)
         # No second result line emitted
         backend._runtime._send_event.assert_not_called()
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 0)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 0, session_id="sess-1", error_type=None, error_message=None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +700,7 @@ class TestResponseTimeoutPlumbing:
     def test_build_config_default_unchanged(self, tmp_path):
         backend = _make_backend(tmp_path)
         config = backend.build_config()
-        assert config.response_timeout == 1800.0
+        assert config.response_timeout == 7200.0
 
 
 class TestRuntimePassesResponseTimeout:
@@ -767,7 +787,9 @@ class TestTurnErrorSemantics:
         result_msg = backend._runtime._send_event.call_args[0][0]
         obj = json.loads(result_msg.data)
         assert obj["subtype"] == "success"
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 0)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 0, session_id="sess-1", error_type=None, error_message=None
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("etype", ["system_event", "message", "result"])
@@ -778,4 +800,6 @@ class TestTurnErrorSemantics:
             "content": "usage limit reached", "session_id": "sess-1",
         })
         await backend.on_exit("t1", 0)
-        backend._runtime._on_pty_exit.assert_awaited_once_with("t1", 1)
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 1, session_id="sess-1", error_type="pty_turn_error", error_message="usage limit reached"
+        )

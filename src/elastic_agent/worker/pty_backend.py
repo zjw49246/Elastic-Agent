@@ -74,6 +74,7 @@ def synthesize_result_line(
     session_id: str | None,
     is_error: bool,
     error_message: str | None = None,
+    error_type: str | None = None,
 ) -> str:
     """Build the `result` event interactive-mode JSONL never emits.
 
@@ -89,6 +90,8 @@ def synthesize_result_line(
     }
     if error_message:
         obj["error"] = error_message
+    if error_type:
+        obj["error_type"] = error_type
     return json.dumps(obj, ensure_ascii=False)
 
 
@@ -112,14 +115,15 @@ if PTY_AVAILABLE:
             self._log_dir = Path(log_dir)
             self._task_session_ids: dict[str, str] = {}
             self._turn_errors: dict[str, str | None] = {}
+            self._turn_error_types: dict[str, str] = {}
             self._saw_result: set[str] = set()
             self._saw_claude_output: set[str] = set()
 
         def build_config(self, **kwargs):
             """Extend the base config with a per-task response timeout.
 
-            PTYConfig.response_timeout defaults to 30 min; long production
-            turns (e.g. 2 h audiobook builds) need the task's own timeout,
+            PTYConfig.response_timeout may be shorter than long production
+            turns; audiobook builds need the task's own timeout,
             otherwise claude-pty aborts the turn long before the task limit.
             """
             config = super().build_config(**kwargs)
@@ -130,6 +134,16 @@ if PTY_AVAILABLE:
 
         def has_task(self, task_id: str) -> bool:
             return task_id in self._sessions
+
+        def mark_task_error(
+            self,
+            task_id: str,
+            error_type: str,
+            error_message: str,
+        ) -> None:
+            """Attach a fatal manager/worker-side error to the PTY turn."""
+            self._turn_errors[task_id] = error_message
+            self._turn_error_types[task_id] = error_type
 
         @property
         def active_tasks(self) -> list[str]:
@@ -177,6 +191,7 @@ if PTY_AVAILABLE:
                 "system_event", "message", "result",
             ):
                 self._turn_errors[task_id] = event_dict.get("content") or "PTY turn error"
+                self._turn_error_types.setdefault(task_id, "pty_turn_error")
             if event_dict.get("event_type") == "result":
                 self._saw_result.add(task_id)
             if event_dict.get("raw_json"):
@@ -190,6 +205,7 @@ if PTY_AVAILABLE:
         async def on_exit(self, key: Any, exit_code: int | None, **context) -> None:
             task_id = key
             error = self._turn_errors.pop(task_id, None)
+            error_type = self._turn_error_types.pop(task_id, None)
             ec = exit_code if exit_code is not None else 0
             if error and ec == 0:
                 # Errors that end the turn without killing the process
@@ -205,13 +221,16 @@ if PTY_AVAILABLE:
                     "Claude PTY session produced no Claude output; "
                     "prompt injection may have failed"
                 )
+                error_type = error_type or "no_claude_output"
                 ec = 1
 
+            session_id = self._task_session_ids.get(task_id)
             if task_id not in self._saw_result:
                 await self._emit_log(task_id, synthesize_result_line(
-                    session_id=self._task_session_ids.get(task_id),
+                    session_id=session_id,
                     is_error=ec != 0,
                     error_message=error,
+                    error_type=error_type,
                 ))
             self._saw_result.discard(task_id)
             self._saw_claude_output.discard(task_id)
@@ -219,7 +238,13 @@ if PTY_AVAILABLE:
             self._sessions.pop(task_id, None)
             self._consumers.pop(task_id, None)
 
-            await self._runtime._on_pty_exit(task_id, ec)
+            await self._runtime._on_pty_exit(
+                task_id,
+                ec,
+                session_id=session_id,
+                error_type=error_type,
+                error_message=error,
+            )
 
         async def recycle_config_dir(self, config_dir: str | None) -> int:
             """Stop every session bound to config_dir. Returns the count.
