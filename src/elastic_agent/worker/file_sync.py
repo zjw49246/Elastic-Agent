@@ -371,18 +371,21 @@ def _file_md5(path: str) -> str:
 
 def _is_delivery_manuscript_name(name: str) -> bool:
     lower = name.lower()
-    return lower.endswith(".md") and lower not in {
-        "intro.md",
-        "audiobook_intro.md",
-        "intro_final.md",
+    return lower in {
+        "manuscript.md",
+        "manuscript_compliant.md",
+        "manuscript_final.md",
     }
 
 
 def _guess_role(filename: str, debounce_tiers: dict[str, float]) -> str:
     normalized = filename.replace("\\", "/")
     name = os.path.basename(normalized).lower()
-    path_parts = set(normalized.split("/"))
-    if "delivery" in path_parts:
+    path_parts = normalized.lower().split("/")
+    path_part_set = set(path_parts)
+    delivery_index = path_parts.index("delivery") if "delivery" in path_part_set else -1
+    is_delivery_root_file = delivery_index >= 0 and delivery_index == len(path_parts) - 2
+    if is_delivery_root_file:
         if name in ("intro.md", "audiobook_intro.md", "intro_final.md"):
             return "delivery_intro"
         if name in ("delivery.zip", "audiobook_delivery.zip") or name.endswith(".zip"):
