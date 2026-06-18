@@ -245,7 +245,7 @@ export HOME="${HOME:-/root}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 VERSION="{version}"
 
-health() {{
+health() {
   command -v claude >/dev/null 2>&1 || return 1
   out="$(claude --version 2>&1)" || return 1
   echo "$out" | grep -qi "native binary not installed" && return 1
@@ -253,7 +253,7 @@ health() {{
     "$VERSION"*) return 0 ;;
     *) echo "claude-cli-health: expected $VERSION, got: $out" >&2; return 1 ;;
   esac
-}}
+}
 
 if health; then
   exit 0
@@ -262,8 +262,8 @@ fi
 echo "claude-cli-health: repairing @anthropic-ai/claude-code@$VERSION" >&2
 backup="/root/claude-code-broken-backup-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$backup"
-find /usr/lib/node_modules/@anthropic-ai -maxdepth 1 -name '.claude-code-*' -exec mv {{}} "$backup"/ \\; 2>/dev/null || true
-find /usr/bin -maxdepth 1 -name '.claude-*' -exec mv {{}} "$backup"/ \\; 2>/dev/null || true
+find /usr/lib/node_modules/@anthropic-ai -maxdepth 1 -name '.claude-code-*' -exec mv {} "$backup"/ \\; 2>/dev/null || true
+find /usr/bin -maxdepth 1 -name '.claude-*' -exec mv {} "$backup"/ \\; 2>/dev/null || true
 npm install -g "@anthropic-ai/claude-code@$VERSION" --include=optional --foreground-scripts --force
 health
 """
