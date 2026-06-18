@@ -327,6 +327,12 @@ class TestHealthCheck:
             sent_messages.append(msg.model_dump_json())
 
         runtime._send_event = mock_send_event
+        runtime._check_claude_cli = lambda: {
+            "ok": True,
+            "path": "/usr/bin/claude",
+            "version": "2.1.181 (Claude Code)",
+            "error": None,
+        }
 
         await runtime._handle_health_check(HealthCheckMessage())
 
@@ -337,6 +343,9 @@ class TestHealthCheck:
         assert "mem" in s
         assert "disk" in s
         assert isinstance(s["active_processes"], list)
+        assert s["runtime_ready"] is True
+        assert s["claude_cli_ok"] is True
+        assert s["claude_version"] == "2.1.181 (Claude Code)"
 
 
 class TestForceSyncOnExit:

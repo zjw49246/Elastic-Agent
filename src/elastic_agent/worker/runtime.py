@@ -16,6 +16,8 @@ import logging
 import os
 import platform
 import signal
+import shutil
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -134,6 +136,7 @@ class WorkerRuntime:
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     sender_task = asyncio.create_task(self._sender_loop())
                     receiver_task = asyncio.create_task(self._receiver_loop())
+                    await self._send_status()
 
                     try:
                         done, pending = await asyncio.wait(
@@ -590,9 +593,59 @@ class WorkerRuntime:
             ))
 
     async def _handle_health_check(self, _msg: HealthCheckMessage) -> None:
+        await self._send_status()
+
+    def _check_claude_cli(self) -> dict[str, Any]:
+        path = shutil.which("claude")
+        if not path:
+            return {
+                "ok": False,
+                "path": None,
+                "version": None,
+                "error": "claude command not found in PATH",
+            }
+
+        try:
+            result = subprocess.run(
+                [path, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "path": path,
+                "version": None,
+                "error": f"claude --version failed: {exc}",
+            }
+
+        output = (result.stdout or result.stderr or "").strip()
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "path": path,
+                "version": output or None,
+                "error": f"claude --version exited {result.returncode}",
+            }
+        if "native binary not installed" in output.lower():
+            return {
+                "ok": False,
+                "path": path,
+                "version": output or None,
+                "error": "Claude Code native binary is not installed",
+            }
+        return {
+            "ok": True,
+            "path": path,
+            "version": output or None,
+            "error": None,
+        }
+
+    async def _send_status(self) -> None:
         cpu = mem = disk = 0.0
         try:
-            import shutil
             total, used, _free = shutil.disk_usage("/")
             disk = used / total * 100 if total else 0
         except Exception:
@@ -619,11 +672,19 @@ class WorkerRuntime:
         except Exception:
             pass
 
+        claude = self._check_claude_cli()
+        runtime_ready = bool(claude["ok"])
+
         await self._send_event(StatusMessage(
             cpu=round(cpu, 1),
             mem=round(mem, 1),
             disk=round(disk, 1),
-            active_processes=list(self._processes.keys()),
+            active_processes=self.active_processes,
+            runtime_ready=runtime_ready,
+            runtime_error=None if runtime_ready else claude["error"],
+            claude_cli_ok=bool(claude["ok"]),
+            claude_version=claude["version"],
+            claude_path=claude["path"],
         ))
 
     async def _handle_upload_file(self, msg: UploadFileMessage) -> None:

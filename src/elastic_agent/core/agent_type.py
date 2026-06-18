@@ -9,6 +9,8 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
+from elastic_agent.core.bootstrap_steps import CLAUDE_CODE_VERSION
+
 
 class AgentType(ABC):
     """Abstract base class for agent implementations."""
@@ -117,7 +119,15 @@ class ClaudeCodeAgentType(AgentType):
         return "0.1.0"
 
     def get_install_command(self) -> list[str]:
-        return ["npm", "install", "-g", "@anthropic-ai/claude-code@latest"]
+        return [
+            "npm",
+            "install",
+            "-g",
+            f"@anthropic-ai/claude-code@{CLAUDE_CODE_VERSION}",
+            "--include=optional",
+            "--foreground-scripts",
+            "--force",
+        ]
 
     def get_launch_command(
         self,

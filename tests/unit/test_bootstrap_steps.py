@@ -36,7 +36,9 @@ class TestAgentInstallStep:
         step = agent_install_step()
         assert step.name == "agent-install"
         assert "npm install -g" in step.command
-        assert "claude-code" in step.command
+        assert "@anthropic-ai/claude-code@2.1.181" in step.command
+        assert "--include=optional" in step.command
+        assert "claude --version" in step.command
 
     def test_custom_string_command(self) -> None:
         step = agent_install_step(agent_install_command="pip install my-agent")

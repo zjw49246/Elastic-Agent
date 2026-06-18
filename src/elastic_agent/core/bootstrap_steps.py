@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from elastic_agent.harness.base import BootstrapStep
 
+CLAUDE_CODE_VERSION = "2.1.181"
+
 
 def system_init_step(
     packages: list[str] | None = None,
@@ -34,7 +36,11 @@ def agent_install_step(
 ) -> BootstrapStep:
     """T-020: Agent installation — install the agent binary (e.g. Claude Code CLI)."""
     if agent_install_command is None:
-        cmd = "npm install -g @anthropic-ai/claude-code@latest"
+        cmd = (
+            f"npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} "
+            "--include=optional --foreground-scripts --force && "
+            "claude --version"
+        )
     elif isinstance(agent_install_command, list):
         cmd = " ".join(agent_install_command)
     else:
@@ -176,6 +182,7 @@ def pty_install_step(
 
 
 PTY_REFRESH_SCRIPT_PATH = "/usr/local/bin/claude-pty-refresh.sh"
+CLAUDE_CLI_HEALTH_SCRIPT_PATH = "/usr/local/bin/claude-cli-healthcheck.sh"
 
 # Worker-side mechanical dep sync (CCM refresh_pty.sh pattern): on every runtime
 # start — including resume of a stopped instance, which skips bootstrap — compare
@@ -232,6 +239,63 @@ def pty_refresh_step(
     )
 
 
+CLAUDE_CLI_HEALTH_SCRIPT = """#!/bin/bash
+set -u
+export HOME="${HOME:-/root}"
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+VERSION="{version}"
+
+health() {{
+  command -v claude >/dev/null 2>&1 || return 1
+  out="$(claude --version 2>&1)" || return 1
+  echo "$out" | grep -qi "native binary not installed" && return 1
+  case "$out" in
+    "$VERSION"*) return 0 ;;
+    *) echo "claude-cli-health: expected $VERSION, got: $out" >&2; return 1 ;;
+  esac
+}}
+
+if health; then
+  exit 0
+fi
+
+echo "claude-cli-health: repairing @anthropic-ai/claude-code@$VERSION" >&2
+backup="/root/claude-code-broken-backup-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$backup"
+find /usr/lib/node_modules/@anthropic-ai -maxdepth 1 -name '.claude-code-*' -exec mv {{}} "$backup"/ \\; 2>/dev/null || true
+find /usr/bin -maxdepth 1 -name '.claude-*' -exec mv {{}} "$backup"/ \\; 2>/dev/null || true
+npm install -g "@anthropic-ai/claude-code@$VERSION" --include=optional --foreground-scripts --force
+health
+"""
+
+
+def claude_cli_health_step(
+    version: str = CLAUDE_CODE_VERSION,
+    timeout: int = 300,
+) -> BootstrapStep:
+    """Install a startup guard that repairs/verifies the Claude Code CLI."""
+    script = CLAUDE_CLI_HEALTH_SCRIPT.replace("{version}", version)
+    cmd = (
+        f"cat > {CLAUDE_CLI_HEALTH_SCRIPT_PATH} << 'HEALTH'\n"
+        f"{script}"
+        "HEALTH\n"
+        f"chmod +x {CLAUDE_CLI_HEALTH_SCRIPT_PATH} && "
+        "mkdir -p /etc/systemd/system/elastic-agent-runtime.service.d && "
+        "cat > /etc/systemd/system/elastic-agent-runtime.service.d/20-claude-cli-health.conf << 'DROPIN'\n"
+        "[Service]\n"
+        f"ExecStartPre=/bin/bash {CLAUDE_CLI_HEALTH_SCRIPT_PATH}\n"
+        "DROPIN\n"
+        "systemctl daemon-reload"
+    )
+    return BootstrapStep(
+        name="claude-cli-health-hook",
+        command=cmd,
+        timeout=timeout,
+        retry_count=1,
+        description="Verify and repair Claude Code CLI before Worker Runtime starts",
+    )
+
+
 def build_default_bootstrap_steps(
     manager_url: str,
     auth_token: str,
@@ -263,6 +327,7 @@ def build_default_bootstrap_steps(
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
         # refresh hook must land after runtime_deploy_step writes the unit
         steps.append(pty_refresh_step())
+        steps.append(claude_cli_health_step())
     if include_login_deps:
         steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps

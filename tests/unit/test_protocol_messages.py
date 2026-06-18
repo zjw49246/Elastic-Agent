@@ -272,6 +272,8 @@ class TestWorkerToManagerMessages:
         assert restored.cpu == 45.2
         assert restored.mem == 72.8
         assert len(restored.active_processes) == 2
+        assert restored.runtime_ready is True
+        assert restored.claude_cli_ok is True
 
     def test_status_defaults(self):
         msg = StatusMessage(cpu=0.0, mem=0.0, disk=0.0)

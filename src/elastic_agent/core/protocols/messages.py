@@ -169,6 +169,11 @@ class StatusMessage(Message):
     mem: float
     disk: float
     active_processes: list[str] = Field(default_factory=list)
+    runtime_ready: bool = True
+    runtime_error: str | None = None
+    claude_cli_ok: bool = True
+    claude_version: str | None = None
+    claude_path: str | None = None
 
 
 class HeartbeatMessage(Message):

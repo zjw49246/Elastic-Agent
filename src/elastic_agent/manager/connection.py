@@ -33,6 +33,7 @@ from elastic_agent.core.protocols.messages import (
     RegisterSyncMappingMessage,
     SendInputMessage,
     StopMessage,
+    StatusMessage,
     UnregisterSyncMappingMessage,
     UploadFileMessage,
     WatchFilesMessage,
@@ -95,6 +96,8 @@ class WorkerConnectionManager:
         self.on_message: MessageHandler | None = None
         self.on_connect: Callable[[str], Awaitable[None]] | None = None
         self.on_disconnect: Callable[[str], Awaitable[None]] | None = None
+        self._worker_status: dict[str, dict[str, Any]] = {}
+        self._worker_status_events: dict[str, asyncio.Event] = {}
 
     @property
     def connected_workers(self) -> list[str]:
@@ -105,6 +108,39 @@ class WorkerConnectionManager:
 
     def is_connected(self, worker_id: str) -> bool:
         return worker_id in self._connections
+
+    def get_worker_status(self, worker_id: str) -> dict[str, Any] | None:
+        return self._worker_status.get(worker_id)
+
+    def is_worker_runtime_ready(self, worker_id: str) -> bool:
+        status = self.get_worker_status(worker_id)
+        return bool(status and status.get("runtime_ready", False))
+
+    async def wait_until_worker_ready(self, worker_id: str, timeout: float = 15.0) -> bool:
+        """Request a health check and wait until the Worker reports runtime_ready."""
+        if not self.is_connected(worker_id):
+            return False
+
+        event = self._worker_status_events.setdefault(worker_id, asyncio.Event())
+        event.clear()
+        try:
+            await self.health_check(worker_id)
+        except Exception:
+            logger.exception("Failed to request health check from worker %s", worker_id)
+            return False
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if self.is_worker_runtime_ready(worker_id):
+                return True
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return False
+            event.clear()
 
     async def handle_connection(self, ws: WebSocket) -> None:
         """Handle an incoming WebSocket connection from a Worker.
@@ -127,6 +163,7 @@ class WorkerConnectionManager:
             if old:
                 logger.info("Replacing existing connection for worker %s", worker_id)
             self._connections[worker_id] = conn
+            self._worker_status_events.setdefault(worker_id, asyncio.Event())
 
         await self._registry.update(
             worker_id,
@@ -153,6 +190,8 @@ class WorkerConnectionManager:
             async with self._lock:
                 if self._connections.get(worker_id) is conn:
                     del self._connections[worker_id]
+                    self._worker_status.pop(worker_id, None)
+                    self._worker_status_events.pop(worker_id, None)
 
             if self.on_disconnect:
                 try:
@@ -220,6 +259,9 @@ class WorkerConnectionManager:
 
             if msg.type == "HEARTBEAT":
                 await self._registry.update(conn.worker_id, last_heartbeat=_utcnow())
+            if isinstance(msg, StatusMessage):
+                self._worker_status[conn.worker_id] = msg.model_dump(mode="json")
+                self._worker_status_events.setdefault(conn.worker_id, asyncio.Event()).set()
 
             if self.on_message:
                 try:

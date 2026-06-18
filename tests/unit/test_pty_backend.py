@@ -545,8 +545,10 @@ class TestPTYBootstrap:
         steps = build_default_bootstrap_steps("ws://m", "tok", "w1", include_pty=True)
         names = [s.name for s in steps]
         assert "pty-refresh-hook" in names
+        assert "claude-cli-health-hook" in names
         # must run after runtime-deploy writes the unit it drops into
         assert names.index("pty-refresh-hook") > names.index("runtime-deploy")
+        assert names.index("claude-cli-health-hook") > names.index("runtime-deploy")
 
     def test_default_steps_exclude_refresh_hook(self):
         steps = build_default_bootstrap_steps("ws://m", "tok", "w1")
@@ -568,6 +570,16 @@ class TestPTYBootstrap:
         # repo URL is templated in, no leftover placeholder
         assert "{pty_repo_url}" not in step.command
         assert "Claude-Code-PTY" in step.command
+
+    def test_claude_cli_health_step_content(self):
+        from elastic_agent.core.bootstrap_steps import claude_cli_health_step
+
+        step = claude_cli_health_step()
+        assert "claude --version" in step.command
+        assert "@anthropic-ai/claude-code@$VERSION" in step.command
+        assert "2.1.181" in step.command
+        assert "ExecStartPre=/bin/bash /usr/local/bin/claude-cli-healthcheck.sh" in step.command
+        assert "20-claude-cli-health.conf" in step.command
 
     def test_all_pip_installs_break_system_packages(self):
         # PEP 668 (Ubuntu 24.04 images) rejects system pip3 installs without

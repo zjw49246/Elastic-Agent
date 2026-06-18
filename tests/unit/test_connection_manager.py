@@ -15,6 +15,7 @@ from elastic_agent.core.protocols.messages import (
     ExecuteMessage,
     HeartbeatMessage,
     LogMessage,
+    StatusMessage,
     StopMessage,
     parse_message,
 )
@@ -278,6 +279,28 @@ class TestSendCommand:
 
         parsed = json.loads(ws.sent[0])
         assert parsed["type"] == "HEALTH_CHECK"
+
+    @pytest.mark.asyncio
+    async def test_status_message_updates_runtime_ready_cache(self, manager):
+        ws = FakeWebSocket([
+            StatusMessage(
+                cpu=1.0,
+                mem=2.0,
+                disk=3.0,
+                runtime_ready=True,
+                claude_cli_ok=True,
+                claude_version="2.1.181 (Claude Code)",
+            ).model_dump_json()
+        ])
+        conn = WorkerConnection("worker-1", ws)
+
+        with pytest.raises(RuntimeError, match="coroutine raised StopIteration"):
+            await manager._message_loop(conn)
+
+        assert manager.is_worker_runtime_ready("worker-1") is True
+        status = manager.get_worker_status("worker-1")
+        assert status is not None
+        assert status["claude_version"] == "2.1.181 (Claude Code)"
 
     @pytest.mark.asyncio
     async def test_send_input_command(self, manager):
