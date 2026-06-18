@@ -216,6 +216,33 @@ class CredentialLoginService:
                 )
         return recovered
 
+    async def _worker_has_active_claude_process(self, worker_id: str) -> bool:
+        """Return True when the worker is already running a Claude task."""
+        host = await self._resolve_host(worker_id)
+        if not host:
+            return False
+        try:
+            ssh_opts = [
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=5",
+            ]
+            cmd = (
+                "pgrep -af '[c]laude .*server:pty-bridge|[c]laude-pty-channel' "
+                ">/dev/null"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", *ssh_opts, "-i", self._ssh_key_path,
+                f"{self._ssh_user}@{host}", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=8)
+            return proc.returncode == 0
+        except Exception:
+            logger.debug("Failed to check active Claude process on worker %s", worker_id)
+            return False
+
     async def release_worker(self, worker_id: str) -> None:
         """Unbind and release all accounts allocated to a Worker."""
         await self._binding.unbind_worker(worker_id)
@@ -392,7 +419,14 @@ class CredentialLoginService:
             try:
                 await self.login_worker(worker_id, skip_validity_check=skip_validity_check)
                 if retry_failed_accounts:
-                    await self.retry_failed_accounts(worker_id)
+                    if await self._worker_has_active_claude_process(worker_id):
+                        logger.info(
+                            "Worker %s already has an active Claude process; "
+                            "skipping failed-account verification login",
+                            worker_id,
+                        )
+                    else:
+                        await self.retry_failed_accounts(worker_id)
             except asyncio.CancelledError:
                 logger.info("Credential login task cancelled for worker %s", worker_id)
                 raise
