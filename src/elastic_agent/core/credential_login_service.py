@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
@@ -329,9 +330,11 @@ class CredentialLoginService:
         try:
             ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                         "-o", "ConnectTimeout=10"]
+            quoted_config_dir = shlex.quote(config_dir)
             cmd = (
-                f"CLAUDE_CONFIG_DIR={config_dir} claude auth status 2>&1 | "
-                f"grep -q 'Logged in' && echo VALID || echo INVALID"
+                f"CLAUDE_CONFIG_DIR={quoted_config_dir} claude auth status 2>&1 | "
+                "grep -Eq 'Logged in|\"loggedIn\"[[:space:]]*:[[:space:]]*true' "
+                "&& echo VALID || echo INVALID"
             )
             proc = await asyncio.create_subprocess_exec(
                 "ssh", *ssh_opts, "-i", self._ssh_key_path,
