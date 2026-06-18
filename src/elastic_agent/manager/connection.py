@@ -158,12 +158,19 @@ class WorkerConnectionManager:
             return
 
         conn = WorkerConnection(worker_id, ws)
+        old_conn: WorkerConnection | None = None
         async with self._lock:
-            old = self._connections.pop(worker_id, None)
-            if old:
+            old_conn = self._connections.pop(worker_id, None)
+            if old_conn:
                 logger.info("Replacing existing connection for worker %s", worker_id)
             self._connections[worker_id] = conn
             self._worker_status_events.setdefault(worker_id, asyncio.Event())
+
+        if old_conn:
+            try:
+                await old_conn.ws.close()
+            except Exception:
+                logger.debug("Failed to close stale connection for worker %s", worker_id)
 
         await self._registry.update(
             worker_id,
@@ -187,13 +194,20 @@ class WorkerConnectionManager:
         except Exception:
             logger.exception("Error in message loop for worker %s", worker_id)
         finally:
+            should_notify_disconnect = False
             async with self._lock:
                 if self._connections.get(worker_id) is conn:
                     del self._connections[worker_id]
                     self._worker_status.pop(worker_id, None)
                     self._worker_status_events.pop(worker_id, None)
+                    should_notify_disconnect = True
+                else:
+                    logger.info(
+                        "Ignoring stale disconnect for replaced worker connection %s",
+                        worker_id,
+                    )
 
-            if self.on_disconnect:
+            if should_notify_disconnect and self.on_disconnect:
                 try:
                     await self.on_disconnect(worker_id)
                 except Exception:
@@ -250,6 +264,10 @@ class WorkerConnectionManager:
         while True:
             raw = await conn.ws.receive_text()
             conn.last_message_at = _utcnow()
+            current_conn = self._connections.get(conn.worker_id)
+            if current_conn is not None and current_conn is not conn:
+                logger.info("Stopping stale message loop for worker %s", conn.worker_id)
+                break
 
             try:
                 msg = parse_message(raw)
