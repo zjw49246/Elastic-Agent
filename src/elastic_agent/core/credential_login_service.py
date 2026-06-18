@@ -72,6 +72,7 @@ class CredentialLoginService:
             oauth_provider=oauth_provider,
             login_timeout=credential_config.login_timeout,
         )
+        self._login_tasks: dict[str, asyncio.Task] = {}
 
     def set_slots(self, slots: list[CredentialSlot]) -> None:
         self._slots = slots
@@ -367,32 +368,79 @@ class CredentialLoginService:
 
     # -- event handlers ------------------------------------------------------
 
+    def _start_login_task(
+        self,
+        worker_id: str,
+        *,
+        skip_validity_check: bool,
+        retry_failed_accounts: bool,
+        reason: str,
+    ) -> None:
+        existing = self._login_tasks.get(worker_id)
+        if existing and not existing.done():
+            logger.info(
+                "Credential login already running for worker %s; skipping %s",
+                worker_id,
+                reason,
+            )
+            return
+
+        async def _run() -> None:
+            try:
+                await self.login_worker(worker_id, skip_validity_check=skip_validity_check)
+                if retry_failed_accounts:
+                    await self.retry_failed_accounts(worker_id)
+            except asyncio.CancelledError:
+                logger.info("Credential login task cancelled for worker %s", worker_id)
+                raise
+            except Exception:
+                logger.exception("Credential login failed for worker %s", worker_id)
+
+        task = asyncio.create_task(_run())
+        self._login_tasks[worker_id] = task
+
+        def _done(done_task: asyncio.Task) -> None:
+            if self._login_tasks.get(worker_id) is done_task:
+                self._login_tasks.pop(worker_id, None)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc:
+                logger.error(
+                    "Credential login background task failed for worker %s",
+                    worker_id,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_done)
+
     async def _on_bootstrap_completed(
         self, event_type: str, worker_id: str, data: dict[str, Any]
     ) -> None:
         logger.info("Bootstrap completed for worker %s — starting credential login", worker_id)
-        try:
-            await self.login_worker(worker_id, skip_validity_check=True)
-        except Exception:
-            logger.exception("Credential login failed for worker %s", worker_id)
+        self._start_login_task(
+            worker_id,
+            skip_validity_check=True,
+            retry_failed_accounts=False,
+            reason="bootstrap",
+        )
 
     async def _on_worker_connected(
         self, event_type: str, worker_id: str, data: dict[str, Any]
     ) -> None:
         """Worker reconnected — try to restore previous account with validity check."""
         logger.info("Worker %s connected — checking credential state", worker_id)
-        try:
-            await self.login_worker(worker_id, skip_validity_check=False)
-        except Exception:
-            logger.exception("Credential login failed for reconnected worker %s", worker_id)
-        # Chrome on this worker is free now — opportunistically recover
-        # accounts that a flaky CF challenge left stuck in login_failed.
-        try:
-            await self.retry_failed_accounts(worker_id)
-        except Exception:
-            logger.exception("login_failed retry errored on worker %s", worker_id)
+        self._start_login_task(
+            worker_id,
+            skip_validity_check=False,
+            retry_failed_accounts=True,
+            reason="worker reconnect",
+        )
 
     async def _on_worker_disconnected(
         self, event_type: str, worker_id: str, data: dict[str, Any]
     ) -> None:
+        task = self._login_tasks.pop(worker_id, None)
+        if task and not task.done():
+            task.cancel()
         await self.release_worker(worker_id)
