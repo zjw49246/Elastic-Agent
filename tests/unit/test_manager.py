@@ -54,9 +54,15 @@ class InMemoryProvider(CloudProvider):
         self._instances.pop(native, None)
 
     async def start_instance(self, instance_id: str) -> None:
-        pass
+        native = instance_id.split(":", 1)[-1] if ":" in instance_id else instance_id
+        inst = self._instances.get(native)
+        if inst:
+            inst.state = InstanceState.RUNNING
 
     async def stop_instance(self, instance_id: str) -> None:
+        pass
+
+    async def reboot_instance(self, instance_id: str) -> None:
         pass
 
     async def list_instances(self, filters: dict | None = None) -> list[Instance]:
@@ -196,6 +202,40 @@ class TestScaleIn:
         await manager.start()
         terminated = await manager.scale_in(["nonexistent"], force=True)
         assert terminated == []
+        await manager.stop()
+
+
+# ------------------------------------------------------------------
+# Tests: resume_node
+# ------------------------------------------------------------------
+
+
+class TestResumeNode:
+    @pytest.mark.asyncio
+    async def test_resume_node_waits_for_stopping_instance(self, manager, provider):
+        await manager.start()
+        records = await manager.scale_out(count=1)
+        node = records[0]
+        await manager.registry.update(node.node_id, status=NodeStatus.STOPPED)
+
+        stopping = Instance(
+            instance_id=node.instance_id,
+            platform="dryrun",
+            native_id=node.instance_id.split(":", 1)[-1],
+            state=InstanceState.STOPPING,
+        )
+        stopped = stopping.model_copy(update={"state": InstanceState.STOPPED})
+        provider.get_instance = AsyncMock(side_effect=[stopping, stopped])
+        provider.start_instance = AsyncMock()
+
+        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            result = await manager.resume_node(node.node_id)
+
+        assert result is not None
+        assert result.status == NodeStatus.CREATING
+        assert provider.get_instance.await_count == 2
+        sleep_mock.assert_awaited_once()
+        provider.start_instance.assert_awaited_once_with(node.instance_id)
         await manager.stop()
 
 

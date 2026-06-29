@@ -18,7 +18,7 @@ from elastic_agent.core.operations_logger import OperationsLogger
 from elastic_agent.core.protocols.messages import Message
 from elastic_agent.core.reconciler import CloudReconciler
 from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
-from elastic_agent.core.providers.base import CloudProvider
+from elastic_agent.core.providers.base import CloudProvider, InstanceState
 from elastic_agent.core.task_registry import TaskRegistry
 from elastic_agent.core.task_router import TaskRouter
 from elastic_agent.core.task_scheduler import TaskScheduler
@@ -28,6 +28,9 @@ from elastic_agent.manager.connection import WorkerConnectionManager
 from elastic_agent.worker.file_sync import StorageBackend
 
 logger = logging.getLogger(__name__)
+
+RESUME_STOPPING_TIMEOUT_SECONDS = 300
+RESUME_STOPPING_POLL_SECONDS = 10
 
 
 class ElasticAgentManager:
@@ -196,6 +199,8 @@ class ElasticAgentManager:
         if node.status != NodeStatus.STOPPED:
             logger.warning("resume_node: node %s is %s, not stopped", node_id, node.status)
             return None
+        if not await self._wait_until_instance_startable(node.instance_id):
+            return None
         try:
             await self.provider.start_instance(node.instance_id)
         except Exception:
@@ -205,6 +210,47 @@ class ElasticAgentManager:
         await self.event_bus.emit("NODE_RESUMING", node_id, {"instance_id": node.instance_id})
         logger.info("resume_node: started stopped instance %s (node %s)", node.instance_id, node_id)
         return await self.registry.get(node_id)
+
+    async def _wait_until_instance_startable(self, instance_id: str) -> bool:
+        """Wait for a cloud instance to leave STOPPING before StartInstance.
+
+        Cloud APIs reject StartInstance while an instance is still shutting down.
+        The registry may already say STOPPED because stop_instance returned, so
+        verify the provider state here and wait briefly instead of immediately
+        falling through to scale-out.
+        """
+        deadline = asyncio.get_running_loop().time() + RESUME_STOPPING_TIMEOUT_SECONDS
+
+        while True:
+            try:
+                instance = await self.provider.get_instance(instance_id)
+            except Exception:
+                logger.warning(
+                    "resume_node: failed to read instance state for %s before start; trying start anyway",
+                    instance_id,
+                    exc_info=True,
+                )
+                return True
+
+            if instance is None or instance.state != InstanceState.STOPPING:
+                return True
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                logger.error(
+                    "resume_node: instance %s stayed in stopping for %ss; will not start now",
+                    instance_id,
+                    RESUME_STOPPING_TIMEOUT_SECONDS,
+                )
+                return False
+
+            sleep_seconds = min(RESUME_STOPPING_POLL_SECONDS, remaining)
+            logger.info(
+                "resume_node: instance %s is still stopping; waiting %.0fs before start",
+                instance_id,
+                sleep_seconds,
+            )
+            await asyncio.sleep(sleep_seconds)
 
     async def drain_node(self, node_id: str) -> bool:
         node = await self.registry.get(node_id)
