@@ -514,6 +514,29 @@ class CredentialPool:
                 status.backoff_until,
             )
 
+    async def mark_backoff_until(
+        self,
+        account_id: str,
+        backoff_until: datetime,
+        error: str | None = None,
+    ) -> None:
+        """Mark an account unavailable until a known reset time."""
+        async with self._lock:
+            self._ensure_loaded()
+            status = self._pool_status.accounts.get(account_id)
+            if status is None:
+                return
+            status.backoff_until = backoff_until
+            status.available = False
+            if error:
+                status.error = error
+            self._flush_sync()
+            logger.info(
+                "CredentialPool: account %s in explicit backoff until %s",
+                account_id,
+                backoff_until,
+            )
+
     async def check_cooldown_recovery(self) -> None:
         """Check all accounts in cooldown; mark available if reset time has passed."""
         async with self._lock:
@@ -558,6 +581,14 @@ class CredentialPool:
         return [
             status
             for status in self._pool_status.accounts.values()
+            if status.assigned_to == worker_id
+        ]
+
+    def list_assigned_account_ids(self, worker_id: str) -> list[str]:
+        """List account ids currently assigned to a specific worker."""
+        return [
+            account_id
+            for account_id, status in self._pool_status.accounts.items()
             if status.assigned_to == worker_id
         ]
 
