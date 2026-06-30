@@ -95,13 +95,39 @@ def synthesize_result_line(
     return json.dumps(obj, ensure_ascii=False)
 
 
-def classify_turn_error(content: str | None) -> tuple[str, str]:
-    message = content or "PTY turn error"
+def classify_turn_error(content: Any | None) -> tuple[str, str]:
+    if isinstance(content, str):
+        message = content
+    elif content is None:
+        message = "PTY turn error"
+    else:
+        try:
+            message = json.dumps(content, ensure_ascii=False)
+        except TypeError:
+            message = str(content)
     lower = message.lower()
     if "response timed out" in lower or "response timeout" in lower:
         return (
             "runtime_timeout",
             f"Worker runtime timed out and interrupted the Claude process ({message})",
+        )
+    if (
+        "rate_limit_event" in lower
+        or "usage limit reached" in lower
+        or "hit your session limit" in lower
+        or '"api_error_status": 429' in lower
+        or '"api_error_status":429' in lower
+    ):
+        return (
+            "claude_rate_limited",
+            "Claude account usage limit was reached. The worker will pause "
+            "until the quota reset time; this task can be continued from the "
+            f"latest Claude session after quota recovers. Original error: {message}",
+        )
+    if "prompt is too long" in lower or "message too long" in lower:
+        return (
+            "prompt_too_long",
+            f"Claude rejected the request because the prompt is too long: {message}",
         )
     return "pty_turn_error", message
 

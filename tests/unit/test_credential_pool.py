@@ -140,6 +140,34 @@ async def test_allocate_max_per_worker(
     assert acct3 is None  # exceeds limit of 2
 
 
+async def test_allocate_replacement_allows_handoff_with_single_worker_slot(
+    config: CredentialConfig, accounts_path: Path
+) -> None:
+    _write_accounts(accounts_path, _make_accounts(2, "high_quota"))
+    config_limited = CredentialConfig(
+        accounts_file=str(accounts_path),
+        pool_status_file=str(config.pool_status_file),
+        quota_threshold=0.85,
+        max_accounts_per_worker=1,
+    )
+    pool = CredentialPool(config_limited)
+    await pool.load()
+
+    old = await pool.allocate("worker-1", "production", "high_quota")
+    assert old is not None
+    assert await pool.allocate("worker-1", "production", "high_quota") is None
+
+    replacement = await pool.allocate_replacement(
+        old.id,
+        "worker-1",
+        "production",
+        "high_quota",
+    )
+
+    assert replacement is not None
+    assert replacement.id != old.id
+
+
 # ---------------------------------------------------------------------------
 # 5. Allocate — skips unavailable accounts
 # ---------------------------------------------------------------------------

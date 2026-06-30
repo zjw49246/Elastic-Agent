@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
@@ -47,6 +48,8 @@ class CredentialRotator:
         self._bus = event_bus
         self._rotation_lock = asyncio.Lock()
         self._interrupt_events: dict[str, asyncio.Event] = {}
+        self._no_replacement_last_warn: dict[tuple[str, str, str], float] = {}
+        self._no_replacement_warn_interval = 600.0
 
         self.send_credential: SendCredentialCallback | None = None
         self.execute_login: Callable[..., Awaitable[Any]] | None = None
@@ -107,6 +110,33 @@ class CredentialRotator:
         config_dir = old_status.config_dir or ""
         group = old_status.group
 
+        # Preflight: do not disturb a live task unless a replacement account
+        # exists. Quota polling is advisory; Claude's own rate-limit event is
+        # the source of truth for stopping a production run.
+        new_account = await self._pool.allocate_replacement(
+            old_account_id,
+            worker_id,
+            slot_type,
+            group,
+        )
+
+        if new_account is None:
+            await self._pool.check_cooldown_recovery()
+            new_account = await self._pool.allocate_replacement(
+                old_account_id,
+                worker_id,
+                slot_type,
+                group,
+            )
+
+        if new_account is None:
+            self._log_no_replacement(worker_id, old_account_id, reason)
+            return RotationResult(
+                success=False,
+                old_account_id=old_account_id,
+                error="No replacement account available; keeping current worker/task running",
+            )
+
         # Step 1: Block new tasks immediately
         if self.on_rotation_started:
             await self.on_rotation_started(worker_id)
@@ -129,34 +159,6 @@ class CredentialRotator:
                 if self.interrupt_task:
                     task_info = await self.interrupt_task(worker_id)
                     needs_resume = task_info is not None
-
-        # Step 3: Find replacement account
-        new_account = await self._pool.allocate(worker_id, slot_type, group)
-
-        if new_account is None:
-            await self._pool.check_cooldown_recovery()
-            new_account = await self._pool.allocate(worker_id, slot_type, group)
-
-        if new_account is None:
-            logger.warning(
-                "CredentialRotator: no replacement account available for %s",
-                old_account_id,
-            )
-            await self._bus.emit(
-                "CREDENTIAL_EXHAUSTED",
-                worker_id,
-                {
-                    "worker_id": worker_id,
-                    "account_id": old_account_id,
-                    "reason": "no_replacement_available",
-                    "interrupted_task": task_info,
-                },
-            )
-            return RotationResult(
-                success=False,
-                old_account_id=old_account_id,
-                error="No replacement account available",
-            )
 
         # Step 4: Login new account
         new_status = self._pool.get_status(new_account.id)
@@ -243,6 +245,35 @@ class CredentialRotator:
             new_account_id=new_account.id,
         )
 
+    def _log_no_replacement(self, worker_id: str, account_id: str, reason: str) -> None:
+        """Throttle advisory no-replacement warnings.
+
+        No replacement during quota polling should not pause dispatch or
+        interrupt the current task; it is only an operator warning. Throttle it
+        so the periodic checker does not flood logs with the same state.
+        """
+        key = (worker_id, account_id, reason)
+        now = time.monotonic()
+        last = self._no_replacement_last_warn.get(key, 0.0)
+        if now - last < self._no_replacement_warn_interval:
+            logger.debug(
+                "CredentialRotator: no replacement for %s on %s still active; "
+                "suppressing duplicate warning",
+                account_id,
+                worker_id,
+            )
+            return
+        self._no_replacement_last_warn[key] = now
+        logger.warning(
+            "CredentialRotator: account %s on worker %s needs rotation "
+            "(reason=%s), but no replacement is available; keeping the current "
+            "task and dispatch state unchanged until Claude reports an actual "
+            "rate limit or an account recovers",
+            account_id,
+            worker_id,
+            reason,
+        )
+
     async def _cleanup_old_account(self, old_account_id: str, worker_id: str) -> None:
         """Release and cooldown the old account when rotation fails."""
         try:
@@ -284,7 +315,15 @@ class CredentialRotator:
                         pass
 
                 if wait_task in done:
-                    result = wait_task.result()
+                    try:
+                        result = wait_task.result()
+                    except Exception:
+                        logger.exception(
+                            "CredentialRotator: wait_for_task_completion failed for %s; "
+                            "treating task as still running",
+                            worker_id,
+                        )
+                        return False
                     return result if isinstance(result, bool) else True
                 # Interrupted by rate-limit signal
                 return False

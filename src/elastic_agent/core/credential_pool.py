@@ -213,7 +213,7 @@ class CredentialPool:
             return False
         if status.assigned_to is not None:
             return False
-        if status.login_status == "logging_in":
+        if status.login_status in {"logging_in", "failed", "login_failed"}:
             return False
         if status.backoff_until is not None and _utcnow() < status.backoff_until:
             return False
@@ -275,6 +275,62 @@ class CredentialPool:
             logger.info(
                 "CredentialPool: allocated %s to worker %s (slot=%s)",
                 chosen_def.id,
+                worker_id,
+                slot_type,
+            )
+            return chosen_def
+
+    async def allocate_replacement(
+        self,
+        old_account_id: str,
+        worker_id: str,
+        slot_type: str,
+        group: str,
+    ) -> AccountDefinition | None:
+        """Allocate a replacement account for an already-assigned worker slot.
+
+        Rotation is a handoff: for a short period the old account is still
+        bound to the worker while the replacement is reserved and logged in.
+        Count the old account as the slot being replaced so
+        max_accounts_per_worker=1 still allows one replacement candidate.
+        """
+        async with self._lock:
+            self._ensure_loaded()
+
+            assigned_count = self._count_assigned_to_worker(worker_id)
+            old_status = self._pool_status.accounts.get(old_account_id)
+            if old_status and old_status.assigned_to == worker_id:
+                assigned_count -= 1
+            if assigned_count >= self._config.max_accounts_per_worker:
+                return None
+
+            candidates: list[tuple[AccountDefinition, AccountStatus]] = []
+            for acct_def in self._accounts_config.accounts:
+                if acct_def.id == old_account_id:
+                    continue
+                if acct_def.group != group:
+                    continue
+                status = self._pool_status.accounts.get(acct_def.id)
+                if status is None:
+                    continue
+                if self._is_available(acct_def, status):
+                    candidates.append((acct_def, status))
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda pair: pair[1].five_hour.utilization)
+            chosen_def, chosen_status = candidates[0]
+            chosen_status.assigned_to = worker_id
+            chosen_status.slot_type = slot_type
+            chosen_status.last_used = _utcnow()
+            chosen_status.available = False
+
+            self._flush_sync()
+            logger.info(
+                "CredentialPool: allocated replacement %s for %s on worker %s (slot=%s)",
+                chosen_def.id,
+                old_account_id,
                 worker_id,
                 slot_type,
             )

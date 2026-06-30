@@ -569,7 +569,7 @@ class TestT134AllAccountsExhausted:
     """T-134: All accounts exhausted handling."""
 
     @pytest.mark.asyncio
-    async def test_all_exhausted_emits_event(self, tmp_pool, binding, event_bus):
+    async def test_all_exhausted_keeps_current_task_running(self, tmp_pool, binding, event_bus):
         await tmp_pool.load()
 
         for i, aid in enumerate(["prod-1", "prod-2", "prod-3"]):
@@ -578,14 +578,18 @@ class TestT134AllAccountsExhausted:
                 await binding.bind(a.id, f"w{i}")
 
         rotator = CredentialRotator(tmp_pool, binding, event_bus)
+        rotator.interrupt_task = AsyncMock()
         events = []
         event_bus.subscribe("CREDENTIAL_EXHAUSTED", lambda et, wid, data: events.append(data))
 
         result = await rotator.rotate("w0", "prod-1", "quota_exceeded")
         assert not result.success
         await asyncio.sleep(0.01)
-        assert len(events) >= 1
-        assert events[0]["reason"] == "no_replacement_available"
+        assert events == []
+        rotator.interrupt_task.assert_not_called()
+        status = tmp_pool.get_status("prod-1")
+        assert status is not None
+        assert status.assigned_to == "w0"
 
     @pytest.mark.asyncio
     async def test_handle_exhausted_event(self, rotator, event_bus):
