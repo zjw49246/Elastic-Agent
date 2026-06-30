@@ -328,10 +328,15 @@ class WorkerConnectionManager:
         ))
 
     async def upload_file(
-        self, worker_id: str, path: str, content_base64: str, mode: str = "0644"
+        self,
+        worker_id: str,
+        path: str,
+        content_base64: str,
+        mode: str = "0644",
+        write_mode: str = "overwrite",
     ) -> None:
         await self.send_command(worker_id, UploadFileMessage(
-            path=path, content_base64=content_base64, mode=mode,
+            path=path, content_base64=content_base64, mode=mode, write_mode=write_mode,
         ))
 
     async def health_check(self, worker_id: str) -> None:

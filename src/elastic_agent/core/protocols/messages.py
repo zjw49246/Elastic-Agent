@@ -77,6 +77,7 @@ class UploadFileMessage(Message):
     path: str
     content_base64: str
     mode: str = "0644"
+    write_mode: Literal["overwrite", "append"] = "overwrite"
 
 
 class SendInputMessage(Message):

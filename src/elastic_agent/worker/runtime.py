@@ -693,7 +693,11 @@ class WorkerRuntime:
             path = Path(msg.path)
             path.parent.mkdir(parents=True, exist_ok=True)
             data = base64.b64decode(msg.content_base64)
-            path.write_bytes(data)
+            if msg.write_mode == "append":
+                with path.open("ab") as fh:
+                    fh.write(data)
+            else:
+                path.write_bytes(data)
             os.chmod(path, int(msg.mode, 8))
         except Exception as exc:
             await self._send_event(ErrorMessage(

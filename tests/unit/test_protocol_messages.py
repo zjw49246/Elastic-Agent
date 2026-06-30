@@ -109,16 +109,19 @@ class TestManagerToWorkerMessages:
             path="/opt/app/config.yaml",
             content_base64="dGVzdA==",
             mode="0755",
+            write_mode="append",
         )
         restored = parse_message(msg.model_dump_json())
         assert isinstance(restored, UploadFileMessage)
         assert restored.path == "/opt/app/config.yaml"
         assert restored.content_base64 == "dGVzdA=="
         assert restored.mode == "0755"
+        assert restored.write_mode == "append"
 
     def test_upload_file_default_mode(self):
         msg = UploadFileMessage(path="/a", content_base64="YQ==")
         assert msg.mode == "0644"
+        assert msg.write_mode == "overwrite"
 
     def test_send_input_roundtrip(self):
         msg = SendInputMessage(task_id="t-1", payload="fix the bug please")
