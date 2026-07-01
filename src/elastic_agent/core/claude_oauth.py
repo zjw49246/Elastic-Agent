@@ -48,28 +48,84 @@ CHROME_PROFILE_DIR = "/tmp/chrome-cdp-oauth"
 CF_CHECKBOX_X = 257
 CF_CHECKBOX_Y = 476
 
-# JS to extract org UUID from React fiber tree
-_JS_EXTRACT_ORG_UUID = """(function(){
-var btn=[...document.querySelectorAll("button")].find(b=>b.textContent.trim()==="Authorize");
-if(!btn)return null;
-var fk=Object.keys(btn).find(k=>k.startsWith("__reactFiber"));
-if(!fk)return null;
-var c=btn[fk];
-for(var i=0;i<30&&c;i++){
-  if(c.memoizedState){
-    var s=c.memoizedState;var x=0;
-    while(s&&x<20){
-      var v=s.memoizedState;
-      if(v&&Array.isArray(v)){
-        for(var it of v){
-          if(it&&it.email_address)return(it.memberships&&it.memberships[0]&&it.memberships[0].organization)?it.memberships[0].organization.uuid:null;
-          if(Array.isArray(it)){for(var sub of it){if(sub&&sub.email_address)return(sub.memberships&&sub.memberships[0]&&sub.memberships[0].organization)?sub.memberships[0].organization.uuid:null;}}
-        }
+# JS to extract org UUID from page APIs first. This is more stable than
+# depending on React fiber field names on the OAuth authorize page.
+_JS_FETCH_ACCOUNT_ORG_UUID = """(async function(){
+function looksUuid(v){return typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)}
+function findOrgUuid(root){
+  var seen=new Set();
+  function scan(v,depth){
+    if(!v||depth>8)return null;
+    if(typeof v!=="object")return null;
+    if(seen.has(v))return null;
+    seen.add(v);
+    if(v.organization&&looksUuid(v.organization.uuid))return v.organization.uuid;
+    if(v.organization_uuid&&looksUuid(v.organization_uuid))return v.organization_uuid;
+    for(var key of ["memberships","organizations","organization","account","user","data","results"]){
+      if(Object.prototype.hasOwnProperty.call(v,key)){
+        var r=scan(v[key],depth+1);if(r)return r;
       }
-      s=s.next;x++;
+    }
+    if(v.uuid&&!v.email_address&&(v.settings||v.name||v.organization_type||v.billing_type))return v.uuid;
+    if(Array.isArray(v)){
+      for(var item of v){var r=scan(item,depth+1);if(r)return r;}
+      return null;
+    }
+    for(var k in v){var r=scan(v[k],depth+1);if(r)return r;}
+    return null;
+  }
+  return scan(root,0);
+}
+for(var url of ["/api/account","/api/organizations"]){
+  try{
+    var r=await fetch(url,{credentials:"include",headers:{"Accept":"application/json"}});
+    if(!r.ok)continue;
+    var data=await r.json();
+    var org=findOrgUuid(data);
+    if(org)return org;
+  }catch(e){}
+}
+return null;
+})()"""
+
+# JS fallback to extract org UUID from React fiber / hydrated page state.
+_JS_EXTRACT_ORG_UUID = """(function(){
+function looksUuid(v){return typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)}
+function findOrgUuid(root){
+  var seen=new Set();
+  function scan(v,depth){
+    if(!v||depth>10)return null;
+    if(typeof v!=="object")return null;
+    if(seen.has(v))return null;
+    seen.add(v);
+    if(v.organization&&looksUuid(v.organization.uuid))return v.organization.uuid;
+    if(v.organization_uuid&&looksUuid(v.organization_uuid))return v.organization_uuid;
+    for(var key of ["memoizedState","pendingProps","memoizedProps","stateNode","return","child","sibling","memberships","organizations","organization","account","user","data","props","pageProps"]){
+      if(Object.prototype.hasOwnProperty.call(v,key)){
+        var r=scan(v[key],depth+1);if(r)return r;
+      }
+    }
+    if(v.uuid&&!v.email_address&&(v.settings||v.name||v.organization_type||v.billing_type))return v.uuid;
+    if(Array.isArray(v)){
+      for(var item of v){var r=scan(item,depth+1);if(r)return r;}
+      return null;
+    }
+    return null;
+  }
+  return scan(root,0);
+}
+var nodes=[...document.querySelectorAll("button,main,body,[data-testid]")];
+for(var node of nodes){
+  for(var key of Object.keys(node)){
+    if(key.startsWith("__reactFiber")||key.startsWith("__reactProps")){
+      var r=findOrgUuid(node[key]);
+      if(r)return r;
     }
   }
-  c=c.return;
+}
+if(window.__NEXT_DATA__){
+  var next=findOrgUuid(window.__NEXT_DATA__);
+  if(next)return next;
 }
 return null;
 })()"""
@@ -527,11 +583,19 @@ class ClaudeOAuthProvider:
                     await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
                     continue
                 result_data = result.get("data") or {}
-                raw = result_data.get("code") or result_data.get("link") or result_data.get("magicLink") or ""
+                raw = (
+                    result_data.get("code")
+                    or result_data.get("link")
+                    or result_data.get("magicLink")
+                    or result.get("code")
+                    or result.get("link")
+                    or result.get("magicLink")
+                    or ""
+                )
 
                 if raw.startswith("https://"):
                     return raw
-                body = result_data.get("body") or raw
+                body = result_data.get("body") or result.get("body") or raw
                 match = re.search(r'https://claude\.ai/magic-link#\S+', body)
                 if match:
                     return match.group(0)
@@ -710,8 +774,7 @@ class ClaudeOAuthProvider:
         parsed = urlparse(authorize_url.replace("claude.com/cai/", "claude.ai/"))
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
-        # Extract org UUID from React fiber tree
-        org_uuid = await cdp.evaluate(_JS_EXTRACT_ORG_UUID)
+        org_uuid = await self._extract_org_uuid(cdp)
         logger.info("Org UUID: %s", org_uuid)
 
         if not org_uuid:
@@ -766,6 +829,29 @@ return r.status+" | "+await r.text()
         except Exception as e:
             logger.error("Failed to parse authorize response: %s", e)
 
+        return None
+
+    async def _extract_org_uuid(self, cdp: _CDPClient) -> str | None:
+        """Extract the Claude organization UUID from the current OAuth page.
+
+        The authorize page is a React app and its internal state shape changes
+        over time. Prefer stable account APIs available in the logged-in browser
+        session, then fall back to scanning hydrated React state.
+        """
+        strategies = [
+            ("account_api", _JS_FETCH_ACCOUNT_ORG_UUID),
+            ("react_state", _JS_EXTRACT_ORG_UUID),
+        ]
+        for name, script in strategies:
+            try:
+                org_uuid = await cdp.evaluate(script, timeout=12)
+            except Exception as exc:
+                logger.warning("Org UUID extraction via %s errored: %s", name, exc)
+                continue
+            if isinstance(org_uuid, str) and org_uuid:
+                logger.info("Org UUID extracted via %s", name)
+                return org_uuid
+            logger.info("Org UUID extraction via %s returned empty", name)
         return None
 
     # -- CLI methods --------------------------------------------------------

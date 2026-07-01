@@ -124,6 +124,42 @@ class TestLoginResult:
 
 class TestClaudeOAuthProvider:
     @pytest.mark.asyncio
+    async def test_extract_org_uuid_prefers_account_api(self, oauth_provider):
+        class FakeCDP:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, expression, timeout=30):
+                self.calls.append(expression)
+                if "/api/account" in expression:
+                    return "11111111-2222-3333-4444-555555555555"
+                return "99999999-9999-9999-9999-999999999999"
+
+        cdp = FakeCDP()
+        org_uuid = await oauth_provider._extract_org_uuid(cdp)
+
+        assert org_uuid == "11111111-2222-3333-4444-555555555555"
+        assert len(cdp.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_extract_org_uuid_falls_back_to_react_state(self, oauth_provider):
+        class FakeCDP:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, expression, timeout=30):
+                self.calls.append(expression)
+                if "/api/account" in expression:
+                    return None
+                return "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        cdp = FakeCDP()
+        org_uuid = await oauth_provider._extract_org_uuid(cdp)
+
+        assert org_uuid == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert len(cdp.calls) == 2
+
+    @pytest.mark.asyncio
     async def test_send_magic_link(self, oauth_provider, mock_http):
         mock_http.post_responses["claude/send"] = {
             "success": True,
