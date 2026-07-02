@@ -12,7 +12,9 @@ On WORKER_DISCONNECTED: unbind and release credentials back to pool.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import shlex
 from dataclasses import dataclass
 from typing import Any
@@ -109,7 +111,11 @@ class CredentialLoginService:
 
         if not skip_validity_check:
             host = await self._resolve_host(worker_id)
-            if host and await self._check_credentials_valid(host, self._slots[0].config_dir):
+            if host and await self._check_credentials_valid(
+                host,
+                self._slots[0].config_dir,
+                expected_email=account.email,
+            ):
                 logger.info(
                     "Credentials for account %s still valid on worker %s — skipping OAuth",
                     account.id, worker_id,
@@ -228,7 +234,9 @@ class CredentialLoginService:
                 "-o", "ConnectTimeout=5",
             ]
             cmd = (
-                "pgrep -af '[c]laude .*server:pty-bridge|[c]laude-pty-channel' "
+                "pgrep -af "
+                "'[c]laude -p|[c]laude .*--output-format stream-json|"
+                "[c]laude .*server:pty-bridge|[c]laude-pty-channel' "
                 ">/dev/null"
             )
             proc = await asyncio.create_subprocess_exec(
@@ -348,21 +356,24 @@ class CredentialLoginService:
 
     # -- credential validity check -------------------------------------------
 
-    async def _check_credentials_valid(self, host: str, config_dir: str) -> bool:
+    async def _check_credentials_valid(
+        self,
+        host: str,
+        config_dir: str,
+        *,
+        expected_email: str | None = None,
+    ) -> bool:
         """SSH into Worker and check if Claude credentials are valid.
 
-        Runs `claude auth status` with the given config_dir. Returns True if
-        the credentials file exists and the auth check passes.
+        Runs `claude auth status` with the given config_dir. Returns True only
+        if the credentials are logged in and, when provided, the logged-in email
+        matches the account that the manager intends to bind to the Worker.
         """
         try:
             ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                         "-o", "ConnectTimeout=10"]
             quoted_config_dir = shlex.quote(config_dir)
-            cmd = (
-                f"CLAUDE_CONFIG_DIR={quoted_config_dir} claude auth status 2>&1 | "
-                "grep -Eq 'Logged in|\"loggedIn\"[[:space:]]*:[[:space:]]*true' "
-                "&& echo VALID || echo INVALID"
-            )
+            cmd = f"CLAUDE_CONFIG_DIR={quoted_config_dir} claude auth status 2>/dev/null || true"
             proc = await asyncio.create_subprocess_exec(
                 "ssh", *ssh_opts, "-i", self._ssh_key_path,
                 f"{self._ssh_user}@{host}", cmd,
@@ -371,7 +382,36 @@ class CredentialLoginService:
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = stdout.decode().strip()
-            return output == "VALID"
+            logged_in = False
+            actual_email: str | None = None
+
+            try:
+                status = json.loads(output)
+                logged_in = bool(status.get("loggedIn"))
+                email = status.get("email")
+                if isinstance(email, str):
+                    actual_email = email.strip()
+            except json.JSONDecodeError:
+                logged_in = "Logged in" in output or '"loggedIn": true' in output
+                match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", output)
+                if match:
+                    actual_email = match.group(0)
+
+            if not logged_in:
+                return False
+            if expected_email and (
+                not actual_email
+                or actual_email.casefold() != expected_email.strip().casefold()
+            ):
+                logger.warning(
+                    "Credential email mismatch on %s (%s): expected %s, got %s",
+                    host,
+                    config_dir,
+                    expected_email,
+                    actual_email or "<unknown>",
+                )
+                return False
+            return True
         except Exception as e:
             logger.debug("Credential validity check failed for %s: %s", host, e)
             return False
@@ -419,6 +459,10 @@ class CredentialLoginService:
             try:
                 await self.login_worker(worker_id, skip_validity_check=skip_validity_check)
                 if retry_failed_accounts:
+                    # CREDENTIAL_READY may dispatch a queued production task immediately.
+                    # Give the dispatcher a short window to start Claude before running
+                    # any scratch verification login on the same Worker.
+                    await asyncio.sleep(5)
                     if await self._worker_has_active_claude_process(worker_id):
                         logger.info(
                             "Worker %s already has an active Claude process; "

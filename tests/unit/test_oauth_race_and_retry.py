@@ -168,3 +168,65 @@ class TestRetryFailedAccounts:
         )
         assert await service.retry_failed_accounts("w1") == 0
         pool.update_login_status.assert_not_awaited()
+
+
+class _FakeProc:
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, b""
+
+
+@pytest.mark.asyncio
+async def test_171mail_numeric_code_falls_back_to_body_link():
+    provider = ClaudeOAuthProvider()
+    link = "https://claude.ai/magic-link#abc123"
+    provider._http_get = AsyncMock(return_value={
+        "code": 200,
+        "data": {
+            "code": 200,
+            "body": f"Click here: {link}",
+        },
+    })
+
+    assert await provider._poll_magic_link("tok") == link
+
+
+class TestCredentialValidity:
+    @pytest.mark.asyncio
+    async def test_valid_requires_matching_email(self):
+        service, _ = _make_service(MagicMock(), [], {})
+        auth_status = (
+            b'{"loggedIn": true, "email": "expected@example.com", '
+            b'"subscriptionType": "max"}'
+        )
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=_FakeProc(auth_status)),
+        ):
+            assert await service._check_credentials_valid(
+                "1.2.3.4",
+                "/root/.claude-prod",
+                expected_email="expected@example.com",
+            )
+
+    @pytest.mark.asyncio
+    async def test_valid_rejects_mismatched_email(self):
+        service, _ = _make_service(MagicMock(), [], {})
+        auth_status = (
+            b'{"loggedIn": true, "email": "other@example.com", '
+            b'"subscriptionType": "max"}'
+        )
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=_FakeProc(auth_status)),
+        ):
+            assert not await service._check_credentials_valid(
+                "1.2.3.4",
+                "/root/.claude-prod",
+                expected_email="expected@example.com",
+            )

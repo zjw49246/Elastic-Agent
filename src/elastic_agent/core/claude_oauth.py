@@ -583,19 +583,25 @@ class ClaudeOAuthProvider:
                     await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
                     continue
                 result_data = result.get("data") or {}
-                raw = (
-                    result_data.get("code")
-                    or result_data.get("link")
-                    or result_data.get("magicLink")
-                    or result.get("code")
-                    or result.get("link")
-                    or result.get("magicLink")
-                    or ""
-                )
+                string_candidates = [
+                    result_data.get("code"),
+                    result_data.get("link"),
+                    result_data.get("magicLink"),
+                    result.get("code"),
+                    result.get("link"),
+                    result.get("magicLink"),
+                ]
+                raw = next((v for v in string_candidates if isinstance(v, str) and v), "")
 
                 if raw.startswith("https://"):
                     return raw
-                body = result_data.get("body") or result.get("body") or raw
+                body = next(
+                    (
+                        v for v in [result_data.get("body"), result.get("body"), raw]
+                        if isinstance(v, str) and v
+                    ),
+                    "",
+                )
                 match = re.search(r'https://claude\.ai/magic-link#\S+', body)
                 if match:
                     return match.group(0)
