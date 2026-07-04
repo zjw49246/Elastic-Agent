@@ -359,6 +359,33 @@ class CredentialPool:
             if status is None:
                 return None
 
+            if status.assigned_to == worker_id:
+                if not acct_def.enabled:
+                    return None
+                if status.login_status in {"logging_in", "failed", "login_failed"}:
+                    return None
+                if status.backoff_until is not None and _utcnow() < status.backoff_until:
+                    return None
+                threshold_pct = self._config.quota_threshold * 100
+                if status.five_hour.utilization >= threshold_pct:
+                    return None
+                if status.seven_day.utilization >= threshold_pct:
+                    return None
+
+                status.slot_type = slot_type
+                status.last_used = _utcnow()
+                status.last_assigned_to = worker_id
+                status.available = False
+                self._flush_sync()
+                logger.info(
+                    "CredentialPool: allocate_specific reused %s on worker %s "
+                    "(slot=%s)",
+                    account_id,
+                    worker_id,
+                    slot_type,
+                )
+                return acct_def
+
             if not self._is_available(acct_def, status):
                 return None
 

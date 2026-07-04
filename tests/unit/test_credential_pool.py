@@ -201,6 +201,22 @@ async def test_claim_existing_assignment_restores_live_worker_and_blocks_duplica
     assert status.assigned_to == "worker-1"
 
 
+async def test_allocate_specific_is_idempotent_for_same_worker(
+    pool: CredentialPool,
+) -> None:
+    await pool.load()
+
+    first = await pool.allocate_specific("prod-1", "worker-1", "production")
+    assert first is not None
+
+    again = await pool.allocate_specific("prod-1", "worker-1", "production")
+    assert again is not None
+    assert again.id == "prod-1"
+
+    duplicate = await pool.allocate_specific("prod-1", "worker-2", "production")
+    assert duplicate is None
+
+
 # ---------------------------------------------------------------------------
 # 5. Allocate — skips unavailable accounts
 # ---------------------------------------------------------------------------
