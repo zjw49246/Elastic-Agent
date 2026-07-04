@@ -487,6 +487,31 @@ async def test_cooldown_with_reset_times(pool: CredentialPool) -> None:
     assert abs((status.backoff_until - five_hour_reset).total_seconds()) < 2
 
 
+async def test_mark_backoff_until_does_not_shorten_existing_backoff(
+    pool: CredentialPool,
+) -> None:
+    await pool.load()
+    later_reset = _utcnow() + timedelta(hours=1)
+    shorter_fallback = _utcnow() + timedelta(minutes=30)
+
+    await pool.mark_backoff_until(
+        "prod-1",
+        later_reset,
+        error="claude_rate_limited",
+    )
+    await pool.mark_backoff_until(
+        "prod-1",
+        shorter_fallback,
+        error="claude_rate_limited",
+    )
+
+    status = pool.get_status("prod-1")
+    assert status is not None
+    assert status.available is False
+    assert status.error == "claude_rate_limited"
+    assert status.backoff_until == later_reset
+
+
 async def test_atomic_write(pool: CredentialPool, status_path: Path) -> None:
     """Verify flush uses atomic rename (no leftover tmp file)."""
     await pool.load()

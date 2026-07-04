@@ -520,11 +520,29 @@ class CredentialPool:
         backoff_until: datetime,
         error: str | None = None,
     ) -> None:
-        """Mark an account unavailable until a known reset time."""
+        """Mark an account unavailable until a known reset time.
+
+        Duplicate rate-limit events can arrive without a reset timestamp after
+        an earlier event already provided the true reset time. Never shorten an
+        active backoff with a less precise fallback timestamp.
+        """
         async with self._lock:
             self._ensure_loaded()
             status = self._pool_status.accounts.get(account_id)
             if status is None:
+                return
+            if status.backoff_until is not None and status.backoff_until > backoff_until:
+                status.available = False
+                if error:
+                    status.error = error
+                self._flush_sync()
+                logger.info(
+                    "CredentialPool: account %s keeps later explicit backoff until %s "
+                    "(ignored shorter %s)",
+                    account_id,
+                    status.backoff_until,
+                    backoff_until,
+                )
                 return
             status.backoff_until = backoff_until
             status.available = False
