@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -230,3 +231,97 @@ class TestCredentialValidity:
                 "/root/.claude-prod",
                 expected_email="expected@example.com",
             )
+
+
+class TestActiveWorkerCredentialRestore:
+    def test_affinity_falls_back_to_persisted_last_assigned_worker(self):
+        newer = datetime.now(timezone.utc)
+        older = newer - timedelta(hours=1)
+        pool = MagicMock()
+        pool._pool_status.accounts = {
+            "a1": SimpleNamespace(
+                last_assigned_to="worker-1",
+                last_used=older,
+                last_login_at=None,
+            ),
+            "a2": SimpleNamespace(
+                last_assigned_to="worker-1",
+                last_used=newer,
+                last_login_at=None,
+            ),
+            "a3": SimpleNamespace(
+                last_assigned_to="worker-2",
+                last_used=newer,
+                last_login_at=None,
+            ),
+        }
+        service = CredentialLoginService(
+            credential_pool=pool,
+            credential_config=SimpleNamespace(login_timeout=60),
+            credential_binding=SimpleNamespace(_affinity={}),
+            event_bus=MagicMock(),
+        )
+
+        assert service._get_affinity_account("worker-1") == "a2"
+
+    @pytest.mark.asyncio
+    async def test_restore_active_worker_claims_local_account(self):
+        account = _acct("a1")
+        pool = MagicMock()
+        pool._accounts_config.accounts = [account]
+        pool.claim_existing_assignment = AsyncMock(return_value=account)
+        binding = MagicMock()
+        binding.get_worker.return_value = None
+        binding.bind = AsyncMock(return_value=True)
+        event_bus = MagicMock()
+        event_bus.emit = AsyncMock()
+        service = CredentialLoginService(
+            credential_pool=pool,
+            credential_config=SimpleNamespace(login_timeout=60),
+            credential_binding=binding,
+            event_bus=event_bus,
+            slots=[CredentialSlot(slot_type="production", config_dir="/root/.claude-prod")],
+        )
+        service._worker_has_active_claude_process = AsyncMock(return_value=True)
+        service._resolve_host = AsyncMock(return_value="1.2.3.4")
+        service._read_account_marker = AsyncMock(return_value="a1")
+        service._get_credentials_status = AsyncMock(return_value=(True, "a1@x.c"))
+        service._write_account_markers = AsyncMock()
+
+        assert await service._restore_active_worker_credential("worker-1")
+
+        pool.claim_existing_assignment.assert_awaited_once_with(
+            "a1",
+            "worker-1",
+            "production",
+            "/root/.claude-prod",
+        )
+        binding.bind.assert_awaited_once_with("a1", "worker-1")
+        event_bus.emit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_active_worker_blocks_duplicate_account(self):
+        account = _acct("a1")
+        pool = MagicMock()
+        pool._accounts_config.accounts = [account]
+        pool.claim_existing_assignment = AsyncMock()
+        binding = MagicMock()
+        binding.get_worker.return_value = "worker-1"
+        event_bus = MagicMock()
+        event_bus.emit = AsyncMock()
+        service = CredentialLoginService(
+            credential_pool=pool,
+            credential_config=SimpleNamespace(login_timeout=60),
+            credential_binding=binding,
+            event_bus=event_bus,
+            slots=[CredentialSlot(slot_type="production", config_dir="/root/.claude-prod")],
+        )
+        service._worker_has_active_claude_process = AsyncMock(return_value=True)
+        service._resolve_host = AsyncMock(return_value="1.2.3.4")
+        service._read_account_marker = AsyncMock(return_value="a1")
+        service._get_credentials_status = AsyncMock(return_value=(True, "a1@x.c"))
+
+        assert await service._restore_active_worker_credential("worker-2")
+
+        pool.claim_existing_assignment.assert_not_called()
+        event_bus.emit.assert_not_called()

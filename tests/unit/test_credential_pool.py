@@ -168,6 +168,39 @@ async def test_allocate_replacement_allows_handoff_with_single_worker_slot(
     assert replacement.id != old.id
 
 
+async def test_claim_existing_assignment_restores_live_worker_and_blocks_duplicate(
+    pool: CredentialPool,
+) -> None:
+    await pool.load()
+
+    claimed = await pool.claim_existing_assignment(
+        "prod-1",
+        "worker-1",
+        "production",
+        "/root/.claude-prod",
+    )
+
+    assert claimed is not None
+    status = pool.get_status("prod-1")
+    assert status is not None
+    assert status.assigned_to == "worker-1"
+    assert status.last_assigned_to == "worker-1"
+    assert status.available is False
+    assert status.login_status == "logged_in"
+
+    duplicate = await pool.claim_existing_assignment(
+        "prod-1",
+        "worker-2",
+        "production",
+        "/root/.claude-prod",
+    )
+
+    assert duplicate is None
+    status = pool.get_status("prod-1")
+    assert status is not None
+    assert status.assigned_to == "worker-1"
+
+
 # ---------------------------------------------------------------------------
 # 5. Allocate — skips unavailable accounts
 # ---------------------------------------------------------------------------

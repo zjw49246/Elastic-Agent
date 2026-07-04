@@ -376,6 +376,67 @@ class CredentialPool:
             )
             return acct_def
 
+    async def claim_existing_assignment(
+        self,
+        account_id: str,
+        worker_id: str,
+        slot_type: str,
+        config_dir: str | None = None,
+    ) -> AccountDefinition | None:
+        """Claim an already-live Worker credential without treating it as idle.
+
+        This is used after a manager restart or transient worker reconnect. A
+        Worker may still be running Claude with a local OAuth session while the
+        manager's in-memory bindings were lost. In that case we must restore the
+        assignment instead of allocating the same account to another Worker.
+        """
+        async with self._lock:
+            self._ensure_loaded()
+
+            acct_def = self._account_def(account_id)
+            if acct_def is None or not acct_def.enabled:
+                return None
+
+            status = self._pool_status.accounts.get(account_id)
+            if status is None:
+                return None
+
+            if status.assigned_to and status.assigned_to != worker_id:
+                logger.error(
+                    "CredentialPool: refused to claim %s for worker %s; "
+                    "already assigned to %s",
+                    account_id,
+                    worker_id,
+                    status.assigned_to,
+                )
+                return None
+
+            if (
+                status.assigned_to != worker_id
+                and self._count_assigned_to_worker(worker_id)
+                >= self._config.max_accounts_per_worker
+            ):
+                return None
+
+            status.assigned_to = worker_id
+            status.slot_type = slot_type
+            status.config_dir = config_dir
+            status.last_used = _utcnow()
+            status.last_assigned_to = worker_id
+            status.available = False
+            status.login_status = "logged_in"
+            status.error = None
+
+            self._flush_sync()
+            logger.info(
+                "CredentialPool: claimed existing assignment %s on worker %s "
+                "(slot=%s)",
+                account_id,
+                worker_id,
+                slot_type,
+            )
+            return acct_def
+
     # -- release -------------------------------------------------------------
 
     async def release(self, account_id: str) -> None:

@@ -251,6 +251,89 @@ class CredentialLoginService:
             logger.debug("Failed to check active Claude process on worker %s", worker_id)
             return False
 
+    async def _restore_active_worker_credential(self, worker_id: str) -> bool:
+        """Restore a credential binding for a Worker that is already running Claude.
+
+        On manager restart the pool/binding state can forget which account a
+        still-running Worker is using. Allocating a fresh account at that point
+        can duplicate an account across Workers. This method reclaims the local
+        account instead, or blocks login if doing so would violate exclusivity.
+        """
+        if not self._slots:
+            return False
+        if not await self._worker_has_active_claude_process(worker_id):
+            return False
+
+        host = await self._resolve_host(worker_id)
+        if not host:
+            logger.warning(
+                "Worker %s has an active Claude process but no SSH host; "
+                "skipping credential allocation",
+                worker_id,
+            )
+            return True
+
+        config_dir = self._slots[0].config_dir
+        marker_account_id = await self._read_account_marker(host, config_dir)
+        logged_in, actual_email = await self._get_credentials_status(host, config_dir)
+        account = self._resolve_account_from_local_state(marker_account_id, actual_email)
+
+        if not logged_in or account is None:
+            logger.error(
+                "Worker %s has an active Claude process but local credentials "
+                "could not be mapped safely (marker=%s, email=%s, logged_in=%s); "
+                "blocking automatic credential allocation",
+                worker_id,
+                marker_account_id or "<missing>",
+                actual_email or "<unknown>",
+                logged_in,
+            )
+            return True
+
+        bound_worker = self._binding.get_worker(account.id)
+        if bound_worker and bound_worker != worker_id:
+            logger.error(
+                "Worker %s is running with account %s, but the account is "
+                "already bound to worker %s; blocking duplicate login",
+                worker_id,
+                account.id,
+                bound_worker,
+            )
+            return True
+
+        claimed = await self._pool.claim_existing_assignment(
+            account.id,
+            worker_id,
+            "production",
+            config_dir,
+        )
+        if claimed is None:
+            logger.error(
+                "Worker %s is running with account %s, but the pool refused "
+                "to claim it; blocking automatic credential allocation",
+                worker_id,
+                account.id,
+            )
+            return True
+
+        if not await self._binding.bind(account.id, worker_id):
+            logger.error(
+                "Worker %s restored account %s in the pool, but binding "
+                "rejected it; blocking duplicate login",
+                worker_id,
+                account.id,
+            )
+            return True
+
+        await self._write_account_markers(host, account.id)
+        await self._notify_worker_credential_ready(worker_id, account.id)
+        logger.info(
+            "Worker %s active Claude process restored credential account %s",
+            worker_id,
+            account.id,
+        )
+        return True
+
     async def release_worker(self, worker_id: str) -> None:
         """Unbind and release all accounts allocated to a Worker."""
         await self._binding.unbind_worker(worker_id)
@@ -274,6 +357,25 @@ class CredentialLoginService:
                 await asyncio.wait_for(proc.communicate(), timeout=10)
             except Exception:
                 logger.debug("Failed to write account_id marker to %s on %s", config_dir, host)
+
+    async def _read_account_marker(self, host: str, config_dir: str) -> str | None:
+        try:
+            ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "ConnectTimeout=10"]
+            quoted_config_dir = shlex.quote(config_dir)
+            cmd = f"cat {quoted_config_dir}/.account_id 2>/dev/null || true"
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", *ssh_opts, "-i", self._ssh_key_path,
+                f"{self._ssh_user}@{host}", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            value = stdout.decode().strip()
+            return value or None
+        except Exception:
+            logger.debug("Failed to read account_id marker from %s on %s", config_dir, host)
+            return None
 
     async def _notify_worker_credential_ready(self, worker_id: str, account_id: str) -> None:
         """Emit CREDENTIAL_READY event so the Worker's QuotaChecker can pick up active slots."""
@@ -319,6 +421,13 @@ class CredentialLoginService:
                 if best_time is None or ts > best_time:
                     best_time = ts
                     best_account = aid
+        for aid, status in self._pool._pool_status.accounts.items():
+            if status.last_assigned_to != worker_id:
+                continue
+            ts = status.last_used or status.last_login_at
+            if best_time is None or (ts is not None and ts > best_time):
+                best_time = ts
+                best_account = aid
         return best_account
 
     # -- display server (Xvfb) check ----------------------------------------
@@ -369,6 +478,28 @@ class CredentialLoginService:
         if the credentials are logged in and, when provided, the logged-in email
         matches the account that the manager intends to bind to the Worker.
         """
+        logged_in, actual_email = await self._get_credentials_status(host, config_dir)
+        if not logged_in:
+            return False
+        if expected_email and (
+            not actual_email
+            or actual_email.casefold() != expected_email.strip().casefold()
+        ):
+            logger.warning(
+                "Credential email mismatch on %s (%s): expected %s, got %s",
+                host,
+                config_dir,
+                expected_email,
+                actual_email or "<unknown>",
+            )
+            return False
+        return True
+
+    async def _get_credentials_status(
+        self,
+        host: str,
+        config_dir: str,
+    ) -> tuple[bool, str | None]:
         try:
             ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                         "-o", "ConnectTimeout=10"]
@@ -397,24 +528,46 @@ class CredentialLoginService:
                 if match:
                     actual_email = match.group(0)
 
-            if not logged_in:
-                return False
-            if expected_email and (
-                not actual_email
-                or actual_email.casefold() != expected_email.strip().casefold()
-            ):
-                logger.warning(
-                    "Credential email mismatch on %s (%s): expected %s, got %s",
-                    host,
-                    config_dir,
-                    expected_email,
-                    actual_email or "<unknown>",
-                )
-                return False
-            return True
+            return logged_in, actual_email
         except Exception as e:
-            logger.debug("Credential validity check failed for %s: %s", host, e)
-            return False
+            logger.debug("Credential status check failed for %s: %s", host, e)
+            return False, None
+
+    def _resolve_account_from_local_state(
+        self,
+        marker_account_id: str | None,
+        actual_email: str | None,
+    ) -> AccountDefinition | None:
+        marker_account = None
+        if marker_account_id:
+            marker_account = next(
+                (
+                    acct for acct in self._pool._accounts_config.accounts
+                    if acct.id == marker_account_id
+                ),
+                None,
+            )
+
+        email_account = None
+        if actual_email:
+            email_account = next(
+                (
+                    acct for acct in self._pool._accounts_config.accounts
+                    if acct.email.casefold() == actual_email.casefold()
+                ),
+                None,
+            )
+
+        if marker_account and email_account and marker_account.id != email_account.id:
+            logger.warning(
+                "Local account marker %s disagrees with Claude auth email %s "
+                "(mapped to %s); trusting auth email",
+                marker_account.id,
+                actual_email,
+                email_account.id,
+            )
+            return email_account
+        return email_account or marker_account
 
     # -- helpers -------------------------------------------------------------
 
@@ -511,6 +664,8 @@ class CredentialLoginService:
     ) -> None:
         """Worker reconnected — try to restore previous account with validity check."""
         logger.info("Worker %s connected — checking credential state", worker_id)
+        if await self._restore_active_worker_credential(worker_id):
+            return
         self._start_login_task(
             worker_id,
             skip_validity_check=False,
