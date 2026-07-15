@@ -15,6 +15,17 @@
 - **账号自动登录**（`worker/login/`，vendored 自 CCM `auto_login.py`+`cdp_login.py`）：登录逻辑=CCM 版，纯 Chrome CDP 直调 OAuth authorize（不用 Playwright/mitmproxy），多后端接码（多数域走 171mail API，mail.com 家族走 mail relay / mail.com Web，按邮箱域名自动选，`resolve_provider`）。**worker 本地跑**：Manager 只持 email+接码token（`AccountDefinition`）并下发；`ClaudeOAuthProvider.login()` 是薄壳，`worker_host` 有值时经 SSH 在 worker 上跑 `python -m elastic_agent.worker.login.auto_login`（起 Xvfb:99 + Chrome），无值时进程内直跑——凭证只落 worker、绝不经 Manager。`OAuthConfig→LoginResult` 契约不变，`CredentialLoginService/Step` 编排层不动。CCM 特定硬编码已参数化（`CLAUDE_MAILCATCHER_URL`/`CLAUDE_171MAIL_URL`/`CLAUDE_SETTINGS_EXTRA_DIRS`）
 - **worker 自治登录**（P3，协议 `ACCOUNT_LOGIN`/`ACCOUNT_LOGIN_RESULT`）：Manager 只下发账号身份（`account_id`/`email`/`email_token`/`config_dir`/`provider`），worker `_handle_account_login` 本地跑 `perform_login`（`worker_host=None`，进程内 Chrome/CDP）→ 成功则 `_warmup_config_dir`（`claude -p` 预热 GrowthBook+验证凭证）+ `recycle_config_dir` + 挂 QuotaChecker slot → 回 `ACCOUNT_LOGIN_RESULT`。区别于既有 `CREDENTIAL_LOGIN`（下发已登好的 token）。凭证只在 worker 生成、不回传。（既有 SSH 驱动登录路径仍保留）
 
+## 两类任务 & 批量编排
+
+- **两类任务模型**（关键区分）：
+  - **Mode A — Elastic 托管 agent**（PTY 路径，上文）：任务=一个 prompt，Elastic 宿主 Claude、逐 turn 记账、逐 turn 换号。
+  - **Mode B — 不透明长命令**：任务=一条任意 shell 命令（如 `uv run ai4sci-bench run …`），它自己开 sandbox、自己内部消费账号——Elastic **看不到**里面的 turn。此时 Elastic 只做：装环境（bootstrap）+ worker 本地登号 + 跑命令 + 盯输出 + 收结果 + 弹性缩扩。`ExecuteMessage.command` 本就是任意 argv（`create_subprocess_exec`），Mode B 天然支持。
+- **声明式 JobSpec**（`core/job_spec.py`）：任务即数据。`setup`(repo+commands)/`run`(command+env+cwd，shell 模式包 `bash -lc`)/`account`(mode/per_worker/config_dir)/`rotation`/`fanout`(workers/shard_by)/`collect`/`completion`。模板 `{{shard_index}}`/`{{num_shards}}`/`{{hostname}}` 由 Manager 渲染；`$(hostname -s)`/`$VAR` 留给 worker shell。
+- **两条接入路**统一成 `Harness`（`harness/generic.py` `resolve_harness`）：`harness_ref` 空→`GenericJobHarness(spec)`（声明式编译 bootstrap/凭证槽/execute）；有值→导入上传的 `Harness` 子类（`module:Class` 或 `/path.py:Class`）。
+- **BatchOrchestrator**（`core/batch_orchestrator.py`）：`launch(spec)` = scale_out(N) → 每 worker 并发 provision→login→run_command；`on_worker_exhausted`/`on_worker_exit` 驱动换号与完成。经 `FleetDriver` Protocol 解耦（真实现 `core/manager_fleet_driver.py`；`Manager.batch` 懒建，`configure_batch(provision_hook,login_hook)` 注入部署期钩子）。
+- **Mode B 换号（策略 a）**：`ExecuteMessage.watch_exhaustion` 开启时 worker `_read_stream` 用 `core/rate_limit.py` 扫 stdout/stderr，撞限流即 `_signal_exhaustion`（发 `RunExhaustedMessage` + SIGINT）；Manager 侧 `on_worker_exhausted` 换新号（worker 本地登录同 config_dir）+ 用 `rotation.resume_args` `--resume` 重启，`max_rotations` 上限；打断退出（ROTATING）不算失败。
+- **前端**（`api/routes/`）：`/api/accounts`（账号池 CRUD，`core/account_store.py` JSON 存储，与 `accounts.json` 同 schema）；`/api/jobs`（提交/列表/详情）+ `/api/jobs/harness`（上传 Harness 代码→`harness_ref`）；`/batch` Batch Console 单页（账号面板 + 任务表单[声明式+上传代码] + 实时任务监控）。凭证绝不入前端/Manager。
+
 ## 依赖链（重要）
 
 ```

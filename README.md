@@ -81,6 +81,55 @@ Protocol notes:
   turn end (`synthesized_by: "pty_backend"`) carrying the session_id.
   `cost_usd` is not available in PTY mode.
 
+## Batch jobs (declarative)
+
+Two task shapes are supported:
+
+- **Mode A — Elastic-hosted agent** (PTY, above): a task is a prompt; Elastic
+  hosts Claude Code and rotates credentials per turn.
+- **Mode B — opaque long command**: a task is an arbitrary shell command (e.g. a
+  benchmark harness that spawns its own sandboxes and consumes the account
+  internally). Elastic provisions the worker, logs an account in locally, runs
+  the command, watches its output for exhaustion, and rotates by restarting with
+  the harness's own `--resume`.
+
+Mode-B jobs are described declaratively as a **JobSpec** — no Python subclass
+needed — and fanned out across the fleet:
+
+```python
+from elastic_agent.core.job_spec import JobSpec
+
+spec = JobSpec.model_validate({
+    "name": "ai4sci-opus48-seed128",
+    "setup": {"repo": "https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git",
+              "commands": ["uv sync"]},
+    "run": {"command": 'uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"',
+            "env": {"AI4SCI_SANDBOX_CPU": "1", "AI4SCI_SANDBOX_MEM": "4g"},
+            "cwd": "Agent-AI4Sci-Bench"},
+    "account": {"mode": "worker_local_login", "per_worker": 1},
+    "rotation": {"strategy": "on_exhaust_restart_resume",
+                 "resume_args": '--resume "results/opus48_$(hostname -s)_seed128"'},
+    "fanout": {"workers": 8, "shard_by": "hostname"},
+})
+job = await manager.batch.launch(spec)   # scale → bootstrap → login → run, per worker
+```
+
+Template `{{shard_index}}` / `{{num_shards}}` / `{{hostname}}` are rendered by the
+Manager; shell constructs like `$(hostname -s)` are evaluated on the worker.
+
+**Upload-code escape hatch**: for jobs needing custom logic, set
+`harness_ref: "module:Class"` (or upload a `.py` via `POST /api/jobs/harness`) to
+drive the job with a real `Harness` subclass instead.
+
+**Frontend**: the Manager serves a **Batch Console** at `/batch` — an Accounts
+panel (email + 接码 token pool), a Job form (both the declarative and upload-code
+paths), and a live per-worker Job monitor. REST: `/api/accounts`, `/api/jobs`,
+`/api/jobs/harness`. Credentials are always minted on the worker and never
+transit the frontend or Manager.
+
+Live batch runs require provision/login hooks wired at deployment:
+`manager.configure_batch(provision_hook=..., login_hook=...)`.
+
 ## Development
 
 ```bash

@@ -94,3 +94,20 @@
 **附带发现**：冒烟首跑因 API 529 overloaded_error 失败（CC 内部重试 10 次未过）——`system/api_error` 是 CC 的重试事件（带 retryAttempt/maxRetries），不带 isApiErrorMessage，turn 未被掐断，等待即可恢复。区别于 isApiErrorMessage:true（turn 被终止、无哨兵）。
 
 **Commit**: 见本节合入 main 的 commit。
+
+## 2026-07-15 批量编排 + 前端：适配 Mode B 不透明长命令任务（AI4Sci-Bench）
+
+**背景**：AI4Sci-Bench 类任务（`uv run ai4sci-bench run …`）是跑数小时、内部自开 Docker sandbox、内部消费账号的黑盒长命令——暴露了框架只假设「Mode A：Elastic 托管 agent、逐 turn 换号」的错配。这类「Mode B」任务里 Elastic 的 PTY 逐 turn 轮换插不进去。
+
+**做法**（4 个 commit）：
+1. `17f72b5` 声明式 `JobSpec` + `GenericJobHarness`：任务即数据；`resolve_harness` 把「声明式」和「上传 Harness 代码」统一成 `Harness`。模板 `{{shard_index}}` 由 Manager 渲染、`$(hostname -s)` 留给 worker shell（shell 模式包 `bash -lc`）。
+2. `193fd1f` `BatchOrchestrator`：单 JobSpec fan-out 到 N worker，`FleetDriver` Protocol 解耦真实 Manager，fake 单测全生命周期。
+3. `22d1444` worker 侧 Mode B 换号(a)：`watch_exhaustion` 开启时扫子进程输出，撞限流即 `RunExhaustedMessage`+SIGINT；复用 P2 的 `core/rate_limit.py` 检测器（消费方从 PTY turn 变成子进程输出行）。
+4. `c150e47` 前端后端：`AccountStore` + `/api/accounts` + `/api/jobs`(+harness 上传) + `/batch` Batch Console 页。
+
+**经验教训**：
+- **别把 Mode A 的逐 turn 轮换硬套 Mode B**。黑盒命令自己消费账号，只能靠扫它的 stdout 做「整条命令」粒度换号 + 它自带的 `--resume` 恢复。换号(a) 会丢在飞 sandbox，是已知代价（用户拍板选 a）。
+- **`ExecuteMessage.command` 本就是任意 argv**——框架早支持任意命令，缺的只是上层编排（scale→bootstrap→login→dispatch→track），Manager 的 `scale_out` 只建实例、这条链是空缺。
+- **凭证边界**：前端/Manager 只碰账号身份（email+接码token），凭证只在 worker 本地 `perform_login` 生成、绝不回传——批量路径全程守住。
+- **未接的活**：`ManagerFleetDriver` 的 provision/login 是部署期注入钩子（bootstrap SSH 管线 + ACCOUNT_LOGIN 结果关联），沙箱内无法端到端验证；真 worker 上需验登录链路 + 瞬时/限流重启。多账号/机（per_worker>1）的独立 config_dir 池 + hardlink 会话迁移仍待做。
+- 全 unit 套件 32F/76E 与环境基线一致（DryRunProvider/InMemoryProvider 缺 reboot_instance、fastapi、reconnect timing，均不 import 新模块），passed 1118→1190（+72），零新回归。
