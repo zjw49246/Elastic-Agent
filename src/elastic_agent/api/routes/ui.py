@@ -121,7 +121,7 @@ _DASHBOARD_HTML = """\
   <header>
     <h1>Elastic-Agent Dashboard</h1>
     <div class="refresh-info">
-      <a href="/batch" style="color:var(--accent);text-decoration:none;margin-right:12px">Batch Console →</a>
+      <a href="/batch" id="navBatch" style="color:var(--accent);text-decoration:none;margin-right:12px">Batch Console →</a>
       Auto-refresh: <span id="refreshInterval">5s</span>
       &middot; Last: <span id="lastRefresh">--</span>
     </div>
@@ -176,6 +176,9 @@ _DASHBOARD_HTML = """\
 const API_KEY = new URLSearchParams(window.location.search).get('api_key') || '';
 const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
                         : {'Content-Type': 'application/json'};
+
+// Preserve ?api_key= when navigating to the Batch Console.
+{const nb = document.getElementById('navBatch'); if (nb) nb.href = '/batch' + window.location.search;}
 
 let refreshTimer = null;
 
@@ -390,7 +393,7 @@ _BATCH_HTML = """\
 <div class="container">
   <header>
     <h1>Batch Console</h1>
-    <a href="/">← Fleet Dashboard</a>
+    <a href="/" id="navFleet">← Fleet Dashboard</a>
   </header>
 
   <!-- Accounts -->
@@ -474,6 +477,8 @@ _BATCH_HTML = """\
 const API_KEY = new URLSearchParams(window.location.search).get('api_key') || '';
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
                         : {'Content-Type':'application/json'};
+// Preserve ?api_key= when navigating to the Fleet Dashboard.
+{const nav = document.getElementById('navFleet'); if (nav) nav.href = '/' + window.location.search;}
 async function api(method, path, body) {
   const opts = {method, headers:{...headers}};
   if (body) opts.body = JSON.stringify(body);
