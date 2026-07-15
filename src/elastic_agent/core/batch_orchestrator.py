@@ -117,8 +117,10 @@ class FleetDriver(Protocol):
     async def run_command(
         self, worker_id: str, task_id: str, command: list[str], cwd: str,
         env: dict[str, str], timeout: int | None,
+        job_id: str, watch_exhaustion: bool,
     ) -> None:
-        """Dispatch an EXECUTE to the worker."""
+        """Dispatch an EXECUTE to the worker. ``watch_exhaustion`` tells the
+        worker to scan output for rate-limit banners (Mode-B rotation)."""
         ...
 
     async def scale_in(self, worker_ids: list[str]) -> None:
@@ -188,6 +190,8 @@ class BatchOrchestrator:
         await self._driver.run_command(
             run.worker_id, run.task_id,
             command=ex["command"], cwd=ex["cwd"], env=ex["env"], timeout=ex["timeout"],
+            job_id=job.job_id,
+            watch_exhaustion=spec.rotation.strategy != "none",
         )
 
     # -- lifecycle events (called by the Manager's message handlers) --------
@@ -230,7 +234,10 @@ class BatchOrchestrator:
         if job is None or worker_id not in job.runs:
             return
         run = job.runs[worker_id]
-        if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED):
+        # A run interrupted mid-rotation exits non-zero; that exit is expected
+        # and must not be treated as a terminal failure — the resume dispatch
+        # (or its RUN_EXHAUSTED handling) owns the outcome.
+        if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED, WorkerPhase.ROTATING):
             return
         if exit_code == job.spec.completion.on_process_exit:
             run.phase = WorkerPhase.DONE

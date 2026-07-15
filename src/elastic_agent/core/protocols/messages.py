@@ -41,6 +41,13 @@ class ExecuteMessage(Message):
     # `command` remains the subprocess fallback. Keys: prompt,
     # resume_session_id, config_dir, model.
     agent_params: dict | None = None
+    # Batch / Mode-B fields. `job_id` ties this run to a BatchJob; when
+    # `watch_exhaustion` is set the worker scans the opaque command's output for
+    # rate-limit/auth-failure banners and, on a hit, interrupts the process and
+    # emits a RunExhaustedMessage so the orchestrator can rotate the account and
+    # restart with --resume (rotation strategy "a").
+    job_id: str | None = None
+    watch_exhaustion: bool = False
 
 
 class StopMessage(Message):
@@ -269,6 +276,20 @@ class CredentialExhaustedMessage(Message):
     reason: str
 
 
+class RunExhaustedMessage(Message):
+    """Worker -> Manager: a Mode-B run command tripped the rate-limit detectors.
+
+    The worker has already interrupted the process; the BatchOrchestrator routes
+    this to on_worker_exhausted() to swap the account and restart with --resume.
+    """
+
+    type: Literal["RUN_EXHAUSTED"] = "RUN_EXHAUSTED"
+    task_id: str
+    job_id: str
+    worker_id: str
+    reason: str = "rate_limit"
+
+
 class AuthMessage(Message):
     type: Literal["AUTH"] = "AUTH"
     token: str
@@ -328,6 +349,7 @@ WorkerToManagerMessage = Annotated[
         CredentialLoginResultMessage,
         AccountLoginResultMessage,
         CredentialExhaustedMessage,
+        RunExhaustedMessage,
         AuthMessage,
     ],
     Field(discriminator="type"),
@@ -363,6 +385,7 @@ AnyMessage = Annotated[
         CredentialLoginResultMessage,
         AccountLoginResultMessage,
         CredentialExhaustedMessage,
+        RunExhaustedMessage,
         AuthMessage,
     ],
     Field(discriminator="type"),

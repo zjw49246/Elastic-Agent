@@ -46,6 +46,7 @@ from elastic_agent.core.protocols.messages import (
     QuotaStatusMessage,
     ReadFileMessage,
     RegisterSyncMappingMessage,
+    RunExhaustedMessage,
     SendInputMessage,
     StatusMessage,
     StopMessage,
@@ -55,6 +56,8 @@ from elastic_agent.core.protocols.messages import (
     UnwatchMessage,
     parse_message,
 )
+
+from elastic_agent.core.rate_limit import is_auth_failure, is_rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +91,12 @@ class WorkerRuntime:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._process_tasks: dict[str, asyncio.Task] = {}
         self._stdin_pipes: dict[str, asyncio.StreamWriter | None] = {}
+
+        # Mode-B exhaustion watch: task_id -> job_id for runs whose opaque
+        # command should be scanned for rate-limit banners; _exhaustion_fired
+        # dedupes so we signal + interrupt only once per run.
+        self._exhaustion_watch: dict[str, str] = {}
+        self._exhaustion_fired: set[str] = set()
 
         self._send_queue: asyncio.Queue[str] = asyncio.Queue()
         self._reconnect_event = asyncio.Event()
@@ -309,6 +318,9 @@ class WorkerRuntime:
 
         self._processes[task_id] = proc
         self._stdin_pipes[task_id] = proc.stdin
+        if getattr(msg, "watch_exhaustion", False):
+            self._exhaustion_watch[task_id] = getattr(msg, "job_id", None) or ""
+            self._exhaustion_fired.discard(task_id)
         logger.info("Started process for task %s (pid=%d)", task_id, proc.pid)
 
         task = asyncio.create_task(self._monitor_process(task_id, proc, log_path, msg.timeout))
@@ -353,6 +365,8 @@ class WorkerRuntime:
             self._processes.pop(task_id, None)
             self._process_tasks.pop(task_id, None)
             self._stdin_pipes.pop(task_id, None)
+            self._exhaustion_watch.pop(task_id, None)
+            self._exhaustion_fired.discard(task_id)
             logger.info("Process for task %s exited with code %d", task_id, exit_code)
 
             if self._file_sync_manager:
@@ -516,6 +530,35 @@ class WorkerRuntime:
                 data=line,
                 parsed=parsed,
             ))
+
+            # Mode-B rotation (a): the opaque command consumes the Claude account
+            # internally, so we can't rotate per turn — instead we watch its
+            # output and, on the first exhaustion banner, interrupt + signal the
+            # Manager to swap accounts and restart with --resume.
+            if (
+                task_id in self._exhaustion_watch
+                and task_id not in self._exhaustion_fired
+                and (is_rate_limited(line) or is_auth_failure(line))
+            ):
+                await self._signal_exhaustion(task_id)
+
+    async def _signal_exhaustion(self, task_id: str) -> None:
+        """Emit RunExhaustedMessage once and interrupt the run so the
+        orchestrator can rotate the account and resume."""
+        if task_id in self._exhaustion_fired:
+            return
+        self._exhaustion_fired.add(task_id)
+        job_id = self._exhaustion_watch.get(task_id, "")
+        logger.warning(
+            "Task %s tripped exhaustion detector; signaling manager + interrupting", task_id
+        )
+        await self._send_event(RunExhaustedMessage(
+            task_id=task_id,
+            job_id=job_id,
+            worker_id=self._worker_id or "unknown",
+            reason="rate_limit",
+        ))
+        await self._stop_process(task_id, "SIGINT")
 
     @staticmethod
     def _try_parse_ndjson(line: str) -> dict | None:

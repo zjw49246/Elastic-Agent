@@ -43,10 +43,12 @@ class FakeDriver:
         return LoginOutcome(success=True, account_id=f"acc-{self._account_seq}",
                             account_email=f"a{self._account_seq}@x.com")
 
-    async def run_command(self, worker_id, task_id, command, cwd, env, timeout):
+    async def run_command(self, worker_id, task_id, command, cwd, env, timeout,
+                          job_id, watch_exhaustion):
         self.dispatched.append({
             "worker_id": worker_id, "task_id": task_id, "command": command,
             "cwd": cwd, "env": env, "timeout": timeout,
+            "job_id": job_id, "watch_exhaustion": watch_exhaustion,
         })
 
     async def scale_in(self, worker_ids):
@@ -94,6 +96,21 @@ class TestLaunch:
         await orch.launch(_spec(fanout={"workers": 2}, account={"mode": "none"}))
         assert d.login_calls == []
         assert len(d.dispatched) == 2
+
+    async def test_watch_exhaustion_flag_reflects_rotation_policy(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        await orch.launch(_spec(fanout={"workers": 1}))  # rotation none
+        assert d.dispatched[0]["watch_exhaustion"] is False
+        assert d.dispatched[0]["job_id"]
+
+        d2 = FakeDriver()
+        orch2 = BatchOrchestrator(d2)
+        await orch2.launch(_spec(
+            fanout={"workers": 1},
+            rotation={"strategy": "on_exhaust_restart_resume", "resume_args": "-r"},
+        ))
+        assert d2.dispatched[0]["watch_exhaustion"] is True
 
     async def test_bootstrap_failure_marks_failed_no_dispatch(self):
         d = FakeDriver()
@@ -156,6 +173,22 @@ class TestRotation:
         assert await orch.on_worker_exhausted(job.job_id, wid) is True   # 2
         assert await orch.on_worker_exhausted(job.job_id, wid) is False  # capped
         assert job.runs[wid].phase == WorkerPhase.FAILED
+
+    async def test_interrupt_exit_during_rotation_ignored(self):
+        # The interrupted run's non-zero exit (from SIGINT) must not mark the
+        # worker FAILED while a rotation is mid-flight.
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        spec = _spec(
+            fanout={"workers": 1},
+            rotation={"strategy": "on_exhaust_restart_resume", "resume_args": "-r", "max_rotations": 3},
+        )
+        job = await orch.launch(spec)
+        wid = next(iter(job.runs))
+        # Simulate: exit arrives while ROTATING (before restart completes).
+        job.runs[wid].phase = WorkerPhase.ROTATING
+        await orch.on_worker_exit(job.job_id, wid, 130)  # 128+SIGINT
+        assert job.runs[wid].phase == WorkerPhase.ROTATING  # unchanged
 
     async def test_rotation_login_failure_fails(self):
         d = FakeDriver()

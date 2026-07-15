@@ -208,6 +208,82 @@ class TestProcessExecution:
         await runtime._process_tasks["task-dup"]
 
 
+class TestExhaustionWatch:
+    """Mode-B rotation (a): watch opaque-command output for exhaustion banners."""
+
+    @pytest.mark.asyncio
+    async def test_banner_signals_and_interrupts(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent: list[dict] = []
+
+        async def mock_send_event(msg):
+            sent.append(json.loads(msg.model_dump_json()))
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        # Print a usage-limit banner then block; the worker should interrupt.
+        msg = ExecuteMessage(
+            task_id="task-exh",
+            command=[sys.executable, "-u", "-c",
+                     "print('You hit your usage limit'); import time; time.sleep(30)"],
+            cwd=str(tmp_path),
+            job_id="job-xyz",
+            watch_exhaustion=True,
+        )
+        await runtime._handle_execute(msg)
+        await asyncio.wait_for(runtime._process_tasks["task-exh"], timeout=20)
+
+        exh = [m for m in sent if m["type"] == "RUN_EXHAUSTED"]
+        assert len(exh) == 1
+        assert exh[0]["job_id"] == "job-xyz"
+        assert exh[0]["worker_id"] == "test-worker-1"
+        assert exh[0]["reason"] == "rate_limit"
+        # process was interrupted → cleaned up
+        assert "task-exh" not in runtime._processes
+        assert "task-exh" not in runtime._exhaustion_watch
+
+    @pytest.mark.asyncio
+    async def test_no_watch_no_signal(self, runtime, tmp_path):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        sent: list[dict] = []
+
+        async def mock_send_event(msg):
+            sent.append(json.loads(msg.model_dump_json()))
+
+        runtime._send_event = mock_send_event
+        runtime._running = True
+
+        # Same banner, but watch disabled → run completes normally, no signal.
+        msg = ExecuteMessage(
+            task_id="task-nowatch",
+            command=[sys.executable, "-u", "-c", "print('You hit your usage limit')"],
+            cwd=str(tmp_path),
+            watch_exhaustion=False,
+        )
+        await runtime._handle_execute(msg)
+        await asyncio.wait_for(runtime._process_tasks["task-nowatch"], timeout=20)
+
+        assert not [m for m in sent if m["type"] == "RUN_EXHAUSTED"]
+
+    @pytest.mark.asyncio
+    async def test_signal_exhaustion_dedupes(self, runtime):
+        sent: list[dict] = []
+
+        async def mock_send_event(msg):
+            sent.append(json.loads(msg.model_dump_json()))
+
+        runtime._send_event = mock_send_event
+        runtime._exhaustion_watch["t"] = "job-1"
+
+        await runtime._signal_exhaustion("t")
+        await runtime._signal_exhaustion("t")  # second call is a no-op
+
+        assert len([m for m in sent if m["type"] == "RUN_EXHAUSTED"]) == 1
+
+
 class TestStopProcess:
     @pytest.mark.asyncio
     async def test_stop_running_process(self, runtime, tmp_path):
