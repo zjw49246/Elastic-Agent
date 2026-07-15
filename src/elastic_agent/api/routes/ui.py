@@ -121,6 +121,7 @@ _DASHBOARD_HTML = """\
   <header>
     <h1>Elastic-Agent Dashboard</h1>
     <div class="refresh-info">
+      <a href="/batch" style="color:var(--accent);text-decoration:none;margin-right:12px">Batch Console →</a>
       Auto-refresh: <span id="refreshInterval">5s</span>
       &middot; Last: <span id="lastRefresh">--</span>
     </div>
@@ -333,6 +334,265 @@ refreshTimer = setInterval(refreshNodes, 5000);
 """
 
 
+_BATCH_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Elastic-Agent Batch Console</title>
+<style>
+  :root {
+    --bg:#0f172a; --surface:#1e293b; --border:#334155; --text:#e2e8f0;
+    --muted:#94a3b8; --accent:#3b82f6; --green:#22c55e; --yellow:#eab308;
+    --red:#ef4444; --orange:#f97316;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+         background:var(--bg); color:var(--text); min-height:100vh; }
+  .container { max-width:1200px; margin:0 auto; padding:20px; }
+  header { display:flex; justify-content:space-between; align-items:center;
+           padding:16px 0; border-bottom:1px solid var(--border); margin-bottom:20px; }
+  header h1 { font-size:1.4rem; } header a { color:var(--accent); text-decoration:none; font-size:.9rem; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px;
+          padding:18px; margin-bottom:20px; }
+  .card h2 { font-size:1.05rem; margin-bottom:12px; }
+  label { display:block; font-size:.8rem; color:var(--muted); margin:8px 0 3px; }
+  input, select, textarea { width:100%; background:var(--bg); color:var(--text);
+    border:1px solid var(--border); border-radius:6px; padding:7px 9px; font-size:.85rem;
+    font-family:inherit; }
+  textarea { resize:vertical; min-height:52px; font-family:ui-monospace,Menlo,monospace; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+  .btn { background:var(--accent); color:#fff; border:none; border-radius:6px;
+    padding:8px 14px; font-size:.85rem; cursor:pointer; margin-top:10px; }
+  .btn-danger { background:var(--red); }
+  .btn-ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
+  table { width:100%; border-collapse:collapse; font-size:.83rem; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; }
+  .badge { padding:2px 8px; border-radius:10px; font-size:.72rem; }
+  .b-running { background:rgba(59,130,246,.2); color:var(--accent); }
+  .b-done { background:rgba(34,197,94,.2); color:var(--green); }
+  .b-failed { background:rgba(239,68,68,.2); color:var(--red); }
+  .b-rotating { background:rgba(249,115,22,.2); color:var(--orange); }
+  .b-pending, .b-bootstrapping, .b-logging_in { background:rgba(148,163,184,.2); color:var(--muted); }
+  .muted { color:var(--muted); font-size:.8rem; }
+  .toast { position:fixed; bottom:20px; right:20px; background:var(--surface);
+    border:1px solid var(--border); border-radius:8px; padding:12px 18px; opacity:0;
+    transition:opacity .3s; pointer-events:none; }
+  .toast.show { opacity:1; } .toast.error { border-color:var(--red); }
+  details { margin-top:6px; } summary { cursor:pointer; }
+  .hint { font-size:.72rem; color:var(--muted); margin-top:2px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Batch Console</h1>
+    <a href="/">← Fleet Dashboard</a>
+  </header>
+
+  <!-- Accounts -->
+  <div class="card">
+    <h2>Accounts</h2>
+    <p class="hint">Only account identities (email + 接码 token). Credentials are minted on the worker at login — never stored here.</p>
+    <table><thead><tr><th>ID</th><th>Email</th><th>Group</th><th>Enabled</th><th></th></tr></thead>
+      <tbody id="acctRows"></tbody></table>
+    <div class="grid3" style="margin-top:12px">
+      <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
+      <div><label>Email</label><input id="acctEmail" placeholder="a@x.com"></div>
+      <div><label>接码 Token</label><input id="acctToken" placeholder="optional"></div>
+    </div>
+    <div class="grid2">
+      <div><label>Group</label><input id="acctGroup" value="standard"></div>
+    </div>
+    <button class="btn" onclick="addAccount()">Add Account</button>
+  </div>
+
+  <!-- Job submission -->
+  <div class="card">
+    <h2>Submit Job</h2>
+    <div class="grid2">
+      <div><label>Job name</label><input id="jName" placeholder="ai4sci-opus48-seed128"></div>
+      <div><label>Workers (fan-out)</label><input id="jWorkers" type="number" value="1" min="1"></div>
+    </div>
+    <label>Setup — repo URL</label>
+    <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
+    <label>Setup — commands (one per line, run after clone)</label>
+    <textarea id="jSetup" placeholder="uv sync"></textarea>
+    <label>Run command (shell; {{shard_index}} / $(hostname -s) supported)</label>
+    <textarea id="jRun" placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
+    <div class="grid2">
+      <div><label>Working dir (cwd)</label><input id="jCwd" value="."></div>
+      <div><label>Shard by</label>
+        <select id="jShard"><option value="hostname">hostname</option>
+          <option value="shard_index">shard_index</option><option value="none">none</option></select></div>
+    </div>
+    <label>Env (KEY=VALUE per line)</label>
+    <textarea id="jEnv" placeholder="AI4SCI_SANDBOX_CPU=1&#10;AI4SCI_SANDBOX_MEM=4g"></textarea>
+    <div class="grid3">
+      <div><label>Account mode</label>
+        <select id="jAcctMode"><option value="worker_local_login">worker_local_login</option>
+          <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
+      <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
+      <div><label>config_dir (blank = ~/.claude)</label><input id="jConfigDir" placeholder=""></div>
+    </div>
+    <div class="grid2">
+      <div><label>Rotation strategy</label>
+        <select id="jRot"><option value="none">none</option>
+          <option value="on_exhaust_restart_resume">on_exhaust_restart_resume (a)</option></select></div>
+      <div><label>Resume args (appended on rotation restart)</label>
+        <input id="jResume" placeholder='--resume "results/opus48_$(hostname -s)_seed128"'></div>
+    </div>
+
+    <details>
+      <summary class="muted">Advanced: upload Harness code (escape hatch)</summary>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Filename (&lt;name&gt;.py)</label><input id="hFile" placeholder="my_harness.py"></div>
+        <div><label>Class name</label><input id="hClass" placeholder="MyHarness"></div>
+      </div>
+      <label>Harness code (a Harness subclass)</label>
+      <textarea id="hCode" style="min-height:120px"></textarea>
+      <button class="btn btn-ghost" onclick="uploadHarness()">Upload → set harness_ref</button>
+      <div><label>harness_ref (set = uploaded code drives the job; blank = declarative)</label>
+        <input id="jHarnessRef" placeholder=""></div>
+    </details>
+
+    <button class="btn" onclick="submitJob()">Launch Job</button>
+  </div>
+
+  <!-- Jobs monitor -->
+  <div class="card">
+    <h2>Jobs <span class="muted" id="jobsRefresh"></span></h2>
+    <div id="jobsList"><p class="muted">No jobs yet.</p></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API_KEY = new URLSearchParams(window.location.search).get('api_key') || '';
+const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
+                        : {'Content-Type':'application/json'};
+async function api(method, path, body) {
+  const opts = {method, headers:{...headers}};
+  if (body) opts.body = JSON.stringify(body);
+  const resp = await fetch('/api' + path, opts);
+  if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+  return resp.status === 204 ? null : resp.json();
+}
+function toast(msg, type='success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = 'toast show ' + type;
+  setTimeout(() => el.className = 'toast', 3500);
+}
+function lines(id) {
+  return document.getElementById(id).value.split('\\n').map(s => s.trim()).filter(Boolean);
+}
+
+// ---- Accounts ----
+async function refreshAccounts() {
+  try {
+    const d = await api('GET', '/accounts');
+    document.getElementById('acctRows').innerHTML = (d.accounts || []).map(a => `
+      <tr><td>${a.id}</td><td>${a.email}</td><td>${a.group}</td><td>${a.enabled}</td>
+      <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
+          onclick="removeAccount('${a.id}')">✕</button></td></tr>`).join('')
+      || '<tr><td colspan="5" class="muted">No accounts.</td></tr>';
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function addAccount() {
+  const id = document.getElementById('acctId').value.trim();
+  const email = document.getElementById('acctEmail').value.trim();
+  if (!id || !email) return toast('id + email required', 'error');
+  try {
+    await api('POST', '/accounts', {id, email,
+      email_token: document.getElementById('acctToken').value.trim(),
+      group: document.getElementById('acctGroup').value.trim() || 'standard'});
+    document.getElementById('acctId').value = ''; document.getElementById('acctEmail').value = '';
+    document.getElementById('acctToken').value = '';
+    toast('Account added'); refreshAccounts();
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function removeAccount(id) {
+  try { await api('DELETE', '/accounts/' + id); toast('Removed'); refreshAccounts(); }
+  catch(e) { toast(e.message, 'error'); }
+}
+
+// ---- Harness upload ----
+async function uploadHarness() {
+  try {
+    const r = await api('POST', '/jobs/harness', {
+      filename: document.getElementById('hFile').value.trim(),
+      class_name: document.getElementById('hClass').value.trim(),
+      content: document.getElementById('hCode').value});
+    document.getElementById('jHarnessRef').value = r.harness_ref;
+    toast('Harness uploaded');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// ---- Job submit ----
+function buildEnv() {
+  const env = {};
+  for (const l of lines('jEnv')) { const i = l.indexOf('='); if (i > 0) env[l.slice(0,i)] = l.slice(i+1); }
+  return env;
+}
+async function submitJob() {
+  const ref = document.getElementById('jHarnessRef').value.trim();
+  const spec = {
+    name: document.getElementById('jName').value.trim() || 'job',
+    setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup')},
+    run: {command: document.getElementById('jRun').value.trim(),
+          cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
+    account: {mode: document.getElementById('jAcctMode').value,
+              group: document.getElementById('jAcctGroup').value.trim() || 'standard',
+              config_dir: document.getElementById('jConfigDir').value.trim()},
+    rotation: {strategy: document.getElementById('jRot').value,
+               resume_args: document.getElementById('jResume').value.trim()},
+    fanout: {workers: parseInt(document.getElementById('jWorkers').value) || 1,
+             shard_by: document.getElementById('jShard').value},
+  };
+  if (ref) spec.harness_ref = ref;
+  try { const j = await api('POST', '/jobs', spec);
+    toast('Launched ' + j.job_id); refreshJobs(); }
+  catch(e) { toast(e.message, 'error'); }
+}
+
+// ---- Jobs monitor ----
+function badge(p) { return `<span class="badge b-${p}">${p}</span>`; }
+async function refreshJobs() {
+  try {
+    const d = await api('GET', '/jobs');
+    const jobs = d.jobs || [];
+    if (!jobs.length) { document.getElementById('jobsList').innerHTML = '<p class="muted">No jobs yet.</p>'; }
+    else {
+      const details = await Promise.all(jobs.map(j => api('GET', '/jobs/' + j.job_id)));
+      document.getElementById('jobsList').innerHTML = details.map(j => `
+        <div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
+          <b>${j.name}</b> <span class="muted">${j.job_id}</span> ·
+          ${Object.entries(j.phases).map(([p,n]) => badge(p)+' '+n).join(' ')}
+          <details><summary class="muted">${j.workers_detail.length} workers</summary>
+          <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
+            <th>account</th><th>rot</th><th>error</th></tr></thead><tbody>
+          ${j.workers_detail.map(w => `<tr><td>${w.shard_index}</td>
+            <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
+            <td>${w.account_email||'--'}</td><td>${w.rotations}</td>
+            <td class="muted">${w.error||''}</td></tr>`).join('')}
+          </tbody></table></details>
+        </div>`).join('');
+    }
+    document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
+  } catch(e) { /* silent */ }
+}
+
+refreshAccounts(); refreshJobs();
+setInterval(refreshJobs, 5000);
+</script>
+</body>
+</html>
+"""
+
+
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard():
     """Serve the Elastic-Agent dashboard UI."""
@@ -343,3 +603,9 @@ async def dashboard():
 async def dashboard_alt():
     """Alias for the dashboard."""
     return HTMLResponse(content=_DASHBOARD_HTML)
+
+
+@router.get("/batch", response_class=HTMLResponse, include_in_schema=False)
+async def batch_console():
+    """Serve the Batch Console (accounts, job submission, job monitor)."""
+    return HTMLResponse(content=_BATCH_HTML)

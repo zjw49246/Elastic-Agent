@@ -309,6 +309,8 @@ class WorkerConnectionManager:
         env: dict[str, str] | None = None,
         timeout: int | None = None,
         agent_params: dict | None = None,
+        job_id: str | None = None,
+        watch_exhaustion: bool = False,
     ) -> None:
         await self.send_command(worker_id, ExecuteMessage(
             task_id=task_id,
@@ -317,6 +319,8 @@ class WorkerConnectionManager:
             env=env or {},
             timeout=timeout,
             agent_params=agent_params,
+            job_id=job_id,
+            watch_exhaustion=watch_exhaustion,
         ))
 
     async def stop_process(self, worker_id: str, task_id: str, sig: str = "SIGTERM") -> None:

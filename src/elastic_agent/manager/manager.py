@@ -59,6 +59,16 @@ class ElasticAgentManager:
         self.registry = NodeRegistry(config.registry.path)
         self.event_bus = EventBus()
         self.connection_manager = WorkerConnectionManager(self.registry)
+
+        # Frontend-editable account pool + batch fan-out orchestrator (lazy).
+        from pathlib import Path as _Path
+
+        from elastic_agent.core.account_store import AccountStore
+
+        self.account_store = AccountStore(
+            str(_Path(config.registry.path).with_name("accounts.json"))
+        )
+        self._batch: Any = None
         self.reconciler = CloudReconciler(
             provider=provider,
             registry=self.registry,
@@ -101,6 +111,7 @@ class ElasticAgentManager:
     async def start(self) -> None:
         await self.registry.load()
         await self.task_registry.load()
+        await self.account_store.load()
 
         online_workers = set(self.connection_manager.connected_workers)
         await self.task_registry.recover(online_workers)
@@ -119,6 +130,28 @@ class ElasticAgentManager:
     # ------------------------------------------------------------------
     # Node operations
     # ------------------------------------------------------------------
+
+    @property
+    def batch(self):
+        """Lazily-built BatchOrchestrator bound to this Manager.
+
+        Provision/login hooks are left unset here (see ManagerFleetDriver); a
+        deployment that runs live batch jobs wires them via
+        ``configure_batch(provision_hook=..., login_hook=...)``.
+        """
+        if self._batch is None:
+            from elastic_agent.core.batch_orchestrator import BatchOrchestrator
+            from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+            self._batch = BatchOrchestrator(ManagerFleetDriver(self))
+        return self._batch
+
+    def configure_batch(self, *, provision_hook=None, login_hook=None,
+                        scale_in_on_complete: bool = False) -> None:
+        """Wire the batch orchestrator with live provision/login hooks."""
+        from elastic_agent.core.batch_orchestrator import BatchOrchestrator
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+        driver = ManagerFleetDriver(self, provision_hook=provision_hook, login_hook=login_hook)
+        self._batch = BatchOrchestrator(driver, scale_in_on_complete=scale_in_on_complete)
 
     async def scale_out(
         self,
