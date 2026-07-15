@@ -119,3 +119,16 @@
 **经验教训（换号竞态）**：worker 撞限流 → 先发 `RUN_EXHAUSTED` → 再 SIGINT 产生 `PROCESS_EXIT`。Manager 先处理 exhausted（换号+重派，相位已从 ROTATING 转回 RUNNING），随后陈旧的 `PROCESS_EXIT`（非零）到达——若只靠 `ROTATING` 相位守卫会把**刚重派的新 run 误判 FAILED**。**修复：`on_worker_exit` 用 `task_id` 匹配当前 `run.task_id`，旧 run 的退出 task_id 不匹配即丢弃。** 这是 recover-then-failed 家族问题的又一实例（对照 PTY 侧 orphan/autonomous 守卫）——凡「中断+重启」路径都要用稳定标识区分「旧实例的尾声」和「新实例的结果」，别用会被重置的相位。
 
 **仍待真机验**：浏览器登录链路、瞬时 429/限流重启、Mode B 撞限流换号，沙箱无法端到端（无 Chrome/账号/真 429）。`manager_url` 需经 `ELASTIC_AGENT_MANAGER_URL` 或 `config.server` 给对；ssh key 路径按 provider.type 取。全 unit 32F/76E 与基线一致，passed→1206。
+
+## 2026-07-15 真机测试（EC2 elastic-agent-test，Ubuntu 26.04）：worker 本地登录跑通 + 修依赖 bug
+
+**环境**：本 sandbox 本身是 EC2（Manager 角色）。在同 VPC/subnet/SG 开一台 `elastic-agent-test`（t3.large, Ubuntu 26.04, key interview-key），私网直连。
+
+**验证结果（全绿）**：
+- 装依赖（xvfb/xdotool/google-chrome 150/node22/claude 2.1.181/httpx/websockets）Ubuntu 26.04 干净装上。
+- worker 本地登录（P3 代码路径 `perform_login`）：171mail API 接码（send+poll magic link，200）→ Chrome CDP OAuth 全流程 → CLI `Login successful` exit 0 → 写出 `.credentials.json`（claudeAiOauth: accessToken/refreshToken/expiresAt/subscriptionType=max/rateLimitTier=default_claude_max_20x）。
+- 凭证可用：`CLAUDE_CONFIG_DIR=... claude -p` 真跑一 turn 返回预期文本，exit 0。
+
+**发现并修复的真 bug（commit 1049118）**：`credential_login_deps_step` 原装 playwright/chromium/mitmproxy，但 vendored CCM 登录代码 exec 的是**真 `google-chrome` 二进制 + xdotool**，根本不用 playwright。若走框架标准 bootstrap 再登录会 `google-chrome not found` 必失败。改为装 xvfb+xdotool+google-chrome-stable(.deb)+httpx+websockets；`config.login_dependencies` 默认改空（仅额外 pip 包）。**教训：vendor 上游脚本时，必须连它的系统依赖一起对齐，别沿用旧 bootstrap 的 deps 假设——单测测不出二进制缺失，真机一测即现。**
+
+**仍未真机验**：完整 Manager↔worker WS + ACCOUNT_LOGIN over WS + 批量编排 e2e（需在 worker 上装本分支而非 PyPI 版 elastic-agent，且 Manager 端口对 worker 开放）；瞬时 429/Mode B 撞限流换号。
