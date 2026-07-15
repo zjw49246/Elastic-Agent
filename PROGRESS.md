@@ -14,7 +14,24 @@
 
 **测试**：`tests/unit/test_pty_backend.py` 63 passed（含 3 个新 orphan/autonomous 回归 + 2 个新 classify）；PTY 相关子集（pty_backend/worker_runtime/task_router/protocol/agent_type/bootstrap_steps）208 passed。
 
-**待续（P2/P3）**：瞬时过载同号退避重试、限速 actionability + assistant 文本兜底、worker 自治登录（协议下发 email+接码token）、hardlink 会话迁移保温热会话、首启 warmup、前端批次编排。
+**待续（P2/P3）**：瞬时过载同号退避重试、限速 actionability + assistant 文本兜底、hardlink 会话迁移保温热会话、首启 warmup、前端批次编排。
+
+**Commit**: 见本节合入的 commit。
+
+## 2026-07-15 自动登录同步成 CCM 版本 · worker 本地登录（task-ccm-sync）
+
+**背景**：用户要求「凭证在 worker 那里登录，Manager 只管 email+接码token 分配」，且「自动登录逻辑同步成 CCM 版本」。原 `claude_oauth.py` 是 Manager 侧经 SSH 反向驱动 worker 上 Chrome 的 CDP 状态机（自研 `_CDPClient` + 只支持 171mail）；CCM 的 `auto_login.py`+`cdp_login.py` 是 **worker 本地自洽**脚本（纯 Chrome CDP、多后端接码、按域名自动选），更贴合意图。
+
+**做了什么**：
+1. **Vendored** CCM 的 `auto_login.py`+`cdp_login.py` 到 `src/elastic_agent/worker/login/`（near-verbatim，只把 CCM 特定硬编码参数化：`CLAUDE_MAILCATCHER_URL`/`CLAUDE_171MAIL_URL`/`CLAUDE_SETTINGS_EXTRA_DIRS`——原来写死了 `mail.claude-code-manager.com` 和 `/home/ubuntu/Claude-Code-Manager`）。
+2. **重写 `ClaudeOAuthProvider`** 为薄壳：删掉自研 `_CDPClient` + 全部 Manager 侧 CDP/接码/CF 机器（~850 行），改为委派给 vendored `perform_login`——`worker_host` 有值时经 SSH 在 worker 上跑 `python -m elastic_agent.worker.login.auto_login`（脚本起 Xvfb:99），无值时进程内直跑；登录后读回凭证填 `LoginResult`。**保留**所有被 quota_checker/runtime 依赖的模块级符号（`refresh_access_token`/`read_credentials`/`write_credentials`/`OAUTH_CLIENT_ID`/`ANTHROPIC_USAGE_URL`）和 `OAuthConfig`(+`provider` 字段)/`LoginResult` 契约 → `CredentialLoginService/Step` 零改动。
+
+**遇到的坑 / 注意**：
+- `httpx`+`websockets` 已是顶层依赖，vendored 脚本无需加依赖；`mitmproxy`/`playwright` 仅在函数内 lazy import + `from __future__ import annotations` 使类型注解不求值，故 worker 无须装它们（当前 CDP 路径也不用）。
+- 删内部方法后 `test_claude_oauth.py`/`test_oauth_race_and_retry.py` 有 18 个测旧 CDP 内部的用例失效——已重写为委派契约测试（local 成功/失败/无凭证/超时/provider 传递、remote 构造 worker 命令 + SSH 失败透传）+ 删 3 个测已删内部方法的用例。顺带修 `test_defaults` 的 stale 断言（login_timeout 240→480）。
+- **未在本沙箱端到端验证浏览器登录**（无 Chrome/真账号/接码可达）；风险集中在 vendored 的 CCM 已验证代码，我方胶水（SSH invoke + LoginResult 映射）已单测覆盖。**合并前需在真 worker 上验证一次真登录**。
+
+**测试**：`test_claude_oauth.py` 24 passed、OAuth+credential+quota 子集 59 passed；全 unit 套件 1074 passed，失败/错误全部是既有环境性（fastapi/DryRunProvider abstract/reconnect timing），与本改动无关（均不 import 改动模块）。
 
 **Commit**: 见本节合入的 commit。
 

@@ -12,93 +12,6 @@ from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, LoginResult, OA
 from elastic_agent.core.credential_login_service import CredentialLoginService, CredentialSlot
 
 
-class _SentinelReached(Exception):
-    pass
-
-
-class _FakeCDP:
-    """CDP stub: email input never renders; URL flips to /new mid-retry.
-
-    Reproduces the production race — slot N>1 logs in via the browser's
-    existing session, /login redirects to /new only after the initial
-    already_logged_in check has run.
-    """
-
-    def __init__(self):
-        self.url_calls = 0
-
-    async def send(self, *a, **k):
-        return {}
-
-    async def navigate(self, *a, **k):
-        return {}
-
-    async def close(self):
-        pass
-
-    async def evaluate(self, expr):
-        if "document.location.href" in expr:
-            self.url_calls += 1
-            # First check (pre-email): still on /login (redirect in flight)
-            return "https://claude.ai/login" if self.url_calls == 1 else "https://claude.ai/new"
-        if "input" in expr.lower() or "email" in expr.lower():
-            return "no email input"
-        return ""
-
-
-@pytest.mark.asyncio
-async def test_logged_in_redirect_during_email_retry_recovers():
-    provider = ClaudeOAuthProvider()
-    config = OAuthConfig(
-        account_id="acc-1", email="a@b.c", email_token="tok",
-        config_dir="/tmp/x",
-    )
-    fake_cdp = _FakeCDP()
-
-    with patch.object(provider, "_launch_chrome", new=AsyncMock(return_value=(MagicMock(), 12345))), \
-         patch.object(provider, "_connect_cdp", new=AsyncMock(return_value=fake_cdp)), \
-         patch.object(provider, "_handle_cloudflare", new=AsyncMock(return_value=True)), \
-         patch.object(provider, "_launch_cli_auth", new=AsyncMock(side_effect=_SentinelReached("REACHED_CLI_AUTH"))), \
-         patch.object(provider, "_cleanup", new=AsyncMock(), create=True), \
-         patch("asyncio.sleep", new=AsyncMock()):
-        result = await provider.login(config)
-
-    # The race fix must carry us past the email step (no "Email input field
-    # not found" failure) all the way to the CLI-auth stage.
-    assert not result.success
-    assert "REACHED_CLI_AUTH" in (result.error or "")
-    assert "Email input" not in (result.error or "")
-
-
-@pytest.mark.asyncio
-async def test_email_failure_error_includes_page_diagnostics():
-    provider = ClaudeOAuthProvider()
-    config = OAuthConfig(
-        account_id="acc-1", email="a@b.c", email_token="tok",
-        config_dir="/tmp/x",
-    )
-
-    class _StuckCDP(_FakeCDP):
-        async def evaluate(self, expr):
-            if "document.location.href" in expr:
-                return "https://claude.ai/login"  # never redirects
-            if "document.title" in expr:
-                return "Just a moment..."
-            return "no email input"
-
-    with patch.object(provider, "_launch_chrome", new=AsyncMock(return_value=(MagicMock(), 12345))), \
-         patch.object(provider, "_connect_cdp", new=AsyncMock(return_value=_StuckCDP())), \
-         patch.object(provider, "_handle_cloudflare", new=AsyncMock(return_value=True)), \
-         patch("asyncio.sleep", new=AsyncMock()):
-        result = await provider.login(config)
-
-    assert not result.success
-    assert "Email input field not found" in result.error
-    # Diagnostics: where the page actually was
-    assert "claude.ai/login" in result.error
-    assert "Just a moment" in result.error
-
-
 def _make_service(provider, accounts, statuses):
     pool = MagicMock()
     pool._accounts_config.accounts = accounts
@@ -178,21 +91,6 @@ class _FakeProc:
 
     async def communicate(self):
         return self._stdout, b""
-
-
-@pytest.mark.asyncio
-async def test_171mail_numeric_code_falls_back_to_body_link():
-    provider = ClaudeOAuthProvider()
-    link = "https://claude.ai/magic-link#abc123"
-    provider._http_get = AsyncMock(return_value={
-        "code": 200,
-        "data": {
-            "code": 200,
-            "body": f"Click here: {link}",
-        },
-    })
-
-    assert await provider._poll_magic_link("tok") == link
 
 
 class TestCredentialValidity:

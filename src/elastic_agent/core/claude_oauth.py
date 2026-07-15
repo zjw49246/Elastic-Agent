@@ -1,33 +1,35 @@
-"""ClaudeOAuthProvider — OAuth auto-login on Worker via 171mail + Chrome CDP + xdotool.
+"""ClaudeOAuthProvider — Claude account auto-login, synced to CCM's version.
 
-Uses real Chrome + CDP for navigation/JS + xdotool for Cloudflare checkbox.
-Calls authorize API directly via CDP fetch(), bypassing Turnstile entirely.
+The browser+CDP+接码 flow lives in the vendored, worker-local login module
+``elastic_agent.worker.login`` (near-verbatim from CCM's proven
+``auto_login.py`` + ``cdp_login.py``): Chrome CDP drives the OAuth authorize
+call directly (no Playwright/mitmproxy), with multi-backend magic-link 接码
+(171mail API for most domains, a mail relay / mail.com web-login for
+mail.com-family accounts, auto-selected by email domain).
 
-Flow (Chrome-first to establish CF cookies before magic link):
-  1. Chrome CDP: visit login page → xdotool clicks CF checkbox → cookies set
-  2. Detect already-logged-in (edit slots reusing session) → skip to step 7
-  3. Enter email on login page → click "Continue with email"
-  4. 171mail: trigger magic link email → poll for magic link URL
-  5. Chrome CDP: navigate to magic link (CF cookies already set) → get 6-digit code
-  6. Chrome CDP: login page → re-enter email + code → establish session
-  7. CLI: launch `claude auth login` → extract OAuth URL
-  8. Chrome CDP: navigate to OAuth URL → call authorize API → code#state
-  9. Feed code#state to CLI stdin → credentials written
+``ClaudeOAuthProvider`` is the thin orchestration wrapper the Manager's
+credential layer talks to. It keeps the ``OAuthConfig -> LoginResult`` contract
+but no longer implements the browser flow itself — it runs the vendored login
+on the machine that owns the config_dir:
+  - ``worker_host is None`` → in-process (this machine is the worker).
+  - ``worker_host`` set → ``python -m elastic_agent.worker.login.auto_login``
+    over SSH on the worker (Manager triggers, worker executes; the credential
+    file never transits the Manager — it is written and stays on the worker).
+
+Shared helpers (``refresh_access_token``, ``write_credentials``,
+``read_credentials``, ``OAUTH_CLIENT_ID``, ``ANTHROPIC_USAGE_URL``) are still
+imported by the worker runtime and quota checker and are unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import logging
-import os
-import re
+import shlex
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -36,137 +38,6 @@ MAIL_API_BASE = "https://b.171mail.com/api/v1"
 ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 ANTHROPIC_ACCOUNT_URL = "https://claude.ai/api/account"
-
-MAGIC_LINK_POLL_INTERVAL = 2.0
-MAGIC_LINK_TIMEOUT = 90.0
-
-CDP_PORT = 9222
-_LOCAL_PORT_COUNTER = itertools.count(19222)
-CHROME_PROFILE_DIR = "/tmp/chrome-cdp-oauth"
-
-# Cloudflare "Verify you are human" checkbox position at 1365x900
-CF_CHECKBOX_X = 257
-CF_CHECKBOX_Y = 476
-
-# JS to extract org UUID from page APIs first. This is more stable than
-# depending on React fiber field names on the OAuth authorize page.
-_JS_FETCH_ACCOUNT_ORG_UUID = """(async function(){
-function looksUuid(v){return typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)}
-function findOrgUuid(root){
-  var seen=new Set();
-  function scan(v,depth){
-    if(!v||depth>8)return null;
-    if(typeof v!=="object")return null;
-    if(seen.has(v))return null;
-    seen.add(v);
-    if(v.organization&&looksUuid(v.organization.uuid))return v.organization.uuid;
-    if(v.organization_uuid&&looksUuid(v.organization_uuid))return v.organization_uuid;
-    for(var key of ["memberships","organizations","organization","account","user","data","results"]){
-      if(Object.prototype.hasOwnProperty.call(v,key)){
-        var r=scan(v[key],depth+1);if(r)return r;
-      }
-    }
-    if(v.uuid&&!v.email_address&&(v.settings||v.name||v.organization_type||v.billing_type))return v.uuid;
-    if(Array.isArray(v)){
-      for(var item of v){var r=scan(item,depth+1);if(r)return r;}
-      return null;
-    }
-    for(var k in v){var r=scan(v[k],depth+1);if(r)return r;}
-    return null;
-  }
-  return scan(root,0);
-}
-for(var url of ["/api/account","/api/organizations"]){
-  try{
-    var r=await fetch(url,{credentials:"include",headers:{"Accept":"application/json"}});
-    if(!r.ok)continue;
-    var data=await r.json();
-    var org=findOrgUuid(data);
-    if(org)return org;
-  }catch(e){}
-}
-return null;
-})()"""
-
-# JS fallback to extract org UUID from React fiber / hydrated page state.
-_JS_EXTRACT_ORG_UUID = """(function(){
-function looksUuid(v){return typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)}
-function findOrgUuid(root){
-  var seen=new Set();
-  function scan(v,depth){
-    if(!v||depth>10)return null;
-    if(typeof v!=="object")return null;
-    if(seen.has(v))return null;
-    seen.add(v);
-    if(v.organization&&looksUuid(v.organization.uuid))return v.organization.uuid;
-    if(v.organization_uuid&&looksUuid(v.organization_uuid))return v.organization_uuid;
-    for(var key of ["memoizedState","pendingProps","memoizedProps","stateNode","return","child","sibling","memberships","organizations","organization","account","user","data","props","pageProps"]){
-      if(Object.prototype.hasOwnProperty.call(v,key)){
-        var r=scan(v[key],depth+1);if(r)return r;
-      }
-    }
-    if(v.uuid&&!v.email_address&&(v.settings||v.name||v.organization_type||v.billing_type))return v.uuid;
-    if(Array.isArray(v)){
-      for(var item of v){var r=scan(item,depth+1);if(r)return r;}
-      return null;
-    }
-    return null;
-  }
-  return scan(root,0);
-}
-var nodes=[...document.querySelectorAll("button,main,body,[data-testid]")];
-for(var node of nodes){
-  for(var key of Object.keys(node)){
-    if(key.startsWith("__reactFiber")||key.startsWith("__reactProps")){
-      var r=findOrgUuid(node[key]);
-      if(r)return r;
-    }
-  }
-}
-if(window.__NEXT_DATA__){
-  var next=findOrgUuid(window.__NEXT_DATA__);
-  if(next)return next;
-}
-return null;
-})()"""
-
-# JS to set an input value via React-compatible dispatch
-_JS_SET_INPUT = """(function(){{
-var inputs=[...document.querySelectorAll('input[type={type}]')].filter(i=>i.offsetParent!==null);
-if(!inputs.length)return 'no {type} input';
-var inp=inputs[0];
-var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-s.call(inp,'{value}');
-inp.dispatchEvent(new Event('input',{{bubbles:true}}));
-inp.dispatchEvent(new Event('change',{{bubbles:true}}));
-return 'set';
-}})()"""
-
-# JS to click a button by text content
-_JS_CLICK_BTN = """(function(){{
-var btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent!==null);
-for(var b of btns){{var t=b.textContent.trim();if({condition}){{b.click();return 'clicked:'+t}}}}
-return 'no match';
-}})()"""
-
-# JS to enter 6-digit verification code
-_JS_ENTER_CODE = """(function(){{
-var code="{code}";
-var inputs=[...document.querySelectorAll('input')].filter(i=>i.offsetParent!==null);
-if(inputs.length>=6){{
-  for(var i=0;i<code.length&&i<inputs.length;i++){{
-    inputs[i].focus();
-    var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-    s.call(inputs[i],code[i]);
-    inputs[i].dispatchEvent(new Event('input',{{bubbles:true}}));
-    inputs[i].dispatchEvent(new Event('change',{{bubbles:true}}));
-  }}
-  return 'entered '+code.length+' digits';
-}}
-var inp=inputs.find(i=>i.type!=='email')||inputs[0];
-if(inp){{var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(inp,code);inp.dispatchEvent(new Event('input',{{bubbles:true}}));return 'entered single'}}
-return 'no inputs';
-}})()"""
 
 
 @dataclass
@@ -194,852 +65,157 @@ class OAuthConfig:
     worker_host: str | None = None
     ssh_key_path: str = "/root/.ssh/elastic-agent-aliyun.pem"
     ssh_user: str = "root"
+    # "171mail" (API 接码) or "mailcom" (Chrome 接码). Auto-detected from the
+    # email domain when None.
+    provider: str | None = None
 
 
-class _CDPClient:
-    """Minimal async Chrome DevTools Protocol client over WebSocket."""
+def resolve_provider(config: OAuthConfig) -> str:
+    """Pick the magic-link backend: explicit ``config.provider`` wins, else
+    auto-detect (mail.com-family → mailcom, everything else → 171mail)."""
+    if config.provider in ("171mail", "mailcom"):
+        return config.provider
+    from elastic_agent.worker.login import is_mailcom_domain
 
-    def __init__(self, ws_url: str):
-        self._ws_url = ws_url
-        self._ws = None
-        self._session = None
-        self._id = 0
-        self._pending: dict[int, asyncio.Future] = {}
-        self._reader_task = None
-
-    async def connect(self):
-        import aiohttp
-        self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(self._ws_url, max_msg_size=10 * 1024 * 1024)
-        self._reader_task = asyncio.create_task(self._reader())
-
-    async def _reader(self):
-        import aiohttp
-        try:
-            async for msg in self._ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    mid = data.get("id")
-                    if mid and mid in self._pending:
-                        self._pending[mid].set_result(data)
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
-        except Exception:
-            pass
-
-    async def send(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
-        self._id += 1
-        msg_id = self._id
-        future = asyncio.get_event_loop().create_future()
-        self._pending[msg_id] = future
-        await self._ws.send_json({"id": msg_id, "method": method, "params": params or {}})
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        finally:
-            self._pending.pop(msg_id, None)
-
-    async def evaluate(self, expression: str, timeout: float = 30) -> Any:
-        """Evaluate JS expression and return the result value."""
-        r = await self.send("Runtime.evaluate", {
-            "expression": expression,
-            "awaitPromise": True,
-            "returnByValue": True,
-        }, timeout=timeout)
-        exc = r.get("result", {}).get("exceptionDetails")
-        if exc:
-            logger.debug("CDP eval exception: %s", str(exc)[:200])
-            return None
-        return r.get("result", {}).get("result", {}).get("value")
-
-    async def navigate(self, url: str) -> dict:
-        return await self.send("Page.navigate", {"url": url})
-
-    async def close(self):
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if self._ws:
-            await self._ws.close()
-        if self._session:
-            await self._session.close()
+    return "mailcom" if is_mailcom_domain(config.email) else "171mail"
 
 
 class ClaudeOAuthProvider:
-    """Executes OAuth login flow on a Worker.
+    """Runs the vendored worker-local login flow and adapts it to LoginResult.
 
-    Uses real Chrome + CDP for navigation/JS evaluation,
-    xdotool for Cloudflare checkbox clicks,
-    and direct authorize API call to bypass Turnstile.
+    The heavy lifting (Chrome, CDP, Cloudflare, 接码, OAuth authorize) is the
+    vendored CCM implementation in ``elastic_agent.worker.login``. This class
+    only chooses where to run it (locally vs. on the worker over SSH) and reads
+    back the credentials it writes.
     """
 
     def __init__(self, http_client: Any | None = None):
         self._http_client = http_client
-        self._lock_files: dict[str, Any] = {}
-        self._current_config: OAuthConfig | None = None
 
     async def login(self, config: OAuthConfig) -> LoginResult:
-        """Execute the full OAuth login flow.
-
-        Flow: Chrome → login page → CF cookies → detect already-logged-in →
-        (if not) email + magic link → verification code → session → CLI OAuth.
-        """
-        account_id = config.account_id
-        logger.info("ClaudeOAuthProvider: starting login for %s", account_id)
-
-        self._current_config = config
-        chrome_process = None
-        cli_process = None
-        cdp = None
-        local_port = None
-        lock_path = None
-
-        try:
-            # Step 1: File lock (remote if worker_host set)
-            if config.worker_host:
-                await self._ssh_exec(
-                    config,
-                    f"mkdir -p {config.config_dir}",
-                    timeout=10,
-                )
-            else:
-                lock_path = Path(config.config_dir) / f".login_lock_{account_id}"
-                lock_path.parent.mkdir(parents=True, exist_ok=True)
-                await self._acquire_lock(lock_path)
-
-            # Step 2: Launch Chrome first, visit login page to establish CF cookies
-            chrome_process, local_port = await self._launch_chrome(config)
-            cdp = await self._connect_cdp(local_port)
-            await cdp.send("Page.enable")
-            logger.info("Chrome + CDP connected")
-
-            # Step 3: Visit login page and pass CF challenge
-            await cdp.navigate("https://claude.ai/login")
-            await asyncio.sleep(3)
-            cf_passed = await self._handle_cloudflare(cdp, "login page", config=config)
-            if not cf_passed:
-                return LoginResult(
-                    success=False, account_id=account_id,
-                    error="Cloudflare challenge failed on login page",
-                )
-            await asyncio.sleep(2)
-
-            # Check if already logged in (e.g. edit slot reusing browser session)
-            current_url = await cdp.evaluate("document.location.href") or ""
-            current_path = urlparse(current_url).path.rstrip("/")
-            already_logged_in = current_path in ("/new", "/chat", "/recents", "")
-
-            if already_logged_in:
-                logger.info("Already logged in at %s, skipping email+magic link", current_url[:80])
-            else:
-                # Step 4: Enter email with retry
-                email_entered = False
-                for attempt in range(8):
-                    r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
-                    logger.info("Email input (attempt %d): %s", attempt + 1, r)
-                    if r and r != "no email input":
-                        email_entered = True
-                        break
-                    # All slots on a machine share one account and browser
-                    # profile, so /login redirects to /new when a previous
-                    # slot already logged in — and that redirect races the
-                    # already_logged_in check above (the slow CF path used
-                    # to mask it). Re-check the URL instead of hunting for
-                    # an email input that will never render.
-                    cur = await cdp.evaluate("document.location.href") or ""
-                    if urlparse(cur).path.rstrip("/") in ("/new", "/chat", "/recents", ""):
-                        already_logged_in = True
-                        logger.info(
-                            "Logged-in redirect landed at %s during email retry, "
-                            "skipping email+magic link", cur[:80],
-                        )
-                        break
-                    await asyncio.sleep(2)
-
-                if not email_entered and not already_logged_in:
-                    # Dump where the page actually is — bare "input not
-                    # found" was undiagnosable (CF interstitial? redirect?).
-                    cur = await cdp.evaluate("document.location.href") or ""
-                    title = await cdp.evaluate("document.title") or ""
-                    return LoginResult(
-                        success=False, account_id=account_id,
-                        error=(
-                            "Email input field not found after retries "
-                            f"(url={cur[:120]}, title={title[:80]})"
-                        ),
-                    )
-
-            if not already_logged_in:
-                await asyncio.sleep(0.5)
-                r = await cdp.evaluate(
-                    _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
-                )
-                logger.info("Email button: %s", r)
-                await asyncio.sleep(3)
-
-                # Step 5: Trigger magic link via 171mail API
-                send_result = await self._send_magic_link(config.email)
-                if send_result.get("code") != 200:
-                    return LoginResult(
-                        success=False, account_id=account_id,
-                        error=f"Failed to send magic link: {send_result.get('message', 'unknown')}",
-                    )
-                logger.info("Magic link email triggered for %s", config.email)
-
-                # Step 6: Poll for magic link URL
-                magic_link = await self._poll_magic_link(config.email_token)
-                if magic_link is None:
-                    return LoginResult(
-                        success=False, account_id=account_id,
-                        error="Timed out waiting for magic link",
-                    )
-                logger.info("Got magic link: %s...", magic_link[:60])
-
-                # Step 7: Navigate to magic link (CF cookies already established)
-                try:
-                    await cdp.navigate(magic_link)
-                except Exception:
-                    logger.warning("CDP connection lost during magic link nav, reconnecting...")
-                    await cdp.close()
-                    cdp = await self._connect_cdp(local_port)
-                    await cdp.send("Page.enable")
-                    await cdp.navigate(magic_link)
-
-                await asyncio.sleep(3)
-                await self._handle_cloudflare(cdp, "magic link", config=config)
-
-                # Poll for verification code or auto-redirect
-                verify_code = None
-                session_established = False
-                for poll_attempt in range(10):
-                    await asyncio.sleep(3)
-                    url = await cdp.evaluate("document.location.href") or ""
-                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
-                    logger.info("Magic link poll %d — URL: %s, body: %s",
-                                poll_attempt + 1, url[:80], body[:120])
-
-                    parsed_path = urlparse(url).path.rstrip("/")
-                    if parsed_path in ("/new", "/chat", "/recents", "") and "magic-link" not in url:
-                        session_established = True
-                        break
-
-                    m = re.search(r'(\d{6})', body)
-                    if m:
-                        verify_code = m.group(1)
-                        break
-
-                    if "loading" not in body.lower() and body.strip():
-                        break
-
-                if not session_established and not verify_code:
-                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 500)") or ""
-                    m = re.search(r'(\d{6})', body)
-                    if m:
-                        verify_code = m.group(1)
-                    else:
-                        return LoginResult(
-                            success=False, account_id=account_id,
-                            error="No verification code or auto-login after magic link",
-                        )
-
-                if not session_established:
-                    logger.info("Verification code: %s", verify_code)
-
-                    # Navigate back to login page to enter code
-                    await cdp.navigate("https://claude.ai/login")
-                    await asyncio.sleep(3)
-                    await self._handle_cloudflare(cdp, "login return", config=config)
-                    await asyncio.sleep(3)
-
-                    for attempt in range(5):
-                        r = await cdp.evaluate(_JS_SET_INPUT.format(type="email", value=config.email))
-                        if r and r != "no email input":
-                            break
-                        await asyncio.sleep(2)
-
-                    await asyncio.sleep(0.5)
-                    r = await cdp.evaluate(
-                        _JS_CLICK_BTN.format(condition="t.includes('Continue with email')")
-                    )
-                    logger.info("Email button re-click: %s", r)
-                    await asyncio.sleep(8)
-
-                    url = await cdp.evaluate("document.location.href") or ""
-                    body = await cdp.evaluate("document.body?.innerText?.substring(0, 200)") or ""
-                    logger.info("After email re-submit — URL: %s, body: %s", url[:80], body[:80])
-
-                    if any(w in body.lower() for w in ("verification", "code", "check")):
-                        r = await cdp.evaluate(_JS_ENTER_CODE.format(code=verify_code))
-                        logger.info("Code entry: %s", r)
-                        await asyncio.sleep(1)
-
-                        r = await cdp.evaluate(
-                            _JS_CLICK_BTN.format(
-                                condition="!t.includes('Google')&&!t.includes('SSO')&&(t.includes('Verify')||t.includes('Continue')||t.includes('Submit')||b.type==='submit')"
-                            )
-                        )
-                        logger.info("Verify button: %s", r)
-                        await asyncio.sleep(10)
-                else:
-                    logger.info("Magic link auto-login succeeded, session already established")
-
-            # Step 8: Launch CLI auth login
-            cli_process = await self._launch_cli_auth(config)
-
-            # Step 9: Extract OAuth authorize URL
-            authorize_url = await self._extract_authorize_url(cli_process, timeout=30)
-            if authorize_url is None:
-                return LoginResult(
-                    success=False, account_id=account_id,
-                    error="Failed to extract OAuth authorize URL from CLI",
-                )
-            logger.info("OAuth URL: %s...", authorize_url[:80])
-
-            # Step 10: Navigate to OAuth URL → click CF → call authorize API
-            await cdp.navigate(authorize_url)
-            await asyncio.sleep(3)
-            await self._handle_cloudflare(cdp, "OAuth", config=config)
-            await asyncio.sleep(8)
-
-            body = await cdp.evaluate("document.body?.innerText?.substring(0, 100)")
-            logger.info("OAuth page: %s", (body or "")[:80])
-
-            # Step 11: Extract org UUID and call authorize API directly
-            code_state = await self._cdp_authorize(cdp, authorize_url)
-            if code_state is None:
-                return LoginResult(
-                    success=False, account_id=account_id,
-                    error="CDP authorize failed",
-                )
-            logger.info("Got code#state (%d chars)", len(code_state))
-
-            # Step 12: Feed code#state to CLI stdin
-            cli_process.stdin.write(f"{code_state}\n".encode())
-            await cli_process.stdin.drain()
-            cli_process.stdin.close()
-
-            # Step 13: Wait for CLI to complete
-            await self._wait_cli_complete(cli_process, timeout=30)
-
-            # Step 14: Verify login
-            creds = await self._read_credentials(config)
-            if creds is None:
-                return LoginResult(
-                    success=False, account_id=account_id,
-                    error="credentials.json not found after login",
-                )
-
-            logger.info("ClaudeOAuthProvider: login successful for %s", account_id)
-            return LoginResult(
-                success=True,
-                account_id=account_id,
-                expires_at=creds.get("expiresAt"),
-                access_token=creds.get("accessToken"),
-                refresh_token=creds.get("refreshToken"),
-            )
-
-        except asyncio.TimeoutError:
-            return LoginResult(
-                success=False, account_id=account_id, error="Login timed out",
-            )
-        except Exception as e:
-            logger.exception("ClaudeOAuthProvider: login failed for %s", account_id)
-            return LoginResult(
-                success=False, account_id=account_id, error=str(e),
-            )
-        finally:
-            if cdp:
-                await cdp.close()
-            if cli_process:
-                await self._kill_process(cli_process)
-            if chrome_process:
-                await self._kill_chrome(chrome_process, config=config)
-            if lock_path:
-                await self._release_lock(lock_path)
-            self._current_config = None
-
-    # -- 171mail helpers ----------------------------------------------------
-
-    async def _send_magic_link(self, email: str) -> dict[str, Any]:
-        """Trigger magic link email via 171mail."""
-        return await self._http_post(
-            f"{MAIL_API_BASE}/claude/send",
-            json_body={"email": email},
+        provider = resolve_provider(config)
+        remote = bool(config.worker_host)
+        logger.info(
+            "ClaudeOAuthProvider: login %s (provider=%s, target=%s)",
+            config.account_id, provider,
+            f"worker:{config.worker_host}" if remote else "local",
         )
 
-    async def _poll_magic_link(self, email_token: str) -> str | None:
-        """Poll 171mail inbox for magic link URL."""
-        start = time.monotonic()
-        while time.monotonic() - start < MAGIC_LINK_TIMEOUT:
-            try:
-                result = await self._http_get(
-                    f"{MAIL_API_BASE}/getClaudeMessage",
-                    params={"token": email_token},
-                )
-                if not isinstance(result, dict):
-                    logger.warning("171mail returned non-dict: %s", type(result))
-                    await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
-                    continue
-                result_data = result.get("data") or {}
-                string_candidates = [
-                    result_data.get("code"),
-                    result_data.get("link"),
-                    result_data.get("magicLink"),
-                    result.get("code"),
-                    result.get("link"),
-                    result.get("magicLink"),
-                ]
-                raw = next((v for v in string_candidates if isinstance(v, str) and v), "")
+        try:
+            if remote:
+                ok, output = await self._login_on_worker(config, provider)
+            else:
+                ok, output = await self._login_local(config, provider)
+        except asyncio.TimeoutError:
+            return LoginResult(
+                success=False, account_id=config.account_id,
+                error=f"login timed out after {config.login_timeout}s",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Login errored for %s", config.account_id)
+            return LoginResult(success=False, account_id=config.account_id, error=str(exc))
 
-                if raw.startswith("https://"):
-                    return raw
-                body = next(
-                    (
-                        v for v in [result_data.get("body"), result.get("body"), raw]
-                        if isinstance(v, str) and v
-                    ),
-                    "",
-                )
-                match = re.search(r'https://claude\.ai/magic-link#\S+', body)
-                if match:
-                    return match.group(0)
-            except Exception as e:
-                logger.warning("171mail poll error (will retry): %s", e)
+        if not ok:
+            return LoginResult(
+                success=False, account_id=config.account_id,
+                error=(output or "auto_login failed").strip()[-500:],
+            )
 
-            await asyncio.sleep(MAGIC_LINK_POLL_INTERVAL)
-        return None
+        oauth = await self._fetch_written_credentials(config)
+        if not oauth or not oauth.get("accessToken"):
+            return LoginResult(
+                success=False, account_id=config.account_id,
+                error="login reported success but no credentials were written",
+            )
+        return LoginResult(
+            success=True,
+            account_id=config.account_id,
+            access_token=oauth.get("accessToken"),
+            refresh_token=oauth.get("refreshToken"),
+            expires_at=oauth.get("expiresAt"),
+        )
 
-    # -- Chrome + CDP methods -----------------------------------------------
+    # -- local: this process runs on the machine that owns config_dir --------
 
-    def _ssh_opts(self, config: OAuthConfig) -> list[str]:
-        """Common SSH options for connecting to Worker."""
-        return [
+    async def _login_local(self, config: OAuthConfig, provider: str) -> tuple[bool, str]:
+        from elastic_agent.worker.login import perform_login
+
+        ok = await asyncio.wait_for(
+            perform_login(
+                email=config.email,
+                token_171=config.email_token,
+                config_dir=config.config_dir,
+                provider=provider,
+            ),
+            timeout=config.login_timeout,
+        )
+        return bool(ok), ""
+
+    # -- remote: Manager triggers, worker executes the vendored CLI over SSH -
+
+    async def _login_on_worker(self, config: OAuthConfig, provider: str) -> tuple[bool, str]:
+        cfg_dir = shlex.quote(config.config_dir)
+        method_arg = f" --login-method {provider}" if provider in ("171mail", "mailcom") else ""
+        # Start a headless X server, then run the vendored login CLI on the
+        # worker. Xvfb + Chrome + xdotool + the CDP flow all live worker-side.
+        script = (
+            "set +e\n"
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+            "pkill -f 'Xvfb :99' 2>/dev/null; sleep 0.5\n"
+            "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac >/dev/null 2>&1 &\n"
+            "sleep 1\n"
+            "export DISPLAY=:99\n"
+            f"mkdir -p {cfg_dir}\n"
+            "python3 -m elastic_agent.worker.login.auto_login"
+            f" --email {shlex.quote(config.email)}"
+            f" --token {shlex.quote(config.email_token)}"
+            f" --config-dir {cfg_dir}{method_arg}\n"
+        )
+        return await self._ssh_run(config, script, timeout=config.login_timeout + 30)
+
+    async def _ssh_run(
+        self, config: OAuthConfig, script: str, timeout: int
+    ) -> tuple[bool, str]:
+        """Run a bash script on the worker via SSH (stdin), return (ok, output)."""
+        ssh_opts = [
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=10",
-            "-o", "LogLevel=ERROR",
-            "-i", config.ssh_key_path,
         ]
-
-    async def _ssh_exec(self, config: OAuthConfig, cmd: str, timeout: int = 30) -> str:
-        """Run a command on the Worker via SSH and return stdout."""
         proc = await asyncio.create_subprocess_exec(
-            "ssh", *self._ssh_opts(config),
-            f"{config.ssh_user}@{config.worker_host}", cmd,
+            "ssh", *ssh_opts, "-i", config.ssh_key_path,
+            f"{config.ssh_user}@{config.worker_host}", "bash -s",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return stdout.decode().strip()
-
-    async def _launch_chrome(self, config: OAuthConfig) -> tuple[asyncio.subprocess.Process, int]:
-        """Launch Chrome on the Worker via SSH and set up a CDP port tunnel.
-
-        Returns (tunnel_process, local_cdp_port).
-        """
-        host = config.worker_host
-        account_id = config.account_id
-
-        # Stop any existing Chrome/Chromium on the Worker
         try:
-            await self._ssh_exec(
-                config,
-                "pkill -f 'chrome.*remote-debugging-port' 2>/dev/null; sleep 1; true",
-                timeout=10,
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(script.encode()), timeout=timeout,
             )
-        except Exception:
-            pass
-
-        profile_dir = f"{CHROME_PROFILE_DIR}-{account_id}"
-
-        # Find Chrome/Chromium binary on the Worker
-        find_cmd = (
-            "command -v google-chrome 2>/dev/null || "
-            "command -v chromium-browser 2>/dev/null || "
-            "command -v chromium 2>/dev/null || "
-            "find /home -path '*/ms-playwright/*/chrome' -type f 2>/dev/null | head -1"
-        )
-        chrome_bin = await self._ssh_exec(config, find_cmd, timeout=10)
-        if not chrome_bin:
-            raise RuntimeError("No Chrome/Chromium binary found on Worker")
-        logger.info("Using browser binary: %s", chrome_bin)
-
-        # Launch Chrome via a fire-and-forget SSH command (-f flag for background)
-        await self._ssh_exec(
-            config,
-            f"mkdir -p {profile_dir}",
-            timeout=10,
-        )
-        # Start Chrome in background using ssh -f (fork to background after auth)
-        bg_proc = await asyncio.create_subprocess_exec(
-            "ssh", *self._ssh_opts(config), "-f",
-            f"{config.ssh_user}@{host}",
-            f"DISPLAY=:99 {chrome_bin} "
-            f"--no-sandbox --disable-gpu --disable-software-rasterizer "
-            f"--no-first-run --no-default-browser-check "
-            f"--disable-extensions --disable-component-extensions-with-background-pages "
-            f"--window-size=1365,900 "
-            f"--remote-debugging-port={CDP_PORT} "
-            f"--user-data-dir={profile_dir} "
-            f"about:blank > /tmp/chrome-oauth.log 2>&1",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(bg_proc.wait(), timeout=10)
-        await asyncio.sleep(4)
-        # Verify Chrome is up
-        result = await self._ssh_exec(
-            config,
-            f"curl -s http://127.0.0.1:{CDP_PORT}/json >/dev/null 2>&1 && echo CHROME_OK || echo CHROME_FAIL",
-            timeout=10,
-        )
-        logger.info("Chrome launch on Worker %s: %s", host, result)
-
-        local_port = next(_LOCAL_PORT_COUNTER)
-
-        # Set up SSH tunnel: local local_port → Worker CDP_PORT
-        tunnel = await asyncio.create_subprocess_exec(
-            "ssh", *self._ssh_opts(config),
-            "-N", "-L", f"{local_port}:127.0.0.1:{CDP_PORT}",
-            f"{config.ssh_user}@{host}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.sleep(2)
-        logger.info("SSH tunnel established: localhost:%d → %s:%d", local_port, host, CDP_PORT)
-        return tunnel, local_port
-
-    async def _connect_cdp(self, local_port: int = CDP_PORT) -> _CDPClient:
-        """Connect to Chrome via CDP WebSocket."""
-        import aiohttp
-        port = local_port
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(10):
-                try:
-                    async with session.get(f"http://127.0.0.1:{port}/json") as resp:
-                        tabs = await resp.json()
-                    page_tab = next((t for t in tabs if t.get("type") == "page"), None)
-                    if page_tab:
-                        ws_url = page_tab["webSocketDebuggerUrl"]
-                        if port != CDP_PORT:
-                            ws_url = ws_url.replace(f":{CDP_PORT}/", f":{port}/")
-                        cdp = _CDPClient(ws_url)
-                        await cdp.connect()
-                        return cdp
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
-        raise RuntimeError("Could not connect to Chrome CDP")
-
-    async def _handle_cloudflare(
-        self, cdp: _CDPClient, context: str, timeout: int = 60,
-        config: OAuthConfig | None = None,
-    ) -> bool:
-        """Detect and handle Cloudflare challenge by clicking checkbox with xdotool."""
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            title = await cdp.evaluate("document.title") or ""
-            body_snippet = await cdp.evaluate("document.body?.innerText?.substring(0, 100)") or ""
-
-            if "just a moment" not in title.lower() and "security verification" not in body_snippet.lower():
-                logger.info("CF cleared for %s", context)
-                return True
-
-            logger.info("CF challenge detected on %s, clicking checkbox at (%d,%d)...",
-                        context, CF_CHECKBOX_X, CF_CHECKBOX_Y)
-            await self._xdotool_click(CF_CHECKBOX_X, CF_CHECKBOX_Y, config=config)
-            await asyncio.sleep(5)
-
-        logger.error("CF challenge did not clear for %s within %ds", context, timeout)
-        return False
-
-    async def _xdotool_click(
-        self, x: int, y: int, config: OAuthConfig | None = None,
-    ) -> None:
-        """Click at screen coordinates using xdotool on the Worker."""
-        cfg = config or self._current_config
-        if cfg and cfg.worker_host:
-            await self._ssh_exec(
-                cfg,
-                f"DISPLAY=:99 xdotool mousemove {x} {y} click 1",
-                timeout=10,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                "xdotool", "mousemove", str(x), str(y), "click", "1",
-                env={**os.environ, "DISPLAY": ":99"},
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-
-    async def _cdp_authorize(self, cdp: _CDPClient, authorize_url: str) -> str | None:
-        """Extract org UUID and call authorize API directly via CDP fetch()."""
-        # Parse OAuth URL parameters
-        parsed = urlparse(authorize_url.replace("claude.com/cai/", "claude.ai/"))
-        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-
-        org_uuid = await self._extract_org_uuid(cdp)
-        logger.info("Org UUID: %s", org_uuid)
-
-        if not org_uuid:
-            logger.error("Could not extract org UUID")
-            return None
-
-        # Build authorize API request
-        scope = " ".join(
-            s for s in params.get("scope", "").split(" ")
-            if s != "org:create_api_key"
-        )
-        api_body = json.dumps({
-            "response_type": params.get("response_type", "code"),
-            "client_id": params.get("client_id", OAUTH_CLIENT_ID),
-            "organization_uuid": org_uuid,
-            "redirect_uri": params.get("redirect_uri", ""),
-            "scope": scope,
-            "state": params.get("state", ""),
-            "code_challenge": params.get("code_challenge", ""),
-            "code_challenge_method": params.get("code_challenge_method", "S256"),
-        })
-
-        # Call authorize API from Chrome context (uses Chrome's session cookies)
-        js_fetch = f"""(async function(){{
-var r=await fetch("/v1/oauth/{org_uuid}/authorize",{{
-  method:"POST",
-  headers:{{"Content-Type":"application/json","Accept":"application/json"}},
-  credentials:"include",
-  body:{json.dumps(api_body)}
-}});
-return r.status+" | "+await r.text()
-}})()"""
-
-        api_result = await cdp.evaluate(js_fetch)
-        logger.info("Authorize API: %s", (api_result or "")[:150])
-
-        if not api_result or not api_result.startswith("200"):
-            logger.error("Authorize API failed: %s", api_result)
-            return None
-
-        try:
-            _, response_text = api_result.split(" | ", 1)
-            response_data = json.loads(response_text)
-            redirect_uri = response_data.get("redirect_uri", "")
-            cb = urlparse(redirect_uri)
-            cb_params = parse_qs(cb.query)
-            code = cb_params.get("code", [""])[0]
-            state = cb_params.get("state", [""])[0]
-            if code and state:
-                return f"{code}#{state}"
-            logger.error("Missing code/state in redirect_uri: %s", redirect_uri[:100])
-        except Exception as e:
-            logger.error("Failed to parse authorize response: %s", e)
-
-        return None
-
-    async def _extract_org_uuid(self, cdp: _CDPClient) -> str | None:
-        """Extract the Claude organization UUID from the current OAuth page.
-
-        The authorize page is a React app and its internal state shape changes
-        over time. Prefer stable account APIs available in the logged-in browser
-        session, then fall back to scanning hydrated React state.
-        """
-        strategies = [
-            ("account_api", _JS_FETCH_ACCOUNT_ORG_UUID),
-            ("react_state", _JS_EXTRACT_ORG_UUID),
-        ]
-        for name, script in strategies:
-            try:
-                org_uuid = await cdp.evaluate(script, timeout=12)
-            except Exception as exc:
-                logger.warning("Org UUID extraction via %s errored: %s", name, exc)
-                continue
-            if isinstance(org_uuid, str) and org_uuid:
-                logger.info("Org UUID extracted via %s", name)
-                return org_uuid
-            logger.info("Org UUID extraction via %s returned empty", name)
-        return None
-
-    # -- CLI methods --------------------------------------------------------
-
-    async def _launch_cli_auth(self, config: OAuthConfig) -> asyncio.subprocess.Process:
-        """Launch Claude CLI auth login on the Worker via SSH."""
-        if config.worker_host:
-            process = await asyncio.create_subprocess_exec(
-                "ssh", *self._ssh_opts(config),
-                f"{config.ssh_user}@{config.worker_host}",
-                f"CLAUDE_CONFIG_DIR={config.config_dir} claude auth login",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            env = {
-                "CLAUDE_CONFIG_DIR": config.config_dir,
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "HOME": str(Path.home()),
-            }
-            process = await asyncio.create_subprocess_exec(
-                "claude", "auth", "login",
-                env=env,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        return process
-
-    async def _extract_authorize_url(
-        self, process: asyncio.subprocess.Process, timeout: int = 30
-    ) -> str | None:
-        """Read CLI stdout for the OAuth authorize URL."""
-        assert process.stdout is not None
-        start = time.monotonic()
-        buffer = ""
-        while time.monotonic() - start < timeout:
-            try:
-                chunk = await asyncio.wait_for(
-                    process.stdout.read(4096), timeout=2.0
-                )
-            except asyncio.TimeoutError:
-                continue
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8", errors="replace")
-            match = re.search(r"(https://claude\.(?:ai|com)/\S*oauth/authorize\S+)", buffer)
-            if match:
-                return match.group(1)
-        return None
-
-    async def _wait_cli_complete(
-        self, process: asyncio.subprocess.Process, timeout: int = 30
-    ) -> None:
-        """Wait for CLI to finish writing credentials."""
-        try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning("CLI process did not exit within %ds", timeout)
+            proc.kill()
+            raise
+        return proc.returncode == 0, (stdout.decode(errors="replace") if stdout else "")
 
-    async def _read_credentials(self, config: OAuthConfig) -> dict[str, Any] | None:
-        """Read the generated .credentials.json file from the Worker."""
-        cred_path = f"{config.config_dir}/.credentials.json"
-        if config.worker_host:
-            try:
-                raw = await self._ssh_exec(
-                    config, f"cat {cred_path} 2>/dev/null", timeout=10
-                )
-                if not raw:
-                    return None
-                data = json.loads(raw)
-                return data.get("claudeAiOauth", {})
-            except Exception:
-                logger.exception("Failed to read credentials from Worker")
-                return None
-        else:
-            p = Path(cred_path)
-            if not p.exists():
-                return None
-            try:
-                data = json.loads(p.read_text())
-                return data.get("claudeAiOauth", {})
-            except Exception:
-                logger.exception("Failed to read credentials.json")
-                return None
+    # -- read back the credentials the login wrote --------------------------
 
-    # -- Chrome cleanup -----------------------------------------------------
-
-    async def _kill_chrome(
-        self, chrome_process: asyncio.subprocess.Process,
-        config: OAuthConfig | None = None,
-    ) -> None:
-        """Kill Chrome on Worker and close SSH tunnel."""
-        await self._kill_process(chrome_process)
-        cfg = config or self._current_config
-        if cfg and cfg.worker_host:
-            try:
-                await self._ssh_exec(
-                    cfg,
-                    f"systemctl stop chrome-oauth 2>/dev/null; pkill -x chrome 2>/dev/null; true",
-                    timeout=10,
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "pkill", "-f", f"chrome.*{CDP_PORT}",
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-            except Exception:
-                pass
-
-    # -- Lock helpers -------------------------------------------------------
-
-    async def _acquire_lock(self, path: Path) -> None:
-        import fcntl
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = open(path, "w")
-        start = time.monotonic()
-        while time.monotonic() - start < 120:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._lock_files[str(path)] = fd
-                return
-            except BlockingIOError:
-                await asyncio.sleep(1)
-        raise TimeoutError(f"Could not acquire lock: {path}")
-
-    async def _release_lock(self, path: Path) -> None:
-        fd = self._lock_files.pop(str(path), None)
-        if fd:
-            try:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                fd.close()
-            except Exception:
-                pass
-
-    async def _kill_process(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
+    async def _fetch_written_credentials(self, config: OAuthConfig) -> dict[str, Any] | None:
+        if not config.worker_host:
+            return read_credentials(config.config_dir)
+        # Remote: read the claudeAiOauth object over SSH; the credential file
+        # stays on the worker (never moved to the Manager).
+        _ok, output = await self._ssh_run(
+            config,
+            f"cat {shlex.quote(config.config_dir)}/.credentials.json 2>/dev/null || true",
+            timeout=30,
+        )
+        if not output.strip():
+            return None
         try:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+            return json.loads(output).get("claudeAiOauth")
         except Exception:
-            pass
-
-    # -- HTTP helpers -------------------------------------------------------
-
-    async def _http_post(self, url: str, json_body: dict) -> dict[str, Any]:
-        if self._http_client:
-            return await self._http_client.post(url, json_body)
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=json_body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                return await resp.json()
-
-    async def _http_get(self, url: str, params: dict | None = None) -> dict[str, Any]:
-        if self._http_client:
-            return await self._http_client.get(url, params)
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                return await resp.json(content_type=None)
-
-    async def _http_get_raw(self, url: str) -> str:
-        if self._http_client:
-            return await self._http_client.get_raw(url)
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                return await resp.text()
-
-
-# -- Token refresh helper ---------------------------------------------------
+            return None
 
 
 async def refresh_access_token(
@@ -1092,6 +268,8 @@ async def refresh_access_token(
 
 def write_credentials(config_dir: str, creds: dict[str, Any]) -> None:
     """Write credentials to .credentials.json."""
+    from pathlib import Path
+
     cred_path = Path(config_dir) / ".credentials.json"
     cred_path.parent.mkdir(parents=True, exist_ok=True)
     data = {"claudeAiOauth": creds}
@@ -1102,6 +280,8 @@ def write_credentials(config_dir: str, creds: dict[str, Any]) -> None:
 
 def read_credentials(config_dir: str) -> dict[str, Any] | None:
     """Read .credentials.json and return the claudeAiOauth object."""
+    from pathlib import Path
+
     cred_path = Path(config_dir) / ".credentials.json"
     if not cred_path.exists():
         return None

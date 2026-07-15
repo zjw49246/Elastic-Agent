@@ -17,6 +17,7 @@ from elastic_agent.core.claude_oauth import (
     OAuthConfig,
     read_credentials,
     refresh_access_token,
+    resolve_provider,
     write_credentials,
 )
 
@@ -92,8 +93,9 @@ class TestOAuthConfig:
             email_token="tok",
             config_dir="/tmp/claude",
         )
-        assert config.login_timeout == 240
+        assert config.login_timeout == 480
         assert config.mitm_port == 8765
+        assert config.provider is None
 
     def test_custom_values(self):
         config = OAuthConfig(
@@ -122,160 +124,138 @@ class TestLoginResult:
         assert r.error == "timeout"
 
 
-class TestClaudeOAuthProvider:
-    @pytest.mark.asyncio
-    async def test_extract_org_uuid_prefers_account_api(self, oauth_provider):
-        class FakeCDP:
-            def __init__(self):
-                self.calls = []
+class TestResolveProvider:
+    def test_mailcom_domain_autodetected(self):
+        cfg = OAuthConfig(account_id="a", email="u@mail.com", email_token="t", config_dir="/tmp/x")
+        assert resolve_provider(cfg) == "mailcom"
 
-            async def evaluate(self, expression, timeout=30):
-                self.calls.append(expression)
-                if "/api/account" in expression:
-                    return "11111111-2222-3333-4444-555555555555"
-                return "99999999-9999-9999-9999-999999999999"
+    def test_other_domain_uses_171mail(self):
+        cfg = OAuthConfig(account_id="a", email="u@foo.com", email_token="t", config_dir="/tmp/x")
+        assert resolve_provider(cfg) == "171mail"
 
-        cdp = FakeCDP()
-        org_uuid = await oauth_provider._extract_org_uuid(cdp)
-
-        assert org_uuid == "11111111-2222-3333-4444-555555555555"
-        assert len(cdp.calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_extract_org_uuid_falls_back_to_react_state(self, oauth_provider):
-        class FakeCDP:
-            def __init__(self):
-                self.calls = []
-
-            async def evaluate(self, expression, timeout=30):
-                self.calls.append(expression)
-                if "/api/account" in expression:
-                    return None
-                return "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-
-        cdp = FakeCDP()
-        org_uuid = await oauth_provider._extract_org_uuid(cdp)
-
-        assert org_uuid == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        assert len(cdp.calls) == 2
-
-    @pytest.mark.asyncio
-    async def test_send_magic_link(self, oauth_provider, mock_http):
-        mock_http.post_responses["claude/send"] = {
-            "success": True,
-            "deviceId": "dev-1",
-            "clientSha": "sha-1",
-        }
-        result = await oauth_provider._send_magic_link("test@example.com")
-        assert result["success"]
-        assert result["deviceId"] == "dev-1"
-        assert len(mock_http.post_calls) == 1
-        assert "claude/send" in mock_http.post_calls[0][0]
-
-    @pytest.mark.asyncio
-    async def test_poll_magic_link_found(self, oauth_provider, mock_http):
-        mock_http.get_responses["getClaudeMessage"] = {
-            "link": "https://claude.ai/magic-link/abc123"
-        }
-        link = await oauth_provider._poll_magic_link("token-123")
-        assert link == "https://claude.ai/magic-link/abc123"
-
-    @pytest.mark.asyncio
-    async def test_poll_magic_link_timeout(self, oauth_provider, mock_http):
-        mock_http.get_responses["getClaudeMessage"] = {}
-        import elastic_agent.core.claude_oauth as mod
-        orig = mod.MAGIC_LINK_TIMEOUT
-        mod.MAGIC_LINK_TIMEOUT = 0.1
-        try:
-            link = await oauth_provider._poll_magic_link("token-123")
-            assert link is None
-        finally:
-            mod.MAGIC_LINK_TIMEOUT = orig
-
-    @pytest.mark.asyncio
-    async def test_verify_magic_link(self, oauth_provider, mock_http):
-        mock_http.post_responses["claude/verify"] = {
-            "success": True,
-            "cookie": "session-cookie-abc",
-            "sessionKey": "key-xyz",
-        }
-        result = await oauth_provider._verify_magic_link(
-            "https://link", "dev-1", "sha-1", "test@example.com"
+    def test_explicit_provider_overrides_autodetect(self):
+        cfg = OAuthConfig(
+            account_id="a", email="u@mail.com", email_token="t",
+            config_dir="/tmp/x", provider="171mail",
         )
-        assert result["success"]
-        assert result["cookie"] == "session-cookie-abc"
+        assert resolve_provider(cfg) == "171mail"
 
-    def test_extract_code_state(self, oauth_provider):
-        url = "https://platform.claude.com/oauth/code/callback?code=abc123&state=xyz"
-        code, state = oauth_provider._extract_code_state(url)
-        assert code == "abc123"
-        assert state == "xyz"
 
-    def test_extract_code_state_with_hash(self, oauth_provider):
-        url = "https://platform.claude.com/oauth/code/callback?code=abc123%23state&state=xyz"
-        code, state = oauth_provider._extract_code_state(url)
-        assert "#" not in code
-
-    def test_extract_cli_port(self, oauth_provider):
-        url = "https://claude.com/cai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback&client_id=xxx"
-        port = oauth_provider._extract_cli_port(url)
-        assert port == 54321
-
-    def test_extract_cli_port_no_port(self, oauth_provider):
-        url = "https://claude.com/cai/oauth/authorize?client_id=xxx"
-        port = oauth_provider._extract_cli_port(url)
-        assert port is None
-
-    def test_parse_session_cookie(self, oauth_provider):
-        cookies = oauth_provider._parse_session_cookie("session-abc")
-        assert len(cookies) == 4
-        assert all(c["name"] == "sessionKey" for c in cookies)
-        assert all(c["value"] == "session-abc" for c in cookies)
+class TestClaudeOAuthProviderLocal:
+    """Local mode (worker_host is None): delegates to the vendored
+    perform_login in-process and reads back the credentials it writes."""
 
     @pytest.mark.asyncio
-    async def test_login_magic_link_send_failure(self, oauth_provider, mock_http, oauth_config):
-        mock_http.post_responses["claude/send"] = {
-            "success": False,
-            "error": "invalid_email",
-        }
-        result = await oauth_provider.login(oauth_config)
+    async def test_success_returns_written_tokens(self, oauth_config):
+        provider = ClaudeOAuthProvider()
+
+        async def fake_perform_login(*, email, token_171, config_dir, provider):
+            write_credentials(config_dir, {
+                "accessToken": "at", "refreshToken": "rt", "expiresAt": 111,
+            })
+            return True
+
+        with patch("elastic_agent.worker.login.perform_login",
+                   new=AsyncMock(side_effect=fake_perform_login)):
+            result = await provider.login(oauth_config)
+        assert result.success
+        assert result.access_token == "at"
+        assert result.refresh_token == "rt"
+        assert result.expires_at == 111
+
+    @pytest.mark.asyncio
+    async def test_failure_surfaces_error(self, oauth_config):
+        provider = ClaudeOAuthProvider()
+        with patch("elastic_agent.worker.login.perform_login",
+                   new=AsyncMock(return_value=False)):
+            result = await provider.login(oauth_config)
         assert not result.success
-        assert "magic link" in result.error.lower()
+        assert "auto_login failed" in result.error
 
     @pytest.mark.asyncio
-    async def test_login_magic_link_poll_timeout(self, oauth_provider, mock_http, oauth_config):
-        mock_http.post_responses["claude/send"] = {
-            "success": True,
-            "deviceId": "d1",
-            "clientSha": "s1",
-        }
-        mock_http.get_responses["getClaudeMessage"] = {}
-
-        import elastic_agent.core.claude_oauth as mod
-        orig = mod.MAGIC_LINK_TIMEOUT
-        mod.MAGIC_LINK_TIMEOUT = 0.1
-        try:
-            result = await oauth_provider.login(oauth_config)
-            assert not result.success
-            assert "timed out" in result.error.lower()
-        finally:
-            mod.MAGIC_LINK_TIMEOUT = orig
-
-    @pytest.mark.asyncio
-    async def test_login_verify_failure(self, oauth_provider, mock_http, oauth_config):
-        mock_http.post_responses["claude/send"] = {
-            "success": True,
-            "deviceId": "d1",
-            "clientSha": "s1",
-        }
-        mock_http.get_responses["getClaudeMessage"] = {"link": "https://link"}
-        mock_http.post_responses["claude/verify"] = {
-            "success": False,
-            "error": "invalid_link",
-        }
-        result = await oauth_provider.login(oauth_config)
+    async def test_success_but_no_credentials_is_failure(self, oauth_config):
+        provider = ClaudeOAuthProvider()
+        # perform_login claims success but wrote nothing to config_dir.
+        with patch("elastic_agent.worker.login.perform_login",
+                   new=AsyncMock(return_value=True)):
+            result = await provider.login(oauth_config)
         assert not result.success
-        assert "verification" in result.error.lower()
+        assert "no credentials" in result.error
+
+    @pytest.mark.asyncio
+    async def test_passes_resolved_provider_to_perform_login(self, oauth_config):
+        provider = ClaudeOAuthProvider()
+        oauth_config.email = "u@mail.com"  # → mailcom
+        mock = AsyncMock(return_value=False)
+        with patch("elastic_agent.worker.login.perform_login", new=mock):
+            await provider.login(oauth_config)
+        assert mock.await_args.kwargs["provider"] == "mailcom"
+        assert mock.await_args.kwargs["config_dir"] == oauth_config.config_dir
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_failure(self, oauth_config):
+        provider = ClaudeOAuthProvider()
+        oauth_config.login_timeout = 0.05
+
+        async def hang(**_):
+            await asyncio.sleep(5)
+
+        with patch("elastic_agent.worker.login.perform_login", new=hang):
+            result = await provider.login(oauth_config)
+        assert not result.success
+        assert "timed out" in result.error
+
+
+class TestClaudeOAuthProviderRemote:
+    """Remote mode (worker_host set): Manager triggers, the worker runs the
+    vendored auto_login CLI over SSH; the credential file stays on the worker."""
+
+    def _remote_config(self):
+        return OAuthConfig(
+            account_id="a", email="u@foo.com", email_token="tok",
+            config_dir="/root/.claude-prod", worker_host="10.0.0.5",
+            ssh_key_path="/k.pem", ssh_user="root",
+        )
+
+    @pytest.mark.asyncio
+    async def test_runs_vendored_cli_on_worker(self):
+        provider = ClaudeOAuthProvider()
+        cfg = self._remote_config()
+        scripts: list[str] = []
+
+        async def fake_ssh_run(config, script, timeout):
+            scripts.append(script)
+            if "auto_login" in script:
+                return True, "SUCCESS"
+            # the credential read-back
+            return True, json.dumps({"claudeAiOauth": {
+                "accessToken": "AT", "refreshToken": "RT", "expiresAt": 222,
+            }})
+
+        with patch.object(provider, "_ssh_run", new=fake_ssh_run):
+            result = await provider.login(cfg)
+
+        assert result.success
+        assert result.access_token == "AT"
+        login_script = next(s for s in scripts if "auto_login" in s)
+        assert "elastic_agent.worker.login.auto_login" in login_script
+        assert "u@foo.com" in login_script
+        assert "--login-method 171mail" in login_script
+        assert "Xvfb :99" in login_script  # worker-side headless display
+
+    @pytest.mark.asyncio
+    async def test_worker_login_failure_surfaces_output(self):
+        provider = ClaudeOAuthProvider()
+        cfg = self._remote_config()
+
+        async def fake_ssh_run(config, script, timeout):
+            return False, "chrome crashed on worker"
+
+        with patch.object(provider, "_ssh_run", new=fake_ssh_run):
+            result = await provider.login(cfg)
+        assert not result.success
+        assert "chrome crashed on worker" in result.error
+
 
 
 class TestReadWriteCredentials:

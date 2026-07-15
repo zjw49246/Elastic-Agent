@@ -11,6 +11,7 @@
 - **orphan / autonomous 守卫**（pty_backend.py `on_event`）：claude-pty 的 PTYEvent 带 `orphan`（冷恢复时重放的上一 turn JSONL）/ `autonomous`（后台子 agent turn）标记。二者都**不参与前台 turn 的记账**——不设 session_id、不标 turn-fatal 错误、不计入 `_saw_result`/`_saw_claude_output`（`turn_scoped` 门）；orphan 事件还直接从转发流丢弃（避免 Manager 重复落盘 / 把旧 result 当本 turn 结果）。否则 resume 会把旧 api_error 重新标致命 → 刚成功的 turn 被误报 failed（recover-then-failed，借鉴 CCM task #729/#87）
 - **开关**：Manager 侧 `TaskRouter(use_pty=True)` + bootstrap `include_pty=True`；worker 侧无需配置
 - **凭证轮换**：原地换凭证（同 config_dir 写新 token）；`CREDENTIAL_LOGIN` 后 worker 调 `recycle_config_dir` 回收该 config_dir 的所有 PTY 会话（温热会话仍持旧账号，不可热复用），下次 EXECUTE 冷恢复读新凭证
+- **账号自动登录**（`worker/login/`，vendored 自 CCM `auto_login.py`+`cdp_login.py`）：登录逻辑=CCM 版，纯 Chrome CDP 直调 OAuth authorize（不用 Playwright/mitmproxy），多后端接码（多数域走 171mail API，mail.com 家族走 mail relay / mail.com Web，按邮箱域名自动选，`resolve_provider`）。**worker 本地跑**：Manager 只持 email+接码token（`AccountDefinition`）并下发；`ClaudeOAuthProvider.login()` 是薄壳，`worker_host` 有值时经 SSH 在 worker 上跑 `python -m elastic_agent.worker.login.auto_login`（起 Xvfb:99 + Chrome），无值时进程内直跑——凭证只落 worker、绝不经 Manager。`OAuthConfig→LoginResult` 契约不变，`CredentialLoginService/Step` 编排层不动。CCM 特定硬编码已参数化（`CLAUDE_MAILCATCHER_URL`/`CLAUDE_171MAIL_URL`/`CLAUDE_SETTINGS_EXTRA_DIRS`）
 
 ## 依赖链（重要）
 
