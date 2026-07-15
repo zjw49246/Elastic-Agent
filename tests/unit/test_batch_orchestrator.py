@@ -190,6 +190,32 @@ class TestRotation:
         await orch.on_worker_exit(job.job_id, wid, 130)  # 128+SIGINT
         assert job.runs[wid].phase == WorkerPhase.ROTATING  # unchanged
 
+    async def test_stale_exit_after_rotation_ignored_by_task_id(self):
+        # Race: after rotation re-dispatches (new task_id, phase RUNNING again),
+        # the interrupted run's stale exit arrives with the OLD task_id — it must
+        # be ignored so the fresh run isn't failed.
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        spec = _spec(
+            fanout={"workers": 1},
+            rotation={"strategy": "on_exhaust_restart_resume", "resume_args": "-r", "max_rotations": 3},
+        )
+        job = await orch.launch(spec)
+        wid = next(iter(job.runs))
+        old_task_id = job.runs[wid].task_id
+
+        await orch.on_worker_exhausted(job.job_id, wid)  # → new task_id, RUNNING
+        new_task_id = job.runs[wid].task_id
+        assert new_task_id != old_task_id
+
+        # stale exit from the interrupted run
+        await orch.on_worker_exit(job.job_id, wid, 130, task_id=old_task_id)
+        assert job.runs[wid].phase == WorkerPhase.RUNNING  # unaffected
+
+        # genuine completion of the fresh run
+        await orch.on_worker_exit(job.job_id, wid, 0, task_id=new_task_id)
+        assert job.runs[wid].phase == WorkerPhase.DONE
+
     async def test_rotation_login_failure_fails(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)

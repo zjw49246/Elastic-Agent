@@ -133,21 +133,31 @@ class ElasticAgentManager:
 
     @property
     def batch(self):
-        """Lazily-built BatchOrchestrator bound to this Manager.
+        """Lazily-built, fully-wired BatchOrchestrator bound to this Manager.
 
-        Provision/login hooks are left unset here (see ManagerFleetDriver); a
-        deployment that runs live batch jobs wires them via
-        ``configure_batch(provision_hook=..., login_hook=...)``.
+        Default wiring (``wire_batch``) provisions via the bootstrap SSH pipeline
+        and logs accounts in on the worker (ACCOUNT_LOGIN), and routes
+        RUN_EXHAUSTED / PROCESS_EXIT from workers back into the orchestrator.
+        Override with ``configure_batch(...)`` for custom hooks.
         """
         if self._batch is None:
-            from elastic_agent.core.batch_orchestrator import BatchOrchestrator
-            from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
-            self._batch = BatchOrchestrator(ManagerFleetDriver(self))
+            from elastic_agent.core.batch_hooks import wire_batch
+            self._batch = wire_batch(self)
         return self._batch
 
     def configure_batch(self, *, provision_hook=None, login_hook=None,
-                        scale_in_on_complete: bool = False) -> None:
-        """Wire the batch orchestrator with live provision/login hooks."""
+                        scale_in_on_complete: bool = False, include_pty: bool = False) -> None:
+        """Rewire the batch orchestrator.
+
+        With no hooks, uses the default live wiring (``wire_batch``). Pass
+        ``provision_hook`` / ``login_hook`` to override either step.
+        """
+        if provision_hook is None and login_hook is None:
+            from elastic_agent.core.batch_hooks import wire_batch
+            self._batch = wire_batch(
+                self, include_pty=include_pty, scale_in_on_complete=scale_in_on_complete,
+            )
+            return
         from elastic_agent.core.batch_orchestrator import BatchOrchestrator
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
         driver = ManagerFleetDriver(self, provision_hook=provision_hook, login_hook=login_hook)

@@ -133,12 +133,30 @@ class BatchOrchestrator:
         self._driver = driver
         self._scale_in_on_complete = scale_in_on_complete
         self._jobs: dict[str, BatchJob] = {}
+        self._worker_index: dict[str, str] = {}  # worker_id -> job_id
 
     def get_job(self, job_id: str) -> BatchJob | None:
         return self._jobs.get(job_id)
 
     def list_jobs(self) -> list[BatchJob]:
         return list(self._jobs.values())
+
+    def job_id_for_worker(self, worker_id: str) -> str | None:
+        return self._worker_index.get(worker_id)
+
+    async def handle_exhausted(self, worker_id: str) -> bool:
+        """Route a worker's RUN_EXHAUSTED by resolving its job (connection knows
+        the worker_id; the run command carried the job_id)."""
+        job_id = self._worker_index.get(worker_id)
+        if job_id is None:
+            return False
+        return await self.on_worker_exhausted(job_id, worker_id)
+
+    async def handle_exit(self, worker_id: str, exit_code: int, task_id: str | None = None) -> None:
+        """Route a worker's PROCESS_EXIT by resolving its job."""
+        job_id = self._worker_index.get(worker_id)
+        if job_id is not None:
+            await self.on_worker_exit(job_id, worker_id, exit_code, task_id=task_id)
 
     async def launch(self, spec: JobSpec) -> BatchJob:
         """Scale out, then bring every worker up concurrently."""
@@ -152,6 +170,7 @@ class BatchOrchestrator:
         for wid, ctx in zip(worker_ids, contexts):
             ctx.hostname = await self._driver.hostname_of(wid)
             job.runs[wid] = WorkerRun(worker_id=wid, ctx=ctx)
+            self._worker_index[wid] = job.job_id
 
         await asyncio.gather(
             *(self._bring_up(job, wid) for wid in job.runs),
@@ -228,15 +247,21 @@ class BatchOrchestrator:
         await self._dispatch(job, run, resume=True)
         return True
 
-    async def on_worker_exit(self, job_id: str, worker_id: str, exit_code: int) -> None:
+    async def on_worker_exit(
+        self, job_id: str, worker_id: str, exit_code: int, task_id: str | None = None,
+    ) -> None:
         """Terminal process exit for a worker's run command."""
         job = self._jobs.get(job_id)
         if job is None or worker_id not in job.runs:
             return
         run = job.runs[worker_id]
-        # A run interrupted mid-rotation exits non-zero; that exit is expected
-        # and must not be treated as a terminal failure — the resume dispatch
-        # (or its RUN_EXHAUSTED handling) owns the outcome.
+        # Ignore a stale exit from a superseded run: when an exhausted run is
+        # interrupted and the rotation restart has already re-dispatched (new
+        # task_id), the interrupted run's non-zero exit still arrives — it must
+        # not fail the fresh run. Matching on task_id closes the race that the
+        # ROTATING phase-guard alone can't (the restart may already be RUNNING).
+        if task_id is not None and run.task_id and task_id != run.task_id:
+            return
         if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED, WorkerPhase.ROTATING):
             return
         if exit_code == job.spec.completion.on_process_exit:
