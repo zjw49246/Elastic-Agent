@@ -65,9 +65,11 @@ class CredentialConfig(BaseSettings):
     rotation_strategy: str = "least_used_first"
     login_timeout: int = 240
     max_accounts_per_worker: int = 4
-    login_dependencies: list[str] = Field(
-        default_factory=lambda: ["playwright", "playwright-stealth", "mitmproxy", "chrome"]
-    )
+    # Extra pip packages for worker-local login; the base deps (google-chrome,
+    # xvfb, xdotool, httpx, websockets) are always installed by
+    # credential_login_deps_step. Empty by default — the vendored CCM login flow
+    # needs no Playwright/mitmproxy.
+    login_dependencies: list[str] = Field(default_factory=list)
 
 
 class ExternalAPIConfig(BaseSettings):

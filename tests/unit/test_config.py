@@ -74,7 +74,9 @@ class TestDefaults:
         assert cfg.rotation_strategy == "least_used_first"
         assert cfg.login_timeout == 240
         assert cfg.max_accounts_per_worker == 4
-        assert "playwright" in cfg.login_dependencies
+        # Base login deps (google-chrome/xvfb/xdotool/httpx/websockets) are always
+        # installed by credential_login_deps_step; this list is extra pip pkgs only.
+        assert cfg.login_dependencies == []
 
     def test_external_api_defaults(self):
         cfg = ExternalAPIConfig()

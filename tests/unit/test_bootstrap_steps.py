@@ -150,17 +150,23 @@ class TestBuildDefaultSteps:
 
 class TestCredentialLoginDepsStep:
     def test_default_deps(self) -> None:
+        # The vendored login flow needs the real google-chrome binary + xdotool
+        # + Xvfb + httpx/websockets (verified on a live Ubuntu worker) — NOT
+        # playwright/chromium.
         step = credential_login_deps_step()
         assert step.name == "credential-login-deps"
-        assert "playwright" in step.command
-        assert "mitmproxy" in step.command
+        assert "google-chrome" in step.command
+        assert "xdotool" in step.command
         assert "xvfb" in step.command
+        assert "httpx" in step.command and "websockets" in step.command
         assert step.timeout == 600
         assert step.retry_count == 1
 
-    def test_custom_deps(self) -> None:
-        step = credential_login_deps_step(login_dependencies=["mitmproxy"])
-        assert "mitmproxy" in step.command
+    def test_custom_deps_appended_as_pip(self) -> None:
+        step = credential_login_deps_step(login_dependencies=["some-extra-pkg"])
+        assert "some-extra-pkg" in step.command
+        # base deps still present
+        assert "google-chrome" in step.command
 
     def test_custom_timeout(self) -> None:
         step = credential_login_deps_step(timeout=900)

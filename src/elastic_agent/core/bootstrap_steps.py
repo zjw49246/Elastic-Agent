@@ -137,33 +137,34 @@ def credential_login_deps_step(
     login_dependencies: list[str] | None = None,
     timeout: int = 600,
 ) -> BootstrapStep:
-    """T-042: Install auto-login dependencies (Playwright, mitmproxy, Chrome, Xvfb)."""
-    deps = login_dependencies or [
-        "playwright", "playwright-stealth", "mitmproxy", "chrome"
-    ]
+    """Install worker-local login deps: real Google Chrome + Xvfb + xdotool + httpx/websockets.
 
-    install_cmds = []
-    for dep in deps:
-        if dep == "chrome":
-            install_cmds.append(
-                "apt-get install -y -qq xvfb && "
-                "pip3 install -q --break-system-packages playwright playwright-stealth && "
-                "playwright install chromium --with-deps"
-            )
-        elif dep == "mitmproxy":
-            install_cmds.append("pip3 install -q --break-system-packages mitmproxy")
-        elif dep in ("playwright", "playwright-stealth"):
-            install_cmds.append(f"pip3 install -q --break-system-packages {dep}")
-        else:
-            install_cmds.append(f"pip3 install -q --break-system-packages {dep}")
+    The vendored CCM login flow (``worker/login/cdp_login.py``) drives the real
+    ``google-chrome`` binary over CDP and clicks with ``xdotool`` under an Xvfb
+    display — it does NOT use Playwright/chromium/mitmproxy. Verified on a live
+    Ubuntu 26.04 worker: with only playwright-chromium the login fails because
+    the code execs ``google-chrome`` (not on PATH). Extra pip packages can be
+    appended via ``login_dependencies``.
+    """
+    apt = (
+        "export DEBIAN_FRONTEND=noninteractive && "
+        "apt-get install -y -qq xvfb xdotool wget ca-certificates python3-pip && "
+        "wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb "
+        "-O /tmp/google-chrome.deb && "
+        "apt-get install -y -qq /tmp/google-chrome.deb"
+    )
+    pip_pkgs = ["httpx", "websockets"]
+    for dep in (login_dependencies or []):
+        if dep not in pip_pkgs and dep not in ("chrome", "google-chrome", "xvfb", "xdotool"):
+            pip_pkgs.append(dep)
+    pip = f"pip3 install -q --break-system-packages {' '.join(pip_pkgs)}"
 
-    cmd = " && ".join(install_cmds)
     return BootstrapStep(
         name="credential-login-deps",
-        command=cmd,
+        command=f"{apt} && {pip}",
         timeout=timeout,
         retry_count=1,
-        description="Install auto-login dependencies (Playwright, mitmproxy, Chrome)",
+        description="Install worker-local login deps (Google Chrome, Xvfb, xdotool, httpx/websockets)",
     )
 
 
