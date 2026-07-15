@@ -27,6 +27,8 @@ import websockets
 import websockets.exceptions
 
 from elastic_agent.core.protocols.messages import (
+    AccountLoginMessage,
+    AccountLoginResultMessage,
     AuthMessage,
     AuthResultMessage,
     CredentialLoginMessage,
@@ -238,6 +240,7 @@ class WorkerRuntime:
             "UNREGISTER_SYNC_MAPPING": self._handle_unregister_sync_mapping,
             "FORCE_SYNC": self._handle_force_sync,
             "CREDENTIAL_LOGIN": self._handle_credential_login,
+            "ACCOUNT_LOGIN": self._handle_account_login,
         }
         handler = handlers.get(msg.type)
         if handler:
@@ -953,6 +956,80 @@ class WorkerRuntime:
             slot_index=msg.slot_index,
             success=True,
         ))
+
+    async def _handle_account_login(self, msg: AccountLoginMessage) -> None:
+        """Worker-autonomous login: the Manager sends the account identity +
+        接码 token; the worker runs the vendored login flow locally (Chrome/CDP
+        on this machine) and the credentials are written here, never sent up.
+        """
+        from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, OAuthConfig
+
+        provider = ClaudeOAuthProvider()
+        # worker_host=None → run the vendored perform_login in-process on this
+        # worker (this IS the machine that owns the config_dir).
+        config = OAuthConfig(
+            account_id=msg.account_id,
+            email=msg.email,
+            email_token=msg.email_token,
+            config_dir=msg.config_dir,
+            provider=msg.provider,
+            worker_host=None,
+        )
+        try:
+            result = await provider.login(config)
+        except Exception as exc:
+            logger.exception("Account login failed for %s", msg.account_id)
+            await self._send_event(AccountLoginResultMessage(
+                account_id=msg.account_id, slot_index=msg.slot_index,
+                success=False, error=str(exc),
+            ))
+            return
+
+        if result.success:
+            logger.info("Account %s logged in on this worker (%s)",
+                        msg.account_id, msg.config_dir)
+            # Warm the account so the first real PTY turn doesn't stall on
+            # GrowthBook/onboarding, and verify the credentials are usable.
+            await self._warmup_config_dir(msg.config_dir)
+            # New credentials on this config_dir: warm PTY sessions there ran
+            # under a different account and must not be hot-reused.
+            if self._pty_backend is not None:
+                try:
+                    await self._pty_backend.recycle_config_dir(msg.config_dir)
+                except Exception:
+                    logger.exception(
+                        "Failed to recycle PTY sessions for %s", msg.config_dir
+                    )
+            if self._quota_checker:
+                self._quota_checker.add_slot(msg.account_id, msg.config_dir)
+
+        await self._send_event(AccountLoginResultMessage(
+            account_id=msg.account_id,
+            slot_index=msg.slot_index,
+            success=result.success,
+            error=result.error,
+        ))
+
+    async def _warmup_config_dir(self, config_dir: str) -> None:
+        """Best-effort `claude -p` warmup for a config_dir after login.
+
+        A fresh account's first turn otherwise pays for GrowthBook cache
+        population + onboarding; a short headless run primes it and confirms
+        the credentials actually work. Failures are non-fatal.
+        """
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            env.setdefault("IS_SANDBOX", "1")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", "reply: ok", "--dangerously-skip-permissions",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=60)
+        except Exception:
+            logger.debug("Warmup run for %s did not complete cleanly", config_dir)
 
     # ---- Heartbeat ----
 

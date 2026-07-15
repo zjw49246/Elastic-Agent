@@ -35,6 +35,25 @@
 
 **Commit**: 见本节合入的 commit。
 
+## 2026-07-15 P2 运行时健壮性 + P3 worker 自治登录（task-ccm-sync）
+
+**P2 — 瞬时过载同号重试**（借鉴 CCM `is_transient_overload`）：
+- 新 `core/rate_limit.py`：`is_rate_limited`/`is_auth_failure`/`is_transient_overload`（互斥、额度/认证优先）/`rate_limit_event_is_actionable`/`transient_retry_delay`，正则照搬 CCM。
+- `classify_turn_error` 加 `transient_overload` 分支（在 rate-limit 之前；transient 检测器内部已排除额度/认证横幅，故额度仍走轮换）。
+- `ElasticPTYBackend` on_exit：`transient_overload` turn **不报失败**，退避后 `_run_transient_retry` 同 session `--resume` 重试（`_schedule_transient_retry`，最多 5 次，`launch` 覆盖捕获 kwargs），耗尽才失败。**为何 worker 侧**：elastic 轮换是 Manager 侧 QuotaMonitor（Usage-API 驱动），与 turn 退出码解耦；瞬时过载是 turn 级、worker 自己 resume 最省事且保住上下文。
+- 未做「assistant 纯文本限速（exit 0）」硬失败——elastic 靠 QuotaMonitor 周期轮换兜底，从正常输出文本硬判失败风险更大；`is_rate_limited`/`rate_limit_event_is_actionable` 已备好供后续 proactive/批量用。
+
+**P3 — worker 自治登录**（协议下发，不再 Manager-over-SSH 驱动）：
+- 新协议 `ACCOUNT_LOGIN`/`ACCOUNT_LOGIN_RESULT`（messages.py + 三个 union + `__init__` 导出）。
+- worker `_handle_account_login`：`ClaudeOAuthProvider(worker_host=None)` 进程内跑 vendored `perform_login` → 成功则 `_warmup_config_dir`（`claude -p 'reply: ok'` 预热+验证）+ `recycle_config_dir` + `quota_checker.add_slot` → 回 result。凭证只在 worker 生成、不回传。既有 SSH 登录路径（CredentialLoginService）保留不动。
+- **⑥ hardlink 会话迁移保温热会话 延后**：它需要把凭证模型从「每 worker 单账号 + 原地换凭证」改成「每账号独立 config_dir + 迁移 session」，这与「每机多号」的批量特性纠缠，属批量编排那一步再一起做（elastic 的 Manager 侧轮换与 CCM 单机本地池是两种架构，不能照搬）。
+
+**测试**（本批最后统一补）：新增 `test_rate_limit.py`（检测器全覆盖）、`test_pty_backend.py::TestTransientOverloadRetry`（分类+调度+重试+耗尽）、`test_worker_runtime.py::TestHandleAccountLogin`（成功/失败/异常）。相关子集 204 passed；改 `_make_backend` 补新 __init__ 字段。
+
+**注意**：瞬时重试与 worker 自治登录的**真实链路未在本沙箱端到端验证**（无真 429/Chrome/账号）；胶水与决策逻辑已单测覆盖，真 worker 上需验证一次。
+
+**Commit**: 见本节合入的 commit。
+
 ## 2026-06-11 PTY 框架支持（task-pty-support）
 
 **做了什么**：worker 支持用 claude-pty 把 Claude Code 宿主在持久 PTY 会话中执行任务，替代每任务 spawn `claude -p`。Manager 侧只加了可选的 `ExecuteMessage.agent_params`（向后兼容）+ `TaskRouter(use_pty=True)` 开关；PTY 仓库零改动。

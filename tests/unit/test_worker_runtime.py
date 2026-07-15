@@ -512,3 +512,80 @@ class TestSyncMappingStorageBackend:
         assert runtime._file_sync_manager is not None
         assert isinstance(runtime._file_sync_manager._storage, LocalBackend)
         await runtime._file_sync_manager.stop()
+
+
+class TestHandleAccountLogin:
+    """P3: worker-autonomous login — the Manager sends the account identity +
+    接码 token; the worker logs itself in locally."""
+
+    def _msg(self, **over):
+        from elastic_agent.core.protocols.messages import AccountLoginMessage
+
+        base = dict(
+            account_id="a1", email="u@foo.com", email_token="tok",
+            config_dir="/root/.claude-prod", provider="171mail", slot_index=2,
+        )
+        base.update(over)
+        return AccountLoginMessage(**base)
+
+    @pytest.mark.asyncio
+    async def test_success_warms_recycles_and_reports(self, runtime):
+        from elastic_agent.core.claude_oauth import LoginResult
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
+        runtime._warmup_config_dir = AsyncMock()
+        runtime._pty_backend = MagicMock()
+        runtime._pty_backend.recycle_config_dir = AsyncMock(return_value=1)
+        runtime._quota_checker = MagicMock()
+
+        with patch(
+            "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
+            new=AsyncMock(return_value=LoginResult(
+                success=True, account_id="a1", access_token="at")),
+        ):
+            await runtime._handle_account_login(self._msg())
+
+        runtime._warmup_config_dir.assert_awaited_once_with("/root/.claude-prod")
+        runtime._pty_backend.recycle_config_dir.assert_awaited_once_with("/root/.claude-prod")
+        runtime._quota_checker.add_slot.assert_called_once_with("a1", "/root/.claude-prod")
+        res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
+        assert res.success and res.account_id == "a1" and res.slot_index == 2
+
+    @pytest.mark.asyncio
+    async def test_failure_reports_error_without_recycle(self, runtime):
+        from elastic_agent.core.claude_oauth import LoginResult
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
+        runtime._warmup_config_dir = AsyncMock()
+        runtime._pty_backend = MagicMock()
+        runtime._pty_backend.recycle_config_dir = AsyncMock()
+
+        with patch(
+            "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
+            new=AsyncMock(return_value=LoginResult(
+                success=False, account_id="a1", error="cf blocked")),
+        ):
+            await runtime._handle_account_login(self._msg())
+
+        runtime._warmup_config_dir.assert_not_awaited()
+        runtime._pty_backend.recycle_config_dir.assert_not_awaited()
+        res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
+        assert not res.success and res.error == "cf blocked"
+
+    @pytest.mark.asyncio
+    async def test_login_exception_reports_failure(self, runtime):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
+        with patch(
+            "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await runtime._handle_account_login(self._msg())
+        res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
+        assert not res.success and "boom" in res.error

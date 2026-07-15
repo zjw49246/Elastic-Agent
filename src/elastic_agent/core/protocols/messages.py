@@ -128,6 +128,24 @@ class CredentialRotateMessage(Message):
     config_dir: str
 
 
+class AccountLoginMessage(Message):
+    """Manager -> Worker: log this account in ON the worker (worker-autonomous).
+
+    Unlike CREDENTIAL_LOGIN (which pushes already-obtained tokens down), this
+    carries only the account identity + 接码 token; the worker runs the vendored
+    login flow locally and the credentials are written on the worker and never
+    sent back up.
+    """
+
+    type: Literal["ACCOUNT_LOGIN"] = "ACCOUNT_LOGIN"
+    account_id: str
+    email: str
+    email_token: str
+    config_dir: str
+    provider: str | None = None
+    slot_index: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Worker -> Manager (Events)
 # ---------------------------------------------------------------------------
@@ -235,6 +253,14 @@ class CredentialLoginResultMessage(Message):
     expires_at: datetime | None = None
 
 
+class AccountLoginResultMessage(Message):
+    type: Literal["ACCOUNT_LOGIN_RESULT"] = "ACCOUNT_LOGIN_RESULT"
+    account_id: str
+    slot_index: int
+    success: bool
+    error: str | None = None
+
+
 class CredentialExhaustedMessage(Message):
     type: Literal["CREDENTIAL_EXHAUSTED"] = "CREDENTIAL_EXHAUSTED"
     worker_id: str
@@ -281,6 +307,7 @@ ManagerToWorkerMessage = Annotated[
         ForceSyncMessage,
         CredentialLoginMessage,
         CredentialRotateMessage,
+        AccountLoginMessage,
         AuthResultMessage,
     ],
     Field(discriminator="type"),
@@ -299,6 +326,7 @@ WorkerToManagerMessage = Annotated[
         ForceSyncResultMessage,
         QuotaStatusMessage,
         CredentialLoginResultMessage,
+        AccountLoginResultMessage,
         CredentialExhaustedMessage,
         AuthMessage,
     ],
@@ -320,6 +348,7 @@ AnyMessage = Annotated[
         ForceSyncMessage,
         CredentialLoginMessage,
         CredentialRotateMessage,
+        AccountLoginMessage,
         AuthResultMessage,
         LogMessage,
         ProcessExitMessage,
@@ -332,6 +361,7 @@ AnyMessage = Annotated[
         ForceSyncResultMessage,
         QuotaStatusMessage,
         CredentialLoginResultMessage,
+        AccountLoginResultMessage,
         CredentialExhaustedMessage,
         AuthMessage,
     ],

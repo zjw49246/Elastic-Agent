@@ -358,6 +358,11 @@ def _make_backend(tmp_path):
     backend._saw_claude_output = set()
     backend._sessions = {}
     backend._consumers = {}
+    backend._launch_kwargs = {}
+    backend._transient_retries = {}
+    backend._transient_retry_max = 5
+    backend._transient_retry_base = 10.0
+    backend._transient_retry_cap = 120.0
     return backend
 
 
@@ -912,3 +917,82 @@ class TestTurnErrorSemantics:
             "t1", 1, session_id="sess-1", error_type="pty_turn_error",
             error_message="the turn failed unexpectedly",
         )
+
+
+@pty_required
+class TestTransientOverloadRetry:
+    """P2: a server-side 429/overload turn is retried on the SAME session
+    after backoff instead of failing the task."""
+
+    @pytest.mark.asyncio
+    async def test_overload_error_classified_and_retried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "elastic_agent.worker.pty_backend.transient_retry_delay",
+            lambda *a, **k: 0.0,
+        )
+        backend = _make_backend(tmp_path)
+        backend.launch = AsyncMock()
+        backend._launch_kwargs["t1"] = {"key": "t1", "prompt": "hi", "cwd": "/x"}
+        # An overload error turn (produces real output, then the api error).
+        await backend.on_event("t1", {
+            "event_type": "message", "raw_json": "{}", "session_id": "s1",
+        })
+        await backend.on_event("t1", {
+            "event_type": "message", "content": "API Error: overloaded_error",
+            "is_error": True, "session_id": "s1",
+        })
+        await backend.on_exit("t1", 1)
+        # Deferred: the Manager is NOT told the task failed…
+        backend._runtime._on_pty_exit.assert_not_called()
+        assert backend._transient_retries["t1"] == 1
+        # …and the session is relaunched (resumed) in the background.
+        await asyncio.sleep(0.05)
+        backend.launch.assert_awaited()
+        assert backend.launch.await_args.kwargs["resume_session_id"] == "s1"
+
+    def test_schedule_false_without_launch_kwargs(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        assert backend._schedule_transient_retry("t1", "s1") is False
+
+    def test_schedule_false_when_budget_exhausted(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend._launch_kwargs["t1"] = {"key": "t1"}
+        backend._transient_retries["t1"] = 5  # already at max
+        assert backend._schedule_transient_retry("t1", "s1") is False
+
+    @pytest.mark.asyncio
+    async def test_run_retry_resumes_same_session(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend.launch = AsyncMock()
+        backend._launch_kwargs["t1"] = {"key": "t1", "resume_session_id": None}
+        await backend._run_transient_retry("t1", "s1", delay=0.0)
+        backend.launch.assert_awaited_once()
+        assert backend.launch.await_args.kwargs["resume_session_id"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_run_retry_launch_failure_reports_exit(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend.launch = AsyncMock(side_effect=RuntimeError("boom"))
+        backend._launch_kwargs["t1"] = {"key": "t1"}
+        await backend._run_transient_retry("t1", "s1", delay=0.0)
+        backend._runtime._on_pty_exit.assert_awaited_once()
+        args, kwargs = backend._runtime._on_pty_exit.await_args
+        assert args[1] == 1
+        assert kwargs["error_type"] == "transient_overload"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_fails_normally(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        backend._launch_kwargs["t1"] = {"key": "t1"}
+        backend._transient_retries["t1"] = 5  # at max
+        await backend.on_event("t1", {
+            "event_type": "message", "content": "overloaded_error",
+            "is_error": True, "raw_json": "{}", "session_id": "s1",
+        })
+        await backend.on_exit("t1", 1)
+        # Budget exhausted → report the failure to the Manager.
+        backend._runtime._on_pty_exit.assert_awaited_once()
+        assert backend._runtime._on_pty_exit.await_args.kwargs["error_type"] == "transient_overload"
+        # Retry state cleared once the task truly ends.
+        assert "t1" not in backend._transient_retries
+        assert "t1" not in backend._launch_kwargs

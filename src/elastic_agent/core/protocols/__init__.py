@@ -1,4 +1,6 @@
 from elastic_agent.core.protocols.messages import (
+    AccountLoginMessage,
+    AccountLoginResultMessage,
     AnyMessage,
     AuthMessage,
     AuthResultMessage,
@@ -33,6 +35,8 @@ from elastic_agent.core.protocols.messages import (
 )
 
 __all__ = [
+    "AccountLoginMessage",
+    "AccountLoginResultMessage",
     "AnyMessage",
     "AuthMessage",
     "AuthResultMessage",

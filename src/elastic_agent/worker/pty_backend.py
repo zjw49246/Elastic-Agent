@@ -21,11 +21,18 @@ Key shape decisions:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from elastic_agent.core.rate_limit import (
+    is_rate_limited,
+    is_transient_overload,
+    transient_retry_delay,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +118,20 @@ def classify_turn_error(content: Any | None) -> tuple[str, str]:
             "runtime_timeout",
             f"Worker runtime timed out and interrupted the Claude process ({message})",
         )
+    # Server-side transient 429/overload (Anthropic infra, NOT an account usage
+    # limit) → retry the SAME account after backoff. Checked before the
+    # usage-limit branch; is_transient_overload already excludes usage-limit /
+    # auth banners so those still route to rotation.
+    if is_transient_overload(message):
+        return (
+            "transient_overload",
+            "Anthropic API is temporarily overloaded / limiting requests "
+            "(infrastructure-side, not an account usage limit). The worker will "
+            f"back off and retry the same account. Original error: {message}",
+        )
     if (
-        "rate_limit_event" in lower
-        or "usage limit reached" in lower
-        or "hit your session limit" in lower
+        is_rate_limited(message)
+        or "rate_limit_event" in lower
         or '"api_error_status": 429' in lower
         or '"api_error_status":429' in lower
     ):
@@ -142,7 +159,15 @@ if PTY_AVAILABLE:
         session when the pool still has it.
         """
 
-        def __init__(self, runtime, max_sessions: int = 4, log_dir: str | Path = "logs"):
+        def __init__(
+            self,
+            runtime,
+            max_sessions: int = 4,
+            log_dir: str | Path = "logs",
+            transient_retry_max: int = 5,
+            transient_retry_base: float = 10.0,
+            transient_retry_cap: float = 120.0,
+        ):
             # Own BridgeHub so prompts go via channel injection (stdin is
             # only the fallback path inside claude-pty).
             self._bridge = BridgeHub()
@@ -155,6 +180,23 @@ if PTY_AVAILABLE:
             self._turn_error_types: dict[str, str] = {}
             self._saw_result: set[str] = set()
             self._saw_claude_output: set[str] = set()
+            # Transient-overload same-account retry (P2): remember each task's
+            # launch kwargs so a 429/overload turn can be re-run on the same
+            # session after backoff instead of failing the task.
+            self._launch_kwargs: dict[str, dict] = {}
+            self._transient_retries: dict[str, int] = {}
+            self._transient_retry_max = transient_retry_max
+            self._transient_retry_base = transient_retry_base
+            self._transient_retry_cap = transient_retry_cap
+
+        async def launch(self, **kwargs):
+            """Capture launch kwargs (for transient retry) then launch."""
+            key = kwargs.get("key")
+            if key is not None:
+                # Keep only what a re-launch needs; resume_session_id is
+                # refreshed from the live session at retry time.
+                self._launch_kwargs[key] = dict(kwargs)
+            return await super().launch(**kwargs)
 
         def build_config(self, **kwargs):
             """Extend the base config with a per-task response timeout.
@@ -286,6 +328,16 @@ if PTY_AVAILABLE:
                 ec = 1
 
             session_id = self._task_session_ids.get(task_id)
+
+            # P2: a server-side transient 429/overload turn is retried on the
+            # SAME session after backoff instead of failing the task. Don't
+            # synthesize a failed result or notify the Manager — the retried
+            # turn's own on_exit reports the eventual outcome.
+            if error_type == "transient_overload" and self._schedule_transient_retry(
+                task_id, session_id
+            ):
+                return
+
             if task_id not in self._saw_result:
                 await self._emit_log(task_id, synthesize_result_line(
                     session_id=session_id,
@@ -298,6 +350,10 @@ if PTY_AVAILABLE:
             self._task_session_ids.pop(task_id, None)
             self._sessions.pop(task_id, None)
             self._consumers.pop(task_id, None)
+            # The task has truly ended (success or non-retryable failure) —
+            # drop its transient-retry budget and stored launch kwargs.
+            self._transient_retries.pop(task_id, None)
+            self._launch_kwargs.pop(task_id, None)
 
             await self._runtime._on_pty_exit(
                 task_id,
@@ -306,6 +362,68 @@ if PTY_AVAILABLE:
                 error_type=error_type,
                 error_message=error,
             )
+
+        def _schedule_transient_retry(self, task_id: str, session_id: str | None) -> bool:
+            """Schedule a same-session retry for a transient-overload turn.
+
+            Returns True if a retry was scheduled (the caller must return
+            without reporting the turn), False to fall through to failure.
+            """
+            if task_id not in self._launch_kwargs:
+                return False
+            attempt = self._transient_retries.get(task_id, 0) + 1
+            if attempt > self._transient_retry_max:
+                logger.warning(
+                    "PTY task %s exhausted %d transient-overload retries; failing",
+                    task_id, self._transient_retry_max,
+                )
+                return False
+            self._transient_retries[task_id] = attempt
+            # Tear down the just-exited turn's per-turn state; keep the retry
+            # budget and stored launch kwargs for the re-launch.
+            self._turn_errors.pop(task_id, None)
+            self._turn_error_types.pop(task_id, None)
+            self._saw_result.discard(task_id)
+            self._saw_claude_output.discard(task_id)
+            self._sessions.pop(task_id, None)
+            self._consumers.pop(task_id, None)
+            delay = transient_retry_delay(
+                attempt, self._transient_retry_base, self._transient_retry_cap
+            )
+            logger.warning(
+                "PTY task %s transient overload — retry %d/%d on same account in %.1fs",
+                task_id, attempt, self._transient_retry_max, delay,
+            )
+            asyncio.create_task(self._run_transient_retry(task_id, session_id, delay))
+            return True
+
+        async def _run_transient_retry(
+            self, task_id: str, session_id: str | None, delay: float
+        ) -> None:
+            await asyncio.sleep(delay)
+            kwargs = dict(self._launch_kwargs.get(task_id) or {})
+            if not kwargs:
+                return
+            # Resume the same session so the retry continues the same context.
+            kwargs["resume_session_id"] = session_id or kwargs.get("resume_session_id")
+            try:
+                await self.launch(**kwargs)
+            except Exception:
+                logger.exception(
+                    "PTY task %s transient retry launch failed; reporting failure",
+                    task_id,
+                )
+                self._launch_kwargs.pop(task_id, None)
+                self._transient_retries.pop(task_id, None)
+                msg = "transient-overload retry failed to relaunch the session"
+                await self._emit_log(task_id, synthesize_result_line(
+                    session_id=session_id, is_error=True,
+                    error_message=msg, error_type="transient_overload",
+                ))
+                await self._runtime._on_pty_exit(
+                    task_id, 1, session_id=session_id,
+                    error_type="transient_overload", error_message=msg,
+                )
 
         async def recycle_config_dir(self, config_dir: str | None) -> int:
             """Stop every session bound to config_dir. Returns the count.
