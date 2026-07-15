@@ -111,3 +111,11 @@
 - **凭证边界**：前端/Manager 只碰账号身份（email+接码token），凭证只在 worker 本地 `perform_login` 生成、绝不回传——批量路径全程守住。
 - **未接的活**：`ManagerFleetDriver` 的 provision/login 是部署期注入钩子（bootstrap SSH 管线 + ACCOUNT_LOGIN 结果关联），沙箱内无法端到端验证；真 worker 上需验登录链路 + 瞬时/限流重启。多账号/机（per_worker>1）的独立 config_dir 池 + hardlink 会话迁移仍待做。
 - 全 unit 套件 32F/76E 与环境基线一致（DryRunProvider/InMemoryProvider 缺 reboot_instance、fastapi、reconnect timing，均不 import 新模块），passed 1118→1190（+72），零新回归。
+
+## 2026-07-15 实盘装配 provision/login：/batch 可真拉起 worker（commit 537d1c3）
+
+**做法**：`core/batch_hooks.py` 把 `ManagerFleetDriver` 的注入钩子变成真行为——provision=等实例 running→`BootstrapHandler` SSH 跑 `compile_bootstrap_steps`→等 WS 连上；login=`AccountAllocator`（内存分配账号身份）+`LoginCoordinator`（发 ACCOUNT_LOGIN、经 event_bus 等 ACCOUNT_LOGIN_RESULT）；`wire_batch` 装配并把 worker 的 RUN_EXHAUSTED/PROCESS_EXIT 经 event_bus 路由回 orchestrator。`Manager.batch` 默认走 `wire_batch`。
+
+**经验教训（换号竞态）**：worker 撞限流 → 先发 `RUN_EXHAUSTED` → 再 SIGINT 产生 `PROCESS_EXIT`。Manager 先处理 exhausted（换号+重派，相位已从 ROTATING 转回 RUNNING），随后陈旧的 `PROCESS_EXIT`（非零）到达——若只靠 `ROTATING` 相位守卫会把**刚重派的新 run 误判 FAILED**。**修复：`on_worker_exit` 用 `task_id` 匹配当前 `run.task_id`，旧 run 的退出 task_id 不匹配即丢弃。** 这是 recover-then-failed 家族问题的又一实例（对照 PTY 侧 orphan/autonomous 守卫）——凡「中断+重启」路径都要用稳定标识区分「旧实例的尾声」和「新实例的结果」，别用会被重置的相位。
+
+**仍待真机验**：浏览器登录链路、瞬时 429/限流重启、Mode B 撞限流换号，沙箱无法端到端（无 Chrome/账号/真 429）。`manager_url` 需经 `ELASTIC_AGENT_MANAGER_URL` 或 `config.server` 给对；ssh key 路径按 provider.type 取。全 unit 32F/76E 与基线一致，passed→1206。
