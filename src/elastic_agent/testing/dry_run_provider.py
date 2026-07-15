@@ -166,6 +166,16 @@ class DryRunProvider(CloudProvider):
             inst.state = InstanceState.STOPPED
         self._record("stop", instance_id)
 
+    async def reboot_instance(self, instance_id: str) -> None:
+        self._check_failure("reboot_instance")
+
+        async with self._lock:
+            inst = self.instances.get(instance_id)
+            if inst is None:
+                raise ValueError(f"Instance {instance_id} not found")
+            inst.state = InstanceState.RUNNING
+        self._record("reboot", instance_id)
+
     async def terminate_instance(self, instance_id: str) -> None:
         self._check_failure("terminate_instance")
         if self._terminate_delay > 0:

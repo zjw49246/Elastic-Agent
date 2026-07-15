@@ -147,6 +147,11 @@ class AWSProvider(CloudProvider):
         await asyncio.to_thread(self._client.terminate_instances, InstanceIds=[native_id])
         logger.info("Terminated AWS instance %s", native_id)
 
+    async def reboot_instance(self, instance_id: str) -> None:
+        native_id = self._native_id(instance_id)
+        await asyncio.to_thread(self._client.reboot_instances, InstanceIds=[native_id])
+        logger.info("Rebooted AWS instance %s", native_id)
+
     async def list_instances(self, filters: dict[str, str] | None = None) -> list[Instance]:
         ec2_filters = [
             {"Name": f"tag:{self.MANAGED_TAG_KEY}", "Values": [self.MANAGED_TAG_VALUE]},
