@@ -8,6 +8,7 @@
   - subprocess（默认）：Manager 经 AgentType 构造 `claude -p ... --output-format stream-json` 命令行，worker spawn 后逐行转发 stdout
   - **PTY 模式**（可选）：`ExecuteMessage.agent_params` 非空且 worker 装了 [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) 时，worker 用 `ElasticPTYBackend`（worker/pty_backend.py，继承 claude_pty 的 BasePTYBackend）把 Claude Code 宿主在持久 PTY 会话里；`command` 始终随消息下发作为 fallback
 - **PTY 事件回传**：带 raw_json 的事件原行透传为 stdout NDJSON（Manager 解析链不变）；交互模式 JSONL 无 result 行，worker 在 turn 结束合成一条（带 session_id，无 cost_usd）；限流/错误 turn → 非零 exit code → 既有凭证轮换照常触发
+- **orphan / autonomous 守卫**（pty_backend.py `on_event`）：claude-pty 的 PTYEvent 带 `orphan`（冷恢复时重放的上一 turn JSONL）/ `autonomous`（后台子 agent turn）标记。二者都**不参与前台 turn 的记账**——不设 session_id、不标 turn-fatal 错误、不计入 `_saw_result`/`_saw_claude_output`（`turn_scoped` 门）；orphan 事件还直接从转发流丢弃（避免 Manager 重复落盘 / 把旧 result 当本 turn 结果）。否则 resume 会把旧 api_error 重新标致命 → 刚成功的 turn 被误报 failed（recover-then-failed，借鉴 CCM task #729/#87）
 - **开关**：Manager 侧 `TaskRouter(use_pty=True)` + bootstrap `include_pty=True`；worker 侧无需配置
 - **凭证轮换**：原地换凭证（同 config_dir 写新 token）；`CREDENTIAL_LOGIN` 后 worker 调 `recycle_config_dir` 回收该 config_dir 的所有 PTY 会话（温热会话仍持旧账号，不可热复用），下次 EXECUTE 冷恢复读新凭证
 

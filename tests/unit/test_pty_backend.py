@@ -115,6 +115,17 @@ class TestEventToLogLine:
         assert "Worker runtime timed out" in message
         assert "Response timed out after 600s" in message
 
+    def test_usage_limit_classified_as_rate_limited(self):
+        error_type, message = classify_turn_error("usage limit reached")
+        assert error_type == "claude_rate_limited"
+        assert "usage limit was reached" in message
+        assert "usage limit reached" in message
+
+    def test_generic_error_stays_pty_turn_error(self):
+        error_type, message = classify_turn_error("the turn failed unexpectedly")
+        assert error_type == "pty_turn_error"
+        assert message == "the turn failed unexpectedly"
+
 
 class TestSynthesizeResultLine:
     def test_success_shape(self):
@@ -409,7 +420,7 @@ class TestElasticPTYBackendEvents:
     async def test_on_exit_error_turn_forces_nonzero_exit(self, tmp_path):
         backend = _make_backend(tmp_path)
         await backend.on_event("t1", {
-            "event_type": "message", "content": "usage limit reached",
+            "event_type": "message", "content": "the turn failed unexpectedly",
             "is_error": True, "session_id": "sess-1",
         })
         await backend.on_exit("t1", 0)
@@ -417,9 +428,10 @@ class TestElasticPTYBackendEvents:
         result_msg = backend._runtime._send_event.call_args[0][0]
         obj = json.loads(result_msg.data)
         assert obj["subtype"] == "error"
-        assert obj["error"] == "usage limit reached"
+        assert obj["error"] == "the turn failed unexpectedly"
         backend._runtime._on_pty_exit.assert_awaited_once_with(
-            "t1", 1, session_id="sess-1", error_type="pty_turn_error", error_message="usage limit reached"
+            "t1", 1, session_id="sess-1", error_type="pty_turn_error",
+            error_message="the turn failed unexpectedly",
         )
 
     @pytest.mark.asyncio
@@ -455,6 +467,62 @@ class TestElasticPTYBackendEvents:
         backend._runtime._on_pty_exit.assert_awaited_once_with(
             "t1", 0, session_id="sess-1", error_type=None, error_message=None
         )
+
+    @pytest.mark.asyncio
+    async def test_orphan_error_does_not_poison_turn(self, tmp_path):
+        """A stale api_error replayed on cold-resume (orphan) must not fail
+        a turn that then succeeds — the recover-then-failed regression."""
+        backend = _make_backend(tmp_path)
+        # Backlog from the previous turn is replayed with orphan=True.
+        await backend.on_event("t1", {
+            "event_type": "message", "content": "usage limit reached",
+            "is_error": True, "orphan": True, "session_id": "sess-1",
+        })
+        # The fresh turn produces real Claude output and no error.
+        raw = json.dumps({"type": "assistant", "message": {"content": []}})
+        await backend.on_event("t1", {
+            "event_type": "message", "raw_json": raw, "session_id": "sess-1",
+        })
+        await backend.on_exit("t1", 0)
+        obj = json.loads(backend._runtime._send_event.call_args[0][0].data)
+        assert obj["subtype"] == "success"
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1", 0, session_id="sess-1", error_type=None, error_message=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_orphan_event_not_forwarded(self, tmp_path):
+        """Orphan replays are duplicates of already-forwarded lines — drop
+        them so the Manager never double-logs or re-parses an old result."""
+        backend = _make_backend(tmp_path)
+        raw = json.dumps({"type": "result", "session_id": "sess-1"})
+        await backend.on_event("t1", {
+            "event_type": "result", "raw_json": raw, "orphan": True, "session_id": "sess-1",
+        })
+        backend._runtime._send_event.assert_not_called()
+        # Orphan result must not satisfy the turn's own result accounting.
+        assert "t1" not in backend._saw_result
+
+    @pytest.mark.asyncio
+    async def test_autonomous_error_does_not_fail_turn(self, tmp_path):
+        """A background sub-agent (autonomous) error is not the foreground
+        turn's error and must not mark the task failed."""
+        backend = _make_backend(tmp_path)
+        raw = json.dumps({"type": "assistant", "message": {"content": []}})
+        await backend.on_event("t1", {
+            "event_type": "message", "raw_json": raw, "session_id": "sess-1",
+        })
+        await backend.on_event("t1", {
+            "event_type": "message", "content": "sub-agent hit an error",
+            "is_error": True, "autonomous": True, "session_id": "subagent-9",
+        })
+        # The sub-agent's session_id must not clobber the task's own.
+        assert backend._task_session_ids["t1"] == "sess-1"
+        await backend.on_exit("t1", 0)
+        obj = json.loads(backend._runtime._send_event.call_args[0][0].data)
+        assert obj["subtype"] == "success"
+        # The synthesized result carries the task's session, not the sub-agent's.
+        assert obj["session_id"] == "sess-1"
 
 
 # ---------------------------------------------------------------------------
@@ -837,9 +905,10 @@ class TestTurnErrorSemantics:
         backend = _make_backend(tmp_path)
         await backend.on_event("t1", {
             "event_type": etype, "is_error": True,
-            "content": "usage limit reached", "session_id": "sess-1",
+            "content": "the turn failed unexpectedly", "session_id": "sess-1",
         })
         await backend.on_exit("t1", 0)
         backend._runtime._on_pty_exit.assert_awaited_once_with(
-            "t1", 1, session_id="sess-1", error_type="pty_turn_error", error_message="usage limit reached"
+            "t1", 1, session_id="sess-1", error_type="pty_turn_error",
+            error_message="the turn failed unexpectedly",
         )

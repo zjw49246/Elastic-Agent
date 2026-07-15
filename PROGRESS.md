@@ -1,5 +1,23 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-15 用 CCM Worker 系统更新框架 · P1（task-ccm-sync）
+
+**背景**：CCM（Claude-Code-Manager）当初借鉴本框架的 Worker 系统，之后独立演进出大量 PTY/凭证运行时经验；本框架落后。二者已不共享代码，但共用同一上游 `claude-pty`。本次先落地风险最低、价值最高的 P1。
+
+**做了什么**：
+1. **claude-pty bump `88b77ad → d6ff732`**（uv.lock）。本框架 pin 落后上游约 30 个提交；`88b77ad` 是 HEAD 的直系祖先。中间含多个影响既有功能的修复：subagent autonomous-callback 在 PTYEvent 上崩溃、cold-resume 强制 stdin、idle reaper、轮换 exit handler 孤儿 proxy、首启 theme-picker/登录方式 drain 修复等。
+2. **orphan / autonomous 守卫**（`pty_backend.py::on_event`）——**修确认的潜在 bug**。此前 `on_event` 完全不看 `orphan`/`autonomous` 标记，而这两个字段在 pin 的 `88b77ad` 就已存在。后果：温热会话 resume 时 claude-pty 重放上一 turn 的 JSONL backlog（orphan），旧 api_error 被重新标 turn-fatal → 毒化本 turn 合成的 result → 刚成功的 turn 被误报 failed；autonomous 子 agent 的 session_id 还会覆盖主 task 的。修法照搬 CCM `_process_event` 的 `turn_scoped = not orphan and not autonomous` 门：二者不参与 session_id/错误/`_saw_result`/`_saw_claude_output` 记账；orphan 事件另从转发流丢弃。
+
+**遇到的坑**：
+- 主 venv **没装 claude-pty**（`pty` extra 未 sync），导致 `@pty_required` 事件测试长期被 skip。装上后暴露 **4 个 pre-经年失效的 stale 测试**——它们断言 `usage limit reached → pty_turn_error`，但 `classify_turn_error` 早已把限速文案重分类为 `claude_rate_limited`（一直被 skip 没人发现）。已改用泛化错误文案解耦分类器，并补 `classify_turn_error` 的限速/泛化分支专测。
+- worktree 里跑测试要用主 venv 的 python 且 pytest 的 `pythonpath=["src"]` 会解析到 worktree 的 src；`uv pip install --python <主venv> pytest pytest-asyncio` 装测试依赖，claude-pty 用 pinned URL@d6ff732 装进主 venv 才能真正跑事件测试。
+
+**测试**：`tests/unit/test_pty_backend.py` 63 passed（含 3 个新 orphan/autonomous 回归 + 2 个新 classify）；PTY 相关子集（pty_backend/worker_runtime/task_router/protocol/agent_type/bootstrap_steps）208 passed。
+
+**待续（P2/P3）**：瞬时过载同号退避重试、限速 actionability + assistant 文本兜底、worker 自治登录（协议下发 email+接码token）、hardlink 会话迁移保温热会话、首启 warmup、前端批次编排。
+
+**Commit**: 见本节合入的 commit。
+
 ## 2026-06-11 PTY 框架支持（task-pty-support）
 
 **做了什么**：worker 支持用 claude-pty 把 Claude Code 宿主在持久 PTY 会话中执行任务，替代每任务 spawn `claude -p`。Manager 侧只加了可选的 `ExecuteMessage.agent_params`（向后兼容）+ `TaskRouter(use_pty=True)` 开关；PTY 仓库零改动。

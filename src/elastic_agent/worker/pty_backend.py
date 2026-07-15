@@ -214,8 +214,18 @@ if PTY_AVAILABLE:
 
         async def on_event(self, key: Any, event_dict: dict, **context) -> None:
             task_id = key
+            # Orphan events are the PREVIOUS turn's session JSONL replayed on
+            # cold-resume; autonomous events belong to a background sub-agent
+            # turn, not the foreground one. Neither may drive the foreground
+            # turn's session-id capture, error marking, or result/output
+            # accounting — otherwise a resumed session re-marks a stale
+            # api_error as turn-fatal and a turn that just succeeded is
+            # reported failed (recover-then-failed), and an autonomous
+            # sub-agent's session_id would clobber the task's own.
+            turn_scoped = not event_dict.get("orphan") and not event_dict.get("autonomous")
+
             sid = event_dict.get("session_id")
-            if sid:
+            if sid and turn_scoped:
                 self._task_session_ids[task_id] = sid
             # Only session-level errors are turn-fatal: API errors, rate
             # limits, response timeouts (claude-pty emits those as
@@ -224,8 +234,10 @@ if PTY_AVAILABLE:
             # turn can still deliver; it must not poison the synthesized
             # result (a real book once finished 100% but was reported
             # failed because of one mid-run tool error).
-            if event_dict.get("is_error") and event_dict.get("event_type") in (
-                "system_event", "message", "result",
+            if (
+                turn_scoped
+                and event_dict.get("is_error")
+                and event_dict.get("event_type") in ("system_event", "message", "result")
             ):
                 error_type, error_message = classify_turn_error(event_dict.get("content"))
                 current_type = self._turn_error_types.get(task_id)
@@ -234,10 +246,17 @@ if PTY_AVAILABLE:
                 ):
                     self._turn_errors[task_id] = error_message
                     self._turn_error_types[task_id] = error_type
-            if event_dict.get("event_type") == "result":
+            if turn_scoped and event_dict.get("event_type") == "result":
                 self._saw_result.add(task_id)
-            if event_dict.get("raw_json"):
+            if turn_scoped and event_dict.get("raw_json"):
                 self._saw_claude_output.add(task_id)
+
+            # Orphan events are stale replays already forwarded in a prior
+            # turn — dropping them keeps the Manager from double-logging and
+            # from parsing an old `result` line as this turn's outcome.
+            # Autonomous (sub-agent) output is real and still forwarded.
+            if event_dict.get("orphan"):
+                return
 
             line = event_to_log_line(event_dict)
             if line is None:
