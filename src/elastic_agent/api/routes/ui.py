@@ -434,9 +434,26 @@ _BATCH_HTML = """\
       <div><label>机器命名前缀（EC2 Name=前缀-i；空=用 Job name）</label>
         <input id="jNamePrefix" placeholder="my-fleet"></div>
       <div><label>机型 instance_type（空=Manager 默认）</label>
-        <input id="jInstanceType" placeholder="t3.xlarge"></div>
-      <div><label>Region（空=Manager 默认）</label>
-        <input id="jRegion" placeholder="ap-northeast-1"></div>
+        <select id="jInstanceType">
+          <option value="">（默认）</option>
+          <optgroup label="通用/便宜">
+            <option>t3.large</option><option>t3.xlarge</option><option>t3.2xlarge</option>
+            <option>m5.xlarge</option><option>m5.2xlarge</option><option>m5.4xlarge</option>
+          </optgroup>
+          <optgroup label="内存型 (ai4sci 建议)">
+            <option>r5.large</option><option>r5.xlarge</option><option>r5.2xlarge</option>
+            <option>r5.4xlarge</option><option>r5.8xlarge</option>
+          </optgroup>
+          <optgroup label="计算型">
+            <option>c5.xlarge</option><option>c5.2xlarge</option><option>c5.4xlarge</option><option>c5.9xlarge</option>
+          </optgroup>
+        </select></div>
+      <div><label>Region（空=Manager 默认；换区需 Manager 侧有对应 AMI/子网）</label>
+        <select id="jRegion">
+          <option value="">（默认）</option>
+          <option>ap-northeast-1</option><option>ap-southeast-1</option><option>ap-south-1</option>
+          <option>us-east-1</option><option>us-west-2</option><option>eu-west-1</option><option>eu-central-1</option>
+        </select></div>
     </div>
     <div class="grid2">
       <div><label>根盘 disk_gb（0=Manager 默认；吃盘任务如 ai4sci 建议 ≥60）</label>
