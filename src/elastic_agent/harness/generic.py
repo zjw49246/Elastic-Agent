@@ -186,7 +186,7 @@ def build_execute(spec: JobSpec, ctx: WorkerContext, *, resume: bool = False) ->
     command = spec.render_resume_command(ctx) if resume else spec.render_command(ctx)
     return {
         "command": command,
-        "cwd": spec.run.cwd,
+        "cwd": spec.resolved_cwd(),
         "env": spec.render_env(ctx),
         "timeout": spec.run.timeout or None,
     }

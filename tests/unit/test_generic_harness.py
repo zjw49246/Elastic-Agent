@@ -87,10 +87,13 @@ class TestScalingSignal:
 
 class TestBuildExecute:
     def test_execute_kwargs(self):
-        spec = _spec(run=RunSpec(command="bench --out {{shard_index}}", cwd="repo", timeout=0))
+        spec = _spec(
+            run=RunSpec(command="bench --out {{shard_index}}", cwd="repo", timeout=0),
+            setup={"target_dir": "/opt/h"},
+        )
         ex = build_execute(spec, WorkerContext(shard_index=2))
         assert ex["command"] == ["bash", "-lc", "bench --out 2"]
-        assert ex["cwd"] == "repo"
+        assert ex["cwd"] == "/opt/h/repo"   # relative cwd joined under the repo root
         assert ex["timeout"] is None  # 0 → no wall-clock limit
 
     def test_resume_appends_args(self):

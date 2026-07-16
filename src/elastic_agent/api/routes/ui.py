@@ -430,14 +430,15 @@ _BATCH_HTML = """\
       <div><label>Job name</label><input id="jName" placeholder="ai4sci-opus48-seed128"></div>
       <div><label>Workers (fan-out)</label><input id="jWorkers" type="number" value="1" min="1"></div>
     </div>
-    <label>Setup — repo URL</label>
+    <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
     <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
-    <label>Setup — commands (one per line, run after clone)</label>
+    <label>Setup — commands（每行一条,在代码目录里跑,如 uv sync）</label>
     <textarea id="jSetup" placeholder="uv sync"></textarea>
-    <label>Run command (shell; {{shard_index}} / $(hostname -s) supported)</label>
+    <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
+    <label>Run command（shell;从代码目录运行;支持 {{shard_index}} 和 $(hostname -s)）</label>
     <textarea id="jRun" placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
     <div class="grid2">
-      <div><label>Working dir (cwd)</label><input id="jCwd" value="."></div>
+      <div><label>Working dir（空/. = 代码目录;相对路径=其子目录）</label><input id="jCwd" value="."></div>
       <div><label>Shard by</label>
         <select id="jShard"><option value="hostname">hostname</option>
           <option value="shard_index">shard_index</option><option value="none">none</option></select></div>

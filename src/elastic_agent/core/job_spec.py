@@ -180,6 +180,23 @@ class JobSpec(BaseModel):
 
     # -- rendering helpers --------------------------------------------------
 
+    def resolved_cwd(self) -> str:
+        """Working directory for the run command.
+
+        The contract: code clones to ``setup.target_dir`` (the repo root), and the
+        run command runs from there — so you write it exactly as if you'd done
+        ``git clone … && cd repo && <command>``. ``run.cwd`` refines it: default
+        (``.``) == the repo root; a relative path is taken under the repo root; an
+        absolute path is used as-is.
+        """
+        base = self.setup.target_dir
+        cwd = (self.run.cwd or ".").strip()
+        if cwd in (".", ""):
+            return base
+        if cwd.startswith("/"):
+            return cwd
+        return f"{base.rstrip('/')}/{cwd}"
+
     def worker_contexts(self) -> list[WorkerContext]:
         """One context per worker for the configured fan-out."""
         n = max(1, self.fanout.workers)

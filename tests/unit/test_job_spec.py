@@ -120,6 +120,20 @@ class TestRenderEnv:
         assert env["CLAUDE_CONFIG_DIR"] == "/root/.claude-slot-1"
 
 
+class TestResolvedCwd:
+    def test_default_is_repo_root(self):
+        spec = JobSpec(name="j", run=RunSpec(command="x"), setup={"target_dir": "/opt/h"})
+        assert spec.resolved_cwd() == "/opt/h"
+
+    def test_relative_joined_under_repo(self):
+        spec = JobSpec(name="j", run=RunSpec(command="x", cwd="sub/dir"), setup={"target_dir": "/opt/h"})
+        assert spec.resolved_cwd() == "/opt/h/sub/dir"
+
+    def test_absolute_used_as_is(self):
+        spec = JobSpec(name="j", run=RunSpec(command="x", cwd="/tmp/work"), setup={"target_dir": "/opt/h"})
+        assert spec.resolved_cwd() == "/tmp/work"
+
+
 class TestJobSpecDefaults:
     def test_minimal_spec(self):
         spec = JobSpec(name="j", run=RunSpec(command="echo hi"))

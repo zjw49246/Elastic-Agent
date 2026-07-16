@@ -136,6 +136,10 @@ def harness_code_step(
         if strip_token:
             parts.append(f"git -C {target_dir} remote set-url origin {repo_url}")
         if extra_commands:
+            # Setup commands (uv sync, pip install, …) run INSIDE the cloned repo
+            # so they find pyproject.toml / requirements.txt — same as a human
+            # doing `git clone … && cd repo && uv sync`.
+            parts.append(f"cd {target_dir}")
             parts.extend(extra_commands)
         cmd = " && ".join(parts)
 
