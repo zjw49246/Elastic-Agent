@@ -175,7 +175,11 @@ _DASHBOARD_HTML = """\
 <script>
 const _urlKey = new URLSearchParams(window.location.search).get('api_key');
 if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
-const API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
+let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
+if (!API_KEY) {  // ask once, then remember in this browser
+  const k = (window.prompt('请输入 API Key（本次为 elastic-demo-2026）：') || '').trim();
+  if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
+}
 const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
                         : {'Content-Type': 'application/json'};
 
@@ -395,7 +399,11 @@ _BATCH_HTML = """\
 <div class="container">
   <header>
     <h1>Batch Console</h1>
-    <a href="/" id="navFleet">← Fleet Dashboard</a>
+    <div>
+      <a href="/fleet" id="navFleet">Fleet Dashboard</a>
+      &nbsp;·&nbsp;
+      <a href="#" onclick="forgetKey();return false" style="color:var(--muted)">换 Key</a>
+    </div>
   </header>
 
   <!-- Accounts -->
@@ -478,11 +486,16 @@ _BATCH_HTML = """\
 <script>
 const _urlKey = new URLSearchParams(window.location.search).get('api_key');
 if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
-const API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
+let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
+if (!API_KEY) {  // ask once, then remember in this browser
+  const k = (window.prompt('请输入 API Key（本次为 elastic-demo-2026）：') || '').trim();
+  if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
+}
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
                         : {'Content-Type':'application/json'};
 // Fleet Dashboard link (key persists via localStorage; keep query too).
 {const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet' + window.location.search;}
+function forgetKey() { localStorage.removeItem('ea_api_key'); location.href = '/'; }
 async function api(method, path, body) {
   const opts = {method, headers:{...headers}};
   if (body) opts.body = JSON.stringify(body);
