@@ -1,5 +1,28 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-16 Docker沙箱 + S3数据集 + worker日志 三功能 + UI Submit 全量排障（task-ccm-sync）
+
+**功能**（commit `ddb9a8f` + buildx `ae85860`）：
+1. **Docker 支持**（`setup.needs_docker`）：`docker_install_step` 装 `docker.io **docker-buildx**` + `usermod -aG docker <ssh_user>` + `enable --now docker`，插在 runtime 部署**前**（systemd 起服务才解析 User 补充组，必须先 usermod）。**buildx 是实盘抠出来的坑**：Docker 29 用 BuildKit build 镜像、必须 buildx，`docker.io` 不含 → "buildx component is missing" → 镜像建不出、agent 没跑、score 0。补 `docker-buildx` 后实盘验证：镜像 build 成功、agent 在容器内跑 23 turns、出真分 46/100。
+2. **S3 数据集**（`setup.s3_datasets:[{uri,dest}]`）：worker 无 S3 凭证（结果上传也 Manager 侧 boto3）→ Manager 下载(`code_sync._download_s3`)→rsync(`stage_s3` 复用 deliver)。
+3. **Worker 日志 API**：`GET /api/nodes/{id}/logs` Manager SSH 跑 journalctl。
+
+**UI Submit 全量 spec 逐层排障**（用户在前端交 `--tasks all --sandbox os` 全量 job，连挂 5 次，每次不同根因，都是 **spec/环境**问题、非框架 bug——除 buildx/docker 那两个补进框架）：
+- `rc=127`：setup 只有 `uv sync` 没装 uv → 加 `curl uv/install.sh|sh`。
+- `rc=2`：`uv sync` 默认 py3.14、**taichi 无 cp314 wheel** → `uv sync --python 3.13`。
+- `credentials not valid`：`account.config_dir` **留空** → 登录校验查错路径（`per_worker=1` 直接透传空 config_dir）。设 `/home/ubuntu/.claude-autorun`。
+- `no available account`：用户 UI 又交一次（空 config_dir）→ 两 job 抢唯一账号；直接 AWS terminate 不释放 allocator（release 只在编排 scale-in 触发）→ 重启 Manager 清 allocator。
+- `--sandbox os` 静默死：**worker 没 Docker**（bootstrap 只装 node/uv/chrome）→ needs_docker 功能（上文）。
+
+**教训**：
+- **provision 中途失败留活 EC2**（wait_until_running 抛前实例已建；login/run 失败也不自动关）——每次失败必查 `Name=ai4sci*` + terminate，尤其 r5 类贵机型。本轮开了~8 台，逐个清了。
+- **直接 AWS terminate 不释放 Manager 内存态**（AccountAllocator 按 worker_id 分配，只在 scale-in release）→ 重复/失败 job 会饿死后续 job 的账号；清账号态最简单是重启 Manager。
+- **潜在 bug（待修）**：run 子进程退出但 Manager 相位卡 `running`（run 静默失败/完成时都见过）；结果照落盘/S3，只是 UI 显示不对。
+- **`serve_demo.py` 缺 `ELASTIC_AGENT_FRAMEWORK_SRC`** 已补：否则 UI 提交的 job 装 PyPI 框架、缺本分支 `ACCOUNT_LOGIN` handler。
+- 单账号跑全量（3小时 opus）大概率撞额度；`rotation` 无备用号也换不动 → 池里要备≥2 号。
+
+**Commit**: `ddb9a8f`（三功能）、`ae85860`（buildx）
+
 ## 2026-07-16 实盘 e2e 逐层打通（full_run → ai4sci-bench，task-ccm-sync）
 
 **背景**：在本 VPC 内起真 Manager（`.claude-manager/full_run.py`，:8080，真 AWS provider），`manager.batch.launch` 开新 EC2→全量 provision→worker 本地登号→跑 ai4sci-bench→收集→S3。逐次 retry 逐层暴露问题，**三个是真代码 bug**（commit `7cdcb57`），两个是外部/操作层。
