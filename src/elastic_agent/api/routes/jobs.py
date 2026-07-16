@@ -38,7 +38,18 @@ def _job_detail(job) -> dict:
                 "phase": r.phase.value,
                 "shard_index": r.ctx.shard_index,
                 "account_id": r.account_id,
-                "account_email": r.ctx.account_email,
+                "account_email": r.account_email,
+                "active_slot": r.active_slot,
+                # All accounts logged in on this worker (per_worker), active flagged.
+                "accounts": [
+                    {
+                        "account_id": aid,
+                        "email": r.account_emails[i] if i < len(r.account_emails) else "",
+                        "config_dir": r.config_dirs[i] if i < len(r.config_dirs) else "",
+                        "active": i == r.active_slot,
+                    }
+                    for i, aid in enumerate(r.account_ids)
+                ],
                 "rotations": r.rotations,
                 "task_id": r.task_id,
                 "error": r.error,

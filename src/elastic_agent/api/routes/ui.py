@@ -617,10 +617,11 @@ async function refreshJobs() {
           ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
           <details><summary class="muted">${j.workers_detail.length} workers</summary>
           <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
-            <th>account</th><th>rot</th><th>error</th></tr></thead><tbody>
+            <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th></tr></thead><tbody>
           ${j.workers_detail.map(w => `<tr><td>${w.shard_index}</td>
             <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
-            <td>${w.account_email||'--'}</td><td>${w.rotations}</td>
+            <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
+            <td>${w.rotations}</td>
             <td class="muted">${w.error||''}</td></tr>`).join('')}
           </tbody></table></details>
         </div>`; }).join('');
