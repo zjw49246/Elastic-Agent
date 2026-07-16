@@ -15,8 +15,39 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _download_s3(uri: str, dest_dir: str) -> int:
+    """Download an S3 object or prefix to ``dest_dir`` (Manager-side, boto3).
+    A trailing ``/`` (or bucket-only) means "prefix → recursive". Returns the
+    number of objects downloaded. Raises on error."""
+    import boto3  # lazy — matches result_uploader; workers never import this
+
+    p = urlparse(uri)
+    bucket, key = p.netloc, p.path.lstrip("/")
+    s3 = boto3.client("s3")
+    Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    n = 0
+    if uri.endswith("/") or not key:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=key):
+            for obj in page.get("Contents", []):
+                k = obj["Key"]
+                if k.endswith("/"):
+                    continue
+                rel = k[len(key):].lstrip("/")
+                target = Path(dest_dir) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(bucket, k, str(target))
+                n += 1
+    else:
+        target = Path(dest_dir) / Path(key).name
+        s3.download_file(bucket, key, str(target))
+        n = 1
+    return n
 
 
 class ManagerCodeSync:
@@ -100,3 +131,16 @@ class ManagerCodeSync:
         if rc != 0:
             logger.error("deliver: rsync to %s failed: %s", host, out[-300:])
         return rc == 0
+
+    async def stage_s3(self, uri: str, host: str, dest: str) -> bool:
+        """Stage an S3 dataset onto a worker: download it on the Manager (which
+        has S3 creds) into the local cache, then rsync to worker:dest. Workers
+        get no S3 creds — mirrors how results flow back (worker→Manager→S3)."""
+        local = self._cache / "s3" / self.repo_name(uri.rstrip("/"))
+        try:
+            n = await asyncio.to_thread(_download_s3, uri, str(local))
+        except Exception:
+            logger.exception("stage_s3: download of %s failed", uri)
+            return False
+        logger.info("stage_s3: downloaded %d object(s) from %s", n, uri)
+        return await self.deliver(str(local), host, dest)

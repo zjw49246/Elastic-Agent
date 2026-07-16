@@ -83,6 +83,18 @@ class WorkerContext:
 # ---------------------------------------------------------------------------
 
 
+class S3Dataset(BaseModel):
+    """A dataset to stage onto each worker from S3 before the run.
+
+    The **Manager** downloads ``uri`` (it has S3 creds) and rsyncs it to the
+    worker at ``dest`` — workers have no IAM profile / S3 creds, mirroring how
+    results flow back (worker→Manager→S3). ``uri`` may be a single object or a
+    prefix (trailing ``/`` → recursive sync)."""
+
+    uri: str                      # s3://bucket/key or s3://bucket/prefix/
+    dest: str                     # absolute path on the worker
+
+
 class SetupSpec(BaseModel):
     """How to provision each worker before the run command (bootstrap-time)."""
 
@@ -97,6 +109,13 @@ class SetupSpec(BaseModel):
     #    Manager) then rsyncs the checkout (minus .git) to the worker — the token
     #    never touches the worker. Preferred for private repos.
     deliver: Literal["worker_clone", "manager_rsync"] = "worker_clone"
+    # Install Docker in bootstrap (before the runtime starts, so the runtime user
+    # is in the docker group). Required for jobs whose run uses Docker, e.g.
+    # ai4sci-bench `--sandbox os`.
+    needs_docker: bool = False
+    # Datasets staged from S3 onto each worker before the run (Manager-side pull
+    # → rsync; workers need no S3 creds).
+    s3_datasets: list[S3Dataset] = Field(default_factory=list)
 
 
 class RunSpec(BaseModel):

@@ -191,13 +191,13 @@ def make_provision_hook(
         steps = compile_bootstrap_steps(
             spec, manager_url=manager_url, auth_token=node.auth_token or "",
             worker_id=worker_id, include_pty=include_pty,
-            runtime_from_src=bool(framework_src),
+            runtime_from_src=bool(framework_src), run_as=ssh_user,
         )
         if not await runner(worker_id, host, steps, ssh_user, ssh_key):
             return False
 
         need_manager_rsync = spec.setup.deliver == "manager_rsync" and spec.setup.repo
-        if need_manager_rsync or framework_src:
+        if need_manager_rsync or framework_src or spec.setup.s3_datasets:
             from elastic_agent.core.bootstrap import SSHExecutor
             from elastic_agent.core.code_sync import ManagerCodeSync
             _sync = ManagerCodeSync(
@@ -244,6 +244,13 @@ def make_provision_hook(
             rc, _out, _err = await ex.execute(step.command, timeout=step.timeout)
             if rc != 0:
                 logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
+                return False
+
+        # Stage S3 datasets onto the worker (Manager downloads → rsync; the
+        # worker needs no S3 creds). Done before the run so the data is in place.
+        for ds in spec.setup.s3_datasets:
+            if not await _sync.stage_s3(ds.uri, host, ds.dest):
+                logger.error("s3 dataset stage failed for %s: %s", worker_id, ds.uri)
                 return False
 
         return await _wait_ws_connected(manager, worker_id, ws_wait_timeout)

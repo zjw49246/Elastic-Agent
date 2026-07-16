@@ -19,6 +19,11 @@ os.environ["ELASTIC_AGENT_MANAGER_URL"] = "ws://172.31.38.111:8080/ws/runtime"
 os.environ["ELASTIC_AGENT_EXTERNAL_API_KEYS"] = "elastic-demo-2026"
 os.environ["ELASTIC_AGENT_RESULTS_S3_BUCKET"] = "elastic-agent-results-297645381734"
 os.environ["ELASTIC_AGENT_RESULTS_S3_INTERVAL"] = "60"
+# Deliver THIS worktree's framework to workers (rsync from src + systemd), so
+# UI-submitted jobs run this branch's code (incl. ACCOUNT_LOGIN handler), not PyPI.
+os.environ["ELASTIC_AGENT_FRAMEWORK_SRC"] = (
+    "/home/ubuntu/Projects/elastic-agent/.claude-manager/worktrees/task-ccm-sync/src"
+)
 os.environ.pop("PORT", None)
 
 # Git token for private-repo delivery (manager_rsync). Read at runtime from the

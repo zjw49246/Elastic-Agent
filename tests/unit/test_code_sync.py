@@ -67,3 +67,32 @@ async def test_deliver_rsync_failure_returns_false(tmp_path):
 def test_repo_name():
     assert ManagerCodeSync.repo_name("https://github.com/a/b.git") == "b"
     assert ManagerCodeSync.repo_name("https://github.com/a/b/") == "b"
+
+
+async def test_stage_s3_downloads_on_manager_then_rsyncs_to_worker(tmp_path, monkeypatch):
+    """S3 dataset staging: Manager downloads (boto3), then rsyncs to the worker
+    (workers get no S3 creds). The rsync target is the requested dest."""
+    import elastic_agent.core.code_sync as cs
+    seen = {}
+    def fake_dl(uri, dest):
+        seen["uri"], seen["dest"] = uri, dest
+        return 5
+    monkeypatch.setattr(cs, "_download_s3", fake_dl)
+    r = FakeRunner()
+    sync = ManagerCodeSync(str(tmp_path), ssh_key="/k.pem", ssh_user="ubuntu", runner=r)
+
+    ok = await sync.stage_s3("s3://bkt/data/", "1.2.3.4", "/home/ubuntu/data")
+
+    assert ok is True
+    assert seen["uri"] == "s3://bkt/data/"
+    joined = r.joined()
+    assert any("rsync" in c and "ubuntu@1.2.3.4:/home/ubuntu/data/" in c for c in joined)
+
+
+async def test_stage_s3_download_failure_returns_false(tmp_path, monkeypatch):
+    import elastic_agent.core.code_sync as cs
+    def boom(uri, dest):
+        raise RuntimeError("no creds")
+    monkeypatch.setattr(cs, "_download_s3", boom)
+    sync = ManagerCodeSync(str(tmp_path), ssh_key="/k.pem", runner=FakeRunner())
+    assert await sync.stage_s3("s3://b/x", "h", "/d") is False

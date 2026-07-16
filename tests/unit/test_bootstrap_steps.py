@@ -210,3 +210,17 @@ class TestCredentialLoginDepsStep:
     def test_custom_timeout(self) -> None:
         step = credential_login_deps_step(timeout=900)
         assert step.timeout == 900
+
+
+class TestDockerInstallStep:
+    def test_installs_docker_and_grants_user(self) -> None:
+        from elastic_agent.core.bootstrap_steps import docker_install_step
+        step = docker_install_step(run_as="ubuntu")
+        assert step.name == "docker-install"
+        assert "docker.io" in step.command
+        assert "usermod -aG docker ubuntu" in step.command
+        assert "enable --now docker" in step.command
+
+    def test_run_as_is_parameterised(self) -> None:
+        from elastic_agent.core.bootstrap_steps import docker_install_step
+        assert "usermod -aG docker ec2-user" in docker_install_step(run_as="ec2-user").command

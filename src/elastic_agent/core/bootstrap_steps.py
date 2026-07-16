@@ -38,6 +38,31 @@ def system_init_step(
     )
 
 
+def docker_install_step(run_as: str = "ubuntu", timeout: int = 420) -> BootstrapStep:
+    """Install Docker Engine and add the runtime user to the ``docker`` group.
+
+    Needed for jobs whose run command uses Docker (e.g. ai4sci-bench
+    ``--sandbox os``). MUST run before the runtime systemd unit starts: systemd
+    resolves a service's supplementary groups at start time, so the runtime (and
+    its child run command) only gets docker-socket access if ``usermod`` ran
+    first. Runs sudo-wrapped (SSHExecutor sudoes non-root users)."""
+    return BootstrapStep(
+        name="docker-install",
+        command=(
+            "export DEBIAN_FRONTEND=noninteractive && "
+            "cloud-init status --wait 2>/dev/null || true; "
+            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+            "apt-get -o DPkg::Lock::Timeout=600 install -y -qq docker.io && "
+            f"usermod -aG docker {run_as} && "
+            "systemctl enable --now docker && "
+            "docker --version"
+        ),
+        timeout=timeout,
+        retry_count=2,
+        description="Install Docker and grant the runtime user socket access",
+    )
+
+
 def agent_install_step(
     agent_install_command: str | list[str] | None = None,
     timeout: int = 300,

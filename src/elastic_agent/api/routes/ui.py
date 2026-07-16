@@ -454,6 +454,12 @@ _BATCH_HTML = """\
     <label>Setup — commands（每行一条,在代码目录里跑,如 uv sync）</label>
     <textarea id="jSetup" placeholder="uv sync"></textarea>
     <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
+    <div class="grid2">
+      <div><label>需要 Docker（run 用 Docker,如 ai4sci <code>--sandbox os</code>）</label>
+        <select id="jNeedsDocker"><option value="false">否</option><option value="true">是</option></select></div>
+      <div><label>S3 数据集（每行 <code>s3://桶/前缀/ 目标目录</code>;Manager 下载后 rsync 到 worker）</label>
+        <textarea id="jS3" placeholder="s3://my-bucket/datasets/ /home/ubuntu/data"></textarea></div>
+    </div>
     <label>Run command（shell;从代码目录运行;支持 {{shard_index}} 和 $(hostname -s)）</label>
     <textarea id="jRun" placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
     <div class="grid2">
@@ -590,7 +596,10 @@ async function submitJob() {
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
     setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup'),
-            deliver: document.getElementById('jDeliver').value},
+            deliver: document.getElementById('jDeliver').value,
+            needs_docker: document.getElementById('jNeedsDocker').value === 'true',
+            s3_datasets: lines('jS3').map(function(l){var p=l.trim().split(/ +/); return {uri:p[0], dest:p[1]||''};})
+                          .filter(function(d){return d.uri && d.dest;})},
     run: {command: document.getElementById('jRun').value.trim(),
           cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
     account: {mode: document.getElementById('jAcctMode').value,

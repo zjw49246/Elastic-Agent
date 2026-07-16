@@ -58,6 +58,22 @@ class TestBootstrapSteps:
         assert "pty-refresh-hook" not in names      # patches that unit → also skipped
         assert "agent-install" in names             # claude CLI still installed
 
+    def test_docker_step_added_only_when_needs_docker(self):
+        spec = _spec(setup={"needs_docker": True})
+        steps = compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+            runtime_from_src=True, run_as="ubuntu")
+        names = [s.name for s in steps]
+        assert "docker-install" in names
+        # before any runtime deploy, and adds the run user to the docker group
+        dstep = next(s for s in steps if s.name == "docker-install")
+        assert "usermod -aG docker ubuntu" in dstep.command
+        # absent by default
+        spec2 = _spec()
+        names2 = [s.name for s in compile_bootstrap_steps(
+            spec2, manager_url="u", auth_token="t", worker_id="w")]
+        assert "docker-install" not in names2
+
     def test_manager_rsync_skips_worker_clone(self):
         # Code is delivered by the Manager (rsync), so no worker git-clone step.
         spec = _spec(setup={"repo": "https://github.com/x/y.git", "commands": ["uv sync"],

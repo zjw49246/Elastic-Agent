@@ -302,3 +302,31 @@ class TestDrainEndpoint:
     async def test_drain_nonexistent(self, client):
         resp = await client.post("/api/nodes/no-node/drain")
         assert resp.status_code == 404
+
+
+class TestNodeLogs:
+    @pytest.mark.asyncio
+    async def test_logs_via_ssh(self, client, manager, monkeypatch):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        captured = {}
+
+        class FakeSSH:
+            def __init__(self, host, *, user=None, key_path=None, use_sudo=None):
+                captured["host"] = host
+
+            async def execute(self, cmd, timeout=None):
+                captured["cmd"] = cmd
+                return 0, "LOGDATA\nline2", ""
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSH)
+        rec = (await manager.scale_out(count=1))[0]
+        resp = await client.get(f"/api/nodes/{rec.node_id}/logs?lines=50")
+        assert resp.status_code == 200
+        assert resp.json()["logs"] == "LOGDATA\nline2"
+        assert "journalctl -u ea-runtime" in captured["cmd"]
+        assert "-n 50" in captured["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_logs_404_for_unknown_node(self, client):
+        resp = await client.get("/api/nodes/no-such/logs")
+        assert resp.status_code == 404

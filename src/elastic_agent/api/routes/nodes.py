@@ -5,6 +5,7 @@ T-016: CRUD endpoints for managing Worker nodes.
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -166,3 +167,40 @@ async def remove_node(node_id: str) -> dict:
     if not ok:
         raise HTTPException(404, f"Node {node_id} not found")
     return {"node_id": node_id, "status": "removed"}
+
+
+class NodeLogsResponse(BaseModel):
+    node_id: str
+    unit: str
+    lines: int
+    logs: str
+
+
+@router.get("/nodes/{node_id}/logs", response_model=NodeLogsResponse)
+async def node_logs(
+    node_id: str,
+    lines: int = Query(200, ge=1, le=5000),
+    unit: str = Query("ea-runtime"),
+) -> NodeLogsResponse:
+    """Fetch a worker's runtime logs via SSH → ``journalctl``. The ea-runtime
+    unit carries bootstrap/login output and the run command's forwarded stdout,
+    so this surfaces most failures without hand-SSHing to the box."""
+    mgr = _mgr()
+    node = await mgr.registry.get(node_id)
+    if node is None:
+        raise HTTPException(404, f"Node {node_id} not found")
+    host = node.public_ip or node.private_ip
+    if not host:
+        raise HTTPException(409, f"Node {node_id} has no address yet")
+
+    from elastic_agent.core.bootstrap import SSHExecutor
+    pc = mgr.config.provider
+    ssh_user = mgr.config.worker.ssh_user
+    key = pc.aliyun.ssh_key_path if pc.type == "aliyun" else pc.aws.ssh_key_path
+    # journalctl needs root; SSHExecutor sudo-wraps non-root users by default.
+    ex = SSHExecutor(host, user=ssh_user, key_path=key)
+    cmd = f"journalctl -u {shlex.quote(unit)} --no-pager -n {int(lines)}"
+    rc, out, err = await ex.execute(cmd, timeout=30)
+    if rc != 0:
+        raise HTTPException(502, f"log fetch failed (rc={rc}): {(err or out)[-300:]}")
+    return NodeLogsResponse(node_id=node_id, unit=unit, lines=lines, logs=out)

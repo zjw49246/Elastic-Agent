@@ -24,6 +24,7 @@ from elastic_agent.core.bootstrap_steps import (
     agent_install_step,
     claude_cli_health_step,
     credential_login_deps_step,
+    docker_install_step,
     harness_code_step,
     pty_install_step,
     pty_refresh_step,
@@ -132,6 +133,7 @@ def compile_bootstrap_steps(
     include_login_deps: bool | None = None,
     pty_package: str | None = None,
     runtime_from_src: bool = False,
+    run_as: str = "ubuntu",
 ) -> list[BootstrapStep]:
     """Full bootstrap sequence for a declarative job.
 
@@ -151,6 +153,10 @@ def compile_bootstrap_steps(
         system_init_step(packages=system_packages),
         agent_install_step(),
     ]
+    # Docker before any runtime deploy: the runtime user's docker-group
+    # membership must exist when systemd starts the unit (see docker_install_step).
+    if spec.setup.needs_docker:
+        steps.append(docker_install_step(run_as=run_as))
     if not runtime_from_src:
         steps.append(runtime_deploy_step(
             manager_url=manager_url,
