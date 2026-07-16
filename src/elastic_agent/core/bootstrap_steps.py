@@ -141,7 +141,12 @@ def runtime_deploy_from_src_step(
     )
     cmd = (
         f"pip3 install -q --break-system-packages {deps} && "
-        f"mkdir -p {home}/ea-logs && "
+        # This step runs sudo-wrapped (root), so a bare mkdir makes ea-logs
+        # root-owned — but the runtime runs as ``run_as``. It would then fail to
+        # open per-task log files, crashing _monitor_process before it reports
+        # the process exit → the Manager's run phase sticks at RUNNING and
+        # collect/S3 never fire. chown it to the runtime user.
+        f"mkdir -p {home}/ea-logs && chown {run_as} {home}/ea-logs && "
         "cat > /usr/local/bin/ea-runtime.sh << 'WRAP'\n"
         f"{wrapper}"
         "WRAP\n"

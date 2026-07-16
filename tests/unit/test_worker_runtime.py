@@ -151,6 +151,41 @@ class TestProcessExecution:
         assert exit_msgs[0]["exit_code"] == 0
 
     @pytest.mark.asyncio
+    async def test_exit_reported_when_log_open_fails(self, runtime, tmp_path, monkeypatch):
+        """A mis-permissioned log dir must not swallow the exit: if opening the
+        per-task log fails, degrade to no local log — don't crash _monitor_process
+        before ProcessExitMessage is sent (else the Manager's run phase sticks at
+        RUNNING and collect/S3 never fire). This was the real 'stuck at running'."""
+        import builtins
+        import elastic_agent.worker.runtime as rt_mod
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        real_open = builtins.open
+
+        def failing_open(path, *a, **k):
+            if str(path).endswith(".ndjson"):
+                raise PermissionError("log dir not writable")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(rt_mod, "open", failing_open, raising=False)
+        sent: list[str] = []
+
+        async def cap(msg):
+            sent.append(msg.model_dump_json())
+
+        runtime._send_event = cap
+        runtime._running = True
+
+        msg = ExecuteMessage(task_id="t-nolog",
+                             command=[sys.executable, "-c", "print('hi')"], cwd=str(tmp_path))
+        await runtime._handle_execute(msg)
+        await asyncio.wait_for(runtime._process_tasks["t-nolog"], timeout=6)
+
+        exit_msgs = [json.loads(m) for m in sent if '"PROCESS_EXIT"' in m]
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio
     async def test_execute_logs_to_file(self, runtime, tmp_path):
         """Test that process output is dual-written to a local NDJSON file."""
         from elastic_agent.core.protocols.messages import ExecuteMessage

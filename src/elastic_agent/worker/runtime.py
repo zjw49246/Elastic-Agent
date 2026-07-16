@@ -351,7 +351,16 @@ class WorkerRuntime:
         log_path: Path,
         timeout: int | None,
     ) -> None:
-        log_file = open(log_path, "a", encoding="utf-8")
+        # Never let a logging failure swallow the process exit: if the local log
+        # can't be opened (e.g. a mis-permissioned log dir), carry on without it
+        # rather than crashing _monitor_process before ProcessExitMessage is sent
+        # (which would strand the Manager's run phase at RUNNING).
+        try:
+            log_file = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            logger.warning("Task %s: cannot open log file %s — continuing without local log",
+                           task_id, log_path)
+            log_file = None
         try:
             stdout_task = asyncio.create_task(
                 self._read_stream(task_id, proc.stdout, "stdout", log_file)
@@ -385,7 +394,8 @@ class WorkerRuntime:
                     _stream_task.cancel()
 
         finally:
-            log_file.close()
+            if log_file is not None:
+                log_file.close()
             exit_code = proc.returncode if proc.returncode is not None else -1
             self._processes.pop(task_id, None)
             self._process_tasks.pop(task_id, None)
@@ -546,8 +556,9 @@ class WorkerRuntime:
                 "timestamp": _utcnow().isoformat(),
                 "parsed": parsed,
             }
-            log_file.write(json.dumps(log_entry) + "\n")
-            log_file.flush()
+            if log_file is not None:
+                log_file.write(json.dumps(log_entry) + "\n")
+                log_file.flush()
 
             await self._send_event(LogMessage(
                 task_id=task_id,
