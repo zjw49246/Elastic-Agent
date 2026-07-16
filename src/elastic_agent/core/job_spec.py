@@ -148,6 +148,9 @@ class FanoutSpec(BaseModel):
     #   partitioning.
     # none: identical command everywhere (outputs must not collide).
     shard_by: Literal["hostname", "shard_index", "none"] = "hostname"
+    # Names the fleet: instances get an EC2 Name tag "<name_prefix>-<i>" so you
+    # can spot your machines in the console. Empty → provider default naming.
+    name_prefix: str = ""
 
 
 class CollectSpec(BaseModel):

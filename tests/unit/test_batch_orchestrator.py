@@ -26,7 +26,8 @@ class FakeDriver:
         self.scaled_in: list[str] = []
         self._account_seq = 0
 
-    async def scale_out(self, count):
+    async def scale_out(self, count, name_prefix=""):
+        self.scale_name_prefix = name_prefix
         return [f"w{i}" for i in range(count)]
 
     async def hostname_of(self, worker_id):
@@ -69,6 +70,15 @@ class TestLaunch:
         assert len(job.runs) == 4
         assert all(r.phase == WorkerPhase.RUNNING for r in job.runs.values())
         assert len(d.dispatched) == 4
+
+    async def test_scale_out_named_by_prefix_or_job_name(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        await orch.launch(_spec(fanout={"workers": 1, "name_prefix": "myfleet"}))
+        assert d.scale_name_prefix == "myfleet"
+        d2 = FakeDriver()
+        await BatchOrchestrator(d2).launch(_spec(name="ai4sci", fanout={"workers": 1}))
+        assert d2.scale_name_prefix == "ai4sci"   # falls back to job name
 
     async def test_shard_index_rendered_per_worker(self):
         d = FakeDriver()

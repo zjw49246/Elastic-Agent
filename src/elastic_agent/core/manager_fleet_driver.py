@@ -51,8 +51,8 @@ class ManagerFleetDriver:
         self._provision = provision_hook or _no_provision
         self._login = login_hook or _no_login
 
-    async def scale_out(self, count: int) -> list[str]:
-        records = await self._mgr.scale_out(count=count)
+    async def scale_out(self, count: int, name_prefix: str = "") -> list[str]:
+        records = await self._mgr.scale_out(count=count, name_prefix=name_prefix or None)
         return [r.node_id for r in records]
 
     async def hostname_of(self, worker_id: str) -> str:

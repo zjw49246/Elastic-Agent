@@ -191,6 +191,7 @@ class ElasticAgentManager:
         count: int = 1,
         instance_type: str | None = None,
         region: str | None = None,
+        name_prefix: str | None = None,
     ) -> list[NodeRecord]:
         from elastic_agent.core.auth import generate_worker_token
         from elastic_agent.core.providers.base import InstanceConfig
@@ -216,7 +217,11 @@ class ElasticAgentManager:
             )
 
         records: list[NodeRecord] = []
-        for _ in range(count):
+        for i in range(count):
+            # Name each instance "<name_prefix>-<i>" so it's identifiable in the
+            # cloud console; without a prefix only the ManagedBy tag is set.
+            if name_prefix:
+                cfg.tags = {"ManagedBy": "elastic-agent", "Name": f"{name_prefix}-{i}"}
             instance = await self.provider.create_instance(cfg)
             token = generate_worker_token()
             record = NodeRecord(
