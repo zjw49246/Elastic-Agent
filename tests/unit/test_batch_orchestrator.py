@@ -27,8 +27,9 @@ class FakeDriver:
         self.collected: list = []
         self._account_seq = 0
 
-    async def scale_out(self, count, name_prefix=""):
+    async def scale_out(self, count, name_prefix="", instance_type="", region=""):
         self.scale_name_prefix = name_prefix
+        self.scale_instance_type = instance_type
         return [f"w{i}" for i in range(count)]
 
     async def hostname_of(self, worker_id):

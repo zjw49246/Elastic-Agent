@@ -430,9 +430,13 @@ _BATCH_HTML = """\
       <div><label>Job name</label><input id="jName" placeholder="ai4sci-opus48-seed128"></div>
       <div><label>Workers (fan-out)</label><input id="jWorkers" type="number" value="1" min="1"></div>
     </div>
-    <div class="grid2">
-      <div><label>机器命名前缀（EC2 Name = 前缀-0,前缀-1…；空=用 Job name）</label>
+    <div class="grid3">
+      <div><label>机器命名前缀（EC2 Name=前缀-i；空=用 Job name）</label>
         <input id="jNamePrefix" placeholder="my-fleet"></div>
+      <div><label>机型 instance_type（空=Manager 默认）</label>
+        <input id="jInstanceType" placeholder="t3.xlarge"></div>
+      <div><label>Region（空=Manager 默认）</label>
+        <input id="jRegion" placeholder="ap-northeast-1"></div>
     </div>
     <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
     <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
@@ -590,7 +594,9 @@ async function submitJob() {
                resume_args: document.getElementById('jResume').value.trim()},
     fanout: {workers: parseInt(document.getElementById('jWorkers').value) || 1,
              shard_by: document.getElementById('jShard').value,
-             name_prefix: document.getElementById('jNamePrefix').value.trim()},
+             name_prefix: document.getElementById('jNamePrefix').value.trim(),
+             instance_type: document.getElementById('jInstanceType').value.trim(),
+             region: document.getElementById('jRegion').value.trim()},
   };
   if (ref) spec.harness_ref = ref;
   try { const j = await api('POST', '/jobs', spec);

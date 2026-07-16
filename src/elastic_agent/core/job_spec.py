@@ -158,6 +158,11 @@ class FanoutSpec(BaseModel):
     # Names the fleet: instances get an EC2 Name tag "<name_prefix>-<i>" so you
     # can spot your machines in the console. Empty → provider default naming.
     name_prefix: str = ""
+    # Per-job machine size / region (override the Manager's provider defaults).
+    # Empty → the Manager's configured default (AMI, subnet, SG, key are always
+    # taken from the Manager config, not per-job).
+    instance_type: str = ""
+    region: str = ""
 
 
 class CollectSpec(BaseModel):

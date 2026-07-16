@@ -118,7 +118,8 @@ class FleetDriver(Protocol):
     """What the orchestrator needs from the Manager. Real impl wraps
     ElasticAgentManager; tests inject a fake."""
 
-    async def scale_out(self, count: int, name_prefix: str = "") -> list[str]:
+    async def scale_out(self, count: int, name_prefix: str = "",
+                        instance_type: str = "", region: str = "") -> list[str]:
         """Create ``count`` workers (named ``<name_prefix>-<i>``); return worker_ids."""
         ...
 
@@ -190,7 +191,9 @@ class BatchOrchestrator:
         self._jobs[job.job_id] = job
 
         n = max(1, spec.fanout.workers)
-        worker_ids = await self._driver.scale_out(n, name_prefix=spec.fanout.name_prefix or spec.name)
+        worker_ids = await self._driver.scale_out(
+            n, name_prefix=spec.fanout.name_prefix or spec.name,
+            instance_type=spec.fanout.instance_type, region=spec.fanout.region)
         contexts = spec.worker_contexts()
         for wid, ctx in zip(worker_ids, contexts):
             ctx.hostname = await self._driver.hostname_of(wid)
