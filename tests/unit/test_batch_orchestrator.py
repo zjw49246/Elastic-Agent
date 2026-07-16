@@ -24,6 +24,7 @@ class FakeDriver:
         self.login_calls: list[tuple[str, str]] = []
         self.dispatched: list[dict] = []
         self.scaled_in: list[str] = []
+        self.collected: list = []
         self._account_seq = 0
 
     async def scale_out(self, count, name_prefix=""):
@@ -51,6 +52,9 @@ class FakeDriver:
             "cwd": cwd, "env": env, "timeout": timeout,
             "job_id": job_id, "watch_exhaustion": watch_exhaustion,
         })
+
+    async def collect(self, worker_id, spec, job_id):
+        self.collected.append((worker_id, job_id))
 
     async def scale_in(self, worker_ids):
         self.scaled_in.extend(worker_ids)

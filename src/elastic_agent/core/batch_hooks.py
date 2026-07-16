@@ -177,6 +177,11 @@ def make_provision_hook(
             logger.error("provision: no host address for %s", worker_id)
             return False
 
+        # A freshly-booted instance isn't SSH-ready immediately — poll until it is.
+        if not await _wait_ssh_ready(host, ssh_user, ssh_key):
+            logger.error("provision: %s never became SSH-ready", worker_id)
+            return False
+
         # Deliver THIS branch's framework to the worker (not PyPI) when
         # ELASTIC_AGENT_FRAMEWORK_SRC is set — the last mile for one-click auto.
         framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
@@ -248,6 +253,28 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
         )
 
     return login
+
+
+async def _wait_ssh_ready(host: str, ssh_user: str, ssh_key: str | None, timeout: float = 240.0) -> bool:
+    """Poll SSH until a fresh instance accepts connections."""
+    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=8", "-o", "BatchMode=yes"]
+    if ssh_key:
+        args += ["-i", ssh_key]
+    args += [f"{ssh_user}@{host}", "echo ready"]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            if proc.returncode == 0 and b"ready" in out:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+    return False
 
 
 async def _wait_ws_connected(manager, worker_id: str, timeout: float) -> bool:

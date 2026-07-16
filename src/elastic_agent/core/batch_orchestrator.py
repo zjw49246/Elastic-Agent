@@ -144,6 +144,10 @@ class FleetDriver(Protocol):
         worker to scan output for rate-limit banners (Mode-B rotation)."""
         ...
 
+    async def collect(self, worker_id: str, spec: JobSpec, job_id: str) -> None:
+        """Pull the worker's results (collect.paths) back to the Manager."""
+        ...
+
     async def scale_in(self, worker_ids: list[str]) -> None:
         """Tear down workers (idle scale-in)."""
         ...
@@ -315,6 +319,10 @@ class BatchOrchestrator:
         if exit_code == job.spec.completion.on_process_exit:
             run.phase = WorkerPhase.DONE
             run.error = None
+            try:
+                await self._driver.collect(worker_id, job.spec, job_id)
+            except Exception:
+                logger.exception("collect failed for %s", worker_id)
         else:
             self._fail(run, f"run exited {exit_code}")
         await self._maybe_finish(job)

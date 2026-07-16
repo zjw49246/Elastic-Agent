@@ -82,5 +82,31 @@ class ManagerFleetDriver:
             watch_exhaustion=watch_exhaustion,
         )
 
+    async def collect(self, worker_id: str, spec, job_id: str) -> None:
+        """rsync the worker's results (collect.paths, or results/) into the
+        Manager's collected/<job_id>/ — the S3 uploader then picks them up."""
+        import asyncio
+        import os
+
+        node = await self._mgr.registry.get(worker_id)
+        host = (node.public_ip or node.private_ip) if node else None
+        if not host:
+            return
+        pc = self._mgr.config.provider
+        ssh_user = self._mgr.config.worker.ssh_user
+        ssh_key = pc.aliyun.ssh_key_path if pc.type == "aliyun" else pc.aws.ssh_key_path
+        dest = os.path.join(self._mgr.collected_root, job_id)
+        os.makedirs(dest, exist_ok=True)
+        ssh = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        if ssh_key:
+            ssh += f" -i {ssh_key}"
+        paths = spec.collect.paths or ["results"]
+        for rel in paths:
+            src = f"{ssh_user}@{host}:{spec.setup.target_dir.rstrip('/')}/{rel.rstrip('/')}/"
+            proc = await asyncio.create_subprocess_exec(
+                "rsync", "-az", "-e", ssh, src, f"{dest}/{rel.rstrip('/')}/",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.communicate()
+
     async def scale_in(self, worker_ids: list[str]) -> None:
         await self._mgr.scale_in(node_ids=list(worker_ids), force=False)

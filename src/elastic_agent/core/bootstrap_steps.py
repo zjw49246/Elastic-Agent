@@ -15,8 +15,12 @@ def system_init_step(
     packages: list[str] | None = None,
     timeout: int = 300,
 ) -> BootstrapStep:
-    """T-019: System initialization — update packages, install base dependencies."""
-    pkg_list = " ".join(packages) if packages else "python3 python3-pip git curl"
+    """T-019: System initialization — update packages, install base dependencies.
+
+    Defaults include node/npm (Claude Code CLI is an npm package) and rsync
+    (manager_rsync code delivery) so a blank Ubuntu image is provisionable.
+    """
+    pkg_list = " ".join(packages) if packages else "python3 python3-pip git curl rsync nodejs npm"
     return BootstrapStep(
         name="system-init",
         command=(
