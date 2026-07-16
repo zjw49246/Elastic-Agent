@@ -69,6 +69,12 @@ class ElasticAgentManager:
             str(_Path(config.registry.path).with_name("accounts.json"))
         )
         self._batch: Any = None
+
+        # Optional S3 result upload: collected/<job_id>/ → s3://<bucket>/<prefix>/.
+        # Enabled by ELASTIC_AGENT_RESULTS_S3_BUCKET.
+        self.collected_root = str(_Path(config.registry.path).with_name("collected"))
+        self._s3_uploader: Any = None
+        self._s3_task: Any = None
         self.reconciler = CloudReconciler(
             provider=provider,
             registry=self.registry,
@@ -117,10 +123,27 @@ class ElasticAgentManager:
         await self.task_registry.recover(online_workers)
 
         await self.reconciler.start_periodic()
+
+        import os as _os
+        bucket = _os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET")
+        if bucket:
+            from elastic_agent.core.result_uploader import S3ResultUploader
+            interval = float(_os.environ.get("ELASTIC_AGENT_RESULTS_S3_INTERVAL", "120"))
+            self._s3_uploader = S3ResultUploader(
+                bucket, self.collected_root,
+                prefix=_os.environ.get("ELASTIC_AGENT_RESULTS_S3_PREFIX", "jobs"),
+                region=self.config.provider.aws.region,
+            )
+            self._s3_task = asyncio.create_task(self._s3_uploader.run_periodic(interval))
+            logger.info("S3 result upload enabled → s3://%s", bucket)
+
         self._started = True
         logger.info("ElasticAgentManager started")
 
     async def stop(self) -> None:
+        if self._s3_task is not None:
+            self._s3_task.cancel()
+            self._s3_task = None
         await self.reconciler.stop_periodic()
         await self.webhook_emitter.stop()
         self.operations_logger.close()

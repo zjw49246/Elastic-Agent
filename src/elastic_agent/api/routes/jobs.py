@@ -82,12 +82,7 @@ def _collected_dir(mgr, job_id: str) -> Path:
     return Path(mgr.config.registry.path).with_name("collected") / job_id
 
 
-@router.get("/jobs/{job_id}/results")
-async def job_results(job_id: str) -> dict:
-    """List a job's collected result files + surface benchmark scores."""
-    base = _collected_dir(_mgr(), job_id)
-    if not base.is_dir():
-        raise HTTPException(404, f"no collected results for job {job_id}")
+def _results_for(mgr, job_id: str, base) -> dict:
     files, scores = [], []
     for p in sorted(base.rglob("*")):
         if p.is_file():
@@ -104,7 +99,34 @@ async def job_results(job_id: str) -> dict:
                 "task_id": d.get("task_id"), "prompt_level": d.get("prompt_level"),
                 "status": d.get("status"), "final_score": d.get("final_score"),
             })
-    return {"job_id": job_id, "file_count": len(files), "scores": scores, "files": files[:500]}
+    s3_uri = mgr._s3_uploader.s3_uri(job_id) if getattr(mgr, "_s3_uploader", None) else None
+    return {"job_id": job_id, "file_count": len(files), "scores": scores, "s3_uri": s3_uri, "files": files}
+
+
+@router.get("/results")
+async def list_all_results() -> dict:
+    """List every collected result dir on the Manager (browsable regardless of
+    how the run was launched)."""
+    mgr = _mgr()
+    root = Path(mgr.collected_root)
+    jobs = []
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if d.is_dir():
+                r = _results_for(mgr, d.name, d)
+                jobs.append({k: r[k] for k in ("job_id", "file_count", "scores", "s3_uri")})
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+@router.get("/jobs/{job_id}/results")
+async def job_results(job_id: str) -> dict:
+    """List a job's collected result files + surface benchmark scores."""
+    base = _collected_dir(_mgr(), job_id)
+    if not base.is_dir():
+        raise HTTPException(404, f"no collected results for job {job_id}")
+    r = _results_for(_mgr(), job_id, base)
+    r["files"] = r["files"][:500]
+    return r
 
 
 @router.get("/jobs/{job_id}/results/download")

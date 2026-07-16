@@ -231,6 +231,17 @@ class TestJobResults:
     async def test_missing_results_404(self, client):
         assert (await client.get("/api/jobs/nope/results")).status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_list_all_results(self, client, manager):
+        self._seed(manager, "job-a")
+        self._seed(manager, "job-b")
+        r = await client.get("/api/results")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 2
+        assert {j["job_id"] for j in body["jobs"]} == {"job-a", "job-b"}
+        assert all(j["file_count"] == 2 for j in body["jobs"])
+
 
 class TestBatchConsoleUI:
     @pytest.mark.asyncio

@@ -480,6 +480,12 @@ _BATCH_HTML = """\
     <h2>Jobs <span class="muted" id="jobsRefresh"></span></h2>
     <div id="jobsList"><p class="muted">No jobs yet.</p></div>
   </div>
+
+  <!-- Collected results (browsable / downloadable) -->
+  <div class="card">
+    <h2>已收集结果 <span class="muted">· 点击下载全部</span></h2>
+    <div id="resultsList"><p class="muted">No results yet.</p></div>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -589,10 +595,26 @@ async function refreshJobs() {
     if (!jobs.length) { document.getElementById('jobsList').innerHTML = '<p class="muted">No jobs yet.</p>'; }
     else {
       const details = await Promise.all(jobs.map(j => api('GET', '/jobs/' + j.job_id)));
-      document.getElementById('jobsList').innerHTML = details.map(j => `
+      const results = await Promise.all(jobs.map(j =>
+        api('GET', '/jobs/' + j.job_id + '/results').catch(() => null)));
+      document.getElementById('jobsList').innerHTML = details.map((j, i) => {
+        const r = results[i];
+        const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
+        const scoreStr = (r && r.scores && r.scores.length)
+          ? r.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
+          : '';
+        const dlBtn = (r && r.file_count)
+          ? `<a class="btn btn-ghost" style="padding:4px 10px;margin:0" href="${dl}">⬇ 下载结果 (${r.file_count})</a>`
+          : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
+        return `
         <div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
-          <b>${j.name}</b> <span class="muted">${j.job_id}</span> ·
-          ${Object.entries(j.phases).map(([p,n]) => badge(p)+' '+n).join(' ')}
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div><b>${j.name}</b> <span class="muted">${j.job_id}</span> ·
+              ${Object.entries(j.phases).map(([p,n]) => badge(p)+' '+n).join(' ')}</div>
+            ${dlBtn}
+          </div>
+          ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
+          ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
           <details><summary class="muted">${j.workers_detail.length} workers</summary>
           <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
             <th>account</th><th>rot</th><th>error</th></tr></thead><tbody>
@@ -601,14 +623,35 @@ async function refreshJobs() {
             <td>${w.account_email||'--'}</td><td>${w.rotations}</td>
             <td class="muted">${w.error||''}</td></tr>`).join('')}
           </tbody></table></details>
-        </div>`).join('');
+        </div>`; }).join('');
     }
     document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
   } catch(e) { /* silent */ }
 }
 
-refreshAccounts(); refreshJobs();
-setInterval(refreshJobs, 5000);
+async function refreshResults() {
+  try {
+    const d = await api('GET', '/results');
+    const jobs = d.jobs || [];
+    if (!jobs.length) { document.getElementById('resultsList').innerHTML = '<p class="muted">No results yet.</p>'; return; }
+    document.getElementById('resultsList').innerHTML = jobs.map(j => {
+      const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
+      const scoreStr = (j.scores && j.scores.length)
+        ? j.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
+        : '';
+      return `<div style="display:flex;justify-content:space-between;align-items:center;
+          border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
+        <div><b>${j.job_id}</b> <span class="muted">(${j.file_count} 文件)</span>
+          ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
+          ${j.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+j.s3_uri+'</div>' : ''}</div>
+        <a class="btn" style="margin:0" href="${dl}">⬇ 下载全部</a>
+      </div>`;
+    }).join('');
+  } catch(e) { /* silent */ }
+}
+
+refreshAccounts(); refreshJobs(); refreshResults();
+setInterval(() => { refreshJobs(); refreshResults(); }, 5000);
 </script>
 </body>
 </html>
