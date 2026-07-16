@@ -507,6 +507,18 @@ _BATCH_HTML = """\
     <div id="jobsList"><p class="muted">No jobs yet.</p></div>
   </div>
 
+  <!-- Worker log viewer (fetches GET /api/nodes/{id}/logs on demand) -->
+  <div id="logModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)closeLogs()">
+    <div style="background:#12121e;border:1px solid var(--border);border-radius:10px;width:82%;max-width:940px;max-height:82vh;display:flex;flex-direction:column;padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b id="logTitle">Worker 日志</b>
+        <span><button class="btn btn-ghost" style="padding:3px 10px" onclick="showLogs(_logWid)">↻ 刷新</button>
+        <button class="btn btn-ghost" style="padding:3px 10px" onclick="closeLogs()">✕ 关闭</button></span>
+      </div>
+      <pre id="logContent" style="overflow:auto;background:#0a0a14;padding:10px;border-radius:6px;font-size:.72rem;line-height:1.35;flex:1;white-space:pre-wrap;margin:0"></pre>
+    </div>
+  </div>
+
   <!-- Collected results (browsable / downloadable) -->
   <div class="card">
     <h2>已收集结果 <span class="muted">· 点击下载全部</span></h2>
@@ -652,18 +664,37 @@ async function refreshJobs() {
           ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
           <details><summary class="muted">${j.workers_detail.length} workers</summary>
           <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
-            <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th></tr></thead><tbody>
+            <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>日志</th></tr></thead><tbody>
           ${j.workers_detail.map(w => `<tr><td>${w.shard_index}</td>
             <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
             <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
             <td>${w.rotations}</td>
-            <td class="muted">${w.error||''}</td></tr>`).join('')}
+            <td class="muted">${w.error||''}</td>
+            <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button>` : ''}</td></tr>`).join('')}
           </tbody></table></details>
         </div>`; }).join('');
     }
     document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
   } catch(e) { /* silent */ }
 }
+
+var _logWid = null;
+async function showLogs(wid) {
+  if (!wid) return;
+  _logWid = wid;
+  document.getElementById('logModal').style.display = 'flex';
+  document.getElementById('logTitle').textContent = 'Worker 日志 · ' + wid;
+  const pre = document.getElementById('logContent');
+  pre.textContent = '加载中…';
+  try {
+    const d = await api('GET', '/nodes/' + encodeURIComponent(wid) + '/logs?lines=400');
+    pre.textContent = d.logs || '(空)';
+    pre.scrollTop = pre.scrollHeight;   // jump to newest
+  } catch(e) {
+    pre.textContent = '拉取日志失败：' + (e.message||e) + '\\n（实例可能已终止/未就绪，或 SSH 不可达）';
+  }
+}
+function closeLogs() { document.getElementById('logModal').style.display = 'none'; _logWid = null; }
 
 async function refreshResults() {
   try {
