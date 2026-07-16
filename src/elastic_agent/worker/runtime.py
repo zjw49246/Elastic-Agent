@@ -61,6 +61,11 @@ from elastic_agent.core.rate_limit import is_auth_failure, is_rate_limited
 
 logger = logging.getLogger(__name__)
 
+# After the run process exits, how long to keep draining stdout/stderr before
+# giving up — a lingering child (e.g. a docker container from `--sandbox os`)
+# can hold the pipe open so it never EOFs. Bounded so the exit is always reported.
+_EXIT_DRAIN_TIMEOUT = 10.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -326,6 +331,19 @@ class WorkerRuntime:
         task = asyncio.create_task(self._monitor_process(task_id, proc, log_path, msg.timeout))
         self._process_tasks[task_id] = task
 
+    @staticmethod
+    async def _wait_process_exit(proc: asyncio.subprocess.Process, timeout: float | None) -> bool:
+        """Wait until the process terminates (returncode set); return False on
+        timeout. Polls returncode instead of ``proc.wait()``, which on asyncio
+        blocks until stdout/stderr EOF — a lingering grandchild (docker container
+        from ``--sandbox os``) can hold those pipes open past process exit."""
+        deadline = (time.monotonic() + timeout) if timeout else None
+        while proc.returncode is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+        return True
+
     async def _monitor_process(
         self,
         task_id: str,
@@ -342,22 +360,29 @@ class WorkerRuntime:
                 self._read_stream(task_id, proc.stderr, "stderr", log_file)
             )
 
-            if timeout:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.warning("Task %s timed out after %ds, sending SIGINT", task_id, timeout)
-                    await self._stop_process(task_id, "SIGINT")
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=15)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
-            else:
-                await proc.wait()
+            # Wait for the process to actually terminate. We poll returncode
+            # rather than await proc.wait(): asyncio's wait() doesn't return
+            # until the stdout/stderr pipes hit EOF, and a lingering child (e.g.
+            # a docker container/dockerd from `--sandbox os`) can hold those
+            # pipes open long — even indefinitely — after the process itself has
+            # exited. Relying on wait() would strand this coroutine so the exit
+            # is never reported, the Manager's run phase stays RUNNING forever,
+            # and collect + S3-upload never fire. returncode is set promptly by
+            # the child watcher (SIGCHLD) regardless of pipe state.
+            if not await self._wait_process_exit(proc, timeout):
+                logger.warning("Task %s timed out after %ds, sending SIGINT", task_id, timeout)
+                await self._stop_process(task_id, "SIGINT")
+                if not await self._wait_process_exit(proc, 15):
+                    proc.kill()
+                    await self._wait_process_exit(proc, 5)
 
-            await stdout_task
-            await stderr_task
+            # Best-effort drain of any buffered output, bounded for the same
+            # reason (the pipe may be held open past exit).
+            for _stream_task in (stdout_task, stderr_task):
+                try:
+                    await asyncio.wait_for(_stream_task, timeout=_EXIT_DRAIN_TIMEOUT)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    _stream_task.cancel()
 
         finally:
             log_file.close()

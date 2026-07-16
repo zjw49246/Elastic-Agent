@@ -121,6 +121,36 @@ class TestProcessExecution:
         assert exit_msgs[0]["exit_code"] == 0
 
     @pytest.mark.asyncio
+    async def test_exit_reported_even_when_child_holds_pipe_open(self, runtime, tmp_path, monkeypatch):
+        """Regression: a run process can exit while a lingering child (e.g. a
+        docker container from `--sandbox os`) keeps stdout open, so it never
+        EOFs. The exit MUST still be reported (bounded drain) — otherwise the
+        Manager's run phase stays RUNNING forever and collect/S3-upload never
+        fire. Without the bounded drain this hangs ~20s and times out."""
+        import elastic_agent.worker.runtime as rt_mod
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        monkeypatch.setattr(rt_mod, "_EXIT_DRAIN_TIMEOUT", 0.5)
+        sent: list[str] = []
+
+        async def cap(msg):
+            sent.append(msg.model_dump_json())
+
+        runtime._send_event = cap
+        runtime._running = True
+
+        leak = "import subprocess,sys; subprocess.Popen(['sleep','20']); print('done',flush=True); sys.exit(0)"
+        msg = ExecuteMessage(task_id="t-leak", command=[sys.executable, "-c", leak], cwd=str(tmp_path))
+
+        await runtime._handle_execute(msg)
+        # Must complete well under the child's 20s (drain bounded to 0.5s).
+        await asyncio.wait_for(runtime._process_tasks["t-leak"], timeout=6)
+
+        exit_msgs = [json.loads(m) for m in sent if '"PROCESS_EXIT"' in m]
+        assert len(exit_msgs) == 1
+        assert exit_msgs[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio
     async def test_execute_logs_to_file(self, runtime, tmp_path):
         """Test that process output is dual-written to a local NDJSON file."""
         from elastic_agent.core.protocols.messages import ExecuteMessage
