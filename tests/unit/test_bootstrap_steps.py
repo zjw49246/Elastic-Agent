@@ -18,9 +18,11 @@ class TestSystemInitStep:
     def test_default_packages(self) -> None:
         step = system_init_step()
         assert step.name == "system-init"
-        assert "apt-get update" in step.command
+        assert "apt-get" in step.command and "update" in step.command
         assert "python3" in step.command
-        assert step.retry_count == 1
+        assert "cloud-init status --wait" in step.command   # fresh-boot apt lock
+        assert "DPkg::Lock::Timeout" in step.command
+        assert step.retry_count == 2
 
     def test_custom_packages(self) -> None:
         step = system_init_step(packages=["nodejs", "npm"])

@@ -25,11 +25,15 @@ def system_init_step(
         name="system-init",
         command=(
             "export DEBIAN_FRONTEND=noninteractive && "
-            "apt-get update -qq && "
-            f"apt-get install -y -qq {pkg_list}"
+            # A fresh instance runs cloud-init / unattended-upgrades on boot,
+            # holding the apt lock — wait for it, and give apt a lock timeout so
+            # install doesn't fail instantly on a just-booted machine.
+            "cloud-init status --wait 2>/dev/null || true; "
+            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+            f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
         ),
         timeout=timeout,
-        retry_count=1,
+        retry_count=2,
         description="Install system packages and base dependencies",
     )
 
@@ -241,10 +245,11 @@ def credential_login_deps_step(
     """
     apt = (
         "export DEBIAN_FRONTEND=noninteractive && "
-        "apt-get install -y -qq xvfb xdotool wget ca-certificates python3-pip && "
+        "cloud-init status --wait 2>/dev/null || true; "
+        "apt-get -o DPkg::Lock::Timeout=600 install -y -qq xvfb xdotool wget ca-certificates python3-pip && "
         "wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb "
         "-O /tmp/google-chrome.deb && "
-        "apt-get install -y -qq /tmp/google-chrome.deb"
+        "apt-get -o DPkg::Lock::Timeout=600 install -y -qq /tmp/google-chrome.deb"
     )
     pip_pkgs = ["httpx", "websockets"]
     for dep in (login_dependencies or []):
