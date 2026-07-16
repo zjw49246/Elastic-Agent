@@ -230,6 +230,53 @@ class TestRotation:
         assert job.runs[wid].phase == WorkerPhase.FAILED
 
 
+class TestMultiAccountPerWorker:
+    def _spec3(self):
+        return _spec(
+            fanout={"workers": 1},
+            account={"per_worker": 3, "config_dir": "/root/.claude"},
+            rotation={"strategy": "on_exhaust_restart_resume", "resume_args": "-r", "max_rotations": 10},
+        )
+
+    async def test_logs_in_all_slots(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(self._spec3())
+        run = next(iter(job.runs.values()))
+        assert len(d.login_calls) == 3
+        assert run.config_dirs == ["/root/.claude-slot-0", "/root/.claude-slot-1", "/root/.claude-slot-2"]
+        assert len(run.account_ids) == 3
+        assert run.active_slot == 0
+        # each slot logged into its own dir
+        assert sorted(c[1] for c in d.login_calls) == run.config_dirs
+
+    async def test_rotation_uses_prelogged_slots_before_relogin(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(self._spec3())
+        wid = next(iter(job.runs))
+        run = job.runs[wid]
+
+        await orch.on_worker_exhausted(job.job_id, wid)   # slot 0→1, no new login
+        assert run.active_slot == 1 and len(d.login_calls) == 3
+        await orch.on_worker_exhausted(job.job_id, wid)   # slot 1→2, no new login
+        assert run.active_slot == 2 and len(d.login_calls) == 3
+        # local pool spent → fresh login into a new dir
+        await orch.on_worker_exhausted(job.job_id, wid)
+        assert len(d.login_calls) == 4
+        assert run.active_slot == 3
+        assert run.config_dirs[3].endswith("-rot-3")
+
+    async def test_active_config_dir_rendered_into_command(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(self._spec3())
+        wid = next(iter(job.runs))
+        assert d.dispatched[-1]["env"]["CLAUDE_CONFIG_DIR"] == "/root/.claude-slot-0"
+        await orch.on_worker_exhausted(job.job_id, wid)
+        assert d.dispatched[-1]["env"]["CLAUDE_CONFIG_DIR"] == "/root/.claude-slot-1"
+
+
 class TestCompletion:
     async def test_exit_zero_marks_done(self):
         d = FakeDriver()

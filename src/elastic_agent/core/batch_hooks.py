@@ -40,40 +40,30 @@ logger = logging.getLogger(__name__)
 class AccountAllocator:
     def __init__(self, account_store) -> None:
         self._store = account_store
-        self._by_worker: dict[str, str] = {}   # worker_id -> account_id
+        self._by_worker: dict[str, list[str]] = {}   # worker_id -> [account_id]
         self._assigned: set[str] = set()
-        self._retired: set[str] = set()         # exhausted; never re-picked
         self._lock = asyncio.Lock()
 
     async def allocate(self, worker_id: str, group: str) -> AccountDefinition | None:
-        """Give ``worker_id`` a fresh account in ``group``.
+        """Give ``worker_id`` a fresh, distinct account in ``group``.
 
-        Any account the worker previously held is retired (treated as exhausted)
-        so a rotation never lands back on the used-up account.
+        Each call returns a different account (so per_worker > 1 gets several) and
+        the account stays assigned to the worker for the job's lifetime — an
+        exhausted account is never re-picked because it remains assigned. Freed in
+        bulk by :meth:`release_worker`.
         """
         async with self._lock:
-            prev = self._by_worker.pop(worker_id, None)
-            if prev is not None:
-                self._assigned.discard(prev)
-                self._retired.add(prev)
-
             for acct in await self._store.list():
-                if (
-                    acct.enabled
-                    and acct.group == group
-                    and acct.id not in self._assigned
-                    and acct.id not in self._retired
-                ):
+                if acct.enabled and acct.group == group and acct.id not in self._assigned:
                     self._assigned.add(acct.id)
-                    self._by_worker[worker_id] = acct.id
+                    self._by_worker.setdefault(worker_id, []).append(acct.id)
                     return acct
             return None
 
     async def release_worker(self, worker_id: str) -> None:
-        """Free a worker's account without retiring it (e.g. on scale-in)."""
+        """Free all of a worker's accounts (e.g. on scale-in)."""
         async with self._lock:
-            acct_id = self._by_worker.pop(worker_id, None)
-            if acct_id is not None:
+            for acct_id in self._by_worker.pop(worker_id, []):
                 self._assigned.discard(acct_id)
 
 

@@ -58,15 +58,36 @@ class LoginOutcome:
 
 @dataclass
 class WorkerRun:
-    """Per-worker slice of a batch job."""
+    """Per-worker slice of a batch job.
+
+    A worker may hold multiple pre-logged accounts (per_worker > 1), each in its
+    own config_dir. ``active_slot`` indexes the account currently driving the run;
+    on exhaustion the orchestrator advances to the next pre-logged slot (fast) or
+    logs a fresh account into a new dir when the local pool is spent.
+    """
 
     worker_id: str
     ctx: WorkerContext
     phase: WorkerPhase = WorkerPhase.PENDING
     task_id: str = ""
-    account_id: str = ""
+    config_dirs: list[str] = field(default_factory=list)
+    account_ids: list[str] = field(default_factory=list)
+    account_emails: list[str] = field(default_factory=list)
+    active_slot: int = 0
     rotations: int = 0
     error: str | None = None
+
+    @property
+    def account_id(self) -> str:
+        return self.account_ids[self.active_slot] if self.active_slot < len(self.account_ids) else ""
+
+    @property
+    def account_email(self) -> str:
+        return self.account_emails[self.active_slot] if self.active_slot < len(self.account_emails) else ""
+
+    @property
+    def config_dir(self) -> str:
+        return self.config_dirs[self.active_slot] if self.active_slot < len(self.config_dirs) else ""
 
 
 @dataclass
@@ -188,21 +209,33 @@ class BatchOrchestrator:
 
             if spec.account.mode != "none":
                 run.phase = WorkerPhase.LOGGING_IN
-                outcome = await self._driver.login(worker_id, spec, self._slot_dir(spec, run))
-                if not outcome.success:
-                    return self._fail(run, outcome.error or "login failed")
-                run.account_id = outcome.account_id
-                run.ctx.account_id = outcome.account_id
-                run.ctx.account_email = outcome.account_email
+                # Log in one account per credential slot (per_worker accounts,
+                # each into its own config_dir) so rotation can switch locally.
+                for slot in self._slot_dirs(job):
+                    outcome = await self._driver.login(worker_id, spec, slot)
+                    if not outcome.success:
+                        return self._fail(run, outcome.error or "login failed")
+                    run.config_dirs.append(slot)
+                    run.account_ids.append(outcome.account_id)
+                    run.account_emails.append(outcome.account_email)
+                run.active_slot = 0
 
             await self._dispatch(job, run, resume=False)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("bring-up failed for %s", worker_id)
             self._fail(run, str(exc))
 
+    def _slot_dirs(self, job: BatchJob) -> list[str]:
+        """config_dirs to log accounts into — from the harness credential slots,
+        falling back to a single default slot."""
+        slots = [s.get("config_dir", "") for s in job.harness.get_credential_slots()]
+        return slots or [job.spec.account.config_dir]
+
     async def _dispatch(self, job: BatchJob, run: WorkerRun, *, resume: bool) -> None:
         spec = job.spec
-        run.ctx.config_dir = self._slot_dir(spec, run)
+        run.ctx.config_dir = run.config_dir
+        run.ctx.account_id = run.account_id
+        run.ctx.account_email = run.account_email
         ex = build_execute(spec, run.ctx, resume=resume)
         run.task_id = f"{job.job_id}:{run.worker_id}:{uuid.uuid4().hex[:6]}"
         run.phase = WorkerPhase.RUNNING
@@ -236,16 +269,31 @@ class BatchOrchestrator:
 
         run.phase = WorkerPhase.ROTATING
         run.rotations += 1
-        outcome = await self._driver.login(worker_id, spec, self._slot_dir(spec, run))
-        if not outcome.success:
-            self._fail(run, outcome.error or "rotation login failed")
-            return False
-        run.account_id = outcome.account_id
-        run.ctx.account_id = outcome.account_id
-        run.ctx.account_email = outcome.account_email
+
+        if run.active_slot + 1 < len(run.config_dirs):
+            # A pre-logged account is ready in the local pool — switch to it with
+            # no re-login (the fast path that per_worker > 1 buys).
+            run.active_slot += 1
+        else:
+            # Local pool spent: log a fresh account into a new config_dir.
+            new_dir = self._extra_dir(job, run)
+            outcome = await self._driver.login(worker_id, spec, new_dir)
+            if not outcome.success:
+                self._fail(run, outcome.error or "rotation login failed")
+                return False
+            run.config_dirs.append(new_dir)
+            run.account_ids.append(outcome.account_id)
+            run.account_emails.append(outcome.account_email)
+            run.active_slot = len(run.config_dirs) - 1
 
         await self._dispatch(job, run, resume=True)
         return True
+
+    @staticmethod
+    def _extra_dir(job: BatchJob, run: WorkerRun) -> str:
+        """A fresh config_dir for a rotation beyond the pre-logged pool."""
+        base = run.config_dirs[0] or job.spec.account.config_dir or "/root/.claude"
+        return f"{base}-rot-{run.rotations}"
 
     async def on_worker_exit(
         self, job_id: str, worker_id: str, exit_code: int, task_id: str | None = None,
@@ -278,10 +326,6 @@ class BatchOrchestrator:
             await self._driver.scale_in(list(job.runs.keys()))
 
     # -- helpers -----------------------------------------------------------
-
-    def _slot_dir(self, spec: JobSpec, run: WorkerRun) -> str:
-        """config_dir for this worker's account (single-slot model)."""
-        return spec.account.config_dir
 
     @staticmethod
     def _fail(run: WorkerRun, error: str) -> None:

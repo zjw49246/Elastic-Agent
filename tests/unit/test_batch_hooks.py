@@ -76,14 +76,15 @@ class TestAccountAllocator:
         b = await alloc.allocate("w2", "standard")
         assert {a.id, b.id} == {"a1", "a2"}
 
-    async def test_reallocate_retires_old(self, tmp_path):
+    async def test_multiple_accounts_per_worker_distinct(self, tmp_path):
+        # per_worker > 1: several distinct accounts on one worker; an already-held
+        # (e.g. exhausted) account is never handed out again while assigned.
         alloc = AccountAllocator(await _store(tmp_path, [_acct(1), _acct(2), _acct(3)]))
-        first = await alloc.allocate("w1", "standard")
-        second = await alloc.allocate("w1", "standard")  # rotation
-        assert second.id != first.id
-        # exhausted account never comes back, even after others freed
-        third = await alloc.allocate("w1", "standard")
-        assert third.id not in {first.id}
+        got = [(await alloc.allocate("w1", "standard")).id for _ in range(3)]
+        assert sorted(got) == ["a1", "a2", "a3"]
+        assert len(set(got)) == 3
+        # pool now spent for this worker
+        assert await alloc.allocate("w1", "standard") is None
 
     async def test_none_when_pool_empty(self, tmp_path):
         alloc = AccountAllocator(await _store(tmp_path, [_acct(1)]))
