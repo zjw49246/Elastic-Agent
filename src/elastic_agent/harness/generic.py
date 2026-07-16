@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -154,8 +155,15 @@ def compile_bootstrap_steps(
     if include_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
-    # Job-specific provisioning: clone repo + run setup commands.
-    steps.extend(GenericJobHarness(spec).get_bootstrap_steps())
+    # Job-specific provisioning: clone repo (with a git token for private repos,
+    # sourced from ELASTIC_AGENT_GIT_TOKEN so secrets never live in the JobSpec)
+    # + run setup commands.
+    setup = spec.setup
+    steps.append(harness_code_step(
+        repo_url=setup.repo, branch=setup.branch, target_dir=setup.target_dir,
+        extra_commands=list(setup.commands),
+        git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
+    ))
 
     if include_pty:
         steps.append(pty_refresh_step())

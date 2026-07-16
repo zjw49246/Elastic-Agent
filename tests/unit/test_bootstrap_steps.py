@@ -105,6 +105,19 @@ class TestHarnessCodeStep:
         )
         assert "develop" in step.command
 
+    def test_git_token_private_repo(self) -> None:
+        # Token embedded in clone URL, then stripped from the persisted remote.
+        step = harness_code_step(
+            repo_url="https://github.com/org/private.git", git_token="ghp_secret",
+        )
+        assert "https://x-access-token:ghp_secret@github.com/org/private.git" in step.command
+        assert "remote set-url origin https://github.com/org/private.git" in step.command
+
+    def test_no_token_no_rewrite(self) -> None:
+        step = harness_code_step(repo_url="https://github.com/org/pub.git")
+        assert "x-access-token" not in step.command
+        assert "remote set-url" not in step.command
+
 
 class TestBuildDefaultSteps:
     def test_returns_four_steps(self) -> None:

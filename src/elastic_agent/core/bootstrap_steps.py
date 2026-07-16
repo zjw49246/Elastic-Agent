@@ -111,15 +111,30 @@ def harness_code_step(
     target_dir: str = "/opt/elastic-agent/harness",
     extra_commands: list[str] | None = None,
     timeout: int = 300,
+    git_token: str | None = None,
 ) -> BootstrapStep:
-    """T-022: Deploy Harness-specific code — clone repo, install dependencies."""
+    """T-022: Deploy Harness-specific code — clone repo, install dependencies.
+
+    ``git_token`` clones a private GitHub repo: the token is embedded in the
+    clone URL, then stripped from the persisted remote so it doesn't linger in
+    ``.git/config`` on the worker.
+    """
     if repo_url is None:
         cmd = f"mkdir -p {target_dir} && echo 'No harness repo configured, skipping'"
     else:
+        clone_url = repo_url
+        strip_token = False
+        if git_token and repo_url.startswith("https://github.com/"):
+            clone_url = repo_url.replace(
+                "https://github.com/", f"https://x-access-token:{git_token}@github.com/"
+            )
+            strip_token = True
         parts = [
             f"mkdir -p {target_dir}",
-            f"git clone --depth 1 --branch {branch} {repo_url} {target_dir}",
+            f"git clone --depth 1 --branch {branch} {clone_url} {target_dir}",
         ]
+        if strip_token:
+            parts.append(f"git -C {target_dir} remote set-url origin {repo_url}")
         if extra_commands:
             parts.extend(extra_commands)
         cmd = " && ".join(parts)
