@@ -52,14 +52,17 @@ def docker_install_step(run_as: str = "ubuntu", timeout: int = 420) -> Bootstrap
             "export DEBIAN_FRONTEND=noninteractive && "
             "cloud-init status --wait 2>/dev/null || true; "
             "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
-            "apt-get -o DPkg::Lock::Timeout=600 install -y -qq docker.io && "
+            # docker-buildx too: Docker 29 builds images with BuildKit, which
+            # needs the buildx component — docker.io alone → `docker build` fails
+            # with "buildx component is missing" (e.g. ai4sci --sandbox os).
+            "apt-get -o DPkg::Lock::Timeout=600 install -y -qq docker.io docker-buildx && "
             f"usermod -aG docker {run_as} && "
             "systemctl enable --now docker && "
-            "docker --version"
+            "docker --version && docker buildx version"
         ),
         timeout=timeout,
         retry_count=2,
-        description="Install Docker and grant the runtime user socket access",
+        description="Install Docker (+buildx) and grant the runtime user socket access",
     )
 
 

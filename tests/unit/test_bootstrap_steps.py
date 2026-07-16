@@ -218,6 +218,7 @@ class TestDockerInstallStep:
         step = docker_install_step(run_as="ubuntu")
         assert step.name == "docker-install"
         assert "docker.io" in step.command
+        assert "docker-buildx" in step.command  # BuildKit builds (--sandbox os)
         assert "usermod -aG docker ubuntu" in step.command
         assert "enable --now docker" in step.command
 
