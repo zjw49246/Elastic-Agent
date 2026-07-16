@@ -152,3 +152,12 @@
 - `fix(providers)/test` AWSProvider/DryRunProvider/4 个测试内联 provider 补 reboot_instance——清掉全部 58 个 collection error。
 
 **全 unit：5 failed / 1315 passed / 0 errors**（5 个 failed 均为未触碰文件的既有 env/时序 flaky）。main 已推。
+
+## 2026-07-16 真跑用户任务 AI4Sci-Bench + 结果交付（main）
+
+**真跑用户的实际任务**：私有 repo `Agent-AI4Sci-Bench`（本机 gh 已登 youchengsong，`git ls-remote` 可达）rsync 到 worker（避免 token 上机），worker 装 uv、`uv sync --python 3.13`（默认 3.14 因 taichi 无 wheel 失败）。用账号（`CLAUDE_CONFIG_DIR=~/.claude-e2e-login`）跑一个真 task：
+`ai4sci-bench run --agent claude_code_cli --agent-config '{"model":"claude-opus-4-8","effort":"medium",...}' --tasks math.homotopy_poly_roots --prompt-levels b1 --sandbox task --tool-mode restricted` → **完成，final_score 39.06/100**（recall 0.6 / precision 0.6，5 次代码执行 0 失败）。`--sandbox task`（per-task uv venv）免 Docker，适合小 worker。
+
+**结果交付**：worker 的 `results/` rsync 回 Manager 的 `collected/<job_id>/`；新端点 `GET /api/jobs/{id}/results`（列表+benchmark final_score）+ `/results/download`（tar.gz）。经公网域名验证：列出 25 文件+分数，下载 32K tar.gz。**用户拿结果 = 从 Manager 公网域名下载**（或后续接 S3/OSS）。
+
+**经验**：跑真 benchmark 前必须对齐 (1) repo 访问（私有→rsync 或 deploy key）(2) Python 版本（sci 依赖常无最新 py wheel，用 uv --python 锁旧版）(3) sandbox 模式（无 Docker 用 --sandbox task）。
