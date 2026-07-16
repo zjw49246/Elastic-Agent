@@ -1,5 +1,24 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-16 实盘 e2e 逐层打通（full_run → ai4sci-bench，task-ccm-sync）
+
+**背景**：在本 VPC 内起真 Manager（`.claude-manager/full_run.py`，:8080，真 AWS provider），`manager.batch.launch` 开新 EC2→全量 provision→worker 本地登号→跑 ai4sci-bench→收集→S3。逐次 retry 逐层暴露问题，**三个是真代码 bug**（commit `7cdcb57`），两个是外部/操作层。
+
+1. **AWS 最终一致性**（`providers/aws.py::wait_until_running`）：`run_instances` 后立刻 `describe_instances` 可能 `InvalidInstanceID.NotFound`（ID 尚未传播），原代码直接抛→`provision` 判死，**而实例其实已起→泄漏白烧钱**。修：poll 循环把「尚未可见」（NotFound/Malformed/空 reservation）当继续等，只有真错误才抛。
+2. **setup/run 用户不一致**（`batch_hooks.py` manager_rsync）：`SSHExecutor` 对非 root 用户**默认 sudo 包裹**（`bootstrap.py:79`），于是 `setup.commands`（`curl uv/install.sh | sh` + `uv sync`）以 **root** 跑→uv 装到 `/root/.local`、`.venv` 归 root；但 run 命令以 **ssh_user(ubuntu)** 跑→`$HOME/.local/bin/uv: No such file`，benchmark 秒退且无 stdout。修：setup 命令 `use_sudo=False` 按 job 用户跑，与 run 共享 HOME。
+3. **根盘扩容错设备**（`providers/aws.py::create_instance`）：BlockDeviceMapping 写死 `DeviceName=/dev/xvda`，但 **Ubuntu AMI root 是 `/dev/sda1`**→我们建了个幽灵 40G 卷没挂上、真 root 仍是 AMI 里 8G→sandbox 建 per-task venv（taichi 53M+scipy 33M…）撑爆 100%。修：`describe_images` 查 AMI 真实 `RootDeviceName` 再扩容（带缓存，fallback `/dev/sda1`）。
+
+**外部/操作层（非代码）**：① full_run 抢 :8080（被常驻 serve_demo 占）→启动即崩、no EC2/no marker——先腾端口；② 171mail `/claude/send` 偶发 500（`SendMagicLink 网络或代理请求失败`）——**外部接码服务瞬时故障**，换号无用，自愈后同参数返回 200。
+
+**踩坑教训**：
+- **验证脚本要贴合真实执行路径**。我一度以为有"第 6 层"（benchmark 内部 `subprocess.run(["uv",...])` 报 `FileNotFoundError: uv`），实为**我的验证脚本用 `#!/bin/bash`+`nohup`（非登录 shell），PATH 没有 `~/.local/bin`**；框架真实路径是 `bash -lc`（`job_spec.py:231/244`，登录 shell），`~/.profile` 有 uv 的 PATH 段→bare `uv` 能解析。用 `bash -lc` 重跑即过。**排查执行环境问题时，务必用与生产相同的 shell 类型（登录/非登录）复现。**
+- provision 中途失败会**留下已开的 EC2**（wait_until_running 抛出前实例已创建）；排查后要 `terminate-instances` 清理，别只看 registry。
+- 复用"已开着的失败 worker"验证下一层 fix（挂它的幽灵卷补磁盘、以正确用户重装 uv）比每次盲开新机（~20min+计费）快得多。
+
+**验证**：真实 login-shell 路径下 benchmark 完整跑起来——sandbox venv 建成、生成 task instance、`claude --model claude-opus-4-8` 真 agent 在解 `homotopy_poly_roots`（跑 solver.py、分析 roots.npy）。三个 fix 均带回归测试，`test_aws_provider.py`(4)+`test_batch_hooks.py`(+1) 全绿；7 个既有失败（config/file_sync/reconciler/worker_reconnect）经 stash 验证为**分支既存、与本改动无关**。
+
+**Commit**: `7cdcb57`
+
 ## 2026-07-15 用 CCM Worker 系统更新框架 · P1（task-ccm-sync）
 
 **背景**：CCM（Claude-Code-Manager）当初借鉴本框架的 Worker 系统，之后独立演进出大量 PTY/凭证运行时经验；本框架落后。二者已不共享代码，但共用同一上游 `claude-pty`。本次先落地风险最低、价值最高的 P1。
