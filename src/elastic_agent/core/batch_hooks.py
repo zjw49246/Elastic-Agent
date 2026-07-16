@@ -161,6 +161,8 @@ def make_provision_hook(
         return bool(result.success)
 
     runner = bootstrap_runner or _run_bootstrap
+    # A custom runner means test/dry mode — skip the real SSH-readiness poll.
+    real_provision = bootstrap_runner is None
 
     async def provision(worker_id: str, harness: Harness, spec: JobSpec) -> bool:
         node = await manager.registry.get(worker_id)
@@ -178,7 +180,7 @@ def make_provision_hook(
             return False
 
         # A freshly-booted instance isn't SSH-ready immediately — poll until it is.
-        if not await _wait_ssh_ready(host, ssh_user, ssh_key):
+        if real_provision and not await _wait_ssh_ready(host, ssh_user, ssh_key):
             logger.error("provision: %s never became SSH-ready", worker_id)
             return False
 
