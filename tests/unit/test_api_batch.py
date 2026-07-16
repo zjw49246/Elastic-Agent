@@ -195,6 +195,43 @@ class TestHarnessUpload:
         assert r.status_code == 400
 
 
+class TestJobResults:
+    def _seed(self, manager, job_id="job-r"):
+        import json as _json
+        from pathlib import Path
+        base = Path(manager.config.registry.path).with_name("collected") / job_id
+        (base / "math.foo").mkdir(parents=True, exist_ok=True)
+        (base / "run_metadata.json").write_text("{}")
+        (base / "math.foo" / "res_b1.json").write_text(_json.dumps({
+            "task_id": "math.foo", "prompt_level": "b1", "status": "completed", "final_score": 39.06,
+        }))
+        return job_id
+
+    @pytest.mark.asyncio
+    async def test_list_results_with_scores(self, client, manager):
+        jid = self._seed(manager)
+        r = await client.get(f"/api/jobs/{jid}/results")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["file_count"] == 2
+        assert body["scores"] == [
+            {"task_id": "math.foo", "prompt_level": "b1", "status": "completed", "final_score": 39.06}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_download_tarball(self, client, manager):
+        jid = self._seed(manager, "job-dl")
+        r = await client.get(f"/api/jobs/{jid}/results/download")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/gzip"
+        assert "job-dl-results.tar.gz" in r.headers["content-disposition"]
+        assert len(r.content) > 0
+
+    @pytest.mark.asyncio
+    async def test_missing_results_404(self, client):
+        assert (await client.get("/api/jobs/nope/results")).status_code == 404
+
+
 class TestBatchConsoleUI:
     @pytest.mark.asyncio
     async def test_batch_page_served(self, client):

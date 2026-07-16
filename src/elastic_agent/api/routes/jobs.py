@@ -7,10 +7,14 @@ Harness code uploads so the "upload code" path has somewhere to land.
 
 from __future__ import annotations
 
+import io
+import json
 import re
+import tarfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from elastic_agent.api.auth import require_api_key
@@ -67,6 +71,56 @@ async def get_job(job_id: str) -> dict:
     if job is None:
         raise HTTPException(404, f"Job {job_id} not found")
     return _job_detail(job)
+
+
+def _collected_dir(mgr, job_id: str) -> Path:
+    """Where a job's collected results live on the Manager.
+
+    The batch flow rsyncs each worker's ``collect.paths`` here after the run; the
+    endpoints below expose them for download — that's how results reach the user.
+    """
+    return Path(mgr.config.registry.path).with_name("collected") / job_id
+
+
+@router.get("/jobs/{job_id}/results")
+async def job_results(job_id: str) -> dict:
+    """List a job's collected result files + surface benchmark scores."""
+    base = _collected_dir(_mgr(), job_id)
+    if not base.is_dir():
+        raise HTTPException(404, f"no collected results for job {job_id}")
+    files, scores = [], []
+    for p in sorted(base.rglob("*")):
+        if p.is_file():
+            files.append({"path": str(p.relative_to(base)), "size": p.stat().st_size})
+    for p in base.rglob("*.json"):
+        if "instances" in p.parts:
+            continue
+        try:
+            d = json.loads(p.read_text())
+        except Exception:
+            continue
+        if isinstance(d, dict) and "final_score" in d:
+            scores.append({
+                "task_id": d.get("task_id"), "prompt_level": d.get("prompt_level"),
+                "status": d.get("status"), "final_score": d.get("final_score"),
+            })
+    return {"job_id": job_id, "file_count": len(files), "scores": scores, "files": files[:500]}
+
+
+@router.get("/jobs/{job_id}/results/download")
+async def job_results_download(job_id: str) -> StreamingResponse:
+    """Download a job's collected results as a .tar.gz."""
+    base = _collected_dir(_mgr(), job_id)
+    if not base.is_dir():
+        raise HTTPException(404, f"no collected results for job {job_id}")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(str(base), arcname=job_id)
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}-results.tar.gz"'},
+    )
 
 
 class HarnessUploadRequest(BaseModel):
