@@ -49,6 +49,14 @@ class TestBootstrapSteps:
         )]
         assert "credential-login-deps" not in names
 
+    def test_manager_rsync_skips_worker_clone(self):
+        # Code is delivered by the Manager (rsync), so no worker git-clone step.
+        spec = _spec(setup={"repo": "https://github.com/x/y.git", "commands": ["uv sync"],
+                            "deliver": "manager_rsync"})
+        names = [s.name for s in compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w")]
+        assert "harness-code" not in names
+
     def test_no_pty_omits_pty_steps(self):
         spec = _spec()
         names = [s.name for s in compile_bootstrap_steps(

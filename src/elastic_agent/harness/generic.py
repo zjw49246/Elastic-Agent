@@ -155,15 +155,17 @@ def compile_bootstrap_steps(
     if include_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
-    # Job-specific provisioning: clone repo (with a git token for private repos,
-    # sourced from ELASTIC_AGENT_GIT_TOKEN so secrets never live in the JobSpec)
-    # + run setup commands.
+    # Job-specific provisioning. For manager_rsync delivery the Manager clones +
+    # rsyncs the code and runs setup commands (see make_provision_hook), so no
+    # worker-side clone step here. For worker_clone, clone on the worker (token
+    # from ELASTIC_AGENT_GIT_TOKEN for private repos — never in the JobSpec).
     setup = spec.setup
-    steps.append(harness_code_step(
-        repo_url=setup.repo, branch=setup.branch, target_dir=setup.target_dir,
-        extra_commands=list(setup.commands),
-        git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
-    ))
+    if setup.deliver != "manager_rsync":
+        steps.append(harness_code_step(
+            repo_url=setup.repo, branch=setup.branch, target_dir=setup.target_dir,
+            extra_commands=list(setup.commands),
+            git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
+        ))
 
     if include_pty:
         steps.append(pty_refresh_step())

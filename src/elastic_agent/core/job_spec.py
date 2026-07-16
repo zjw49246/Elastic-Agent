@@ -90,6 +90,13 @@ class SetupSpec(BaseModel):
     branch: str = "main"
     target_dir: str = "/opt/elastic-agent/harness"
     commands: list[str] = Field(default_factory=list)
+    # How the code reaches the worker:
+    #  worker_clone : the worker `git clone`s the repo itself (fine for public;
+    #    private needs a token pushed to the worker).
+    #  manager_rsync: the Manager clones the repo locally (token stays on the
+    #    Manager) then rsyncs the checkout (minus .git) to the worker — the token
+    #    never touches the worker. Preferred for private repos.
+    deliver: Literal["worker_clone", "manager_rsync"] = "worker_clone"
 
 
 class RunSpec(BaseModel):

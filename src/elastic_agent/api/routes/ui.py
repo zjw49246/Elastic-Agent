@@ -436,6 +436,11 @@ _BATCH_HTML = """\
     </div>
     <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
     <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
+    <label>代码分发方式</label>
+    <select id="jDeliver">
+      <option value="manager_rsync">manager_rsync（私有 repo 推荐：token 只在 Manager，clone 后 rsync 到 worker，token 不上机）</option>
+      <option value="worker_clone">worker_clone（公开 repo：worker 自己 git clone）</option>
+    </select>
     <label>Setup — commands（每行一条,在代码目录里跑,如 uv sync）</label>
     <textarea id="jSetup" placeholder="uv sync"></textarea>
     <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
@@ -574,7 +579,8 @@ async function submitJob() {
   const ref = document.getElementById('jHarnessRef').value.trim();
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
-    setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup')},
+    setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup'),
+            deliver: document.getElementById('jDeliver').value},
     run: {command: document.getElementById('jRun').value.trim(),
           cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
     account: {mode: document.getElementById('jAcctMode').value,

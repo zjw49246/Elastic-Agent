@@ -21,6 +21,17 @@ os.environ["ELASTIC_AGENT_RESULTS_S3_BUCKET"] = "elastic-agent-results-297645381
 os.environ["ELASTIC_AGENT_RESULTS_S3_INTERVAL"] = "60"
 os.environ.pop("PORT", None)
 
+# Git token for private-repo delivery (manager_rsync). Read at runtime from the
+# box's authenticated gh — stays in the Manager process env, never hardcoded and
+# never sent to workers (rsync excludes .git).
+try:
+    import subprocess as _sp
+    _tok = _sp.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10).stdout.strip()
+    if _tok:
+        os.environ["ELASTIC_AGENT_GIT_TOKEN"] = _tok
+except Exception:
+    pass
+
 import uvicorn
 
 from elastic_agent.api.app import create_app

@@ -184,6 +184,28 @@ def make_provision_hook(
         if not await runner(worker_id, host, steps, ssh_user, ssh_key):
             return False
 
+        # manager_rsync: clone on the Manager (token stays here) → rsync to the
+        # worker (no token) → run setup commands on the worker.
+        if spec.setup.deliver == "manager_rsync" and spec.setup.repo:
+            from elastic_agent.core.bootstrap import SSHExecutor
+            from elastic_agent.core.code_sync import ManagerCodeSync
+            sync = ManagerCodeSync(
+                cache_dir=os.path.join(os.path.dirname(manager.collected_root), "repo_cache"),
+                git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
+                ssh_key=ssh_key, ssh_user=ssh_user,
+            )
+            local = await sync.ensure_clone(spec.setup.repo, spec.setup.branch)
+            if not await sync.deliver(local, host, spec.setup.target_dir):
+                logger.error("manager_rsync deliver failed for %s", worker_id)
+                return False
+            if spec.setup.commands:
+                ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key)
+                setup_cmd = f"cd {spec.setup.target_dir} && " + " && ".join(spec.setup.commands)
+                rc, _out, _err = await ex.execute(setup_cmd, timeout=1200)
+                if rc != 0:
+                    logger.error("manager_rsync setup commands failed on %s (rc=%s)", worker_id, rc)
+                    return False
+
         return await _wait_ws_connected(manager, worker_id, ws_wait_timeout)
 
     return provision
