@@ -47,6 +47,7 @@ class _TestProvider(CloudProvider):
     async def terminate_instance(self, instance_id: str) -> None: pass
     async def start_instance(self, instance_id: str) -> None: pass
     async def stop_instance(self, instance_id: str) -> None: pass
+    async def reboot_instance(self, instance_id: str) -> None: pass
     async def list_instances(self, filters=None) -> list[Instance]: return []
     async def get_instance(self, instance_id: str) -> Instance | None: return None
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance: return None

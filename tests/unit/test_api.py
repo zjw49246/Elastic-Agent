@@ -60,6 +60,9 @@ class InMemoryProvider(CloudProvider):
     async def stop_instance(self, instance_id: str) -> None:
         pass
 
+    async def reboot_instance(self, instance_id: str) -> None:
+        pass
+
     async def list_instances(self, filters: dict | None = None) -> list[Instance]:
         return list(self._instances.values())
 
