@@ -119,6 +119,30 @@ class TestHarnessCodeStep:
         assert "remote set-url" not in step.command
 
 
+class TestRuntimeDeployFromSrc:
+    def test_systemd_unit_from_src(self) -> None:
+        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
+        step = runtime_deploy_from_src_step(
+            manager_url="ws://1.2.3.4:8080/ws/runtime", auth_token="tok",
+            worker_id="w1", src_dir="/opt/ea/src", run_as="ubuntu",
+        )
+        c = step.command
+        assert step.name == "runtime-deploy-from-src"
+        assert "ea-runtime.service" in c and "Restart=always" in c
+        assert "User=ubuntu" in c
+        assert "PYTHONPATH=/opt/ea/src" in c
+        assert "elastic_agent.worker.runtime_main" in c
+        assert "--manager-url ws://1.2.3.4:8080/ws/runtime" in c and "--token tok" in c
+        assert "Xvfb :99" in c                      # display for the login flow
+        assert "systemctl restart ea-runtime" in c
+
+    def test_root_gets_is_sandbox(self) -> None:
+        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
+        step = runtime_deploy_from_src_step("u", "t", "w", run_as="root")
+        assert "IS_SANDBOX=1" in step.command
+        assert "User=root" in step.command
+
+
 class TestBuildDefaultSteps:
     def test_returns_four_steps(self) -> None:
         steps = build_default_bootstrap_steps(

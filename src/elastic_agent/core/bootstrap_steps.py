@@ -55,6 +55,76 @@ def agent_install_step(
     )
 
 
+def runtime_deploy_from_src_step(
+    manager_url: str,
+    auth_token: str,
+    worker_id: str,
+    src_dir: str = "/opt/elastic-agent/framework/src",
+    run_as: str = "ubuntu",
+    display: str = ":99",
+    runtime_deps: list[str] | None = None,
+    timeout: int = 300,
+) -> BootstrapStep:
+    """Run the Worker Runtime from rsync'd framework source (not PyPI).
+
+    The framework is delivered by the Manager (manager_rsync) to ``src_dir``; this
+    installs the runtime's Python deps, writes a wrapper (starts Xvfb for the
+    login flow + execs the runtime from src with PYTHONPATH) and a systemd unit
+    (``Restart=always``, ``User=run_as``) so the worker stays connected across SSH
+    disconnects — the robust replacement for a foreground-held SSH session.
+    """
+    deps = " ".join(runtime_deps or ["pydantic", "pydantic-settings", "websockets", "httpx", "psutil"])
+    home = "/root" if run_as == "root" else f"/home/{run_as}"
+    wrapper = (
+        "#!/bin/bash\n"
+        "set -u\n"
+        f"export HOME={home}\n"
+        f"export DISPLAY={display}\n"
+        f"export PYTHONPATH={src_dir}\n"
+        f"export PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\n"
+        + ("export IS_SANDBOX=1\n" if run_as == "root" else "")
+        + f'pkill -f "Xvfb {display}" 2>/dev/null; rm -f /tmp/.X{display[1:]}-lock\n'
+        f"Xvfb {display} -screen 0 1280x1024x24 >/tmp/ea-xvfb.log 2>&1 &\n"
+        "sleep 1\n"
+        f"exec python3 -m elastic_agent.worker.runtime_main "
+        f"--manager-url {manager_url} --token {auth_token} --worker-id {worker_id} "
+        f"--log-dir {home}/ea-logs\n"
+    )
+    unit = (
+        "[Unit]\n"
+        "Description=Elastic Agent Worker Runtime (from src)\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={run_as}\n"
+        "ExecStart=/bin/bash /usr/local/bin/ea-runtime.sh\n"
+        "Restart=always\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    cmd = (
+        f"pip3 install -q --break-system-packages {deps} && "
+        f"mkdir -p {home}/ea-logs && "
+        "cat > /usr/local/bin/ea-runtime.sh << 'WRAP'\n"
+        f"{wrapper}"
+        "WRAP\n"
+        "chmod +x /usr/local/bin/ea-runtime.sh && "
+        "cat > /etc/systemd/system/ea-runtime.service << 'UNIT'\n"
+        f"{unit}"
+        "UNIT\n"
+        "systemctl daemon-reload && systemctl enable ea-runtime && "
+        "systemctl restart ea-runtime"
+    )
+    return BootstrapStep(
+        name="runtime-deploy-from-src",
+        command=cmd,
+        timeout=timeout,
+        retry_count=1,
+        description="Run Worker Runtime from rsync'd framework src via systemd (+Xvfb)",
+    )
+
+
 def runtime_deploy_step(
     manager_url: str,
     auth_token: str,

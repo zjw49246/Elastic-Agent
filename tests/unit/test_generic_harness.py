@@ -49,6 +49,15 @@ class TestBootstrapSteps:
         )]
         assert "credential-login-deps" not in names
 
+    def test_runtime_from_src_skips_pypi_runtime_deploy(self):
+        spec = _spec()
+        names = [s.name for s in compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+            include_pty=True, runtime_from_src=True)]
+        assert "runtime-deploy" not in names       # PyPI deploy skipped
+        assert "pty-refresh-hook" not in names      # patches that unit → also skipped
+        assert "agent-install" in names             # claude CLI still installed
+
     def test_manager_rsync_skips_worker_clone(self):
         # Code is delivered by the Manager (rsync), so no worker git-clone step.
         spec = _spec(setup={"repo": "https://github.com/x/y.git", "commands": ["uv sync"],

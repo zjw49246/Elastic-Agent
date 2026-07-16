@@ -177,25 +177,33 @@ def make_provision_hook(
             logger.error("provision: no host address for %s", worker_id)
             return False
 
+        # Deliver THIS branch's framework to the worker (not PyPI) when
+        # ELASTIC_AGENT_FRAMEWORK_SRC is set — the last mile for one-click auto.
+        framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
+
         steps = compile_bootstrap_steps(
             spec, manager_url=manager_url, auth_token=node.auth_token or "",
             worker_id=worker_id, include_pty=include_pty,
+            runtime_from_src=bool(framework_src),
         )
         if not await runner(worker_id, host, steps, ssh_user, ssh_key):
             return False
 
-        # manager_rsync: clone on the Manager (token stays here) → rsync to the
-        # worker (no token) → run setup commands on the worker.
-        if spec.setup.deliver == "manager_rsync" and spec.setup.repo:
+        need_manager_rsync = spec.setup.deliver == "manager_rsync" and spec.setup.repo
+        if need_manager_rsync or framework_src:
             from elastic_agent.core.bootstrap import SSHExecutor
             from elastic_agent.core.code_sync import ManagerCodeSync
-            sync = ManagerCodeSync(
+            _sync = ManagerCodeSync(
                 cache_dir=os.path.join(os.path.dirname(manager.collected_root), "repo_cache"),
                 git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
                 ssh_key=ssh_key, ssh_user=ssh_user,
             )
-            local = await sync.ensure_clone(spec.setup.repo, spec.setup.branch)
-            if not await sync.deliver(local, host, spec.setup.target_dir):
+
+        # manager_rsync: clone on the Manager (token stays here) → rsync to the
+        # worker (no token) → run setup commands on the worker.
+        if need_manager_rsync:
+            local = await _sync.ensure_clone(spec.setup.repo, spec.setup.branch)
+            if not await _sync.deliver(local, host, spec.setup.target_dir):
                 logger.error("manager_rsync deliver failed for %s", worker_id)
                 return False
             if spec.setup.commands:
@@ -205,6 +213,24 @@ def make_provision_hook(
                 if rc != 0:
                     logger.error("manager_rsync setup commands failed on %s (rc=%s)", worker_id, rc)
                     return False
+
+        # Framework src → worker + systemd unit (runtime runs from src, survives
+        # SSH disconnects). No token needed — it's a local directory.
+        if framework_src:
+            from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
+            fw_dir = "/opt/elastic-agent/framework/src"
+            if not await _sync.deliver(framework_src, host, fw_dir):
+                logger.error("framework rsync failed for %s", worker_id)
+                return False
+            step = runtime_deploy_from_src_step(
+                manager_url=manager_url, auth_token=node.auth_token or "",
+                worker_id=worker_id, src_dir=fw_dir, run_as=ssh_user,
+            )
+            ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key)
+            rc, _out, _err = await ex.execute(step.command, timeout=step.timeout)
+            if rc != 0:
+                logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
+                return False
 
         return await _wait_ws_connected(manager, worker_id, ws_wait_timeout)
 

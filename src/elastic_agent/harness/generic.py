@@ -131,12 +131,18 @@ def compile_bootstrap_steps(
     include_pty: bool = False,
     include_login_deps: bool | None = None,
     pty_package: str | None = None,
+    runtime_from_src: bool = False,
 ) -> list[BootstrapStep]:
     """Full bootstrap sequence for a declarative job.
 
     Mirrors ``build_default_bootstrap_steps`` but sources the harness-code step
     from the JobSpec's ``setup`` (repo + commands) instead of a bare repo URL,
     and auto-enables login deps when the job logs accounts in on the worker.
+
+    ``runtime_from_src`` skips the PyPI runtime-deploy (and pty-refresh, which
+    patches that unit): the Manager rsyncs the framework source and starts the
+    runtime from it via systemd (see make_provision_hook) — used when the worker
+    must run this branch, not the published package.
     """
     if include_login_deps is None:
         include_login_deps = spec.account.mode == "worker_local_login"
@@ -144,14 +150,15 @@ def compile_bootstrap_steps(
     steps: list[BootstrapStep] = [
         system_init_step(packages=system_packages),
         agent_install_step(),
-        runtime_deploy_step(
+    ]
+    if not runtime_from_src:
+        steps.append(runtime_deploy_step(
             manager_url=manager_url,
             auth_token=auth_token,
             worker_id=worker_id,
             runtime_port=runtime_port,
             heartbeat_interval=heartbeat_interval,
-        ),
-    ]
+        ))
     if include_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
@@ -167,7 +174,7 @@ def compile_bootstrap_steps(
             git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
         ))
 
-    if include_pty:
+    if include_pty and not runtime_from_src:
         steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
     if include_login_deps:
