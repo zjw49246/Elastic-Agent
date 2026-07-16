@@ -32,6 +32,7 @@ class InMemoryProvider(CloudProvider):
         return "dryrun"
 
     async def create_instance(self, config: InstanceConfig) -> Instance:
+        self._last_config = config
         self._counter += 1
         iid = f"i-dry-{self._counter:04d}"
         inst = Instance(
@@ -140,6 +141,22 @@ class TestScaleOut:
         assert rec.node_id.startswith("dryrun:")
         all_nodes = await manager.registry.list_all()
         assert len(all_nodes) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_scale_out_disk_and_spot_reach_instance_config(self, manager, provider):
+        await manager.start()
+        await manager.scale_out(count=1, disk_gb=80, spot=True)
+        assert provider._last_config.root_disk_size_gb == 80
+        assert provider._last_config.spot is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_scale_out_disk_default_when_unset(self, manager, provider):
+        await manager.start()
+        await manager.scale_out(count=1)  # no disk_gb → InstanceConfig default (40)
+        assert provider._last_config.root_disk_size_gb == 40
+        assert provider._last_config.spot is False
         await manager.stop()
 
     @pytest.mark.asyncio

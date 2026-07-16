@@ -52,10 +52,12 @@ class ManagerFleetDriver:
         self._login = login_hook or _no_login
 
     async def scale_out(self, count: int, name_prefix: str = "",
-                        instance_type: str = "", region: str = "") -> list[str]:
+                        instance_type: str = "", region: str = "",
+                        disk_gb: int = 0, spot: bool = False) -> list[str]:
         records = await self._mgr.scale_out(
             count=count, name_prefix=name_prefix or None,
-            instance_type=instance_type or None, region=region or None)
+            instance_type=instance_type or None, region=region or None,
+            disk_gb=disk_gb or None, spot=spot)
         return [r.node_id for r in records]
 
     async def hostname_of(self, worker_id: str) -> str:

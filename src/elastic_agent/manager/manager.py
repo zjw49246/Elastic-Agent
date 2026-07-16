@@ -192,6 +192,8 @@ class ElasticAgentManager:
         instance_type: str | None = None,
         region: str | None = None,
         name_prefix: str | None = None,
+        disk_gb: int | None = None,
+        spot: bool = False,
     ) -> list[NodeRecord]:
         from elastic_agent.core.auth import generate_worker_token
         from elastic_agent.core.providers.base import InstanceConfig
@@ -215,6 +217,10 @@ class ElasticAgentManager:
                 subnet_id=provider_cfg.aws.subnet_id,
                 tags={"ManagedBy": "elastic-agent"},
             )
+        # Per-job disk/spot overrides; disk_gb falsy → keep InstanceConfig default.
+        if disk_gb:
+            cfg.root_disk_size_gb = disk_gb
+        cfg.spot = spot
 
         records: list[NodeRecord] = []
         for i in range(count):

@@ -438,6 +438,12 @@ _BATCH_HTML = """\
       <div><label>Region（空=Manager 默认）</label>
         <input id="jRegion" placeholder="ap-northeast-1"></div>
     </div>
+    <div class="grid2">
+      <div><label>根盘 disk_gb（0=Manager 默认；吃盘任务如 ai4sci 建议 ≥60）</label>
+        <input id="jDiskGb" type="number" value="0" min="0"></div>
+      <div><label>Spot 竞价实例（省钱，可能被回收）</label>
+        <select id="jSpot"><option value="false">否</option><option value="true">是</option></select></div>
+    </div>
     <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
     <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
     <label>代码分发方式</label>
@@ -596,7 +602,9 @@ async function submitJob() {
              shard_by: document.getElementById('jShard').value,
              name_prefix: document.getElementById('jNamePrefix').value.trim(),
              instance_type: document.getElementById('jInstanceType').value.trim(),
-             region: document.getElementById('jRegion').value.trim()},
+             region: document.getElementById('jRegion').value.trim(),
+             disk_gb: parseInt(document.getElementById('jDiskGb').value) || 0,
+             spot: document.getElementById('jSpot').value === 'true'},
   };
   if (ref) spec.harness_ref = ref;
   try { const j = await api('POST', '/jobs', spec);

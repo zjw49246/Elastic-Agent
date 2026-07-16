@@ -163,6 +163,11 @@ class FanoutSpec(BaseModel):
     # taken from the Manager config, not per-job).
     instance_type: str = ""
     region: str = ""
+    # Root disk size (GiB) and spot pricing, per-job. disk_gb=0 → provider
+    # default (InstanceConfig.root_disk_size_gb). Bump disk_gb for jobs whose
+    # run builds heavy sandboxes/venvs (e.g. ai4sci-bench) — the default is tight.
+    disk_gb: int = 0
+    spot: bool = False
 
 
 class CollectSpec(BaseModel):

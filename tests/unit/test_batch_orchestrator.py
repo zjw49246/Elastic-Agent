@@ -27,9 +27,12 @@ class FakeDriver:
         self.collected: list = []
         self._account_seq = 0
 
-    async def scale_out(self, count, name_prefix="", instance_type="", region=""):
+    async def scale_out(self, count, name_prefix="", instance_type="", region="",
+                        disk_gb=0, spot=False):
         self.scale_name_prefix = name_prefix
         self.scale_instance_type = instance_type
+        self.scale_disk_gb = disk_gb
+        self.scale_spot = spot
         return [f"w{i}" for i in range(count)]
 
     async def hostname_of(self, worker_id):
@@ -84,6 +87,13 @@ class TestLaunch:
         d2 = FakeDriver()
         await BatchOrchestrator(d2).launch(_spec(name="ai4sci", fanout={"workers": 1}))
         assert d2.scale_name_prefix == "ai4sci"   # falls back to job name
+
+    async def test_fanout_disk_and_spot_flow_to_scale_out(self):
+        d = FakeDriver()
+        await BatchOrchestrator(d).launch(
+            _spec(fanout={"workers": 1, "disk_gb": 80, "spot": True}))
+        assert d.scale_disk_gb == 80
+        assert d.scale_spot is True
 
     async def test_shard_index_rendered_per_worker(self):
         d = FakeDriver()
