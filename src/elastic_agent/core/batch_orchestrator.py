@@ -161,6 +161,7 @@ class BatchOrchestrator:
         self._scale_in_on_complete = scale_in_on_complete
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
+        self._collect_tasks: dict[str, asyncio.Task] = {}  # worker_id -> periodic collect
 
     def get_job(self, job_id: str) -> BatchJob | None:
         return self._jobs.get(job_id)
@@ -254,6 +255,40 @@ class BatchOrchestrator:
             job_id=job.job_id,
             watch_exhaustion=spec.rotation.strategy != "none",
         )
+        self._start_periodic_collect(job, run.worker_id)
+
+    def _start_periodic_collect(self, job: BatchJob, worker_id: str) -> None:
+        """While the run goes, pull results back every ``collect.interval_seconds``
+        (0 = off) so long runs stream partial results to the Manager → S3 as
+        tasks finish. One loop per worker; survives rotation."""
+        spec = job.spec
+        interval = spec.collect.interval_seconds
+        if interval <= 0 or not spec.collect.paths:
+            return
+        existing = self._collect_tasks.get(worker_id)
+        if existing and not existing.done():
+            return
+
+        async def _loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    run = job.runs.get(worker_id)
+                    if run is None or run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED):
+                        return
+                    try:
+                        await self._driver.collect(worker_id, spec, job.job_id)
+                    except Exception:
+                        logger.exception("periodic collect failed for %s", worker_id)
+            except asyncio.CancelledError:
+                return
+
+        self._collect_tasks[worker_id] = asyncio.create_task(_loop())
+
+    def _stop_periodic_collect(self, worker_id: str) -> None:
+        task = self._collect_tasks.pop(worker_id, None)
+        if task and not task.done():
+            task.cancel()
 
     # -- lifecycle events (called by the Manager's message handlers) --------
 
@@ -324,12 +359,15 @@ class BatchOrchestrator:
         if exit_code == job.spec.completion.on_process_exit:
             run.phase = WorkerPhase.DONE
             run.error = None
-            try:
-                await self._driver.collect(worker_id, job.spec, job_id)
-            except Exception:
-                logger.exception("collect failed for %s", worker_id)
         else:
             self._fail(run, f"run exited {exit_code}")
+        # Final collect on EITHER outcome — a failed/quota-exhausted run still has
+        # whatever tasks completed; pull them back so partial results reach S3.
+        self._stop_periodic_collect(worker_id)
+        try:
+            await self._driver.collect(worker_id, job.spec, job_id)
+        except Exception:
+            logger.exception("collect failed for %s", worker_id)
         await self._maybe_finish(job)
 
     async def _maybe_finish(self, job: BatchJob) -> None:

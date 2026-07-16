@@ -190,9 +190,14 @@ class FanoutSpec(BaseModel):
 
 
 class CollectSpec(BaseModel):
-    """What to pull back from each worker when the job finishes."""
+    """What to pull back from each worker, and how often."""
 
     paths: list[str] = Field(default_factory=list)
+    # Pull results back periodically WHILE the run is going (seconds), not only
+    # on completion — so long runs stream partial results to the Manager → S3 as
+    # tasks finish, and a run that quota-outs/fails partway still yields whatever
+    # completed. 0 = collect only at the end.
+    interval_seconds: int = 0
 
 
 class CompletionSpec(BaseModel):

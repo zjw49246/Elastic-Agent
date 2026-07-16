@@ -487,6 +487,12 @@ _BATCH_HTML = """\
     </div>
     <label>Env (KEY=VALUE per line)</label>
     <textarea id="jEnv" placeholder="AI4SCI_SANDBOX_CPU=1&#10;AI4SCI_SANDBOX_MEM=4g"></textarea>
+    <div class="grid2">
+      <div><label>结果收集目录 collect.paths（每行一个,相对代码目录,如 results）</label>
+        <textarea id="jCollect" placeholder="results"></textarea></div>
+      <div><label>增量收集间隔秒（0=只在完成时收集；&gt;0=边跑边收→持续上 S3，长跑推荐 120）</label>
+        <input id="jCollectInterval" type="number" value="0" min="0"></div>
+    </div>
     <div class="grid3">
       <div><label>Account mode</label>
         <select id="jAcctMode"><option value="worker_local_login">worker_local_login</option>
@@ -643,6 +649,8 @@ async function submitJob() {
              region: document.getElementById('jRegion').value.trim(),
              disk_gb: parseInt(document.getElementById('jDiskGb').value) || 0,
              spot: document.getElementById('jSpot').value === 'true'},
+    collect: {paths: lines('jCollect'),
+              interval_seconds: parseInt(document.getElementById('jCollectInterval').value) || 0},
   };
   if (ref) spec.harness_ref = ref;
   try { const j = await api('POST', '/jobs', spec);

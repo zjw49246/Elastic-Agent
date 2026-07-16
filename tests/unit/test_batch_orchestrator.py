@@ -241,6 +241,29 @@ class TestRotation:
         await orch.on_worker_exit(job.job_id, wid, 0, task_id=new_task_id)
         assert job.runs[wid].phase == WorkerPhase.DONE
 
+    async def test_final_collect_on_failed_run(self):
+        # A non-zero exit (e.g. quota-out) still pulls back whatever completed —
+        # partial results must reach the Manager → S3, not be discarded.
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(fanout={"workers": 1}, collect={"paths": ["results"]}))
+        wid = next(iter(job.runs))
+        await orch.on_worker_exit(job.job_id, wid, 1, task_id=job.runs[wid].task_id)
+        assert job.runs[wid].phase == WorkerPhase.FAILED
+        assert (wid, job.job_id) in d.collected
+
+    async def test_periodic_collect_streams_partial_results(self):
+        import asyncio
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1},
+            collect={"paths": ["results"], "interval_seconds": 1}))
+        wid = next(iter(job.runs))
+        await asyncio.sleep(1.3)             # one interval elapses mid-run
+        assert len(d.collected) >= 1         # collected while still RUNNING
+        orch._stop_periodic_collect(wid)     # cleanup the background loop
+
     async def test_rotation_login_failure_fails(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
