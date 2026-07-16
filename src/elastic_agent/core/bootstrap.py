@@ -66,11 +66,17 @@ class SSHExecutor:
         user: str = "root",
         key_path: str | None = None,
         port: int = 22,
+        use_sudo: bool | None = None,
     ) -> None:
         self.host = host
         self.user = user
         self.key_path = key_path
         self.port = port
+        # Non-root SSH users (e.g. Ubuntu AMIs log in as `ubuntu`) can't run the
+        # bootstrap's apt/systemctl/`/etc` writes directly; wrap the whole remote
+        # command in `sudo` so it runs as root. Assumes passwordless sudo (the
+        # default on cloud images). Explicit override via use_sudo.
+        self.use_sudo = (user != "root") if use_sudo is None else use_sudo
 
     def _build_ssh_cmd(self, command: str | list[str], env: dict[str, str] | None = None, cwd: str | None = None) -> list[str]:
         ssh_args = [
@@ -97,7 +103,11 @@ class SSHExecutor:
             cmd_str = command
         remote_parts.append(cmd_str)
 
-        ssh_args.append(" && ".join(remote_parts))
+        remote_cmd = " && ".join(remote_parts)
+        if self.use_sudo:
+            # Run the whole pipeline as root under a login shell.
+            remote_cmd = f"sudo -n bash -c {_shell_quote(remote_cmd)}"
+        ssh_args.append(remote_cmd)
         return ssh_args
 
     async def execute(

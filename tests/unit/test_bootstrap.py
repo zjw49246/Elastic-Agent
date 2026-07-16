@@ -390,6 +390,24 @@ class TestSSHExecutor:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "2222"
 
+    def test_root_user_no_sudo(self):
+        executor = SSHExecutor(host="1.2.3.4", user="root")
+        assert executor.use_sudo is False
+        assert "sudo" not in executor._build_ssh_cmd("apt update")[-1]
+
+    def test_non_root_user_wraps_sudo(self):
+        # Ubuntu AMIs log in as `ubuntu`; bootstrap's apt/systemctl need root.
+        executor = SSHExecutor(host="1.2.3.4", user="ubuntu")
+        assert executor.use_sudo is True
+        remote = executor._build_ssh_cmd("apt update", env={"A": "1"}, cwd="/opt")[-1]
+        assert remote.startswith("sudo -n bash -c ")
+        # the whole pipeline (env+cd+cmd) is inside the sudo shell
+        assert "export A=" in remote and "cd " in remote and "apt update" in remote
+
+    def test_explicit_use_sudo_override(self):
+        assert SSHExecutor(host="h", user="ubuntu", use_sudo=False).use_sudo is False
+        assert SSHExecutor(host="h", user="root", use_sudo=True).use_sudo is True
+
     @pytest.mark.asyncio
     async def test_execute_timeout(self):
         executor = SSHExecutor(host="1.2.3.4")
