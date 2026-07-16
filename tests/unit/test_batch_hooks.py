@@ -216,6 +216,54 @@ class TestProvisionHook:
         hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=0.1)
         assert await hook("w1", None, JobSpec(name="j", run=RunSpec(command="x"))) is False
 
+    async def test_manager_rsync_setup_runs_as_job_user_no_sudo(self, tmp_path, monkeypatch):
+        """Setup commands must run as the ssh_user (no sudo) so per-user installs
+        (e.g. `uv` in $HOME/.local) match the user the run command executes as.
+        Regression: sudo-wrapped setup put uv/.venv under /root, invisible to the
+        ubuntu runtime → run died with `$HOME/.local/bin/uv: No such file`."""
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        import elastic_agent.core.code_sync as code_sync_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec, SetupSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        mgr.config.worker.ssh_user = "ubuntu"  # non-root → default would sudo-wrap
+        mgr.collected_root = str(tmp_path / "collected")
+
+        class FakeSync:
+            def __init__(self, *a, **k): ...
+            async def ensure_clone(self, repo, branch): return "/local/clone"
+            async def deliver(self, local, host, target): return True
+
+        captured = {}
+
+        class FakeSSHExecutor:
+            def __init__(self, host, *, user=None, key_path=None, use_sudo=None):
+                captured["user"] = user
+                captured["use_sudo"] = use_sudo
+
+            async def execute(self, cmd, timeout=None):
+                captured["cmd"] = cmd
+                return 0, "", ""
+
+        monkeypatch.setattr(code_sync_mod, "ManagerCodeSync", FakeSync)
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*a):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="$HOME/.local/bin/uv run x"),
+            setup=SetupSpec(repo="https://example.com/r.git", deliver="manager_rsync",
+                            target_dir="/home/ubuntu/bench",
+                            commands=["curl -LsSf https://astral.sh/uv/install.sh | sh"]),
+        )
+        hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=1)
+        assert await hook("w1", None, spec) is True
+        assert captured["user"] == "ubuntu"
+        assert captured["use_sudo"] is False
+        assert "/home/ubuntu/bench" in captured["cmd"]
+
 
 # --------------------------------------------------------------------------
 # wire_batch event routing

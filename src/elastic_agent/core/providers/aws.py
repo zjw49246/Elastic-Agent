@@ -17,6 +17,20 @@ from elastic_agent.core.providers.base import (
 
 logger = logging.getLogger(__name__)
 
+# EC2 IDs are eventually consistent: a describe right after RunInstances may not
+# see the new instance yet. These signal "not visible yet, keep polling".
+_NOT_FOUND_CODES = {"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"}
+
+
+def _is_not_found_yet(exc: Exception) -> bool:
+    if isinstance(exc, LookupError):  # _describe_one: empty reservation
+        return True
+    resp = getattr(exc, "response", None)  # botocore ClientError
+    if isinstance(resp, dict):
+        return resp.get("Error", {}).get("Code") in _NOT_FOUND_CODES
+    return False
+
+
 _AWS_STATE_MAP: dict[str, InstanceState] = {
     "pending": InstanceState.PENDING,
     "running": InstanceState.RUNNING,
@@ -62,6 +76,7 @@ class AWSProvider(CloudProvider):
     def __init__(self, config: AWSProviderConfig) -> None:
         self._config = config
         self._client = self._create_client()
+        self._root_dev_cache: dict[str, str] = {}
 
     def _create_client(self):
         import boto3
@@ -77,6 +92,24 @@ class AWSProvider(CloudProvider):
         if not reservations or not reservations[0].get("Instances"):
             raise LookupError(f"Instance not found: {native_id}")
         return reservations[0]["Instances"][0]
+
+    def _root_device_name(self, image_id: str) -> str:
+        """The AMI's real root device name. Ubuntu roots on /dev/sda1, Amazon
+        Linux on /dev/xvda — sizing the wrong name creates a phantom unused
+        volume while the actual root stays at the AMI's baked-in size, so the
+        instance runs out of disk. Cached; falls back to the common Ubuntu name."""
+        if image_id in self._root_dev_cache:
+            return self._root_dev_cache[image_id]
+        name = "/dev/sda1"
+        try:
+            resp = self._client.describe_images(ImageIds=[image_id])
+            images = resp.get("Images", [])
+            if images and images[0].get("RootDeviceName"):
+                name = images[0]["RootDeviceName"]
+        except Exception:  # noqa: BLE001
+            logger.warning("could not resolve root device for %s; using %s", image_id, name)
+        self._root_dev_cache[image_id] = name
+        return name
 
     async def create_instance(self, config: InstanceConfig) -> Instance:
         tags = {**config.tags, self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE}
@@ -110,9 +143,11 @@ class AWSProvider(CloudProvider):
         if config.user_data:
             kwargs["UserData"] = config.user_data
 
+        image_id = config.image_id or self._config.ami_id
+        root_device = await asyncio.to_thread(self._root_device_name, image_id)
         block_devices = [
             {
-                "DeviceName": "/dev/xvda",
+                "DeviceName": root_device,
                 "Ebs": {
                     "VolumeSize": config.root_disk_size_gb,
                     "VolumeType": "gp3",
@@ -187,7 +222,18 @@ class AWSProvider(CloudProvider):
         interval = 5
 
         while time.monotonic() < deadline:
-            raw = await asyncio.to_thread(self._describe_one, native_id)
+            try:
+                raw = await asyncio.to_thread(self._describe_one, native_id)
+            except Exception as exc:  # noqa: BLE001
+                # AWS is eventually consistent: a describe issued moments after
+                # RunInstances can return InvalidInstanceID.NotFound (or an empty
+                # reservation) before the new ID has propagated. Treat as "not
+                # ready yet" and keep polling instead of aborting provision.
+                if _is_not_found_yet(exc):
+                    logger.debug("wait_until_running: %s not visible yet, retrying", native_id)
+                    await asyncio.sleep(interval)
+                    continue
+                raise
             inst = _to_instance(raw, self._config.region)
             if inst.state == InstanceState.RUNNING:
                 return inst

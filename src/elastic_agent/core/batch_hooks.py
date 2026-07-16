@@ -214,7 +214,14 @@ def make_provision_hook(
                 logger.error("manager_rsync deliver failed for %s", worker_id)
                 return False
             if spec.setup.commands:
-                ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key)
+                # Run setup AS THE JOB USER (no sudo). The benchmark/run command
+                # executes as ssh_user via the runtime; setup must share its HOME
+                # so per-user installs land where run can find them. If setup were
+                # sudo-wrapped (SSHExecutor's default for non-root users), things
+                # like `curl uv/install.sh | sh` + `uv sync` would install into
+                # /root/.local + a root-owned .venv, invisible to the ssh_user run
+                # → `$HOME/.local/bin/uv: No such file or directory` at run time.
+                ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
                 setup_cmd = f"cd {spec.setup.target_dir} && " + " && ".join(spec.setup.commands)
                 rc, _out, _err = await ex.execute(setup_cmd, timeout=1200)
                 if rc != 0:
