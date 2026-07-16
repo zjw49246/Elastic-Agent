@@ -26,24 +26,27 @@ async def ui_client():
 
 class TestDashboardEndpoint:
     @pytest.mark.asyncio
-    async def test_root_returns_html(self, ui_client):
+    async def test_root_returns_batch_console(self, ui_client):
+        # Root now serves the Batch Console (primary surface).
         client, _ = ui_client
         resp = await client.get("/")
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
-        assert "Elastic-Agent Dashboard" in resp.text
+        assert "Batch Console" in resp.text
+        assert "Submit Job" in resp.text
 
     @pytest.mark.asyncio
-    async def test_dashboard_alias(self, ui_client):
+    async def test_fleet_dashboard(self, ui_client):
         client, _ = ui_client
-        resp = await client.get("/dashboard")
-        assert resp.status_code == 200
-        assert "Elastic-Agent Dashboard" in resp.text
+        for path in ("/fleet", "/dashboard"):
+            resp = await client.get(path)
+            assert resp.status_code == 200
+            assert "Elastic-Agent Dashboard" in resp.text
 
     @pytest.mark.asyncio
-    async def test_html_contains_key_elements(self, ui_client):
+    async def test_fleet_contains_key_elements(self, ui_client):
         client, _ = ui_client
-        resp = await client.get("/")
+        resp = await client.get("/fleet")
         html = resp.text
         assert "Scale Out" in html
         assert "nodeGrid" in html
@@ -60,9 +63,9 @@ class TestDashboardEndpoint:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_html_contains_api_calls(self, ui_client):
+    async def test_fleet_contains_api_calls(self, ui_client):
         client, _ = ui_client
-        resp = await client.get("/")
+        resp = await client.get("/fleet")
         html = resp.text
         assert "'/api'" in html or '"/api"' in html
         assert "/nodes" in html

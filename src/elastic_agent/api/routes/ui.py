@@ -173,12 +173,14 @@ _DASHBOARD_HTML = """\
 <div class="toast" id="toast"></div>
 
 <script>
-const API_KEY = new URLSearchParams(window.location.search).get('api_key') || '';
+const _urlKey = new URLSearchParams(window.location.search).get('api_key');
+if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
+const API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
 const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
                         : {'Content-Type': 'application/json'};
 
-// Preserve ?api_key= when navigating to the Batch Console.
-{const nb = document.getElementById('navBatch'); if (nb) nb.href = '/batch' + window.location.search;}
+// Batch Console link (key persists via localStorage; keep query too).
+{const nb = document.getElementById('navBatch'); if (nb) nb.href = '/' + window.location.search;}
 
 let refreshTimer = null;
 
@@ -474,11 +476,13 @@ _BATCH_HTML = """\
 <div class="toast" id="toast"></div>
 
 <script>
-const API_KEY = new URLSearchParams(window.location.search).get('api_key') || '';
+const _urlKey = new URLSearchParams(window.location.search).get('api_key');
+if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
+const API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
                         : {'Content-Type':'application/json'};
-// Preserve ?api_key= when navigating to the Fleet Dashboard.
-{const nav = document.getElementById('navFleet'); if (nav) nav.href = '/' + window.location.search;}
+// Fleet Dashboard link (key persists via localStorage; keep query too).
+{const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet' + window.location.search;}
 async function api(method, path, body) {
   const opts = {method, headers:{...headers}};
   if (body) opts.body = JSON.stringify(body);
@@ -599,18 +603,24 @@ setInterval(refreshJobs, 5000);
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard():
-    """Serve the Elastic-Agent dashboard UI."""
+async def root_batch():
+    """Root serves the Batch Console — the primary surface (accounts, jobs)."""
+    return HTMLResponse(content=_BATCH_HTML)
+
+
+@router.get("/batch", response_class=HTMLResponse, include_in_schema=False)
+async def batch_console():
+    """Alias for the Batch Console."""
+    return HTMLResponse(content=_BATCH_HTML)
+
+
+@router.get("/fleet", response_class=HTMLResponse, include_in_schema=False)
+async def fleet_dashboard():
+    """Serve the Fleet Dashboard (nodes, scaling)."""
     return HTMLResponse(content=_DASHBOARD_HTML)
 
 
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard_alt():
-    """Alias for the dashboard."""
+    """Alias for the Fleet Dashboard."""
     return HTMLResponse(content=_DASHBOARD_HTML)
-
-
-@router.get("/batch", response_class=HTMLResponse, include_in_schema=False)
-async def batch_console():
-    """Serve the Batch Console (accounts, job submission, job monitor)."""
-    return HTMLResponse(content=_BATCH_HTML)
