@@ -197,7 +197,7 @@ def make_provision_hook(
             return False
 
         need_manager_rsync = spec.setup.deliver == "manager_rsync" and spec.setup.repo
-        if need_manager_rsync or framework_src or spec.setup.s3_datasets:
+        if need_manager_rsync or framework_src:
             from elastic_agent.core.bootstrap import SSHExecutor
             from elastic_agent.core.code_sync import ManagerCodeSync
             _sync = ManagerCodeSync(
@@ -246,12 +246,36 @@ def make_provision_hook(
                 logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
                 return False
 
-        # Stage S3 datasets onto the worker (Manager downloads → rsync; the
-        # worker needs no S3 creds). Done before the run so the data is in place.
-        for ds in spec.setup.s3_datasets:
-            if not await _sync.stage_s3(ds.uri, host, ds.dest):
-                logger.error("s3 dataset stage failed for %s: %s", worker_id, ds.uri)
+        # S3 datasets: the worker pulls them DIRECTLY from S3 with its instance-
+        # profile credentials (no Manager download+rsync relay). The worker IAM
+        # role (fanout provider's worker_instance_profile) grants S3 access; we
+        # ensure awscli is present, then `aws s3 sync/cp` each dataset in place
+        # before the run. Done on the worker so large datasets never transit the
+        # Manager. (GitHub code delivery is unchanged — still manager_rsync.)
+        if spec.setup.s3_datasets:
+            from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
+            ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
+            rc, _o, _e = await ex.execute(
+                "command -v aws >/dev/null 2>&1 || "
+                "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli)",
+                timeout=600,
+            )
+            if rc != 0:
+                logger.error("awscli install failed on %s: %s", worker_id, _e[:200])
                 return False
+            for ds in spec.setup.s3_datasets:
+                uri = ds.uri.strip()
+                # trailing '/' → prefix (recursive sync); otherwise a single object.
+                if uri.endswith("/"):
+                    cmd = (f"mkdir -p {_shell_quote(ds.dest)} && "
+                           f"aws s3 sync {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
+                else:
+                    cmd = (f"mkdir -p $(dirname {_shell_quote(ds.dest)}) && "
+                           f"aws s3 cp {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
+                rc, _o, _e = await ex.execute(cmd, timeout=3600)
+                if rc != 0:
+                    logger.error("s3 dataset pull failed on %s: %s (%s)", worker_id, uri, _e[:200])
+                    return False
 
         return await _wait_ws_connected(manager, worker_id, ws_wait_timeout)
 
