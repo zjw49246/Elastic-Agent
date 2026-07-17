@@ -218,6 +218,29 @@ class ClaudeOAuthProvider:
             return None
 
 
+def _post_form_urllib(url: str, body: str) -> dict[str, Any] | None:
+    """POST an x-www-form-urlencoded body via the stdlib and return parsed JSON
+    (or None on non-200 / transport error). This is the aiohttp-free refresh
+    path: the worker framework env may not ship aiohttp, and a missing aiohttp
+    previously crashed every QuotaChecker token refresh."""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(
+        url,
+        data=body.encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 async def refresh_access_token(
     refresh_token: str,
     http_client: Any | None = None,
@@ -235,17 +258,12 @@ async def refresh_access_token(
         if http_client:
             result = await http_client.post_form(ANTHROPIC_TOKEN_URL, body)
         else:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    ANTHROPIC_TOKEN_URL,
-                    data=body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    result = await resp.json()
+            # stdlib fallback — no aiohttp dependency (the worker framework env
+            # may not ship it). Run the blocking POST off the event loop.
+            import asyncio
+            result = await asyncio.to_thread(_post_form_urllib, ANTHROPIC_TOKEN_URL, body)
+            if not result:
+                return None
 
         access_token = result.get("access_token")
         new_refresh = result.get("refresh_token", refresh_token)

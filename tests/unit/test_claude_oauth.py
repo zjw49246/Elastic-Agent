@@ -334,6 +334,35 @@ class TestRefreshAccessToken:
         result = await refresh_access_token("token", http_client=bad_client)
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_refresh_no_http_client_uses_stdlib_not_aiohttp(self):
+        # With no injected http_client the refresh must succeed via the stdlib
+        # (urllib) path — the worker framework env may not ship aiohttp, and a
+        # missing aiohttp used to crash every QuotaChecker refresh.
+        class _Resp:
+            status = 200
+            def read(self):
+                return json.dumps({
+                    "access_token": "AT", "refresh_token": "RT2", "expires_in": 3600,
+                }).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with patch("urllib.request.urlopen", return_value=_Resp()):
+            result = await refresh_access_token("old-refresh")
+        assert result is not None
+        assert result["accessToken"] == "AT"
+        assert result["refreshToken"] == "RT2"
+        assert result["expiresAt"] > int(time.time() * 1000)
+
+    @pytest.mark.asyncio
+    async def test_refresh_no_http_client_transport_error_returns_none(self):
+        with patch("urllib.request.urlopen", side_effect=Exception("boom")):
+            result = await refresh_access_token("old-refresh")
+        assert result is None
+
 
 class TestOAuthConstants:
     def test_client_id(self):
