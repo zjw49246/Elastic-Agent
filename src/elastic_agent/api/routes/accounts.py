@@ -39,6 +39,41 @@ async def list_accounts() -> AccountListResponse:
     return AccountListResponse(accounts=accounts, total=len(accounts))
 
 
+@router.get("/accounts/allocations")
+async def account_allocations() -> dict:
+    """Which accounts are currently bound to which worker/job.
+
+    Derived from the orchestrator's in-memory jobs (reflects the current Manager
+    session; cleared on restart). Answers "is this account allocated, and where"
+    (Q1) and, filtered by worker, "which accounts does this worker have" (Q2).
+    Keyed by ``account_id`` → list of bindings (a worker can hold several when
+    ``per_worker > 1``; ``active`` flags the one currently driving the run)."""
+    mgr = _mgr()
+    out: dict[str, list[dict]] = {}
+    try:
+        jobs = mgr.batch.list_jobs()
+    except Exception:
+        jobs = []
+    for job in jobs:
+        for wid, run in getattr(job, "runs", {}).items():
+            ids = getattr(run, "account_ids", []) or []
+            emails = getattr(run, "account_emails", []) or []
+            active = getattr(run, "active_slot", 0)
+            phase = run.phase.value if hasattr(run.phase, "value") else str(run.phase)
+            for i, aid in enumerate(ids):
+                if not aid:
+                    continue
+                out.setdefault(aid, []).append({
+                    "job_id": job.job_id,
+                    "job_name": getattr(job.spec, "name", ""),
+                    "worker_id": wid,
+                    "phase": phase,
+                    "email": emails[i] if i < len(emails) else "",
+                    "active": (i == active),
+                })
+    return {"allocations": out, "total_accounts_bound": len(out)}
+
+
 @router.post("/accounts", response_model=AccountDefinition, status_code=201)
 async def add_account(req: AccountRequest) -> AccountDefinition:
     defn = AccountDefinition(**req.model_dump())

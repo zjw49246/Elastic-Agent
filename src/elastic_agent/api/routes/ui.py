@@ -410,7 +410,7 @@ _BATCH_HTML = """\
   <div class="card">
     <h2>Accounts</h2>
     <p class="hint">Only account identities (email + 接码 token). Credentials are minted on the worker at login — never stored here.</p>
-    <table><thead><tr><th>ID</th><th>Email</th><th>Group</th><th>Enabled</th><th></th></tr></thead>
+    <table><thead><tr><th>ID</th><th>Email</th><th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
       <tbody id="acctRows"></tbody></table>
     <div class="grid3" style="margin-top:12px">
       <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
@@ -581,11 +581,18 @@ function lines(id) {
 async function refreshAccounts() {
   try {
     const d = await api('GET', '/accounts');
-    document.getElementById('acctRows').innerHTML = (d.accounts || []).map(a => `
-      <tr><td>${a.id}</td><td>${a.email}</td><td>${a.group}</td><td>${a.enabled}</td>
-      <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
-          onclick="removeAccount('${a.id}')">✕</button></td></tr>`).join('')
-      || '<tr><td colspan="5" class="muted">No accounts.</td></tr>';
+    let alloc = {};
+    try { alloc = (await api('GET', '/accounts/allocations')).allocations || {}; } catch(e) {}
+    document.getElementById('acctRows').innerHTML = (d.accounts || []).map(a => {
+      const b = alloc[a.id] || [];
+      const bind = b.length
+        ? b.map(x => `${(x.worker_id||'').replace('aws:','')} <span class="muted">(${x.job_name||x.job_id}·${x.phase}${x.active?'·当前':''})</span>`).join('<br>')
+        : '<span class="muted">空闲</span>';
+      return `<tr><td>${a.id}</td><td>${a.email}</td><td>${a.group}</td><td>${a.enabled}</td>
+        <td style="font-size:.72rem">${bind}</td>
+        <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
+            onclick="removeAccount('${a.id}')">✕</button></td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="muted">No accounts.</td></tr>';
   } catch(e) { toast(e.message, 'error'); }
 }
 async function addAccount() {

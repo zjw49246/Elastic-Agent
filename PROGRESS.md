@@ -221,3 +221,9 @@
 - 排障顺序对了才快：job failed → 看 `phases` → 看 opus48 输出**只有 `instances/`（准备产物）无跑分 json** → 定位「准备阶段崩」→ 拉 worker ea-logs ndjson 尾部拿到 `generate_gt.py failed`。**"只有 instances/ 没有结果 json" = 准备阶段就崩**，是关键信号。
 - 空转实例要及时 terminate 止血（旧 failed job 的实例空跑 10h ≈ 白烧 $5）。
 - 跑真 benchmark 优先找它**自带的自动化全量命令**（fullrun/batch-run），通常已处理坏任务隔离/resume/preflight，比外面套 shell 循环稳。
+
+## 2026-07-17 登录 stealth 翻车 + 账号可见性（main）
+
+**stealth 反 CF 弄巧成拙（教训）**：给阿里云过 Cloudflare 加的 stealth（`--disable-blink-features=AutomationControlled` + `navigator.webdriver` 等指纹伪装，commit `94db2ab`）**反而触发 Turnstile**——A/B 实测：stealth ON → magic-link/OAuth 页弹交互式勾选框、CDP 点击过不去 → 登录失败；stealth OFF → 三处 CF 全自动放行、登录成功。**不一致的指纹比"像自动化"更可疑**。已完全回退（`a68a41e`）。**根因教训：改登录这种外部反爬逻辑，必须在真实登录上 A/B 验证，别只验 mode=none 的旁路**（我当初验 worker 直连 S3 用的 account.mode=none，没走登录，漏了）。排障关键靠失败 worker 的 journalctl + `/tmp/cdp_oauth.png` 截图（截图是视口坐标，xdotool 是屏幕坐标，差一个浏览器 chrome 高度——一度误判成坐标 bug）。
+
+**账号可见性**：新端点 `GET /api/accounts/allocations`（从 orchestrator 内存 job 反推 账号→worker/job/phase/active）+ 账号面板加「当前绑定 worker」列。回答"账号是否已分配给 worker"。注意：orchestrator job 内存态、Manager 重启即清（重启部署代码会丢正在跑的 job 记录——本次多次踩到，长期应让新 Manager 能重连/收养在跑的 worker）。
