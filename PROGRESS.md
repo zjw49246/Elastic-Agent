@@ -203,3 +203,21 @@
 **结果交付**：worker 的 `results/` rsync 回 Manager 的 `collected/<job_id>/`；新端点 `GET /api/jobs/{id}/results`（列表+benchmark final_score）+ `/results/download`（tar.gz）。经公网域名验证：列出 25 文件+分数，下载 32K tar.gz。**用户拿结果 = 从 Manager 公网域名下载**（或后续接 S3/OSS）。
 
 **经验**：跑真 benchmark 前必须对齐 (1) repo 访问（私有→rsync 或 deploy key）(2) Python 版本（sci 依赖常无最新 py wheel，用 uv --python 锁旧版）(3) sandbox 模式（无 Docker 用 --sandbox task）。
+
+## 2026-07-17 全量 benchmark 跑通链路修复：fullrun + 账号 starvation + aiohttp
+
+**背景**：昨天提交的全量 job（`run --tasks all --sandbox os`）实际 **0 分**——failed。逐层排查真因：
+
+1. **`run --tasks all` 是「全体先准备 GT、一坏俱崩」**：`orchestrator._prepare_instances` 对所有任务上来就在线生成 ground-truth，一个任务的 `generate_gt.py` 抛异常 → 整批在任何 agent 执行前全崩。已踩到 2 个坏任务：`robotics/cr3bp_halo_orbit`（status 非法枚举，sed 绕）+ `computer_science/deployment_prediction_sets`（拒绝采样在 seed=119 下 20 次采不到合格实例，**确定性复现**）。S3 上只有输入/参考数据、无跑分。
+   - **解**：改用 benchmark 自带 **`ai4sci-bench fullrun`**——它 `for task in all_task_ids: try: orchestrator.run([task]) except Exception: 记 ✗FAILED 继续`（cli.py:4272），**天然 per-task 隔离** + resume（output-dir 已有结果跳过已完成）+ preflight/diagnose。别手撸循环，作者已内置。任务集用 `ai4sci-bench list`（过滤器同 `--tasks all`）确认 59 个 final 任务。
+
+2. **账号 starvation（框架真 bug，根治）**：`AccountAllocator` 只在 scale-in（`release_worker`）释放账号，而 `_scale_in_on_complete` 默认 False → job DONE/FAILED 后账号一直被 `_assigned` 占住 → 下一个 job `allocate` 返回 None → `no available account`。单账号 demo 跑第二个 job 必挂，之前只能靠**重启 Manager**绕。
+   - **解**（commit `290138e`）：`_maybe_finish` 无条件把该 job 所有 worker 账号 `release_worker` 回 allocator；并在 **bring-up gather 后**（整批 provision/login 失败路径）+ **rotation 耗尽 decline 处**（额度耗尽→resume 路径）补调 `_maybe_finish`。`release_worker` 幂等（按 worker_id pop），多路径重复调用安全。+6 回归测试。
+   - **教训**：单例 orchestrator（`manager._batch = wire_batch(self)` 缓存）→ allocator 跨 job 共享，任何"资源占用只在 scale-in 释放"的设计对"不 scale-in 的完成"都会泄漏。
+
+3. **`aiohttp` 硬依赖缺失（框架真 bug）**（commit `c6d1eb1`）：`claude_oauth.refresh_access_token` fallback 分支 `import aiohttp`，但 `pyproject.toml` 未声明该依赖 → worker 框架环境 `ModuleNotFoundError` → QuotaChecker 每 3 分钟刷 token 崩、额度检测/换号失灵。改用 **stdlib urllib**（恒可用、无新依赖）经 `asyncio.to_thread` 跑单次 POST（不阻塞事件循环）。注入 `http_client` 的既有路径不变。+2 回归测试。
+
+**教训汇总**：
+- 排障顺序对了才快：job failed → 看 `phases` → 看 opus48 输出**只有 `instances/`（准备产物）无跑分 json** → 定位「准备阶段崩」→ 拉 worker ea-logs ndjson 尾部拿到 `generate_gt.py failed`。**"只有 instances/ 没有结果 json" = 准备阶段就崩**，是关键信号。
+- 空转实例要及时 terminate 止血（旧 failed job 的实例空跑 10h ≈ 白烧 $5）。
+- 跑真 benchmark 优先找它**自带的自动化全量命令**（fullrun/batch-run），通常已处理坏任务隔离/resume/preflight，比外面套 shell 循环稳。
