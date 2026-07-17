@@ -88,8 +88,17 @@ class ManagerFleetDriver:
         )
 
     async def collect(self, worker_id: str, spec, job_id: str) -> None:
-        """rsync the worker's results (collect.paths, or results/) into the
-        Manager's collected/<job_id>/ — the S3 uploader then picks them up."""
+        """Push the worker's results (collect.paths, or results/) to durable
+        storage.
+
+        Worker-direct (AWS + worker_instance_profile + a results bucket): the
+        WORKER ``aws s3 sync``s its outputs straight to
+        ``s3://<bucket>/jobs/<job_id>/<rel>/`` using its instance-profile creds —
+        no Manager relay, so large result sets never transit the Manager. This
+        matches the S3ResultUploader layout.
+
+        Otherwise (fallback): rsync worker → Manager ``collected/<job_id>/`` and
+        let the S3 uploader mirror it."""
         import asyncio
         import os
 
@@ -100,12 +109,31 @@ class ManagerFleetDriver:
         pc = self._mgr.config.provider
         ssh_user = self._mgr.config.worker.ssh_user
         ssh_key = pc.aliyun.ssh_key_path if pc.type == "aliyun" else pc.aws.ssh_key_path
+        paths = spec.collect.paths or ["results"]
+
+        bucket = os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET", "")
+        worker_direct = bool(pc.type == "aws" and pc.aws.worker_instance_profile and bucket)
+
+        if worker_direct:
+            from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
+            ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
+            for rel in paths:
+                r = rel.rstrip("/")
+                src = f"{spec.setup.target_dir.rstrip('/')}/{r}/"
+                uri = f"s3://{bucket}/jobs/{job_id}/{r}/"
+                await ex.execute(
+                    "command -v aws >/dev/null 2>&1 || "
+                    "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli); "
+                    f"aws s3 sync {_shell_quote(src)} {_shell_quote(uri)} --no-progress",
+                    timeout=1800,
+                )
+            return
+
         dest = os.path.join(self._mgr.collected_root, job_id)
         os.makedirs(dest, exist_ok=True)
         ssh = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         if ssh_key:
             ssh += f" -i {ssh_key}"
-        paths = spec.collect.paths or ["results"]
         for rel in paths:
             src = f"{ssh_user}@{host}:{spec.setup.target_dir.rstrip('/')}/{rel.rstrip('/')}/"
             proc = await asyncio.create_subprocess_exec(
