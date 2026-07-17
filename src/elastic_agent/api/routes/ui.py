@@ -608,6 +608,11 @@ async function addAccount() {
     toast('Account added'); refreshAccounts();
   } catch(e) { toast(e.message, 'error'); }
 }
+async function terminateWorker(wid) {
+  if (!window.confirm('终止 worker ' + wid + ' ？该 EC2 实例会被销毁（失败/空转的 worker 用它清理，省钱）。')) return;
+  try { await api('DELETE', '/nodes/' + encodeURIComponent(wid)); toast('已终止 ' + wid); refreshJobs(); }
+  catch(e) { toast(e.message, 'error'); }
+}
 async function removeAccount(id) {
   try { await api('DELETE', '/accounts/' + id); toast('Removed'); refreshAccounts(); }
   catch(e) { toast(e.message, 'error'); }
@@ -700,7 +705,7 @@ async function refreshJobs() {
             <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
             <td>${w.rotations}</td>
             <td class="muted">${w.error||''}</td>
-            <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button>` : ''}</td></tr>`).join('')}
+            <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker('${w.worker_id}')">终止</button>` : ''}</td></tr>`).join('')}
           </tbody></table></details>
         </div>`; }).join('');
     }
