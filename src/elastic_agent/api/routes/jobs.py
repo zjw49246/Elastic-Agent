@@ -29,6 +29,25 @@ def _mgr():
     return get_manager()
 
 
+def _specs_dir(mgr) -> Path:
+    """Where submitted JobSpecs are persisted so they survive a Manager restart
+    (the orchestrator's job records are in-memory and lost on restart)."""
+    d = Path(mgr.config.registry.path).with_name("specs")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _persist_spec(mgr, job_id: str, spec) -> None:
+    import time
+    try:
+        (_specs_dir(mgr) / f"{job_id}.json").write_text(
+            json.dumps({"job_id": job_id, "name": spec.name, "submitted_at": time.time(),
+                        "spec": spec.model_dump()}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _job_detail(job) -> dict:
     return {
         **job.summary(),
@@ -68,21 +87,58 @@ async def submit_job(spec: JobSpec) -> dict:
     except NotImplementedError as exc:
         # provision/login hooks not wired for live runs — surface clearly.
         raise HTTPException(503, str(exc))
+    _persist_spec(_mgr(), job.job_id, spec)  # survive Manager restart
+    return _job_detail(job)
+
+
+@router.post("/jobs/{job_id}/resubmit", status_code=201)
+async def resubmit_job(job_id: str) -> dict:
+    """Relaunch a job from its persisted spec — works even after a Manager
+    restart wiped the in-memory record."""
+    mgr = _mgr()
+    p = _specs_dir(mgr) / f"{job_id}.json"
+    if not p.exists():
+        raise HTTPException(404, f"no persisted spec for job {job_id}")
+    spec = JobSpec(**json.loads(p.read_text(encoding="utf-8"))["spec"])
+    job = await mgr.batch.launch(spec)
+    _persist_spec(mgr, job.job_id, spec)
     return _job_detail(job)
 
 
 @router.get("/jobs")
 async def list_jobs() -> dict:
-    jobs = _mgr().batch.list_jobs()
-    return {"jobs": [j.summary() for j in jobs], "total": len(jobs)}
+    mgr = _mgr()
+    live = mgr.batch.list_jobs()
+    live_ids = {j.job_id for j in live}
+    out = [j.summary() for j in live]
+    # Persisted specs whose jobs are no longer in memory (restarted) — surface
+    # them so they can be reviewed / resubmitted.
+    for f in sorted(_specs_dir(mgr).glob("*.json")):
+        if f.stem in live_ids:
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        out.append({"job_id": f.stem, "name": data.get("name", ""), "workers": 0,
+                    "phases": {}, "done": True, "in_memory": False})
+    return {"jobs": out, "total": len(out)}
 
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> dict:
-    job = _mgr().batch.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, f"Job {job_id} not found")
-    return _job_detail(job)
+    mgr = _mgr()
+    job = mgr.batch.get_job(job_id)
+    if job is not None:
+        return _job_detail(job)
+    # Fall back to the persisted spec (job gone from memory after a restart).
+    p = _specs_dir(mgr) / f"{job_id}.json"
+    if p.exists():
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {"job_id": job_id, "name": data.get("name"), "in_memory": False,
+                "spec": data.get("spec"), "workers_detail": [],
+                "note": "not in Manager memory (restarted); POST /jobs/{id}/resubmit to rerun"}
+    raise HTTPException(404, f"Job {job_id} not found")
 
 
 def _collected_dir(mgr, job_id: str) -> Path:
