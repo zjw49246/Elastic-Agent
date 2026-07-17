@@ -10,3 +10,6 @@ build/
 .ruff_cache/
 htmlcov/
 .coverage
+
+# Local dev/demo launchers + worktrees (env-specific, may hold tokens — never commit)
+.claude-manager/
