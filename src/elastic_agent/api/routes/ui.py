@@ -177,7 +177,7 @@ const _urlKey = new URLSearchParams(window.location.search).get('api_key');
 if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
 let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
 if (!API_KEY) {  // ask once, then remember in this browser
-  const k = (window.prompt('请输入 API Key（本次为 elastic-demo-2026）：') || '').trim();
+  const k = (window.prompt('请输入 API Key：') || '').trim();
   if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
 }
 const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
@@ -555,7 +555,7 @@ const _urlKey = new URLSearchParams(window.location.search).get('api_key');
 if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
 let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
 if (!API_KEY) {  // ask once, then remember in this browser
-  const k = (window.prompt('请输入 API Key（本次为 elastic-demo-2026）：') || '').trim();
+  const k = (window.prompt('请输入 API Key：') || '').trim();
   if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
 }
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
