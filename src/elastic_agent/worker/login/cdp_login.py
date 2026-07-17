@@ -9,6 +9,38 @@ import httpx, websockets
 MAILCATCHER = os.environ.get("CLAUDE_MAILCATCHER_URL", "https://mail.claude-code-manager.com")
 CDP_PORT = 9222
 
+# Stealth patch injected via Page.addScriptToEvaluateOnNewDocument before any
+# navigation, so it runs on every page/frame ahead of Cloudflare's fingerprint
+# probes. Removes the tells that flag a CDP-controlled browser (navigator.
+# webdriver, empty plugins, missing window.chrome, headless-ish WebGL). On AWS
+# EC2 IPs Cloudflare usually auto-passes so this never mattered; on lower-
+# reputation IPs (e.g. Aliyun) CF serves a real Turnstile that a plain CDP
+# Chrome fails — this lets it pass like a normal browser. Disable via
+# CLAUDE_LOGIN_STEALTH=0.
+_STEALTH_JS = """
+(() => {
+  try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]}); } catch (e) {}
+  try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+  try {
+    const q = window.navigator.permissions && window.navigator.permissions.query;
+    if (q) window.navigator.permissions.query = (p) =>
+      (p && p.name === 'notifications')
+        ? Promise.resolve({ state: Notification.permission })
+        : q(p);
+  } catch (e) {}
+  try {
+    const gp = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (p) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return gp.call(this, p);
+    };
+  } catch (e) {}
+})();
+"""
+
 async def cdp_eval(ws, expr, timeout=10):
     mid = int(time.time()*1000) % 100000
     await ws.send(json.dumps({"id": mid, "method": "Runtime.evaluate",
@@ -87,11 +119,15 @@ async def cdp_login(email: str, token: str, config_dir: str, oauth_url: str = ""
     # 不加会让渲染进程因共享内存不足直接崩溃 → CDP 9222 端口起不来，
     # 后面连 http://127.0.0.1:9222/json 报 ConnectError（登录整段失败）。
     chrome_env = _ensure_display(dict(os.environ))
-    chrome = subprocess.Popen(["google-chrome", "--no-sandbox", "--disable-gpu",
+    chrome_args = ["google-chrome", "--no-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", "--disable-software-rasterizer",
         "--no-first-run", "--disable-extensions", "--window-size=1365,900",
-        f"--remote-debugging-port={CDP_PORT}", "--user-data-dir=/tmp/chrome-test-login",
-        "about:blank"], stdout=subprocess.DEVNULL,
+        f"--remote-debugging-port={CDP_PORT}", "--user-data-dir=/tmp/chrome-test-login"]
+    if os.environ.get("CLAUDE_LOGIN_STEALTH", "1") != "0":
+        # Hide the automation fingerprint Cloudflare gates on (removes
+        # navigator.webdriver=true). Pairs with the _STEALTH_JS init script.
+        chrome_args += ["--disable-blink-features=AutomationControlled", "--lang=en-US,en"]
+    chrome = subprocess.Popen([*chrome_args, "about:blank"], stdout=subprocess.DEVNULL,
         stderr=open("/tmp/chrome-cdp-stderr.log", "w"), env=chrome_env)
     print(f"Chrome pid={chrome.pid}")
 
@@ -119,6 +155,12 @@ async def cdp_login(email: str, token: str, config_dir: str, oauth_url: str = ""
         async with websockets.connect(ws_url, max_size=10_000_000) as ws:
             await ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
             await ws.send(json.dumps({"id": 0, "method": "Network.enable"}))
+            if os.environ.get("CLAUDE_LOGIN_STEALTH", "1") != "0":
+                # Apply the stealth patch on every future document (runs before
+                # Cloudflare's page scripts) so CF sees a normal browser.
+                await ws.send(json.dumps({"id": 5,
+                    "method": "Page.addScriptToEvaluateOnNewDocument",
+                    "params": {"source": _STEALTH_JS}}))
             await asyncio.sleep(0.5)
 
             # 4. Login page
