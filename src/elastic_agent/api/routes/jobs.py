@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import tarfile
 from pathlib import Path
@@ -114,16 +115,89 @@ def _results_for(mgr, job_id: str, base) -> dict:
     return {"job_id": job_id, "file_count": len(files), "scores": scores, "s3_uri": s3_uri, "files": files}
 
 
+# --- S3-backed results (worker-direct push lands only in S3, not the Manager's
+# local collected/ — read straight from S3 so download/UI still work). ---------
+
+def _s3_bucket() -> str:
+    return os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET", "")
+
+
+def _s3_client():
+    import boto3
+    return boto3.client("s3")
+
+
+def _s3_list_job(job_id: str) -> list[tuple[str, int, str]]:
+    """Objects under s3://<bucket>/jobs/<job_id>/ → [(rel_path, size, key)].
+    Empty when no bucket is configured or nothing is there."""
+    bucket = _s3_bucket()
+    if not bucket:
+        return []
+    prefix = f"jobs/{job_id}/"
+    out: list[tuple[str, int, str]] = []
+    try:
+        s3 = _s3_client()
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(prefix):]
+                if rel:
+                    out.append((rel, obj["Size"], obj["Key"]))
+    except Exception:
+        pass
+    return out
+
+
+def _results_from_s3(job_id: str, objs: list[tuple[str, int, str]], *, parse_scores: bool) -> dict:
+    bucket = _s3_bucket()
+    files = [{"path": rel, "size": size} for rel, size, _ in objs]
+    scores: list[dict] = []
+    if parse_scores:
+        s3 = _s3_client()
+        parsed = 0
+        for rel, size, key in objs:
+            if parsed >= 500 or not rel.endswith(".json") or "instances" in rel.split("/"):
+                continue
+            if size > 2_000_000:  # skip large blobs (agent stdout dumps etc.)
+                continue
+            try:
+                d = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            except Exception:
+                continue
+            parsed += 1
+            if isinstance(d, dict) and "final_score" in d:
+                scores.append({
+                    "task_id": d.get("task_id"), "prompt_level": d.get("prompt_level"),
+                    "status": d.get("status"), "final_score": d.get("final_score"),
+                })
+    return {"job_id": job_id, "file_count": len(files), "scores": scores,
+            "s3_uri": f"s3://{bucket}/jobs/{job_id}/", "files": files}
+
+
 @router.get("/results")
 async def list_all_results() -> dict:
-    """List every collected result dir on the Manager (browsable regardless of
-    how the run was launched)."""
+    """List every job's results — from S3 (authoritative once uploaded) with a
+    local collected/ fallback for non-S3 deployments."""
     mgr = _mgr()
+    jobs, seen = [], set()
+    bucket = _s3_bucket()
+    if bucket:  # list job prefixes cheaply (no per-file score parsing here)
+        try:
+            s3 = _s3_client()
+            for page in s3.get_paginator("list_objects_v2").paginate(
+                    Bucket=bucket, Prefix="jobs/", Delimiter="/"):
+                for cp in page.get("CommonPrefixes", []):
+                    jid = cp["Prefix"][len("jobs/"):].strip("/")
+                    if jid and jid not in seen:
+                        seen.add(jid)
+                        r = _results_from_s3(jid, _s3_list_job(jid), parse_scores=False)
+                        jobs.append({k: r[k] for k in ("job_id", "file_count", "scores", "s3_uri")})
+        except Exception:
+            pass
     root = Path(mgr.collected_root)
-    jobs = []
     if root.is_dir():
         for d in sorted(root.iterdir()):
-            if d.is_dir():
+            if d.is_dir() and d.name not in seen:
+                seen.add(d.name)
                 r = _results_for(mgr, d.name, d)
                 jobs.append({k: r[k] for k in ("job_id", "file_count", "scores", "s3_uri")})
     return {"jobs": jobs, "total": len(jobs)}
@@ -131,10 +205,15 @@ async def list_all_results() -> dict:
 
 @router.get("/jobs/{job_id}/results")
 async def job_results(job_id: str) -> dict:
-    """List a job's collected result files + surface benchmark scores."""
+    """List a job's result files + benchmark scores (S3 first, local fallback)."""
+    objs = _s3_list_job(job_id)
+    if objs:
+        r = _results_from_s3(job_id, objs, parse_scores=True)
+        r["files"] = r["files"][:500]
+        return r
     base = _collected_dir(_mgr(), job_id)
     if not base.is_dir():
-        raise HTTPException(404, f"no collected results for job {job_id}")
+        raise HTTPException(404, f"no results for job {job_id}")
     r = _results_for(_mgr(), job_id, base)
     r["files"] = r["files"][:500]
     return r
@@ -142,13 +221,27 @@ async def job_results(job_id: str) -> dict:
 
 @router.get("/jobs/{job_id}/results/download")
 async def job_results_download(job_id: str) -> StreamingResponse:
-    """Download a job's collected results as a .tar.gz."""
-    base = _collected_dir(_mgr(), job_id)
-    if not base.is_dir():
-        raise HTTPException(404, f"no collected results for job {job_id}")
+    """Download a job's results as a .tar.gz (S3 first, local fallback)."""
+    objs = _s3_list_job(job_id)
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(str(base), arcname=job_id)
+    if objs:
+        bucket = _s3_bucket()
+        s3 = _s3_client()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for rel, size, key in objs:
+                try:
+                    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                except Exception:
+                    continue
+                info = tarfile.TarInfo(name=f"{job_id}/{rel}")
+                info.size = len(body)
+                tar.addfile(info, io.BytesIO(body))
+    else:
+        base = _collected_dir(_mgr(), job_id)
+        if not base.is_dir():
+            raise HTTPException(404, f"no results for job {job_id}")
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(str(base), arcname=job_id)
     buf.seek(0)
     return StreamingResponse(
         buf, media_type="application/gzip",
