@@ -137,6 +137,13 @@ class AWSProvider(CloudProvider):
         if sg_ids:
             kwargs["SecurityGroupIds"] = sg_ids
 
+        # Attach the worker IAM instance profile (if configured) so the worker
+        # can reach S3 directly — dataset pull + result push without a Manager
+        # relay. Workers otherwise have no cloud credentials.
+        instance_profile = self._config.worker_instance_profile
+        if instance_profile:
+            kwargs["IamInstanceProfile"] = {"Name": instance_profile}
+
         if config.spot:
             kwargs["InstanceMarketOptions"] = {"MarketType": "spot"}
 

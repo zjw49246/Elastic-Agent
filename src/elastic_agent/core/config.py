@@ -34,6 +34,10 @@ class AWSProviderConfig(BaseSettings):
     key_pair_name: str = "elastic-agent-key"
     ssh_key_path: str = "~/.ssh/elastic-agent-aws.pem"
     max_instances: int = 30
+    # IAM instance profile attached to worker EC2s so they can reach S3
+    # directly (pull datasets, push results) without the Manager relaying data.
+    # Empty → no profile attached (workers have no cloud creds).
+    worker_instance_profile: str = ""
 
 
 class ProviderConfig(BaseSettings):
