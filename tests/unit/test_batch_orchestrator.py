@@ -358,3 +358,75 @@ class TestCompletion:
         assert s["workers"] == 2
         assert s["name"] == "ai4sci"
         assert s["done"] is False
+
+
+class _RecordingAllocator:
+    """Minimal allocator double: records which workers were released."""
+
+    def __init__(self):
+        self.released: list[str] = []
+
+    async def release_worker(self, worker_id: str) -> None:
+        self.released.append(worker_id)
+
+
+class TestAccountRelease:
+    """A finished job (DONE or FAILED, via any terminal path) must release its
+    workers' accounts back to the allocator so a later job can reuse them —
+    regression guard for single-account starvation."""
+
+    async def test_release_on_done(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        alloc = _RecordingAllocator()
+        orch._allocator = alloc
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        wid = next(iter(job.runs))
+        await orch.on_worker_exit(job.job_id, wid, 0)  # DONE
+        assert alloc.released == [wid]
+
+    async def test_release_on_failed_run_exit(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        alloc = _RecordingAllocator()
+        orch._allocator = alloc
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        wid = next(iter(job.runs))
+        await orch.on_worker_exit(job.job_id, wid, 1)  # FAILED
+        assert alloc.released == [wid]
+
+    async def test_release_on_bringup_login_failure(self):
+        d = FakeDriver()
+        d.login_ok = False
+        orch = BatchOrchestrator(d)
+        alloc = _RecordingAllocator()
+        orch._allocator = alloc
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+        assert all(r.phase == WorkerPhase.FAILED for r in job.runs.values())
+        assert set(alloc.released) == set(job.runs.keys())
+
+    async def test_release_on_rotation_exhausted(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        alloc = _RecordingAllocator()
+        orch._allocator = alloc
+        spec = _spec(
+            fanout={"workers": 1},
+            rotation={"strategy": "on_exhaust_restart_resume", "max_rotations": 1, "resume_args": "--resume x"},
+        )
+        job = await orch.launch(spec)
+        wid = next(iter(job.runs))
+        assert await orch.on_worker_exhausted(job.job_id, wid) is True   # rotation 1
+        assert await orch.on_worker_exhausted(job.job_id, wid) is False  # capped → FAILED
+        assert job.runs[wid].phase == WorkerPhase.FAILED
+        assert wid in alloc.released
+
+    async def test_no_allocator_is_noop(self):
+        # Orchestrator without an _allocator handle (e.g. tests/custom wiring)
+        # must not blow up on terminal.
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        wid = next(iter(job.runs))
+        await orch.on_worker_exit(job.job_id, wid, 0)
+        assert job.runs[wid].phase == WorkerPhase.DONE

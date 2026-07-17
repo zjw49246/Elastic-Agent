@@ -207,6 +207,9 @@ class BatchOrchestrator:
             *(self._bring_up(job, wid) for wid in job.runs),
             return_exceptions=True,
         )
+        # A job that fails entirely during provision/login never reaches a run
+        # exit, so settle terminal state (and release its accounts) here too.
+        await self._maybe_finish(job)
         return job
 
     async def _bring_up(self, job: BatchJob, worker_id: str) -> None:
@@ -306,9 +309,11 @@ class BatchOrchestrator:
 
         if spec.rotation.strategy != "on_exhaust_restart_resume":
             self._fail(run, "account exhausted (no rotation policy)")
+            await self._maybe_finish(job)
             return False
         if run.rotations >= spec.rotation.max_rotations:
             self._fail(run, f"account exhausted (max {spec.rotation.max_rotations} rotations reached)")
+            await self._maybe_finish(job)
             return False
 
         run.phase = WorkerPhase.ROTATING
@@ -324,6 +329,7 @@ class BatchOrchestrator:
             outcome = await self._driver.login(worker_id, spec, new_dir)
             if not outcome.success:
                 self._fail(run, outcome.error or "rotation login failed")
+                await self._maybe_finish(job)
                 return False
             run.config_dirs.append(new_dir)
             run.account_ids.append(outcome.account_id)
@@ -373,6 +379,19 @@ class BatchOrchestrator:
     async def _maybe_finish(self, job: BatchJob) -> None:
         if not all(r.phase in (WorkerPhase.DONE, WorkerPhase.FAILED) for r in job.runs.values()):
             return
+        # Release each worker's accounts back to the allocator once the job is
+        # terminal (DONE/FAILED) so a later job can reuse them. Previously
+        # accounts were only freed on scale-in (_scale_in_on_complete defaults
+        # to False), which starved single-account setups after the first job
+        # finished. release_worker is idempotent (pops by worker_id), so calling
+        # this across the several terminal paths is safe.
+        allocator = getattr(self, "_allocator", None)
+        if allocator is not None:
+            for worker_id in job.runs:
+                try:
+                    await allocator.release_worker(worker_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("account release failed for %s", worker_id)
         if self._scale_in_on_complete:
             await self._driver.scale_in(list(job.runs.keys()))
 
