@@ -162,6 +162,7 @@ class BatchOrchestrator:
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
         self._collect_tasks: dict[str, asyncio.Task] = {}  # worker_id -> periodic collect
+        self._launch_tasks: set[asyncio.Task] = set()  # background bring-ups (submit)
 
     def get_job(self, job_id: str) -> BatchJob | None:
         return self._jobs.get(job_id)
@@ -186,31 +187,59 @@ class BatchOrchestrator:
         if job_id is not None:
             await self.on_worker_exit(job_id, worker_id, exit_code, task_id=task_id)
 
-    async def launch(self, spec: JobSpec) -> BatchJob:
-        """Scale out, then bring every worker up concurrently."""
+    def _create_job(self, spec: JobSpec) -> BatchJob:
+        """Register a job record synchronously (fast). ``resolve_harness`` runs
+        here so a bad harness_ref fails the caller immediately, not in the
+        background."""
         harness = resolve_harness(spec)
         job = BatchJob(job_id=f"job-{uuid.uuid4().hex[:8]}", spec=spec, harness=harness)
         self._jobs[job.job_id] = job
+        return job
 
-        n = max(1, spec.fanout.workers)
-        worker_ids = await self._driver.scale_out(
-            n, name_prefix=spec.fanout.name_prefix or spec.name,
-            instance_type=spec.fanout.instance_type, region=spec.fanout.region,
-            disk_gb=spec.fanout.disk_gb, spot=spec.fanout.spot)
-        contexts = spec.worker_contexts()
-        for wid, ctx in zip(worker_ids, contexts):
-            ctx.hostname = await self._driver.hostname_of(wid)
-            job.runs[wid] = WorkerRun(worker_id=wid, ctx=ctx)
-            self._worker_index[wid] = job.job_id
+    async def submit(self, spec: JobSpec) -> BatchJob:
+        """Register the job and return immediately; run scale-out + bring-up in
+        the background. Scale-out and per-worker bootstrap/login take tens of
+        seconds to minutes — awaiting them (as ``launch`` does) makes the HTTP
+        submit hang with no UI feedback, which reads as a dead button and invites
+        double-submits. ``submit`` returns as soon as the job_id exists so the UI
+        can start polling ``/jobs/{id}``."""
+        job = self._create_job(spec)
+        task = asyncio.create_task(self._bring_up_all(job))
+        self._launch_tasks.add(task)
+        task.add_done_callback(self._launch_tasks.discard)
+        return job
 
-        await asyncio.gather(
-            *(self._bring_up(job, wid) for wid in job.runs),
-            return_exceptions=True,
-        )
+    async def launch(self, spec: JobSpec) -> BatchJob:
+        """Scale out, then bring every worker up concurrently (awaits fully)."""
+        job = self._create_job(spec)
+        await self._bring_up_all(job)
+        return job
+
+    async def _bring_up_all(self, job: BatchJob) -> None:
+        spec = job.spec
+        try:
+            n = max(1, spec.fanout.workers)
+            worker_ids = await self._driver.scale_out(
+                n, name_prefix=spec.fanout.name_prefix or spec.name,
+                instance_type=spec.fanout.instance_type, region=spec.fanout.region,
+                disk_gb=spec.fanout.disk_gb, spot=spec.fanout.spot)
+            contexts = spec.worker_contexts()
+            for wid, ctx in zip(worker_ids, contexts):
+                ctx.hostname = await self._driver.hostname_of(wid)
+                job.runs[wid] = WorkerRun(worker_id=wid, ctx=ctx)
+                self._worker_index[wid] = job.job_id
+
+            await asyncio.gather(
+                *(self._bring_up(job, wid) for wid in job.runs),
+                return_exceptions=True,
+            )
+        except Exception:
+            # Runs in a background task under ``submit`` — an unhandled scale-out
+            # error would otherwise vanish. Log and fall through to settle state.
+            logger.exception("bring-up failed for job %s", job.job_id)
         # A job that fails entirely during provision/login never reaches a run
         # exit, so settle terminal state (and release its accounts) here too.
         await self._maybe_finish(job)
-        return job
 
     async def _bring_up(self, job: BatchJob, worker_id: str) -> None:
         run = job.runs[worker_id]

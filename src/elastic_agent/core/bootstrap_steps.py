@@ -123,8 +123,13 @@ def runtime_deploy_from_src_step(
         f"Xvfb {display} -screen 0 1280x1024x24 >/tmp/ea-xvfb.log 2>&1 &\n"
         "sleep 1\n"
         f"exec python3 -m elastic_agent.worker.runtime_main "
-        f"--manager-url {manager_url} --token {auth_token} --worker-id {worker_id} "
-        f"--log-dir {home}/ea-logs\n"
+        # Use --opt=value (not --opt value): auth_token is secrets.token_urlsafe,
+        # which can begin with '-'. In the space form argparse reads the leading-'-'
+        # token as another option → "argument --token: expected one argument" → the
+        # runtime crash-loops, never connects its WS, and provision fails with
+        # "worker never connected within 300s". The '=' form is unambiguous.
+        f"--manager-url={manager_url} --token={auth_token} --worker-id={worker_id} "
+        f"--log-dir={home}/ea-logs\n"
     )
     unit = (
         "[Unit]\n"

@@ -57,6 +57,10 @@ class FakeBatch:
         self._jobs[job.job_id] = job
         return job
 
+    async def submit(self, spec):
+        # Route uses submit() (background bring-up); for tests it mirrors launch().
+        return await self.launch(spec)
+
     def list_jobs(self):
         return list(self._jobs.values())
 
@@ -152,6 +156,16 @@ class TestJobsAPI:
         detail = (await client.get(f"/api/jobs/{jid}")).json()
         assert detail["job_id"] == jid
         assert detail["spec"]["name"] == "ai4sci"
+
+    @pytest.mark.asyncio
+    async def test_list_includes_workers_detail(self, client):
+        # The UI renders each job card straight from the list response, so every
+        # item must carry workers_detail (no per-job detail fetch) — and drop the
+        # heavy spec to keep the list lean.
+        await client.post("/api/jobs", json=self._SPEC)
+        item = (await client.get("/api/jobs")).json()["jobs"][0]
+        assert len(item["workers_detail"]) == 3
+        assert "spec" not in item
 
     @pytest.mark.asyncio
     async def test_get_missing_404(self, client):

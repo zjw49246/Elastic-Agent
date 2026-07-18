@@ -70,6 +70,36 @@ def _spec(**kw):
     return JobSpec(**kw)
 
 
+class TestSubmit:
+    async def test_submit_returns_before_bringup_and_finishes_in_background(self):
+        import asyncio
+        gate = asyncio.Event()
+        d = FakeDriver()
+        orig = d.scale_out
+        async def gated_scale(*a, **k):
+            await gate.wait()
+            return await orig(*a, **k)
+        d.scale_out = gated_scale
+        orch = BatchOrchestrator(d)
+
+        job = await orch.submit(_spec(fanout={"workers": 2}))
+        # Returned immediately with a job_id, registered, but bring-up gated → no runs yet.
+        assert job.job_id and orch.get_job(job.job_id) is job
+        assert job.runs == {}
+
+        gate.set()  # release the background bring-up
+        for _ in range(200):
+            if len(job.runs) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(job.runs) == 2  # bring-up completed off the request path
+
+    async def test_submit_bad_harness_ref_raises_synchronously(self):
+        orch = BatchOrchestrator(FakeDriver())
+        with pytest.raises(Exception):
+            await orch.submit(_spec(harness_ref="no.such.module:Nope"))
+
+
 class TestLaunch:
     async def test_fans_out_to_all_workers(self):
         d = FakeDriver()

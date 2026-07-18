@@ -755,7 +755,15 @@ async def perform_login(
     两者共享 Step 2-4（CLI auth login + Chrome CDP OAuth + code#state 交给 CLI）。
     provider: 显式指定 "171mail" 或 "mailcom"，None 则按邮箱域名自动判断。
     """
-    config_path = Path(config_dir).expanduser()
+    # An empty or relative config_dir is dangerous: Claude Code would write
+    # ".credentials.json" relative to the process CWD (systemd's default "/",
+    # which the non-root runtime user cannot write) → `claude auth login` prints
+    # "Login successful" but persists nothing → "credentials not valid after
+    # login". Anchor to an absolute, user-writable dir (Claude's default
+    # ~/.claude) so login + the later run share the same real path.
+    config_path = Path(config_dir).expanduser() if config_dir else (Path.home() / ".claude")
+    if not config_path.is_absolute():
+        config_path = Path.home() / ".claude"
     config_path.mkdir(parents=True, exist_ok=True)
 
     if provider:

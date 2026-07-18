@@ -466,8 +466,9 @@ _BATCH_HTML = """\
       <option value="manager_rsync">manager_rsync（私有 repo 推荐：token 只在 Manager，clone 后 rsync 到 worker，token 不上机）</option>
       <option value="worker_clone">worker_clone（公开 repo：worker 自己 git clone）</option>
     </select>
-    <label>Setup — commands（每行一条,在代码目录里跑,如 uv sync）</label>
-    <textarea id="jSetup" placeholder="uv sync"></textarea>
+    <label>Setup — commands（每行一条,在代码目录里跑；默认已装 uv 并 pin Python 3.13）</label>
+    <textarea id="jSetup" placeholder="uv sync">curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3.13</textarea>
     <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
     <div class="grid2">
       <div><label>需要 Docker（run 用 Docker,如 ai4sci <code>--sandbox os</code>）</label>
@@ -496,7 +497,7 @@ _BATCH_HTML = """\
         <select id="jAcctMode"><option value="worker_local_login">worker_local_login</option>
           <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
-      <div><label>config_dir (blank = ~/.claude)</label><input id="jConfigDir" placeholder=""></div>
+      <div><label>config_dir (blank = ~/.claude)</label><input id="jConfigDir" value="/home/ubuntu/.claude"></div>
     </div>
     <div class="grid2">
       <div><label>Rotation strategy</label>
@@ -519,7 +520,7 @@ _BATCH_HTML = """\
         <input id="jHarnessRef" placeholder=""></div>
     </details>
 
-    <button class="btn" onclick="submitJob()">Launch Job</button>
+    <button class="btn" id="jSubmitBtn" onclick="submitJob()">Launch Job</button>
   </div>
 
   <!-- Jobs monitor -->
@@ -663,54 +664,86 @@ async function submitJob() {
               interval_seconds: parseInt(document.getElementById('jCollectInterval').value) || 0},
   };
   if (ref) spec.harness_ref = ref;
+  const btn = document.getElementById('jSubmitBtn');
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
   try { const j = await api('POST', '/jobs', spec);
     toast('Launched ' + j.job_id); refreshJobs(); }
   catch(e) { toast(e.message, 'error'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
 
 // ---- Jobs monitor ----
 function badge(p) { return `<span class="badge b-${p}">${p}</span>`; }
+// Run async `fn` over items with at most `limit` in flight; never throws.
+async function mapLimit(items, limit, fn) {
+  const it = items[Symbol.iterator]();
+  const runners = [];
+  for (let k = 0; k < Math.min(limit, items.length); k++) {
+    runners.push((async () => {
+      for (let n = it.next(); !n.done; n = it.next()) {
+        try { await fn(n.value); } catch (e) { /* ignore per-item */ }
+      }
+    })());
+  }
+  await Promise.all(runners);
+}
+// One job card. `r` = its results payload (or null while not yet loaded).
+function jobRowHtml(j, r) {
+  const wd = j.workers_detail || [];
+  const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
+  const scoreStr = (r && r.scores && r.scores.length)
+    ? r.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
+    : '';
+  const dlBtn = (r && r.file_count)
+    ? `<a class="btn btn-ghost" style="padding:4px 10px;margin:0" href="${dl}">⬇ 下载结果 (${r.file_count})</a>`
+    : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
+  return `
+  <div id="jobrow-${j.job_id}" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div><b>${j.name||''}</b> <span class="muted">${j.job_id}</span> ·
+        ${Object.entries(j.phases||{}).map(([p,n]) => badge(p)+' '+n).join(' ')}</div>
+      ${dlBtn}
+    </div>
+    ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
+    ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
+    <details><summary class="muted">${wd.length} workers</summary>
+    <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
+      <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>日志</th></tr></thead><tbody>
+    ${wd.map(w => `<tr><td>${w.shard_index}</td>
+      <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
+      <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
+      <td>${w.rotations}</td>
+      <td class="muted">${w.error||''}</td>
+      <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker('${w.worker_id}')">终止</button>` : ''}</td></tr>`).join('')}
+    </tbody></table></details>
+  </div>`;
+}
 async function refreshJobs() {
   try {
     const d = await api('GET', '/jobs');
     const jobs = d.jobs || [];
-    if (!jobs.length) { document.getElementById('jobsList').innerHTML = '<p class="muted">No jobs yet.</p>'; }
-    else {
-      const details = await Promise.all(jobs.map(j => api('GET', '/jobs/' + j.job_id)));
-      const results = await Promise.all(jobs.map(j =>
-        api('GET', '/jobs/' + j.job_id + '/results').catch(() => null)));
-      document.getElementById('jobsList').innerHTML = details.map((j, i) => {
-        const r = results[i];
-        const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
-        const scoreStr = (r && r.scores && r.scores.length)
-          ? r.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
-          : '';
-        const dlBtn = (r && r.file_count)
-          ? `<a class="btn btn-ghost" style="padding:4px 10px;margin:0" href="${dl}">⬇ 下载结果 (${r.file_count})</a>`
-          : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
-        return `
-        <div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <div><b>${j.name}</b> <span class="muted">${j.job_id}</span> ·
-              ${Object.entries(j.phases).map(([p,n]) => badge(p)+' '+n).join(' ')}</div>
-            ${dlBtn}
-          </div>
-          ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
-          ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
-          <details><summary class="muted">${j.workers_detail.length} workers</summary>
-          <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
-            <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>日志</th></tr></thead><tbody>
-          ${j.workers_detail.map(w => `<tr><td>${w.shard_index}</td>
-            <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
-            <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
-            <td>${w.rotations}</td>
-            <td class="muted">${w.error||''}</td>
-            <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker('${w.worker_id}')">终止</button>` : ''}</td></tr>`).join('')}
-          </tbody></table></details>
-        </div>`; }).join('');
+    if (!jobs.length) {
+      document.getElementById('jobsList').innerHTML = '<p class="muted">No jobs yet.</p>';
+      document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
+      return;
     }
+    // Render immediately from the list response (it already carries phases +
+    // workers_detail) so the panel never blanks. Then enrich each card with its
+    // results lazily, capped concurrency + per-item catch — a slow or failing
+    // /results lookup can no longer take the whole render down. (The old code
+    // fired 2 requests per job with no catch; once jobs piled up the flood timed
+    // out, Promise.all rejected, and it silently fell back to "No jobs yet".)
+    document.getElementById('jobsList').innerHTML = jobs.map(j => jobRowHtml(j, null)).join('');
     document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
-  } catch(e) { /* silent */ }
+    await mapLimit(jobs, 4, async (j) => {
+      const r = await api('GET', '/jobs/' + j.job_id + '/results').catch(() => null);
+      if (r && (r.file_count || (r.scores && r.scores.length) || r.s3_uri)) {
+        const el = document.getElementById('jobrow-' + j.job_id);
+        if (el) el.outerHTML = jobRowHtml(j, r);
+      }
+    });
+  } catch (e) { /* silent — keep whatever is already rendered */ }
 }
 
 var _logWid = null;

@@ -134,9 +134,23 @@ class TestRuntimeDeployFromSrc:
         assert "User=ubuntu" in c
         assert "PYTHONPATH=/opt/ea/src" in c
         assert "elastic_agent.worker.runtime_main" in c
-        assert "--manager-url ws://1.2.3.4:8080/ws/runtime" in c and "--token tok" in c
+        # --opt=value form (not space) so leading-'-' tokens don't break argparse
+        assert "--manager-url=ws://1.2.3.4:8080/ws/runtime" in c and "--token=tok" in c
         assert "Xvfb :99" in c                      # display for the login flow
         assert "systemctl restart ea-runtime" in c
+
+    def test_token_with_leading_dash_uses_equals_form(self) -> None:
+        # Regression: secrets.token_urlsafe can start with '-'. In the space form
+        # (`--token -Cu2...`) argparse reads the value as another option and dies with
+        # "argument --token: expected one argument" → runtime crash-loops → worker
+        # never connects → provision fails ("never connected within 300s").
+        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
+        tok = "-Cu2AifsKw6IW8G1T704zqv2S3CJrNvL1wgFYoAxmSI"
+        c = runtime_deploy_from_src_step(
+            manager_url="ws://1.2.3.4:8080/ws/runtime", auth_token=tok, worker_id="w1",
+        ).command
+        assert f"--token={tok}" in c
+        assert f"--token {tok}" not in c            # never the ambiguous space form
 
     def test_root_gets_is_sandbox(self) -> None:
         from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step

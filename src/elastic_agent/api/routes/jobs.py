@@ -79,11 +79,22 @@ def _job_detail(job) -> dict:
     }
 
 
+def _job_list_item(job) -> dict:
+    """Job summary + workers_detail but WITHOUT the (heavy) spec — enough for the
+    UI's job list to render a full card without a per-job detail request."""
+    d = _job_detail(job)
+    d.pop("spec", None)
+    d["in_memory"] = True
+    return d
+
+
 @router.post("/jobs", status_code=201)
 async def submit_job(spec: JobSpec) -> dict:
     """Validate + launch a batch job. Returns the job summary."""
     try:
-        job = await _mgr().batch.launch(spec)
+        # submit() returns as soon as the job is registered; scale-out + bring-up
+        # run in the background so the HTTP call (and the UI button) don't hang.
+        job = await _mgr().batch.submit(spec)
     except NotImplementedError as exc:
         # provision/login hooks not wired for live runs — surface clearly.
         raise HTTPException(503, str(exc))
@@ -100,7 +111,7 @@ async def resubmit_job(job_id: str) -> dict:
     if not p.exists():
         raise HTTPException(404, f"no persisted spec for job {job_id}")
     spec = JobSpec(**json.loads(p.read_text(encoding="utf-8"))["spec"])
-    job = await mgr.batch.launch(spec)
+    job = await mgr.batch.submit(spec)  # background bring-up; return job_id fast
     _persist_spec(mgr, job.job_id, spec)
     return _job_detail(job)
 
@@ -110,7 +121,11 @@ async def list_jobs() -> dict:
     mgr = _mgr()
     live = mgr.batch.list_jobs()
     live_ids = {j.job_id for j in live}
-    out = [j.summary() for j in live]
+    # Include workers_detail inline (via _job_list_item) so the UI renders each
+    # job card straight from this one response instead of firing a detail request
+    # per job — that per-job fan-out floods the Manager and, once many jobs pile
+    # up, makes the jobs panel silently fail to render ("No jobs yet").
+    out = [_job_list_item(j) for j in live]
     # Persisted specs whose jobs are no longer in memory (restarted) — surface
     # them so they can be reviewed / resubmitted.
     for f in sorted(_specs_dir(mgr).glob("*.json")):
@@ -121,7 +136,7 @@ async def list_jobs() -> dict:
         except Exception:
             continue
         out.append({"job_id": f.stem, "name": data.get("name", ""), "workers": 0,
-                    "phases": {}, "done": True, "in_memory": False})
+                    "phases": {}, "done": True, "in_memory": False, "workers_detail": []})
     return {"jobs": out, "total": len(out)}
 
 
