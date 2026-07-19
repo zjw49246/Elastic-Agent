@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from elastic_agent.core.providers.base import (
     CloudProvider,
+    ElasticIp,
     Instance,
     InstanceConfig,
     InstanceState,
@@ -60,6 +61,7 @@ class DryRunProvider(CloudProvider):
         auto_assign_ip: bool = True,
     ) -> None:
         self.instances: dict[str, Instance] = {}
+        self.eips: dict[str, ElasticIp] = {}
         self.operations: list[DryRunOperation] = []
         self._create_delay = create_delay
         self._start_delay = start_delay
@@ -218,3 +220,54 @@ class DryRunProvider(CloudProvider):
             raise ValueError(f"Instance {instance_id} not found")
         inst.state = InstanceState.RUNNING
         return inst
+
+    # -- Elastic IP --------------------------------------------------------
+
+    async def allocate_eip(self, tags: dict[str, str] | None = None) -> ElasticIp:
+        self._check_failure("allocate_eip")
+        async with self._lock:
+            self._counter += 1
+            alloc_id = f"eipalloc-{self._counter:04d}"
+            public_ip = f"52.0.0.{self._counter}"
+            eip = ElasticIp(allocation_id=alloc_id, public_ip=public_ip)
+            self.eips[alloc_id] = eip
+        self._record("allocate_eip", alloc_id, public_ip=public_ip)
+        return eip.model_copy()
+
+    async def associate_eip(self, instance_id: str, allocation_id: str) -> ElasticIp:
+        self._check_failure("associate_eip")
+        async with self._lock:
+            eip = self.eips.get(allocation_id)
+            if eip is None:
+                raise ValueError(f"EIP {allocation_id} not found")
+            eip.instance_id = instance_id
+            eip.association_id = f"eipassoc-{allocation_id[-4:]}"
+            # A bound instance always shows the EIP as its public IP, and it
+            # stays put across stop/start (that's the whole point).
+            inst = self.instances.get(instance_id)
+            if inst is not None:
+                inst.public_ip = eip.public_ip
+        self._record("associate_eip", instance_id, allocation_id=allocation_id)
+        return eip.model_copy()
+
+    async def disassociate_eip(self, allocation_id: str) -> None:
+        self._check_failure("disassociate_eip")
+        async with self._lock:
+            eip = self.eips.get(allocation_id)
+            if eip is None:
+                return
+            eip.instance_id = None
+            eip.association_id = None
+        self._record("disassociate_eip", allocation_id)
+
+    async def release_eip(self, allocation_id: str) -> None:
+        self._check_failure("release_eip")
+        async with self._lock:
+            self.eips.pop(allocation_id, None)
+        self._record("release_eip", allocation_id)
+
+    async def describe_eip(self, allocation_id: str) -> ElasticIp | None:
+        self._check_failure("describe_eip")
+        async with self._lock:
+            eip = self.eips.get(allocation_id)
+            return eip.model_copy() if eip else None

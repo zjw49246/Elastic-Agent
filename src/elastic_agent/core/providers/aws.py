@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from elastic_agent.core.config import AWSProviderConfig
 from elastic_agent.core.providers.base import (
     CloudProvider,
+    ElasticIp,
     Instance,
     InstanceConfig,
     InstanceState,
@@ -193,6 +194,92 @@ class AWSProvider(CloudProvider):
         native_id = self._native_id(instance_id)
         await asyncio.to_thread(self._client.reboot_instances, InstanceIds=[native_id])
         logger.info("Rebooted AWS instance %s", native_id)
+
+    # -- Elastic IP --------------------------------------------------------
+
+    async def allocate_eip(self, tags: dict[str, str] | None = None) -> ElasticIp:
+        all_tags = {**(tags or {}), self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE}
+        tag_spec = [
+            {
+                "ResourceType": "elastic-ip",
+                "Tags": [{"Key": k, "Value": v} for k, v in all_tags.items()],
+            }
+        ]
+
+        def _call():
+            return self._client.allocate_address(Domain="vpc", TagSpecifications=tag_spec)
+
+        resp = await asyncio.to_thread(_call)
+        eip = ElasticIp(allocation_id=resp["AllocationId"], public_ip=resp["PublicIp"])
+        logger.info("Allocated EIP %s (%s)", eip.public_ip, eip.allocation_id)
+        return eip
+
+    async def associate_eip(self, instance_id: str, allocation_id: str) -> ElasticIp:
+        native_id = self._native_id(instance_id)
+
+        def _call():
+            # AllowReassociation makes this idempotent: re-associating the same
+            # EIP to the same (or a replacement) instance on each start is a
+            # no-op rather than an error.
+            return self._client.associate_address(
+                AllocationId=allocation_id,
+                InstanceId=native_id,
+                AllowReassociation=True,
+            )
+
+        resp = await asyncio.to_thread(_call)
+        eip = await self.describe_eip(allocation_id)
+        public_ip = eip.public_ip if eip else ""
+        logger.info("Associated EIP %s -> %s", allocation_id, native_id)
+        return ElasticIp(
+            allocation_id=allocation_id,
+            public_ip=public_ip,
+            association_id=resp.get("AssociationId"),
+            instance_id=instance_id,
+        )
+
+    async def disassociate_eip(self, allocation_id: str) -> None:
+        eip = await self.describe_eip(allocation_id)
+        if eip is None or not eip.association_id:
+            return  # already detached / gone — nothing to do
+
+        def _call():
+            return self._client.disassociate_address(AssociationId=eip.association_id)
+
+        await asyncio.to_thread(_call)
+        logger.info("Disassociated EIP %s", allocation_id)
+
+    async def release_eip(self, allocation_id: str) -> None:
+        def _call():
+            return self._client.release_address(AllocationId=allocation_id)
+
+        await asyncio.to_thread(_call)
+        logger.info("Released EIP %s", allocation_id)
+
+    async def describe_eip(self, allocation_id: str) -> ElasticIp | None:
+        def _call():
+            return self._client.describe_addresses(AllocationIds=[allocation_id])
+
+        try:
+            resp = await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            resp_err = getattr(exc, "response", None)
+            if isinstance(resp_err, dict) and resp_err.get("Error", {}).get(
+                "Code"
+            ) in {"InvalidAllocationID.NotFound", "InvalidAddress.NotFound"}:
+                return None
+            raise
+        addrs = resp.get("Addresses", [])
+        if not addrs:
+            return None
+        a = addrs[0]
+        native_iid = a.get("InstanceId")
+        return ElasticIp(
+            allocation_id=a["AllocationId"],
+            public_ip=a["PublicIp"],
+            association_id=a.get("AssociationId"),
+            instance_id=f"aws:{native_iid}" if native_iid else None,
+        )
 
     async def list_instances(self, filters: dict[str, str] | None = None) -> list[Instance]:
         ec2_filters = [
