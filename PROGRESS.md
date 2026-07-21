@@ -1,5 +1,23 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-21 task153：账号固定 EIP + 临时 EC2 全生命周期重写
+
+**问题**：旧模型把账号绑定到长期 EC2，停机仍保留根盘等资源；Job 创建、登录、结果收集、取消和云 API 最终一致性之间也没有一个可恢复的所有权事务，失败窗口可能遗留收费实例、重复 EIP、账号 claim 或错误登录身份。
+
+**实现**（commit `4a1f244`）：
+
+- 持久关系改为稳定 `account_id → AWS EIP`；每个 Job 创建独占 lease 和 fresh EC2，attach 后 bootstrap/login/run，终态先 final collect，再 detach、确认 terminate EC2/root EBS、释放 lease/claim，EIP 仅在显式 decommission 时释放。
+- 绑定、lease、JobSpec 都以 mode 0600 + fsync 原子落盘；Manager flock 防双主，启动/live recovery 按 controller/account/lease tags 收敛不确定的 AllocateAddress/RunInstances。
+- 整单容量先预占，多 shard EIP reservation 并发但 all-settled；普通失败、反复取消、capacity release 和 post-reserve 窗口都先完成补偿再返回，清理失败保持 fail-closed/pending retry。
+- EIP worker 禁 IPv6，强制分发当前 Manager 的 worker 包、停旧服务并要求新 WebSocket 重连；登录结果按 request id 关联，精确核对 email 且 warmup 成功后才运行。EIP spec 拒绝 `HOME`/`CLAUDE_CONFIG_DIR` 覆盖。
+- 账号邮箱 token 写入 Manager 的 mode-0600 store 且 API 不回显；跨机登录要求 WSS。当前真实执行仍仅支持 Claude，Codex 自动登录和通用 IMAP 未实现。
+
+**避免复发**：任何不可取消的云调用都必须先持久化意图，并由循环 shield 的 owner task 等真实结果后补偿；永远不能先释放账号 claim 再处理 durable lease。部署验证不能只看 registry READY，必须证明当前 worker 版本重新连接并完成身份校验。
+
+**验证**：task153 聚焦回归 `521 passed`；安装 PTY extra 后全量 `1689 passed, 12 skipped, 8 failed`，8 项均为任务前基线（credential rotation、默认端口、file-sync 断言/权限），本功能无新增失败；`ruff`（变更核心）、`compileall`、`git diff --check` 通过。未使用真实 AWS 凭证做破坏性 smoke test。
+
+**Commit**: `4a1f244`
+
 ## 2026-07-16 Docker沙箱 + S3数据集 + worker日志 三功能 + UI Submit 全量排障（task-ccm-sync）
 
 **功能**（commit `ddb9a8f` + buildx `ae85860`）：
