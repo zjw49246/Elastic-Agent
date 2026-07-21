@@ -245,3 +245,13 @@
 **stealth 反 CF 弄巧成拙（教训）**：给阿里云过 Cloudflare 加的 stealth（`--disable-blink-features=AutomationControlled` + `navigator.webdriver` 等指纹伪装，commit `94db2ab`）**反而触发 Turnstile**——A/B 实测：stealth ON → magic-link/OAuth 页弹交互式勾选框、CDP 点击过不去 → 登录失败；stealth OFF → 三处 CF 全自动放行、登录成功。**不一致的指纹比"像自动化"更可疑**。已完全回退（`a68a41e`）。**根因教训：改登录这种外部反爬逻辑，必须在真实登录上 A/B 验证，别只验 mode=none 的旁路**（我当初验 worker 直连 S3 用的 account.mode=none，没走登录，漏了）。排障关键靠失败 worker 的 journalctl + `/tmp/cdp_oauth.png` 截图（截图是视口坐标，xdotool 是屏幕坐标，差一个浏览器 chrome 高度——一度误判成坐标 bug）。
 
 **账号可见性**：新端点 `GET /api/accounts/allocations`（从 orchestrator 内存 job 反推 账号→worker/job/phase/active）+ 账号面板加「当前绑定 worker」列。回答"账号是否已分配给 worker"。注意：orchestrator job 内存态、Manager 重启即清（重启部署代码会丢正在跑的 job 记录——本次多次踩到，长期应让新 Manager 能重连/收养在跑的 worker）。
+
+## 2026-07-21 Codex 密码自动登录（commit `5f52384`）
+
+**问题**：Elastic 只有 Claude 的 worker-local 登录；`group=codex` 只是标签。Codex 的 OAuth callback 又固定回到启动 CLI 的本机，不能由 Manager 代登或只分发 token；无邮箱查询 token 时还必须允许管理员在同一登录请求中补交 OTP。
+
+**解决**：账号模型新增 `agent_type` 与写入后不回显的 OpenAI password；worker 在同机启动 `codex login`，用 Xvfb + 系统 Chrome + Playwright 完成 email/password/OTP，严格校验 `auth.json` 的 ChatGPT OAuth、id-token email，并用隔离的 `codex exec` 做真实可用性验证。失败/取消事务性恢复旧凭证。Manager 用 request/account/worker 三元关联 OTP 与结果，断线立即失败；取消时等待 worker 清理 ACK，普通 worker 清理不确定则隔离账号，EIP Job 则靠先销毁临时 EC2 再释放 claim 保证安全。Codex Job 固定 CLI 版本并强制部署当前 worker 源码，避免旧协议误走 Claude。
+
+**以后避免**：浏览器登录不能只以“页面走完”为成功，必须同时验证最终账号身份和 CLI 真调用；异步取消也不能把“已发 cancel”当作“已清理”，资源/账号复用前必须有 ACK、实例销毁或隔离兜底。秘密字段的 REST、日志、异常和 UI 都要逐层检查，OTP 元数据用 DOM text 节点渲染，不能直接拼 HTML。
+
+**验证**：相关回归 389 项全绿；全量为 1770 passed / 12 skipped / 8 个既有基线失败（凭证轮换 3、端口默认值 2、文件同步 3），无新增失败；ruff、`compileall`、diff check 与 Batch Console JavaScript 语法检查通过。未使用真实 OpenAI 账号做线上登录，也未创建 AWS 资源。
