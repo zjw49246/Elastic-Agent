@@ -15,8 +15,9 @@ import json
 import logging
 import os
 import platform
-import signal
+import re
 import shutil
+import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -51,12 +52,11 @@ from elastic_agent.core.protocols.messages import (
     StatusMessage,
     StopMessage,
     UnregisterSyncMappingMessage,
+    UnwatchMessage,
     UploadFileMessage,
     WatchFilesMessage,
-    UnwatchMessage,
     parse_message,
 )
-
 from elastic_agent.core.rate_limit import is_auth_failure, is_rate_limited
 
 logger = logging.getLogger(__name__)
@@ -236,7 +236,12 @@ class WorkerRuntime:
             try:
                 msg = parse_message(raw)
             except Exception:
-                logger.warning("Failed to parse message: %s", raw[:200] if isinstance(raw, str) else raw[:200])
+                # Raw control messages can contain write-only mailbox tokens or
+                # credential material. Never echo malformed payloads to logs.
+                logger.warning(
+                    "Failed to parse worker control message (%d bytes)",
+                    len(raw),
+                )
                 continue
             await self._dispatch(msg)
 
@@ -1041,16 +1046,21 @@ class WorkerRuntime:
         接码 token; the worker runs the vendored login flow locally (Chrome/CDP
         on this machine) and the credentials are written here, never sent up.
         """
-        from elastic_agent.core.claude_oauth import ClaudeOAuthProvider, OAuthConfig
+        from elastic_agent.core.claude_oauth import (
+            ClaudeOAuthProvider,
+            OAuthConfig,
+            normalize_local_config_dir,
+        )
 
         provider = ClaudeOAuthProvider()
+        config_dir = normalize_local_config_dir(msg.config_dir)
         # worker_host=None → run the vendored perform_login in-process on this
         # worker (this IS the machine that owns the config_dir).
         config = OAuthConfig(
             account_id=msg.account_id,
             email=msg.email,
             email_token=msg.email_token,
-            config_dir=msg.config_dir,
+            config_dir=config_dir,
             provider=msg.provider,
             worker_host=None,
         )
@@ -1059,6 +1069,7 @@ class WorkerRuntime:
         except Exception as exc:
             logger.exception("Account login failed for %s", msg.account_id)
             await self._send_event(AccountLoginResultMessage(
+                login_request_id=msg.login_request_id,
                 account_id=msg.account_id, slot_index=msg.slot_index,
                 success=False, error=str(exc),
             ))
@@ -1066,49 +1077,185 @@ class WorkerRuntime:
 
         if result.success:
             logger.info("Account %s logged in on this worker (%s)",
-                        msg.account_id, msg.config_dir)
+                        msg.account_id, config_dir)
+            identity_ok = await self._verify_config_identity(
+                config_dir, msg.email
+            )
+            if not identity_ok:
+                result.success = False
+                result.error = (
+                    "Claude credentials are valid for a different or unknown "
+                    "email than the selected account"
+                )
             # Warm the account so the first real PTY turn doesn't stall on
             # GrowthBook/onboarding, and verify the credentials are usable.
-            await self._warmup_config_dir(msg.config_dir)
+            warmup_ok = (
+                await self._warmup_config_dir(config_dir)
+                if result.success
+                else False
+            )
+            if result.success and not warmup_ok:
+                result.success = False
+                result.error = (
+                    "Claude login produced credentials, but the credential "
+                    "validation command failed"
+                )
             # New credentials on this config_dir: warm PTY sessions there ran
             # under a different account and must not be hot-reused.
-            if self._pty_backend is not None:
+            if result.success and self._pty_backend is not None:
                 try:
-                    await self._pty_backend.recycle_config_dir(msg.config_dir)
+                    await self._pty_backend.recycle_config_dir(config_dir)
                 except Exception:
                     logger.exception(
-                        "Failed to recycle PTY sessions for %s", msg.config_dir
+                        "Failed to recycle PTY sessions for %s", config_dir
                     )
-            if self._quota_checker:
-                self._quota_checker.add_slot(msg.account_id, msg.config_dir)
+            if result.success and self._quota_checker:
+                self._quota_checker.add_slot(msg.account_id, config_dir)
 
         await self._send_event(AccountLoginResultMessage(
+            login_request_id=msg.login_request_id,
             account_id=msg.account_id,
             slot_index=msg.slot_index,
             success=result.success,
             error=result.error,
         ))
 
-    async def _warmup_config_dir(self, config_dir: str) -> None:
-        """Best-effort `claude -p` warmup for a config_dir after login.
+    @staticmethod
+    async def _stop_process_group(
+        proc: asyncio.subprocess.Process,
+        *,
+        grace_seconds: float = 5.0,
+    ) -> None:
+        """Terminate and reap an isolated validation subprocess group."""
+        if proc.returncode is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+
+    async def _verify_config_identity(
+        self,
+        config_dir: str,
+        expected_email: str,
+        *,
+        timeout: float = 30.0,
+    ) -> bool:
+        """Require Claude's authenticated email to match the selected account."""
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            env.setdefault("IS_SANDBOX", "1")
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "auth", "status",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            if proc.returncode != 0:
+                return False
+            output = stdout.decode(errors="replace").strip()
+            logged_in = False
+            actual_email: str | None = None
+            try:
+                status = json.loads(output)
+                logged_in = bool(status.get("loggedIn"))
+                email = status.get("email")
+                if isinstance(email, str):
+                    actual_email = email.strip()
+            except json.JSONDecodeError:
+                logged_in = (
+                    "Logged in" in output or '"loggedIn": true' in output
+                )
+                match = re.search(
+                    r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", output
+                )
+                if match:
+                    actual_email = match.group(0)
+            matches = bool(
+                logged_in
+                and actual_email
+                and actual_email.casefold()
+                == expected_email.strip().casefold()
+            )
+            if not matches:
+                logger.warning(
+                    "Claude auth identity mismatch for %s: expected %s, got %s",
+                    config_dir,
+                    expected_email,
+                    actual_email or "<unknown>",
+                )
+            return matches
+        except asyncio.CancelledError:
+            if proc is not None:
+                await self._stop_process_group(proc)
+            raise
+        except Exception:
+            if proc is not None:
+                await self._stop_process_group(proc)
+            logger.exception("Could not verify Claude auth identity for %s", config_dir)
+            return False
+
+    async def _warmup_config_dir(
+        self, config_dir: str, *, timeout: float = 60.0
+    ) -> bool:
+        """Run and verify ``claude -p`` for a newly logged-in config dir.
 
         A fresh account's first turn otherwise pays for GrowthBook cache
         population + onboarding; a short headless run primes it and confirms
-        the credentials actually work. Failures are non-fatal.
+        the credentials actually work. A non-zero exit/timeout is a login
+        failure, not a successful warmup. Timed-out process groups are always
+        terminated and reaped so they cannot survive into the Job.
         """
         env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             env.setdefault("IS_SANDBOX", "1")
+        proc: asyncio.subprocess.Process | None = None
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 "claude", "-p", "reply: ok", "--dangerously-skip-permissions",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 env=env,
+                start_new_session=True,
             )
-            await asyncio.wait_for(proc.wait(), timeout=60)
+            return_code = await asyncio.wait_for(proc.wait(), timeout=timeout)
+            if return_code != 0:
+                logger.warning(
+                    "Credential validation for %s exited with code %s",
+                    config_dir,
+                    return_code,
+                )
+                return False
+            return True
+        except asyncio.CancelledError:
+            if proc is not None:
+                await self._stop_process_group(proc)
+            raise
         except Exception:
-            logger.debug("Warmup run for %s did not complete cleanly", config_dir)
+            if proc is not None:
+                await self._stop_process_group(proc)
+            logger.exception(
+                "Credential validation for %s did not complete cleanly",
+                config_dir,
+            )
+            return False
 
     # ---- Heartbeat ----
 

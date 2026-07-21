@@ -256,7 +256,7 @@ async function scaleInNode(nodeId) {
   confirm('Terminate Node', `Terminate node ${nodeId}?`,
     async () => {
       try {
-        await api('POST', '/scale-in', {node_ids: [nodeId], force: false});
+        await api('POST', '/scale-in', {node_ids: [nodeId], force: true});
         toast(`Node ${nodeId} terminating`);
         refreshNodes();
       } catch(e) { toast(e.message, 'error'); }
@@ -409,13 +409,17 @@ _BATCH_HTML = """\
   <!-- Accounts -->
   <div class="card">
     <h2>Accounts</h2>
-    <p class="hint">Only account identities (email + 接码 token). Credentials are minted on the worker at login — never stored here.</p>
+    <p class="hint">
+      Manager 会把 email + 接码/邮箱授权 token 保存到权限 0600 的账号文件；token 提交后不回显。
+      Claude OAuth 凭证在 worker 生成且不回传。当前自动登录仅支持 Claude（171mail、mail.com）；
+      group=codex 只是账号池标签，尚无 Codex 登录/执行链路，也未实现通用 IMAP。
+    </p>
     <table><thead><tr><th>ID</th><th>Email</th><th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
       <tbody id="acctRows"></tbody></table>
     <div class="grid3" style="margin-top:12px">
       <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
       <div><label>Email</label><input id="acctEmail" placeholder="a@x.com"></div>
-      <div><label>接码 Token</label><input id="acctToken" placeholder="optional"></div>
+      <div><label>接码/邮箱授权 Token（写入后不回显）</label><input id="acctToken" placeholder="optional"></div>
     </div>
     <div class="grid2">
       <div><label>Group</label><input id="acctGroup" value="standard"></div>
@@ -473,7 +477,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     <div class="grid2">
       <div><label>需要 Docker（run 用 Docker,如 ai4sci <code>--sandbox os</code>）</label>
         <select id="jNeedsDocker"><option value="false">否</option><option value="true">是</option></select></div>
-      <div><label>S3 数据集（每行 <code>s3://桶/前缀/ 目标目录</code>;Manager 下载后 rsync 到 worker）</label>
+      <div><label>S3 数据集（每行 <code>s3://桶/前缀/ 目标目录</code>；worker 用实例角色直拉，不经 Manager）</label>
         <textarea id="jS3" placeholder="s3://my-bucket/datasets/ /home/ubuntu/data"></textarea></div>
     </div>
     <label>Run command（shell;从代码目录运行;支持 {{shard_index}} 和 $(hostname -s)）</label>
@@ -498,6 +502,20 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
           <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
       <div><label>config_dir (blank = ~/.claude)</label><input id="jConfigDir" value="/home/ubuntu/.claude"></div>
+    </div>
+    <div class="grid2">
+      <div><label>账号固定 EIP</label>
+        <select id="jAcctBinding" onchange="updateEipBindingUI()">
+          <option value="none">关闭（普通临时 EC2）</option>
+          <option value="eip">启用（一号一 IP）</option>
+        </select></div>
+      <div><label>指定账号（Ctrl/Cmd 多选；留空则按 Group 自动选择）</label>
+        <select id="jAcctIds" multiple size="4" disabled></select></div>
+    </div>
+    <div class="hint" id="jEipHint">
+      启用后，一个账号固定绑定一个 IPv4 EIP，每台临时 EC2 只使用一个账号；如指定账号，
+      选中账号数必须等于 Workers。新 EC2 仍会重新登录 Claude，任务结束先收集结果再销毁 EC2，
+      但保留 EIP。
     </div>
     <div class="grid2">
       <div><label>Rotation strategy</label>
@@ -582,9 +600,10 @@ function lines(id) {
 async function refreshAccounts() {
   try {
     const d = await api('GET', '/accounts');
+    const accounts = d.accounts || [];
     let alloc = {};
     try { alloc = (await api('GET', '/accounts/allocations')).allocations || {}; } catch(e) {}
-    document.getElementById('acctRows').innerHTML = (d.accounts || []).map(a => {
+    document.getElementById('acctRows').innerHTML = accounts.map(a => {
       const b = alloc[a.id] || [];
       const bind = b.length
         ? b.map(x => `${(x.worker_id||'').replace('aws:','')} <span class="muted">(${x.job_name||x.job_id}·${x.phase}${x.active?'·当前':''})</span>`).join('<br>')
@@ -594,6 +613,19 @@ async function refreshAccounts() {
         <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
             onclick="removeAccount('${a.id}')">✕</button></td></tr>`;
     }).join('') || '<tr><td colspan="6" class="muted">No accounts.</td></tr>';
+
+    const picker = document.getElementById('jAcctIds');
+    const selected = new Set(Array.from(picker.selectedOptions).map(o => o.value));
+    picker.replaceChildren();
+    accounts.forEach(a => {
+      const option = document.createElement('option');
+      option.value = a.id;
+      option.textContent = `${a.email || a.id} · ${a.group || 'standard'} (${a.id})`;
+      option.disabled = !a.enabled;
+      option.selected = selected.has(a.id) && a.enabled;
+      picker.appendChild(option);
+    });
+    updateEipBindingUI();
   } catch(e) { toast(e.message, 'error'); }
 }
 async function addAccount() {
@@ -637,8 +669,26 @@ function buildEnv() {
   for (const l of lines('jEnv')) { const i = l.indexOf('='); if (i > 0) env[l.slice(0,i)] = l.slice(i+1); }
   return env;
 }
+function updateEipBindingUI() {
+  const enabled = document.getElementById('jAcctBinding').value === 'eip';
+  const picker = document.getElementById('jAcctIds');
+  const rotation = document.getElementById('jRot');
+  picker.disabled = !enabled;
+  const restartOption = Array.from(rotation.options)
+    .find(o => o.value === 'on_exhaust_restart_resume');
+  if (restartOption) restartOption.disabled = enabled;
+  if (enabled && rotation.value === 'on_exhaust_restart_resume') rotation.value = 'none';
+}
 async function submitJob() {
   const ref = document.getElementById('jHarnessRef').value.trim();
+  const workers = parseInt(document.getElementById('jWorkers').value) || 1;
+  const accountBinding = document.getElementById('jAcctBinding').value;
+  const accountIds = accountBinding === 'eip'
+    ? Array.from(document.getElementById('jAcctIds').selectedOptions).map(o => o.value)
+    : [];
+  if (accountBinding === 'eip' && accountIds.length && accountIds.length !== workers) {
+    return toast(`EIP 绑定模式下，选中账号数必须等于 Workers（当前 ${accountIds.length}/${workers}）`, 'error');
+  }
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
     setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup'),
@@ -650,10 +700,12 @@ async function submitJob() {
           cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
     account: {mode: document.getElementById('jAcctMode').value,
               group: document.getElementById('jAcctGroup').value.trim() || 'standard',
-              config_dir: document.getElementById('jConfigDir').value.trim()},
+              config_dir: document.getElementById('jConfigDir').value.trim(),
+              binding: accountBinding,
+              ids: accountIds},
     rotation: {strategy: document.getElementById('jRot').value,
                resume_args: document.getElementById('jResume').value.trim()},
-    fanout: {workers: parseInt(document.getElementById('jWorkers').value) || 1,
+    fanout: {workers: workers,
              shard_by: document.getElementById('jShard').value,
              name_prefix: document.getElementById('jNamePrefix').value.trim(),
              instance_type: document.getElementById('jInstanceType').value.trim(),
@@ -785,7 +837,7 @@ async function refreshResults() {
   } catch(e) { /* silent */ }
 }
 
-refreshAccounts(); refreshJobs(); refreshResults();
+updateEipBindingUI(); refreshAccounts(); refreshJobs(); refreshResults();
 setInterval(() => { refreshJobs(); refreshResults(); }, 5000);
 </script>
 </body>

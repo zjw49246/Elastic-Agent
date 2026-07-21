@@ -118,6 +118,7 @@ class SSHExecutor:
         cwd: str | None = None,
     ) -> tuple[int, str, str]:
         ssh_cmd = self._build_ssh_cmd(command, env=env, cwd=cwd)
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *ssh_cmd,
@@ -139,6 +140,17 @@ class SSHExecutor:
             except Exception:
                 pass
             return -1, "", f"Command timed out after {timeout}s"
+        except asyncio.CancelledError:
+            # A bounded restart-recovery collection may cancel an in-flight
+            # worker-direct SSH command.  Reap it before propagating
+            # cancellation so it cannot outlive the Manager/EIP lease.
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            raise
         except Exception as exc:
             return -1, "", str(exc)
 

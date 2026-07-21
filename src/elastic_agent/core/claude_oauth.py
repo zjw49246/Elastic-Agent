@@ -28,7 +28,8 @@ import json
 import logging
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,19 @@ MAIL_API_BASE = "https://b.171mail.com/api/v1"
 ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 ANTHROPIC_ACCOUNT_URL = "https://claude.ai/api/account"
+
+
+def normalize_local_config_dir(config_dir: str | None) -> str:
+    """Return the credential directory for a login running on this machine.
+
+    An absolute path is an explicit caller choice and is preserved verbatim.
+    Empty and relative values cannot safely be interpreted across Manager and
+    worker working directories, so they mean Claude's default directory for
+    the OS user running this worker.
+    """
+    if config_dir and Path(config_dir).is_absolute():
+        return config_dir
+    return str(Path.home() / ".claude")
 
 
 @dataclass
@@ -93,6 +107,14 @@ class ClaudeOAuthProvider:
         self._http_client = http_client
 
     async def login(self, config: OAuthConfig) -> LoginResult:
+        # Direct provider callers do not necessarily go through WorkerRuntime.
+        # Normalize local paths here as a second, idempotent guard so the login
+        # flow and credential read-back always target the same directory.
+        if not config.worker_host:
+            config = replace(
+                config,
+                config_dir=normalize_local_config_dir(config.config_dir),
+            )
         provider = resolve_provider(config)
         remote = bool(config.worker_host)
         logger.info(

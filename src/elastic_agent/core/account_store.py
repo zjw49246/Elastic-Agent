@@ -2,18 +2,25 @@
 
 A thin CRUD layer over ``accounts.json`` (the same file CredentialPool reads for
 allocation). The frontend's Accounts panel adds/removes account *identities*
-(email + 接码 token + group); credentials are never stored here — they are minted
-on the worker at login time. Kept deliberately separate from CredentialPool,
-which owns runtime allocation/quota state.
+(email + mailbox/接码 authorization token + group). The mailbox token is stored
+write-only in a mode-0600 file and sent to the selected worker over a protected
+transport; Claude OAuth access/refresh credentials are minted only on that
+worker and are never stored here. Kept deliberately separate from
+CredentialPool, which owns runtime allocation/quota state.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from elastic_agent.core.credential_pool import AccountDefinition, AccountsConfig
+
+
+class AccountStoreCorruptError(RuntimeError):
+    """The identity/token source file is invalid and must be repaired."""
 
 
 class AccountStore:
@@ -30,10 +37,19 @@ class AccountStore:
     def _load_sync(self) -> None:
         if self._path.exists():
             try:
+                # The file contains mailbox/IMAP authorization tokens. Tighten
+                # legacy permissions before reading; refusing to run is safer
+                # than continuing with a world-readable credential source.
+                os.chmod(self._path, 0o600)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 self._config = AccountsConfig.model_validate(raw)
-            except Exception:
-                self._config = AccountsConfig()
+            except Exception as exc:
+                self._loaded = False
+                # Resetting to empty would make the next UI edit overwrite all
+                # valid accounts/tokens because one legacy row was malformed.
+                raise AccountStoreCorruptError(
+                    f"account store is corrupt: {self._path}"
+                ) from exc
         else:
             self._config = AccountsConfig()
         self._loaded = True
@@ -42,12 +58,36 @@ class AccountStore:
         if not self._loaded:
             self._load_sync()
 
-    def _flush_sync(self) -> None:
+    def _flush_sync(self, config: AccountsConfig) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.loads(self._config.model_dump_json())
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        # Revalidate the whole candidate before touching the only copy of
+        # account identities/tokens, then publish in memory only after the
+        # atomic durable replace succeeds.
+        config = AccountsConfig.model_validate(config.model_dump())
+        payload = json.loads(config.model_dump_json())
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(json.dumps(payload, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, self._path)
+            if hasattr(os, "O_DIRECTORY"):
+                directory_fd = os.open(
+                    self._path.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._config = config
 
     # -- CRUD --------------------------------------------------------------
 
@@ -65,17 +105,40 @@ class AccountStore:
         """Add or replace an account by id."""
         async with self._lock:
             self._ensure_loaded()
-            self._config.accounts = [a for a in self._config.accounts if a.id != account.id]
-            self._config.accounts.append(account)
-            self._flush_sync()
+            collision = next(
+                (
+                    existing
+                    for existing in self._config.accounts
+                    if existing.id != account.id
+                    and existing.email.casefold() == account.email.casefold()
+                ),
+                None,
+            )
+            if collision is not None:
+                raise ValueError(
+                    f"email {account.email!r} is already account {collision.id!r}"
+                )
+            candidate = self._config.model_copy(deep=True)
+            candidate.accounts = [
+                existing
+                for existing in candidate.accounts
+                if existing.id != account.id
+            ]
+            candidate.accounts.append(account.model_copy(deep=True))
+            self._flush_sync(candidate)
             return account
 
     async def remove(self, account_id: str) -> bool:
         async with self._lock:
             self._ensure_loaded()
             before = len(self._config.accounts)
-            self._config.accounts = [a for a in self._config.accounts if a.id != account_id]
-            removed = len(self._config.accounts) < before
+            candidate = self._config.model_copy(deep=True)
+            candidate.accounts = [
+                account
+                for account in candidate.accounts
+                if account.id != account_id
+            ]
+            removed = len(candidate.accounts) < before
             if removed:
-                self._flush_sync()
+                self._flush_sync(candidate)
             return removed

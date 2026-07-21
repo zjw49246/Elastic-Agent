@@ -9,11 +9,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from elastic_agent.core.account_binding import AccountBinding, BindingState, LeaseState
 from elastic_agent.core.config import ElasticAgentConfig
-from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
-from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
+from elastic_agent.core.providers.base import (
+    CloudProvider,
+    Instance,
+    InstanceConfig,
+    InstanceNotFoundError,
+    InstanceState,
+)
+from elastic_agent.core.registry import NodeRecord, NodeStatus
 from elastic_agent.manager.manager import ElasticAgentManager
-
+from elastic_agent.testing.dry_run_provider import DryRunProvider
 
 # ------------------------------------------------------------------
 # Helpers — in-memory mock provider
@@ -69,14 +76,16 @@ class InMemoryProvider(CloudProvider):
     async def list_instances(self, filters: dict | None = None) -> list[Instance]:
         return list(self._instances.values())
 
-    async def get_instance(self, instance_id: str) -> Instance | None:
+    async def get_instance(self, instance_id: str) -> Instance:
         native = instance_id.split(":", 1)[-1] if ":" in instance_id else instance_id
-        return self._instances.get(native)
+        instance = self._instances.get(native)
+        if instance is None:
+            raise InstanceNotFoundError(f"Instance not found: {instance_id}")
+        return instance
 
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:
         inst = await self.get_instance(instance_id)
-        if inst:
-            inst.state = InstanceState.RUNNING
+        inst.state = InstanceState.RUNNING
         return inst
 
 
@@ -88,9 +97,26 @@ class InMemoryProvider(CloudProvider):
 @pytest.fixture
 def tmp_config(tmp_path):
     registry_path = tmp_path / "registry.json"
-    cfg = ElasticAgentConfig()
-    cfg.registry.path = str(registry_path)
-    return cfg
+    return ElasticAgentConfig(
+        registry={"path": str(registry_path)},
+        task_registry={"path": str(tmp_path / "task_registry.json")},
+        webhook={"dead_letter_path": str(tmp_path / "dead_letters.json")},
+        logging={"operations_log": str(tmp_path / "operations.log")},
+    )
+
+
+@pytest.fixture(autouse=True)
+def fast_binding_manager_polling(monkeypatch):
+    """Keep production's five-minute cloud ambiguity window out of unit tests."""
+    import elastic_agent.core.binding_manager as binding_manager_module
+
+    monkeypatch.setattr(
+        binding_manager_module, "EIP_ALLOCATION_CONVERGENCE_ATTEMPTS", 2
+    )
+    monkeypatch.setattr(
+        binding_manager_module, "EIP_ALLOCATION_CONVERGENCE_SECONDS", 0
+    )
+    monkeypatch.setattr(binding_manager_module, "TEARDOWN_CONFIRM_SECONDS", 0)
 
 
 @pytest.fixture
@@ -122,6 +148,242 @@ class TestManagerLifecycle:
         nodes = await manager.registry.list_all()
         assert nodes == []
         await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_binding_store_has_single_manager_leader(self, tmp_config, provider):
+        first = ElasticAgentManager(tmp_config, provider)
+        second = ElasticAgentManager(tmp_config, provider)
+
+        await first.start()
+        try:
+            with pytest.raises(RuntimeError, match="another ElasticAgentManager"):
+                await second.start()
+        finally:
+            await first.stop()
+
+        # Releasing the first Manager's lock makes the same durable store
+        # available immediately; the failed start did not poison ``second``.
+        await second.start()
+        assert second._started is True
+        await second.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_releases_attached_lease_but_retains_eip(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-1", job_id="interrupted-job", region="dryrun-region"
+        )
+        instance = await provider.create_instance(
+            InstanceConfig(
+                instance_type="t3.small",
+                image_id="ami-test",
+                key_pair_name="test-key",
+                tags={
+                    "ManagedBy": "elastic-agent",
+                    "ElasticAgentController": (
+                        previous.account_binding_store.controller_id
+                    ),
+                    "ElasticAgentAccount": "acct-1",
+                    "ElasticAgentLease": lease.lease_id,
+                },
+            )
+        )
+        await previous.registry.add(
+            NodeRecord(
+                node_id=instance.instance_id,
+                instance_id=instance.instance_id,
+                platform=instance.platform,
+                status=NodeStatus.READY,
+                metadata={"lease_id": lease.lease_id},
+            )
+        )
+        attached = await previous.binding_manager.attach_instance(
+            lease.lease_id,
+            instance.instance_id,
+            worker_id=instance.instance_id,
+        )
+        binding = await previous.binding_manager.get_binding("acct-1")
+        allocation_id = binding.eip_allocation_id
+        assert attached.state == LeaseState.ATTACHED
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            recovered = await restarted.binding_manager.get_lease(lease.lease_id)
+            assert recovered.state == LeaseState.RELEASED
+            assert recovered.eip_detached is True
+            assert recovered.instance_terminated is True
+            assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
+            assert (await provider.describe_eip(allocation_id)).instance_id is None
+            assert len(provider.get_operations("release_eip")) == 0
+            assert restarted.binding_recovery_ready is True
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_direct_eip_launch_persists_spec_before_crash_and_recovery_collects(
+        self, tmp_config, monkeypatch,
+    ):
+        """The Python API must have the same recovery journal as REST submit."""
+        from elastic_agent.core.credential_pool import AccountDefinition
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        tmp_config.provider.type = "aws"
+        tmp_config.provider.aws.region = "dryrun-region"
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_MANAGER_URL", "wss://manager.example/ws/runtime"
+        )
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        await previous.account_store.add(AccountDefinition(
+            id="acct-direct",
+            email="direct@example.com",
+            email_token="mailbox-token",
+        ))
+        spec = JobSpec.model_validate({
+            "name": "direct-eip-crash",
+            "run": {"command": "echo run"},
+            "account": {
+                "mode": "worker_local_login",
+                "binding": "eip",
+                "ids": ["acct-direct"],
+            },
+            "fanout": {"workers": 1, "region": "dryrun-region"},
+            "collect": {"paths": ["results"]},
+        })
+
+        orchestrator = previous.batch
+        real_reserve = orchestrator._driver._bound_reserve
+        crashed: dict[str, object] = {}
+
+        async def crash_after_instance(job_id, slot, job_spec, account_id=""):
+            assignment = await real_reserve(
+                job_id, slot, job_spec, account_id
+            )
+            records = await previous.scale_out(
+                count=1,
+                name_prefix="crash-window",
+                tags=assignment.instance_tags(job_id),
+            )
+            assignment = await orchestrator._driver.attach_bound(
+                records[0].node_id, assignment
+            )
+            path = Path(tmp_config.registry.path).with_name("specs") / f"{job_id}.json"
+            # This assertion is deliberately inside the first reservation hook:
+            # the spec must predate the lease and every later cloud side effect.
+            assert json.loads(path.read_text(encoding="utf-8"))["spec"]["name"] == (
+                "direct-eip-crash"
+            )
+            crashed.update(
+                lease_id=assignment.lease_id,
+                instance_id=records[0].instance_id,
+                job_id=job_id,
+            )
+            # Raising before returning the assignment models a hard process loss:
+            # the orchestrator cannot compensate a lease it never received.
+            raise RuntimeError("simulated Manager crash after attached lease")
+
+        orchestrator._driver._bound_reserve = crash_after_instance
+        job = await orchestrator.launch(spec)
+        assert "simulated Manager crash" in (job.error or "")
+        assert crashed
+        await previous.stop()
+
+        collected: list[tuple[str, str, str]] = []
+
+        async def record_recovery_collect(_driver, worker_id, recovered_spec, job_id):
+            instance = provider.instances[str(crashed["instance_id"])]
+            assert instance.state != InstanceState.TERMINATED
+            collected.append((worker_id, recovered_spec.name, job_id))
+
+        monkeypatch.setattr(
+            ManagerFleetDriver, "collect", record_recovery_collect
+        )
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            recovered = await restarted.binding_manager.get_lease(
+                str(crashed["lease_id"])
+            )
+            assert collected == [(
+                str(crashed["instance_id"]),
+                "direct-eip-crash",
+                str(crashed["job_id"]),
+            )]
+            assert recovered.recovery_collection_attempted is True
+            assert recovered.recovery_collection_error is None
+            assert recovered.state == LeaseState.RELEASED
+            assert provider.instances[str(crashed["instance_id"])].state == (
+                InstanceState.TERMINATED
+            )
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_waits_for_reserved_lease_instance_to_become_visible(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-1", job_id="crashed-launch", region="dryrun-region"
+        )
+        instance = await provider.create_instance(
+            InstanceConfig(
+                instance_type="t3.small",
+                image_id="ami-test",
+                key_pair_name="test-key",
+                tags={
+                    "ManagedBy": "elastic-agent",
+                    "ElasticAgentController": (
+                        previous.account_binding_store.controller_id
+                    ),
+                    "ElasticAgentAccount": "acct-1",
+                    "ElasticAgentLease": lease.lease_id,
+                },
+            )
+        )
+        await previous.stop()
+
+        real_list_instances = provider.list_instances
+        provider.list_instances = AsyncMock(
+            side_effect=[[], await real_list_instances()]
+        )
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            # The first successful but empty scan is not proof that the
+            # RunInstances call never happened: EC2's control plane is
+            # eventually consistent, so EIP jobs remain quarantined.
+            after_first_scan = await restarted.binding_manager.get_lease(
+                lease.lease_id
+            )
+            assert after_first_scan.state == LeaseState.RESERVED
+            assert after_first_scan.instance_id is None
+            assert restarted.binding_recovery_ready is False
+
+            # Drive the next pass directly so this test does not sleep for the
+            # production scan interval. The immutable cloud tags reconnect the
+            # instance to its durable lease, then normal release tears it down.
+            await restarted._recover_bound_resources_once()
+
+            recovered = await restarted.binding_manager.get_lease(lease.lease_id)
+            assert recovered.state == LeaseState.RELEASED
+            assert recovered.instance_id == instance.instance_id
+            assert recovered.instance_terminated is True
+            assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
+            assert restarted.binding_recovery_ready is True
+            assert provider.list_instances.await_count == 2
+        finally:
+            await restarted.stop()
 
 
 # ------------------------------------------------------------------
@@ -157,6 +419,129 @@ class TestScaleOut:
         await manager.scale_out(count=1)  # no disk_gb → InstanceConfig default (40)
         assert provider._last_config.root_disk_size_gb == 40
         assert provider._last_config.spot is False
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_spot_is_honored_when_disk_override_is_unset(
+        self, manager, provider
+    ):
+        await manager.start()
+        await manager.scale_out(count=1, disk_gb=0, spot=True)
+        assert provider._last_config.root_disk_size_gb == 40
+        assert provider._last_config.spot is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_configured_instance_limit_rejects_oversized_scale_out(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 1
+        await manager.start()
+
+        with pytest.raises(RuntimeError, match="configured maximum is 1"):
+            await manager.scale_out(count=2)
+
+        assert provider._counter == 0
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_bound_fanout_over_limit_allocates_no_eips_or_leases(
+        self, manager, provider, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 5
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_MANAGER_URL", "wss://manager.example/ws/runtime"
+        )
+        await manager.start()
+        spec = JobSpec.model_validate({
+            "name": "too-wide-eip-job",
+            "run": {"command": "echo run"},
+            "account": {"mode": "worker_local_login", "binding": "eip"},
+            "fanout": {"workers": 20},
+        })
+
+        job = await manager.batch.launch(spec)
+
+        assert "configured maximum is 5" in (job.error or "")
+        assert provider._counter == 0
+        assert await manager.binding_manager.list_bindings() == []
+        assert await manager.binding_manager.list_leases() == []
+        assert manager._instance_capacity_holds == {}
+        assert manager._inflight_instance_creates == 0
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_instance_limit_counts_concurrent_inflight_creates(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 1
+        await manager.start()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_create = provider.create_instance
+
+        async def slow_create(config):
+            entered.set()
+            await release.wait()
+            return await real_create(config)
+
+        provider.create_instance = slow_create
+        first = asyncio.create_task(manager.scale_out())
+        await entered.wait()
+
+        with pytest.raises(RuntimeError, match="configured maximum is 1"):
+            await manager.scale_out()
+
+        release.set()
+        assert len(await first) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_scale_out_merges_bound_lifecycle_tags(self, manager, provider):
+        await manager.start()
+        await manager.account_binding_store.upsert_binding(
+            AccountBinding(
+                account_id="acct-1",
+                eip_allocation_id="eipalloc-test",
+                eip_ip="203.0.113.10",
+                state=BindingState.READY,
+            )
+        )
+        lease = await manager.account_binding_store.reserve_lease(
+            "acct-1", job_id="job-1"
+        )
+        records = await manager.scale_out(
+            count=1,
+            name_prefix="bound-job-0",
+            tags={
+                "ElasticAgentJob": "job-1",
+                "ElasticAgentAccount": "acct-1",
+                "ElasticAgentLease": lease.lease_id,
+            },
+        )
+        assert provider._last_config.tags == {
+            "ManagedBy": "elastic-agent",
+            "Name": "bound-job-0-0",
+            "ElasticAgentJob": "job-1",
+            "ElasticAgentAccount": "acct-1",
+            "ElasticAgentLease": lease.lease_id,
+            "ElasticAgentController": manager.account_binding_store.controller_id,
+        }
+        persisted = await manager.account_binding_store.get_lease(lease.lease_id)
+        assert persisted.instance_id == records[0].instance_id
+        assert persisted.worker_id == records[0].node_id
+        assert persisted.state == LeaseState.ATTACHING
+        assert records[0].metadata == {
+            "job_id": "job-1",
+            "account_id": "acct-1",
+            "lease_id": lease.lease_id,
+            "controller_id": manager.account_binding_store.controller_id,
+        }
         await manager.stop()
 
     @pytest.mark.asyncio
@@ -219,6 +604,31 @@ class TestScaleIn:
         await manager.start()
         terminated = await manager.scale_in(["nonexistent"], force=True)
         assert terminated == []
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_force_scale_in_bound_node_uses_lease_cleanup(
+        self, manager, provider
+    ):
+        await manager.start()
+        node = NodeRecord(
+            node_id="dryrun:i-bound",
+            instance_id="dryrun:i-bound",
+            platform="dryrun",
+            status=NodeStatus.READY,
+            metadata={"lease_id": "lease-1"},
+        )
+        await manager.registry.add(node)
+        manager._cleanup_bound_lease = AsyncMock()
+        provider.terminate_instance = AsyncMock()
+
+        assert await manager.scale_in([node.node_id], force=True) == [node.node_id]
+        manager._cleanup_bound_lease.assert_awaited_once_with(
+            node.node_id,
+            "lease-1",
+            reason="worker force-scaled in by administrator",
+        )
+        provider.terminate_instance.assert_not_awaited()
         await manager.stop()
 
 
@@ -356,3 +766,703 @@ class TestEventRouting:
         await manager._on_worker_disconnect("w-1")
         assert "WORKER_DISCONNECTED" in events
         await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_bound_disconnect_grace_uses_safe_cleanup(self, manager):
+        await manager.start()
+        node = NodeRecord(
+            node_id="w-bound",
+            instance_id="dryrun:i-bound",
+            platform="dryrun",
+            status=NodeStatus.READY,
+            metadata={"lease_id": "lease-bound"},
+        )
+        await manager.registry.add(node)
+        manager._cleanup_bound_lease = AsyncMock()
+        manager.binding_manager.get_lease = AsyncMock(
+            return_value=MagicMock(state="attached")
+        )
+
+        with patch(
+            "elastic_agent.manager.manager.BOUND_DISCONNECT_GRACE_SECONDS", 0
+        ):
+            await manager._on_worker_disconnect(node.node_id)
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        manager._cleanup_bound_lease.assert_awaited_once()
+        assert manager._cleanup_bound_lease.await_args.args == (
+            node.node_id, "lease-bound"
+        )
+        assert "did not reconnect" in manager._cleanup_bound_lease.await_args.kwargs["reason"]
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_bound_reconnect_cancels_pending_disconnect_cleanup(self, manager):
+        await manager.start()
+        node = NodeRecord(
+            node_id="w-bound",
+            instance_id="dryrun:i-bound",
+            platform="dryrun",
+            status=NodeStatus.READY,
+            metadata={"lease_id": "lease-bound"},
+        )
+        await manager.registry.add(node)
+        manager._cleanup_bound_node = AsyncMock()
+
+        await manager._on_worker_disconnect(node.node_id)
+        assert node.node_id in manager._bound_disconnect_tasks
+        await manager._on_worker_connect(node.node_id)
+        await asyncio.sleep(0)
+
+        manager._cleanup_bound_node.assert_not_awaited()
+        assert node.node_id not in manager._bound_disconnect_tasks
+        await manager.stop()
+
+
+class TestEipRecoveryHardening:
+    @staticmethod
+    def _lease_tags(manager, lease, account_id):
+        return {
+            "ElasticAgentJob": lease.job_id,
+            "ElasticAgentAccount": account_id,
+            "ElasticAgentLease": lease.lease_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_create_is_found_and_terminated(self, tmp_config):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-timeout", job_id="job-timeout"
+        )
+        real_create = provider.create_instance
+
+        async def timeout_after_create(config):
+            await real_create(config)
+            raise TimeoutError("SDK timed out after acceptance")
+
+        provider.create_instance = timeout_after_create
+        manager._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(TimeoutError):
+            await manager.scale_out(
+                tags=self._lease_tags(manager, lease, "acct-timeout")
+            )
+
+        uncertain = await manager.binding_manager.get_lease(lease.lease_id)
+        assert uncertain.launch_uncertain is True
+        assert uncertain.instance_id is None
+
+        await manager._recover_bound_resources_once()
+
+        recovered = await manager.binding_manager.get_lease(lease.lease_id)
+        assert recovered.state == LeaseState.RELEASED
+        assert recovered.instance_terminated is True
+        assert len(provider.get_operations("terminate")) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_create_after_cloud_acceptance_enters_live_recovery(
+        self, tmp_config
+    ):
+        """Cancellation while RunInstances is returning must not lose the EC2."""
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-cancelled-create", job_id="job-cancelled-create"
+        )
+        real_create = provider.create_instance
+        cloud_created = asyncio.Event()
+
+        async def create_then_block(config):
+            await real_create(config)
+            cloud_created.set()
+            await asyncio.Future()
+
+        provider.create_instance = create_then_block
+        # Drive recovery explicitly so the assertions cannot race its background
+        # task. The production notifier still has to be called by scale_out.
+        manager._ensure_binding_recovery_task = MagicMock()
+        scale_task = asyncio.create_task(manager.scale_out(
+            tags=self._lease_tags(
+                manager, lease, "acct-cancelled-create"
+            )
+        ))
+        await cloud_created.wait()
+        scale_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await scale_task
+
+        uncertain = await manager.binding_manager.get_lease(lease.lease_id)
+        assert uncertain.launch_uncertain is True
+        assert uncertain.instance_id is None
+        assert lease.lease_id in manager._recovery_lease_ids
+        assert manager._binding_recovery_scan_pending is True
+        manager._ensure_binding_recovery_task.assert_called_once_with()
+        assert len(provider.instances) == 1
+
+        await manager._recover_bound_resources_once()
+
+        recovered = await manager.binding_manager.get_lease(lease.lease_id)
+        assert recovered.state == LeaseState.RELEASED
+        assert recovered.instance_terminated is True
+        assert len(provider.get_operations("terminate")) == 1
+        assert manager.binding_recovery_ready is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_after_instance_id_persisted_terminates_exact_instance(
+        self, tmp_config
+    ):
+        """Cancellation after RunInstances returns uses the known-id compensation."""
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-cancelled-persist", job_id="job-cancelled-persist"
+        )
+        real_begin_attach = manager.account_binding_store.begin_attach
+        instance_persisted = asyncio.Event()
+
+        async def persist_then_block(lease_id, instance_id, worker_id=""):
+            await real_begin_attach(lease_id, instance_id, worker_id)
+            instance_persisted.set()
+            await asyncio.Future()
+
+        manager.account_binding_store.begin_attach = persist_then_block
+        scale_task = asyncio.create_task(manager.scale_out(
+            tags=self._lease_tags(
+                manager, lease, "acct-cancelled-persist"
+            )
+        ))
+        await instance_persisted.wait()
+        scale_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await scale_task
+
+        compensated = await manager.binding_manager.get_lease(lease.lease_id)
+        assert compensated.instance_id
+        assert compensated.launch_uncertain is False
+        assert provider.instances[compensated.instance_id].state == (
+            InstanceState.TERMINATED
+        )
+        assert len(provider.get_operations("terminate")) == 1
+        assert lease.lease_id not in manager._recovery_lease_ids
+
+        # Settle the durable reservation so this test also proves compensation
+        # remains compatible with the idempotent normal release path.
+        manager.account_binding_store.begin_attach = real_begin_attach
+        released = await manager.binding_manager.release(lease.lease_id)
+        assert released.state == LeaseState.RELEASED
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_timeout_before_create_clears_uncertainty_after_full_scan(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-no-create", job_id="job-no-create"
+        )
+
+        async def timeout_before_create(_config):
+            raise TimeoutError("request never left process")
+
+        provider.create_instance = timeout_before_create
+        manager._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(TimeoutError):
+            await manager.scale_out(
+                tags=self._lease_tags(manager, lease, "acct-no-create")
+            )
+
+        manager._binding_recovery_scans_remaining = 1
+        await manager._recover_bound_resources_once()
+
+        recovered = await manager.binding_manager.get_lease(lease.lease_id)
+        assert recovered.state == LeaseState.RELEASED
+        assert recovered.launch_uncertain is False
+        assert provider.get_operations("terminate") == []
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_ambiguity_does_not_tear_down_other_active_lease(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        live = await manager.binding_manager.reserve(
+            "acct-live", job_id="job-live"
+        )
+        live_record = (await manager.scale_out(
+            tags=self._lease_tags(manager, live, "acct-live")
+        ))[0]
+
+        ambiguous = await manager.binding_manager.reserve(
+            "acct-ambiguous", job_id="job-ambiguous"
+        )
+        real_create = provider.create_instance
+
+        async def timeout_after_create(config):
+            await real_create(config)
+            raise TimeoutError("ambiguous")
+
+        provider.create_instance = timeout_after_create
+        manager._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(TimeoutError):
+            await manager.scale_out(
+                tags=self._lease_tags(manager, ambiguous, "acct-ambiguous")
+            )
+        await manager._recover_bound_resources_once()
+
+        live_after = await manager.binding_manager.get_lease(live.lease_id)
+        assert live_after.state == LeaseState.ATTACHING
+        assert provider.instances[live_record.instance_id].state != InstanceState.TERMINATED
+
+        await manager.binding_manager.release(live.lease_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_foreign_exact_instance_remains_fail_closed_after_quarantine(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-foreign", job_id="job-foreign"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": "another-controller",
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        task = restarted._binding_recovery_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            restarted._binding_recovery_task = None
+        restarted._binding_recovery_scans_remaining = 1
+        restarted._binding_recovery_scan_pending = True
+        await restarted._recover_bound_resources_once()
+
+        still_active = await restarted.binding_manager.get_lease(lease.lease_id)
+        assert still_active.state != LeaseState.RELEASED
+        assert lease.lease_id in restarted._recovery_unsafe_lease_ids
+        assert provider.get_operations("terminate") == []
+        await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_unknown_exact_lookup_never_advances_to_raw_termination(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-unknown", job_id="job-unknown"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        await previous.stop()
+
+        provider.list_instances = AsyncMock(return_value=[])
+        provider.get_instance = AsyncMock(
+            side_effect=RuntimeError("AWS throttling")
+        )
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        task = restarted._binding_recovery_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            restarted._binding_recovery_task = None
+
+        restarted._binding_recovery_scans_remaining = 1
+        restarted._binding_recovery_scan_pending = True
+        await restarted._recover_bound_resources_once()
+
+        current = await restarted.binding_manager.get_lease(lease.lease_id)
+        assert current.state != LeaseState.RELEASED
+        assert lease.lease_id in restarted._recovery_unknown_lease_ids
+        assert restarted._binding_recovery_scans_remaining == 1
+        assert provider.get_operations("terminate") == []
+
+        # A later strict controller-tag scan is affirmative evidence. It must
+        # clear UNKNOWN and resume normal durable release rather than leaving
+        # the instance quarantined forever after one transient API failure.
+        provider.list_instances.return_value = [instance]
+        provider.get_instance = AsyncMock(return_value=instance)
+        restarted._binding_recovery_scan_pending = True
+        await restarted._recover_bound_resources_once()
+
+        recovered = await restarted.binding_manager.get_lease(lease.lease_id)
+        assert recovered.state == LeaseState.RELEASED
+        assert lease.lease_id not in restarted._recovery_unknown_lease_ids
+        assert len(provider.get_operations("terminate")) == 1
+        await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_reconciler_does_not_kill_runinstances_in_flight(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-inflight", job_id="job-inflight"
+        )
+        await manager.account_binding_store.update_lease(
+            lease.lease_id,
+            launch_uncertain=True,
+            last_operation="create_instance",
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": manager.account_binding_store.controller_id,
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await manager.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.CREATING,
+            metadata={
+                "controller_id": manager.account_binding_store.controller_id,
+                "account_id": lease.account_id,
+                "lease_id": lease.lease_id,
+            },
+        ))
+
+        await manager._on_reconciler_bound_lost(
+            instance.instance_id, lease.lease_id
+        )
+
+        still_pending = await manager.binding_manager.get_lease(lease.lease_id)
+        assert still_pending.launch_uncertain is True
+        assert still_pending.instance_id is None
+        assert provider.get_operations("terminate") == []
+
+        await provider.terminate_instance(instance.instance_id)
+        await manager.account_binding_store.update_lease(
+            lease.lease_id, launch_uncertain=False
+        )
+        await manager.binding_manager.release(lease.lease_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_reconciler_rejects_mismatched_account_metadata(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-owner", job_id="job-owner"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": manager.account_binding_store.controller_id,
+                "ElasticAgentAccount": "acct-wrong",
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await manager.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        await manager.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.READY,
+            metadata={
+                "controller_id": manager.account_binding_store.controller_id,
+                "account_id": "acct-wrong",
+                "lease_id": lease.lease_id,
+            },
+        ))
+
+        with pytest.raises(RuntimeError, match="account ownership"):
+            await manager._on_reconciler_bound_lost(
+                instance.instance_id, lease.lease_id
+            )
+
+        assert provider.get_operations("terminate") == []
+        await manager.binding_manager.release(lease.lease_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_orphan_termination_is_attempted_even_if_eip_detach_fails(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-orphan", job_id="job-orphan"
+        )
+        binding = await manager.binding_manager.get_binding(lease.account_id)
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": manager.account_binding_store.controller_id,
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentLease": "lease-crashed-before-persist",
+            },
+        ))
+        await provider.associate_eip(
+            instance.instance_id, binding.eip_allocation_id
+        )
+        provider.fail_next("disassociate_eip", RuntimeError("detach failed"))
+
+        with pytest.raises(RuntimeError, match="cleanup incomplete"):
+            await manager._detach_then_terminate_orphan(
+                instance.instance_id, binding
+            )
+
+        assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
+        assert len(provider.get_operations("terminate")) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_orphan_wrong_eip_tags_refuse_detach_but_still_terminate_instance(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-tag-guard", job_id="job-tag-guard"
+        )
+        binding = await manager.binding_manager.get_binding(lease.account_id)
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": manager.account_binding_store.controller_id,
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentLease": "lease-orphan",
+            },
+        ))
+        await provider.associate_eip(
+            instance.instance_id, binding.eip_allocation_id
+        )
+        provider.eips[binding.eip_allocation_id].tags["AccountId"] = "foreign"
+
+        with pytest.raises(RuntimeError, match="ownership tags do not match"):
+            await manager._detach_then_terminate_orphan(
+                instance.instance_id, binding
+            )
+
+        assert provider.get_operations("disassociate_eip") == []
+        assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
+        assert len(provider.get_operations("terminate")) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_release_error_running_orphan_retries_on_next_reconcile(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-release-retry", job_id="job-release-retry"
+        )
+        record = (await manager.scale_out(
+            tags=self._lease_tags(manager, lease, lease.account_id)
+        ))[0]
+        await manager.binding_manager.attach_instance(
+            lease.lease_id, record.instance_id, worker_id=record.node_id
+        )
+        provider.fail_next("terminate_instance", RuntimeError("temporary failure"))
+
+        with pytest.raises(RuntimeError, match="temporary failure"):
+            await manager.binding_manager.release(lease.lease_id)
+        failed = await manager.binding_manager.get_lease(lease.lease_id)
+        assert failed.state == LeaseState.ERROR
+        assert failed.last_operation == "release"
+
+        # Simulate the registry write being lost with the Manager crash. The
+        # strict controller/account/lease tags let the next reconcile adopt the
+        # exact instance and retry the durable release transaction.
+        await manager.registry.remove(record.node_id)
+        await manager.reconciler.reconcile()
+
+        released = await manager.binding_manager.get_lease(lease.lease_id)
+        assert released.state == LeaseState.RELEASED
+        assert provider.instances[record.instance_id].state == InstanceState.TERMINATED
+        assert len(provider.get_operations("terminate")) == 1
+        await manager.stop()
+
+
+class TestManagerShutdownSafety:
+    @pytest.mark.asyncio
+    async def test_failed_start_cancels_recovery_before_unlock(
+        self, tmp_config, provider
+    ):
+        manager = ElasticAgentManager(tmp_config, provider)
+        cancelled = asyncio.Event()
+
+        async def recovery_loop():
+            try:
+                await manager._shutdown_event.wait()
+            finally:
+                cancelled.set()
+
+        async def initialize():
+            manager._binding_recovery_task = asyncio.create_task(recovery_loop())
+            await asyncio.sleep(0)
+
+        manager._initialize_binding_recovery = initialize
+        manager.task_registry.recover = AsyncMock(
+            side_effect=RuntimeError("startup failed after recovery began")
+        )
+
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await manager.start()
+        assert cancelled.is_set()
+        assert manager._binding_lock_fd is None
+
+        replacement = ElasticAgentManager(tmp_config, provider)
+        await replacement.start()
+        await replacement.stop()
+
+    @pytest.mark.asyncio
+    async def test_controller_lock_is_held_until_batch_shutdown_finishes(
+        self, tmp_config, provider
+    ):
+        first = ElasticAgentManager(tmp_config, provider)
+        await first.start()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowBatch:
+            async def shutdown(self):
+                entered.set()
+                await release.wait()
+
+        first._batch = SlowBatch()
+        stop_task = asyncio.create_task(first.stop())
+        await entered.wait()
+
+        second = ElasticAgentManager(tmp_config, provider)
+        with pytest.raises(RuntimeError, match="another ElasticAgentManager"):
+            await second.start()
+
+        release.set()
+        await stop_task
+        await second.start()
+        await second.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stop_still_holds_lock_until_shutdown_finishes(
+        self, tmp_config, provider
+    ):
+        first = ElasticAgentManager(tmp_config, provider)
+        await first.start()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowBatch:
+            async def shutdown(self):
+                entered.set()
+                await release.wait()
+
+        first._batch = SlowBatch()
+        stop_task = asyncio.create_task(first.stop())
+        await entered.wait()
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        second = ElasticAgentManager(tmp_config, provider)
+        with pytest.raises(RuntimeError, match="another ElasticAgentManager"):
+            await second.start()
+        assert not stop_task.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+        assert first._binding_lock_fd is None
+
+        await second.start()
+        await second.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_settles_cloud_work_before_unlock(
+        self, tmp_config, provider
+    ):
+        first = ElasticAgentManager(tmp_config, provider)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_initialize():
+            entered.set()
+            await release.wait()
+
+        first._initialize_binding_recovery = slow_initialize
+        start_task = asyncio.create_task(first.start())
+        await entered.wait()
+        start_task.cancel()
+        await asyncio.sleep(0)
+
+        second = ElasticAgentManager(tmp_config, provider)
+        with pytest.raises(RuntimeError, match="another ElasticAgentManager"):
+            await second.start()
+        assert not start_task.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await start_task
+        assert first._binding_lock_fd is None
+
+        await second.start()
+        await second.stop()

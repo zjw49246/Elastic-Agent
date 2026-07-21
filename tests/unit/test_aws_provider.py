@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -47,6 +48,7 @@ def _provider_with_client(client) -> AWSProvider:
     prov._config = AWSProviderConfig(region="ap-northeast-1")
     prov._client = client
     prov._root_dev_cache = {}
+    prov._recent_instances = {}
     return prov
 
 
@@ -131,3 +133,50 @@ async def test_wait_until_running_reraises_real_errors():
 
     with pytest.raises(ClientError):
         await prov.wait_until_running("aws:i-0abc", timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_terminate_is_idempotent_when_instance_is_already_gone(_no_sleep):
+    client = MagicMock()
+    client.terminate_instances.side_effect = ClientError(
+        {"Error": {"Code": "InvalidInstanceID.NotFound", "Message": "gone"}},
+        "TerminateInstances",
+    )
+    prov = _provider_with_client(client)
+
+    await prov.terminate_instance("aws:i-gone")
+
+    assert client.terminate_instances.call_count == 1
+    client.terminate_instances.assert_called_with(InstanceIds=["i-gone"])
+
+
+@pytest.mark.asyncio
+async def test_terminate_retries_not_found_for_just_created_instance(_no_sleep):
+    client = MagicMock()
+    client.terminate_instances.side_effect = [_not_found(), _not_found(), {}]
+    prov = _provider_with_client(client)
+    prov._recent_instances["i-new"] = time.monotonic()
+
+    await prov.terminate_instance("aws:i-new")
+
+    assert client.terminate_instances.call_count == 3
+    assert "i-new" not in prov._recent_instances
+
+
+@pytest.mark.asyncio
+async def test_list_instances_deduplicates_managed_tag_filter():
+    client = MagicMock()
+    paginator = client.get_paginator.return_value
+    paginator.paginate.return_value = [_running_response("i-owned")]
+    prov = _provider_with_client(client)
+
+    instances = await prov.list_instances(filters={
+        "ManagedBy": "elastic-agent",
+        "ElasticAgentController": "controller-1",
+    })
+
+    filters = paginator.paginate.call_args.kwargs["Filters"]
+    names = [item["Name"] for item in filters]
+    assert names.count("tag:ManagedBy") == 1
+    assert names.count("tag:ElasticAgentController") == 1
+    assert instances[0].instance_id == "aws:i-owned"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -16,6 +17,10 @@ class InstanceState(str, enum.Enum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     TERMINATED = "terminated"
+
+
+class InstanceNotFoundError(ValueError):
+    """Provider definitively reports that an exact instance id does not exist."""
 
 
 class InstanceConfig(BaseModel):
@@ -31,6 +36,8 @@ class InstanceConfig(BaseModel):
     user_data: str | None = None
     root_disk_size_gb: int = 40
     root_disk_type: str = "cloud_essd"
+    # Provider idempotency key. AWS maps this to RunInstances.ClientToken.
+    client_token: str | None = None
 
 
 class Instance(BaseModel):
@@ -50,24 +57,40 @@ class Instance(BaseModel):
 
 
 class ElasticIp(BaseModel):
-    """A static public IP (AWS EIP) that survives instance stop/start.
+    """A static public IP (AWS EIP) retained across temporary instances.
 
-    Bound 1:1 to a codex account's machine so the account is always seen from
-    the same IP (and, with the persistent EBS root, the same device) — see
-    the account↔IP binding design. ``allocation_id`` is the durable handle
-    used to (re)associate on every start and to release only when the account
-    is decommissioned. ``association_id`` is set while attached to an instance.
+    The allocation is bound 1:1 to an account.  A job temporarily associates
+    it with a newly-created instance, then detaches it before that instance is
+    terminated.  ``association_id`` is present only during that job lease.
     """
 
     allocation_id: str
     public_ip: str
     association_id: str | None = None
     instance_id: str | None = None
+    tags: dict[str, str] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CloudIdentity:
+    """Cloud control-plane scope that owns persistent resources."""
+
+    provider: str = ""
+    account_id: str = ""
+    region: str = ""
 
 
 class CloudProvider(ABC):
     MANAGED_TAG_KEY = "ManagedBy"
     MANAGED_TAG_VALUE = "elastic-agent"
+
+    async def get_identity(self) -> CloudIdentity:
+        """Return provider/account/region used for durable-resource guards.
+
+        Providers without persistent EIP support may keep the empty default.
+        AWS overrides this with STS caller identity and configured region.
+        """
+        return CloudIdentity()
 
     @abstractmethod
     async def create_instance(self, config: InstanceConfig) -> Instance:
@@ -111,17 +134,39 @@ class CloudProvider(ABC):
         raise NotImplementedError("Elastic IPs are not supported by this provider")
 
     async def associate_eip(self, instance_id: str, allocation_id: str) -> ElasticIp:
-        """Attach an allocated EIP to an instance (idempotent re-association)."""
+        """Attach a detached EIP; never steal it from another instance."""
         raise NotImplementedError("Elastic IPs are not supported by this provider")
 
-    async def disassociate_eip(self, allocation_id: str) -> None:
-        """Detach an EIP from its instance (the allocation is kept)."""
+    async def disassociate_eip(
+        self,
+        allocation_id: str,
+        *,
+        association_id: str | None = None,
+        expected_instance_id: str | None = None,
+    ) -> None:
+        """Detach the expected association while retaining the allocation.
+
+        Passing the association observed by the caller prevents a stale lease
+        from looking up and detaching a newer owner's association.
+        """
         raise NotImplementedError("Elastic IPs are not supported by this provider")
 
     async def release_eip(self, allocation_id: str) -> None:
         """Permanently release an allocated EIP (only on account decommission)."""
         raise NotImplementedError("Elastic IPs are not supported by this provider")
 
+    async def tag_eip(
+        self, allocation_id: str, tags: dict[str, str]
+    ) -> None:
+        """Apply ownership tags to an EIP and preserve the managed marker."""
+        raise NotImplementedError("Elastic IPs are not supported by this provider")
+
     async def describe_eip(self, allocation_id: str) -> ElasticIp | None:
         """Look up an EIP by allocation id, or None if it no longer exists."""
+        raise NotImplementedError("Elastic IPs are not supported by this provider")
+
+    async def list_eips(
+        self, filters: dict[str, str] | None = None
+    ) -> list[ElasticIp]:
+        """List managed EIPs, optionally filtered by exact tag values."""
         raise NotImplementedError("Elastic IPs are not supported by this provider")

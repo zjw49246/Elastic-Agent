@@ -36,6 +36,7 @@ all = [
     "elastic-agent[aliyun,aws,worker,pty]",
 ]
 dev = [
+    "boto3>=1.35.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0",

@@ -7,13 +7,12 @@ Verifies that persistent state (JSON files) survives a Manager restart cycle.
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
 from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
 from elastic_agent.core.task_registry import TaskRegistry, TaskStatus
-from elastic_agent.testing import DryRunProvider, MockOSS, create_test_config
+from elastic_agent.testing import create_test_config
 
 from .conftest import connect_mock_worker
 
@@ -94,7 +93,7 @@ class TestCrashRecovery:
 
     @pytest.mark.asyncio
     async def test_full_manager_restart_cycle(self, running_server):
-        """Simulate Manager restart by creating a second Manager with same state files."""
+        """Reject split brain, then recover state after the owner has stopped."""
         from elastic_agent.manager.manager import ElasticAgentManager
 
         srv = running_server
@@ -120,6 +119,16 @@ class TestCrashRecovery:
             provider=srv["provider"],
             file_storage=srv["oss"],
         )
+
+        with pytest.raises(
+            RuntimeError,
+            match="another ElasticAgentManager owns EIP bindings",
+        ):
+            await manager2.start()
+
+        # A real replacement process can acquire ownership only after the old
+        # Manager has stopped (or its process has exited and the flock closed).
+        await srv["manager"].stop()
         await manager2.start()
         try:
             all_nodes2 = await manager2.registry.list_all()

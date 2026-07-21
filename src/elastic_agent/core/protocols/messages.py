@@ -145,6 +145,7 @@ class AccountLoginMessage(Message):
     """
 
     type: Literal["ACCOUNT_LOGIN"] = "ACCOUNT_LOGIN"
+    login_request_id: str = ""
     account_id: str
     email: str
     email_token: str
@@ -262,6 +263,7 @@ class CredentialLoginResultMessage(Message):
 
 class AccountLoginResultMessage(Message):
     type: Literal["ACCOUNT_LOGIN_RESULT"] = "ACCOUNT_LOGIN_RESULT"
+    login_request_id: str = ""
     account_id: str
     slot_index: int
     success: bool

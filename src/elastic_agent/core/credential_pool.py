@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elastic_agent.core.config import CredentialConfig
 
@@ -34,6 +34,14 @@ class AccountDefinition(BaseModel):
     group: str = "standard"
     enabled: bool = True
 
+    @field_validator("id", "email", "group")
+    @classmethod
+    def require_identity_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("account id, email, and group must be non-empty")
+        return normalized
+
 
 class GroupDefinition(BaseModel):
     """Group metadata from accounts.json."""
@@ -46,6 +54,22 @@ class AccountsConfig(BaseModel):
 
     accounts: list[AccountDefinition] = Field(default_factory=list)
     groups: dict[str, GroupDefinition] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def unique_real_identities(self) -> AccountsConfig:
+        """One real mailbox/account identity may appear only once.
+
+        ``AccountDefinition.id`` is an administrator label, so it cannot by
+        itself enforce one account ↔ one EIP.  Case-folded email uniqueness
+        prevents the same login from being assigned two ids and two exits.
+        """
+        ids = [account.id for account in self.accounts]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate account id in accounts config")
+        emails = [account.email.casefold() for account in self.accounts]
+        if len(emails) != len(set(emails)):
+            raise ValueError("duplicate account email in accounts config")
+        return self
 
 
 # ---------------------------------------------------------------------------

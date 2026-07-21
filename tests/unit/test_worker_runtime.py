@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -663,6 +664,7 @@ class TestHandleAccountLogin:
         from elastic_agent.core.protocols.messages import AccountLoginMessage
 
         base = dict(
+            login_request_id="login-request-1",
             account_id="a1", email="u@foo.com", email_token="tok",
             config_dir="/root/.claude-prod", provider="171mail", slot_index=2,
         )
@@ -676,7 +678,8 @@ class TestHandleAccountLogin:
 
         sent = []
         runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
-        runtime._warmup_config_dir = AsyncMock()
+        runtime._verify_config_identity = AsyncMock(return_value=True)
+        runtime._warmup_config_dir = AsyncMock(return_value=True)
         runtime._pty_backend = MagicMock()
         runtime._pty_backend.recycle_config_dir = AsyncMock(return_value=1)
         runtime._quota_checker = MagicMock()
@@ -693,6 +696,36 @@ class TestHandleAccountLogin:
         runtime._quota_checker.add_slot.assert_called_once_with("a1", "/root/.claude-prod")
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
         assert res.success and res.account_id == "a1" and res.slot_index == 2
+        assert res.login_request_id == "login-request-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw_config_dir", ["", "relative-slot"])
+    async def test_empty_or_relative_config_dir_is_normalized_for_all_consumers(
+        self, runtime, tmp_path, raw_config_dir,
+    ):
+        from elastic_agent.core.claude_oauth import LoginResult
+
+        expected = str(tmp_path / ".claude")
+        runtime._send_event = AsyncMock()
+        runtime._verify_config_identity = AsyncMock(return_value=True)
+        runtime._warmup_config_dir = AsyncMock(return_value=True)
+        runtime._pty_backend = MagicMock()
+        runtime._pty_backend.recycle_config_dir = AsyncMock(return_value=1)
+        runtime._quota_checker = MagicMock()
+        login = AsyncMock(return_value=LoginResult(
+            success=True, account_id="a1", access_token="at",
+        ))
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login", new=login),
+        ):
+            await runtime._handle_account_login(self._msg(config_dir=raw_config_dir))
+
+        assert login.await_args.args[0].config_dir == expected
+        runtime._warmup_config_dir.assert_awaited_once_with(expected)
+        runtime._pty_backend.recycle_config_dir.assert_awaited_once_with(expected)
+        runtime._quota_checker.add_slot.assert_called_once_with("a1", expected)
 
     @pytest.mark.asyncio
     async def test_failure_reports_error_without_recycle(self, runtime):
@@ -718,6 +751,72 @@ class TestHandleAccountLogin:
         assert not res.success and res.error == "cf blocked"
 
     @pytest.mark.asyncio
+    async def test_failed_credential_validation_reports_login_failure(
+        self, runtime
+    ):
+        from elastic_agent.core.claude_oauth import LoginResult
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
+        runtime._verify_config_identity = AsyncMock(return_value=True)
+        runtime._warmup_config_dir = AsyncMock(return_value=False)
+        runtime._pty_backend = MagicMock()
+        runtime._pty_backend.recycle_config_dir = AsyncMock()
+        runtime._quota_checker = MagicMock()
+
+        with patch(
+            "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
+            new=AsyncMock(return_value=LoginResult(
+                success=True, account_id="a1", access_token="at"
+            )),
+        ):
+            await runtime._handle_account_login(self._msg())
+
+        res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
+        assert res.success is False
+        assert "validation command failed" in res.error
+        runtime._pty_backend.recycle_config_dir.assert_not_awaited()
+        runtime._quota_checker.add_slot.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wrong_authenticated_email_never_runs_on_selected_account(
+        self, runtime
+    ):
+        from elastic_agent.core.claude_oauth import LoginResult
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda m: sent.append(m) or asyncio.sleep(0)
+        runtime._verify_config_identity = AsyncMock(return_value=False)
+        runtime._warmup_config_dir = AsyncMock(return_value=True)
+        runtime._pty_backend = MagicMock()
+        runtime._pty_backend.recycle_config_dir = AsyncMock()
+        runtime._quota_checker = MagicMock()
+
+        with patch(
+            "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
+            new=AsyncMock(return_value=LoginResult(
+                success=True, account_id="a1", access_token="at"
+            )),
+        ):
+            await runtime._handle_account_login(self._msg(email="expected@x.com"))
+
+        runtime._verify_config_identity.assert_awaited_once_with(
+            "/root/.claude-prod", "expected@x.com"
+        )
+        runtime._warmup_config_dir.assert_not_awaited()
+        runtime._pty_backend.recycle_config_dir.assert_not_awaited()
+        runtime._quota_checker.add_slot.assert_not_called()
+        result = [
+            message
+            for message in sent
+            if isinstance(message, AccountLoginResultMessage)
+        ][0]
+        assert result.success is False
+        assert "different or unknown email" in result.error
+
+    @pytest.mark.asyncio
     async def test_login_exception_reports_failure(self, runtime):
         from elastic_agent.core.protocols.messages import AccountLoginResultMessage
 
@@ -730,3 +829,64 @@ class TestHandleAccountLogin:
             await runtime._handle_account_login(self._msg())
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
         assert not res.success and "boom" in res.error
+
+    @pytest.mark.asyncio
+    async def test_warmup_requires_zero_exit_status(self, runtime):
+        proc = MagicMock(pid=1234, returncode=7)
+        proc.wait = AsyncMock(return_value=7)
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=proc),
+        ) as create:
+            assert await runtime._warmup_config_dir("/tmp/claude") is False
+        assert create.await_args.kwargs["start_new_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_auth_identity_uses_casefolded_exact_email(self, runtime):
+        proc = MagicMock(pid=1234, returncode=0)
+        proc.communicate = AsyncMock(return_value=(
+            json.dumps({
+                "loggedIn": True,
+                "email": "User@Example.COM",
+            }).encode(),
+            None,
+        ))
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=proc),
+        ):
+            assert await runtime._verify_config_identity(
+                "/tmp/claude", "user@example.com"
+            ) is True
+
+    @pytest.mark.asyncio
+    async def test_warmup_timeout_terminates_and_reaps_process_group(
+        self, runtime
+    ):
+        class SlowProcess:
+            def __init__(self):
+                self.pid = 4321
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    await asyncio.Event().wait()
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        proc = SlowProcess()
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=proc),
+            ),
+            patch("os.killpg") as killpg,
+        ):
+            assert await runtime._warmup_config_dir(
+                "/tmp/claude", timeout=0.01
+            ) is False
+
+        killpg.assert_called_once_with(proc.pid, signal.SIGTERM)
+        assert proc.wait_calls == 2

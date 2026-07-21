@@ -164,6 +164,39 @@ class TestClaudeOAuthProviderLocal:
         assert result.expires_at == 111
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw_config_dir", ["", "relative-slot"])
+    async def test_empty_or_relative_config_dir_uses_worker_home_default(
+        self, tmp_path, raw_config_dir,
+    ):
+        provider = ClaudeOAuthProvider()
+        config = OAuthConfig(
+            account_id="a1",
+            email="u@foo.com",
+            email_token="tok",
+            config_dir=raw_config_dir,
+        )
+        expected = str(tmp_path / ".claude")
+        seen_config_dirs: list[str] = []
+
+        async def fake_perform_login(*, email, token_171, config_dir, provider):
+            seen_config_dirs.append(config_dir)
+            write_credentials(config_dir, {"accessToken": "at"})
+            return True
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch(
+                "elastic_agent.worker.login.perform_login",
+                new=AsyncMock(side_effect=fake_perform_login),
+            ),
+        ):
+            result = await provider.login(config)
+
+        assert result.success
+        assert seen_config_dirs == [expected]
+        assert read_credentials(expected) == {"accessToken": "at"}
+
+    @pytest.mark.asyncio
     async def test_failure_surfaces_error(self, oauth_config):
         provider = ClaudeOAuthProvider()
         with patch("elastic_agent.worker.login.perform_login",

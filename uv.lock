@@ -742,6 +742,7 @@ aws = [
     { name = "boto3" },
 ]
 dev = [
+    { name = "boto3" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -760,6 +761,7 @@ requires-dist = [
     { name = "alibabacloud-ecs20140526", marker = "extra == 'aliyun'", specifier = ">=4.1.0" },
     { name = "alibabacloud-tea-openapi", marker = "extra == 'aliyun'", specifier = ">=0.3.14" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
+    { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.35.0" },
     { name = "claude-pty", marker = "extra == 'pty'", git = "https://github.com/zjw49246/Claude-Code-PTY" },
     { name = "elastic-agent", extras = ["aliyun", "aws", "worker", "pty"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.115.0" },

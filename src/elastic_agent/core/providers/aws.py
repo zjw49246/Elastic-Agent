@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 
 from elastic_agent.core.config import AWSProviderConfig
 from elastic_agent.core.providers.base import (
+    CloudIdentity,
     CloudProvider,
     ElasticIp,
     Instance,
     InstanceConfig,
+    InstanceNotFoundError,
     InstanceState,
 )
 
@@ -21,14 +23,29 @@ logger = logging.getLogger(__name__)
 # EC2 IDs are eventually consistent: a describe right after RunInstances may not
 # see the new instance yet. These signal "not visible yet, keep polling".
 _NOT_FOUND_CODES = {"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"}
+_EIP_NOT_FOUND_CODES = {
+    "InvalidAllocationID.NotFound",
+    "InvalidAddress.NotFound",
+}
+RECENT_INSTANCE_VISIBILITY_SECONDS = 300
+RECENT_INSTANCE_RETRY_SECONDS = 5
+EIP_ASSOCIATION_CONFIRM_ATTEMPTS = 30
+EIP_ASSOCIATION_CONFIRM_SECONDS = 2.0
 
 
 def _is_not_found_yet(exc: Exception) -> bool:
-    if isinstance(exc, LookupError):  # _describe_one: empty reservation
+    if isinstance(exc, (LookupError, InstanceNotFoundError)):
         return True
     resp = getattr(exc, "response", None)  # botocore ClientError
     if isinstance(resp, dict):
         return resp.get("Error", {}).get("Code") in _NOT_FOUND_CODES
+    return False
+
+
+def _is_eip_not_found(exc: Exception) -> bool:
+    resp = getattr(exc, "response", None)  # botocore ClientError
+    if isinstance(resp, dict):
+        return resp.get("Error", {}).get("Code") in _EIP_NOT_FOUND_CODES
     return False
 
 
@@ -78,6 +95,8 @@ class AWSProvider(CloudProvider):
         self._config = config
         self._client = self._create_client()
         self._root_dev_cache: dict[str, str] = {}
+        self._recent_instances: dict[str, float] = {}
+        self._identity: CloudIdentity | None = None
 
     def _create_client(self):
         import boto3
@@ -87,11 +106,28 @@ class AWSProvider(CloudProvider):
     def _native_id(self, instance_id: str) -> str:
         return instance_id.removeprefix("aws:")
 
+    async def get_identity(self) -> CloudIdentity:
+        if getattr(self, "_identity", None) is None:
+            import boto3
+
+            def _call() -> dict:
+                return boto3.client(
+                    "sts", region_name=self._config.region
+                ).get_caller_identity()
+
+            response = await asyncio.to_thread(_call)
+            self._identity = CloudIdentity(
+                provider="aws",
+                account_id=str(response.get("Account") or ""),
+                region=self._config.region,
+            )
+        return self._identity
+
     def _describe_one(self, native_id: str) -> dict:
         resp = self._client.describe_instances(InstanceIds=[native_id])
         reservations = resp.get("Reservations", [])
         if not reservations or not reservations[0].get("Instances"):
-            raise LookupError(f"Instance not found: {native_id}")
+            raise InstanceNotFoundError(f"Instance not found: {native_id}")
         return reservations[0]["Instances"][0]
 
     def _root_device_name(self, image_id: str) -> str:
@@ -148,6 +184,9 @@ class AWSProvider(CloudProvider):
         if config.spot:
             kwargs["InstanceMarketOptions"] = {"MarketType": "spot"}
 
+        if config.client_token:
+            kwargs["ClientToken"] = config.client_token
+
         if config.user_data:
             kwargs["UserData"] = config.user_data
 
@@ -171,6 +210,7 @@ class AWSProvider(CloudProvider):
         resp = await asyncio.to_thread(_call)
         ec2_inst = resp["Instances"][0]
         native_id = ec2_inst["InstanceId"]
+        self._recent_instances[native_id] = time.monotonic()
         logger.info("Created AWS instance %s", native_id)
 
         return _to_instance(ec2_inst, self._config.region)
@@ -187,7 +227,34 @@ class AWSProvider(CloudProvider):
 
     async def terminate_instance(self, instance_id: str) -> None:
         native_id = self._native_id(instance_id)
-        await asyncio.to_thread(self._client.terminate_instances, InstanceIds=[native_id])
+        created_at = getattr(self, "_recent_instances", {}).get(native_id)
+        visibility_deadline = (
+            created_at + RECENT_INSTANCE_VISIBILITY_SECONDS
+            if created_at is not None
+            else None
+        )
+        while True:
+            try:
+                await asyncio.to_thread(
+                    self._client.terminate_instances, InstanceIds=[native_id]
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if not _is_not_found_yet(exc):
+                    raise
+                if (
+                    visibility_deadline is not None
+                    and time.monotonic() < visibility_deadline
+                ):
+                    # This provider created the ID during the current process,
+                    # so NotFound means "not visible yet", not "already gone".
+                    # Keep retrying across AWS's documented eventual-consistency
+                    # window so immediate crash compensation cannot leak it.
+                    await asyncio.sleep(RECENT_INSTANCE_RETRY_SECONDS)
+                    continue
+                logger.info("AWS instance %s is already gone", native_id)
+                return
+        getattr(self, "_recent_instances", {}).pop(native_id, None)
         logger.info("Terminated AWS instance %s", native_id)
 
     async def reboot_instance(self, instance_id: str) -> None:
@@ -218,33 +285,71 @@ class AWSProvider(CloudProvider):
         native_id = self._native_id(instance_id)
 
         def _call():
-            # AllowReassociation makes this idempotent: re-associating the same
-            # EIP to the same (or a replacement) instance on each start is a
-            # no-op rather than an error.
+            # Never let a stale/concurrent lease steal an EIP from a live job.
+            # BindingManager checks the current attachment first; AWS is the
+            # final race-safe guard between that check and this API call.
             return self._client.associate_address(
                 AllocationId=allocation_id,
                 InstanceId=native_id,
-                AllowReassociation=True,
+                AllowReassociation=False,
             )
 
         resp = await asyncio.to_thread(_call)
-        eip = await self.describe_eip(allocation_id)
-        public_ip = eip.public_ip if eip else ""
-        logger.info("Associated EIP %s -> %s", allocation_id, native_id)
-        return ElasticIp(
-            allocation_id=allocation_id,
-            public_ip=public_ip,
-            association_id=resp.get("AssociationId"),
-            instance_id=instance_id,
+        association_id = resp.get("AssociationId")
+        observed: ElasticIp | None = None
+        for attempt in range(EIP_ASSOCIATION_CONFIRM_ATTEMPTS):
+            observed = await self.describe_eip(allocation_id)
+            if (
+                observed is not None
+                and observed.instance_id == instance_id
+                and (
+                    not association_id
+                    or observed.association_id == association_id
+                )
+            ):
+                logger.info("Associated EIP %s -> %s", allocation_id, native_id)
+                return observed
+            if attempt + 1 < EIP_ASSOCIATION_CONFIRM_ATTEMPTS:
+                await asyncio.sleep(EIP_ASSOCIATION_CONFIRM_SECONDS)
+        if observed is None:
+            detail = "not visible"
+        else:
+            detail = (
+                f"observed instance={observed.instance_id!r}, "
+                f"association={observed.association_id!r}"
+            )
+        raise RuntimeError(
+            f"EIP {allocation_id} association did not converge to "
+            f"{instance_id!r}: {detail}"
         )
 
-    async def disassociate_eip(self, allocation_id: str) -> None:
+    async def disassociate_eip(
+        self,
+        allocation_id: str,
+        *,
+        association_id: str | None = None,
+        expected_instance_id: str | None = None,
+    ) -> None:
         eip = await self.describe_eip(allocation_id)
         if eip is None or not eip.association_id:
             return  # already detached / gone — nothing to do
+        if expected_instance_id and eip.instance_id != expected_instance_id:
+            raise RuntimeError(
+                f"EIP {allocation_id} is attached to {eip.instance_id}, "
+                f"not expected instance {expected_instance_id}"
+            )
+        if association_id and eip.association_id != association_id:
+            raise RuntimeError(
+                f"EIP {allocation_id} association changed from "
+                f"{association_id} to {eip.association_id}"
+            )
+        # Use the caller-observed association id.  Even if the EIP is moved in
+        # the tiny gap after the check, AWS will receive the old association id
+        # and cannot disconnect the new owner.
+        target_association = association_id or eip.association_id
 
         def _call():
-            return self._client.disassociate_address(AssociationId=eip.association_id)
+            return self._client.disassociate_address(AssociationId=target_association)
 
         await asyncio.to_thread(_call)
         logger.info("Disassociated EIP %s", allocation_id)
@@ -253,8 +358,28 @@ class AWSProvider(CloudProvider):
         def _call():
             return self._client.release_address(AllocationId=allocation_id)
 
-        await asyncio.to_thread(_call)
+        try:
+            await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            if _is_eip_not_found(exc):
+                logger.info("AWS EIP %s is already gone", allocation_id)
+                return
+            raise
         logger.info("Released EIP %s", allocation_id)
+
+    async def tag_eip(
+        self, allocation_id: str, tags: dict[str, str]
+    ) -> None:
+        all_tags = {
+            **tags,
+            self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE,
+        }
+        await asyncio.to_thread(
+            self._client.create_tags,
+            Resources=[allocation_id],
+            Tags=[{"Key": key, "Value": value} for key, value in all_tags.items()],
+        )
+        logger.info("Tagged EIP %s for Elastic Agent ownership", allocation_id)
 
     async def describe_eip(self, allocation_id: str) -> ElasticIp | None:
         def _call():
@@ -263,10 +388,7 @@ class AWSProvider(CloudProvider):
         try:
             resp = await asyncio.to_thread(_call)
         except Exception as exc:  # noqa: BLE001
-            resp_err = getattr(exc, "response", None)
-            if isinstance(resp_err, dict) and resp_err.get("Error", {}).get(
-                "Code"
-            ) in {"InvalidAllocationID.NotFound", "InvalidAddress.NotFound"}:
+            if _is_eip_not_found(exc):
                 return None
             raise
         addrs = resp.get("Addresses", [])
@@ -279,15 +401,48 @@ class AWSProvider(CloudProvider):
             public_ip=a["PublicIp"],
             association_id=a.get("AssociationId"),
             instance_id=f"aws:{native_iid}" if native_iid else None,
+            tags={tag["Key"]: tag["Value"] for tag in a.get("Tags", [])},
         )
 
-    async def list_instances(self, filters: dict[str, str] | None = None) -> list[Instance]:
-        ec2_filters = [
-            {"Name": f"tag:{self.MANAGED_TAG_KEY}", "Values": [self.MANAGED_TAG_VALUE]},
+    async def list_eips(
+        self, filters: dict[str, str] | None = None
+    ) -> list[ElasticIp]:
+        wanted = {
+            self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE,
+            **(filters or {}),
+        }
+        aws_filters = [
+            {"Name": f"tag:{key}", "Values": [value]}
+            for key, value in wanted.items()
         ]
-        if filters:
-            for k, v in filters.items():
-                ec2_filters.append({"Name": f"tag:{k}", "Values": [v]})
+        resp = await asyncio.to_thread(
+            self._client.describe_addresses, Filters=aws_filters
+        )
+        result: list[ElasticIp] = []
+        for address in resp.get("Addresses", []):
+            native_iid = address.get("InstanceId")
+            result.append(ElasticIp(
+                allocation_id=address["AllocationId"],
+                public_ip=address["PublicIp"],
+                association_id=address.get("AssociationId"),
+                instance_id=f"aws:{native_iid}" if native_iid else None,
+                tags={tag["Key"]: tag["Value"] for tag in address.get("Tags", [])},
+            ))
+        return result
+
+    async def list_instances(self, filters: dict[str, str] | None = None) -> list[Instance]:
+        # Callers commonly include ManagedBy defensively.  Merge by key before
+        # building the EC2 filter list: duplicate filter names are unnecessary
+        # and can be rejected by the real DescribeInstances API even though
+        # permissive unit mocks accept them.
+        wanted = {
+            **(filters or {}),
+            self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE,
+        }
+        ec2_filters = [
+            {"Name": f"tag:{key}", "Values": [value]}
+            for key, value in wanted.items()
+        ]
 
         all_instances: list[Instance] = []
         paginator = self._client.get_paginator("describe_instances")
@@ -307,7 +462,14 @@ class AWSProvider(CloudProvider):
 
     async def get_instance(self, instance_id: str) -> Instance:
         native_id = self._native_id(instance_id)
-        raw = await asyncio.to_thread(self._describe_one, native_id)
+        try:
+            raw = await asyncio.to_thread(self._describe_one, native_id)
+        except Exception as exc:
+            if _is_not_found_yet(exc):
+                raise InstanceNotFoundError(
+                    f"Instance not found: {native_id}"
+                ) from exc
+            raise
         return _to_instance(raw, self._config.region)
 
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:

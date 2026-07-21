@@ -19,7 +19,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from elastic_agent.api.auth import require_api_key
+from elastic_agent.core.batch_orchestrator import JobSpecPersistenceError
 from elastic_agent.core.job_spec import JobSpec
+from elastic_agent.core.job_spec_store import job_specs_dir
 
 router = APIRouter(tags=["jobs"], dependencies=[Depends(require_api_key)])
 
@@ -32,20 +34,7 @@ def _mgr():
 def _specs_dir(mgr) -> Path:
     """Where submitted JobSpecs are persisted so they survive a Manager restart
     (the orchestrator's job records are in-memory and lost on restart)."""
-    d = Path(mgr.config.registry.path).with_name("specs")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _persist_spec(mgr, job_id: str, spec) -> None:
-    import time
-    try:
-        (_specs_dir(mgr) / f"{job_id}.json").write_text(
-            json.dumps({"job_id": job_id, "name": spec.name, "submitted_at": time.time(),
-                        "spec": spec.model_dump()}, ensure_ascii=False, indent=2),
-            encoding="utf-8")
-    except Exception:
-        pass
+    return job_specs_dir(mgr.config.registry.path)
 
 
 def _job_detail(job) -> dict:
@@ -73,8 +62,25 @@ def _job_detail(job) -> dict:
                 "rotations": r.rotations,
                 "task_id": r.task_id,
                 "error": r.error,
+                "lease_id": r.lease_id,
+                "eip": r.eip,
+                "eip_allocation_id": r.eip_allocation_id,
+                "final_collected": r.final_collected,
+                "collection_error": r.collection_error,
+                "cleaned_up": r.cleaned_up,
+                "cleanup_error": r.cleanup_error,
+                "cleanup_attempts": r.cleanup_attempts,
             }
             for r in job.runs.values()
+        ],
+        "pending_cleanup_detail": [
+            {
+                "lease_id": assignment.lease_id,
+                "account_id": assignment.account_id,
+                "slot": assignment.slot,
+                "error": job.cleanup_errors.get(assignment.lease_id),
+            }
+            for assignment in job.pending_cleanup.values()
         ],
     }
 
@@ -91,14 +97,15 @@ def _job_list_item(job) -> dict:
 @router.post("/jobs", status_code=201)
 async def submit_job(spec: JobSpec) -> dict:
     """Validate + launch a batch job. Returns the job summary."""
+    mgr = _mgr()
     try:
-        # submit() returns as soon as the job is registered; scale-out + bring-up
-        # run in the background so the HTTP call (and the UI button) don't hang.
-        job = await _mgr().batch.submit(spec)
+        # Manager-wired submit journals the spec before registration; scale-out
+        # and bring-up remain background work after this call returns.
+        job = await mgr.batch.submit(spec)
+    except JobSpecPersistenceError as exc:
+        raise HTTPException(500, str(exc)) from exc
     except NotImplementedError as exc:
-        # provision/login hooks not wired for live runs — surface clearly.
-        raise HTTPException(503, str(exc))
-    _persist_spec(_mgr(), job.job_id, spec)  # survive Manager restart
+        raise HTTPException(503, str(exc)) from exc
     return _job_detail(job)
 
 
@@ -111,8 +118,12 @@ async def resubmit_job(job_id: str) -> dict:
     if not p.exists():
         raise HTTPException(404, f"no persisted spec for job {job_id}")
     spec = JobSpec(**json.loads(p.read_text(encoding="utf-8"))["spec"])
-    job = await mgr.batch.submit(spec)  # background bring-up; return job_id fast
-    _persist_spec(mgr, job.job_id, spec)
+    try:
+        job = await mgr.batch.submit(spec)
+    except JobSpecPersistenceError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(503, str(exc)) from exc
     return _job_detail(job)
 
 
@@ -128,6 +139,10 @@ async def list_jobs() -> dict:
     out = [_job_list_item(j) for j in live]
     # Persisted specs whose jobs are no longer in memory (restarted) — surface
     # them so they can be reviewed / resubmitted.
+    leases = await mgr.account_binding_store.list_leases()
+    leases_by_job: dict[str, list] = {}
+    for lease in leases:
+        leases_by_job.setdefault(lease.job_id, []).append(lease)
     for f in sorted(_specs_dir(mgr).glob("*.json")):
         if f.stem in live_ids:
             continue
@@ -135,8 +150,25 @@ async def list_jobs() -> dict:
             data = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
-        out.append({"job_id": f.stem, "name": data.get("name", ""), "workers": 0,
-                    "phases": {}, "done": True, "in_memory": False, "workers_detail": []})
+        recovered = leases_by_job.get(f.stem, [])
+        collection_errors = [
+            lease.recovery_collection_error
+            for lease in recovered
+            if lease.recovery_collection_error
+        ]
+        cleanup_pending = sum(lease.state != "released" for lease in recovered)
+        out.append({
+            "job_id": f.stem,
+            "name": data.get("name", ""),
+            "workers": len(recovered),
+            "phases": {"failed": len(collection_errors)} if collection_errors else {},
+            "done": cleanup_pending == 0,
+            "cleanup_pending": cleanup_pending,
+            "error": "; ".join(collection_errors) or None,
+            "in_memory": False,
+            "workers_detail": [],
+            "recovery_leases": [lease.model_dump() for lease in recovered],
+        })
     return {"jobs": out, "total": len(out)}
 
 
@@ -150,9 +182,29 @@ async def get_job(job_id: str) -> dict:
     p = _specs_dir(mgr) / f"{job_id}.json"
     if p.exists():
         data = json.loads(p.read_text(encoding="utf-8"))
-        return {"job_id": job_id, "name": data.get("name"), "in_memory": False,
-                "spec": data.get("spec"), "workers_detail": [],
-                "note": "not in Manager memory (restarted); POST /jobs/{id}/resubmit to rerun"}
+        leases = await mgr.account_binding_store.list_leases()
+        recovered = [lease for lease in leases if lease.job_id == job_id]
+        collection_errors = [
+            lease.recovery_collection_error
+            for lease in recovered
+            if lease.recovery_collection_error
+        ]
+        return {
+            "job_id": job_id,
+            "name": data.get("name"),
+            "in_memory": False,
+            "spec": data.get("spec"),
+            "workers_detail": [],
+            "cleanup_pending": sum(
+                lease.state != "released" for lease in recovered
+            ),
+            "error": "; ".join(collection_errors) or None,
+            "recovery_leases": [lease.model_dump() for lease in recovered],
+            "note": (
+                "not in Manager memory (restarted); recovery collection/cleanup "
+                "outcomes are shown above; POST /jobs/{id}/resubmit to rerun"
+            ),
+        }
     raise HTTPException(404, f"Job {job_id} not found")
 
 

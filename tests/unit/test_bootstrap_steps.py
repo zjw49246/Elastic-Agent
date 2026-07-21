@@ -138,6 +138,14 @@ class TestRuntimeDeployFromSrc:
         assert "--manager-url=ws://1.2.3.4:8080/ws/runtime" in c and "--token=tok" in c
         assert "Xvfb :99" in c                      # display for the login flow
         assert "systemctl restart ea-runtime" in c
+        assert c.startswith("set -e\n")
+        assert (
+            "(systemctl disable --now elastic-agent-runtime.service "
+            ">/dev/null 2>&1 || true)\n"
+        ) in c
+        # The best-effort old-service stop must not turn an earlier install or
+        # unit-write failure into a successful bootstrap exit status.
+        assert "&& systemctl disable --now" not in c
 
     def test_token_with_leading_dash_uses_equals_form(self) -> None:
         # Regression: secrets.token_urlsafe can start with '-'. In the space form

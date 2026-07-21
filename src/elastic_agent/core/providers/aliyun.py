@@ -12,6 +12,7 @@ from elastic_agent.core.providers.base import (
     CloudProvider,
     Instance,
     InstanceConfig,
+    InstanceNotFoundError,
     InstanceState,
 )
 
@@ -109,7 +110,7 @@ class AliyunProvider(CloudProvider):
         resp = self._client.describe_instances(req)
         instances = resp.body.instances.instance or []
         if not instances:
-            raise LookupError(f"Instance not found: {native_id}")
+            raise InstanceNotFoundError(f"Instance not found: {native_id}")
         return instances[0].to_map()
 
     async def create_instance(self, config: InstanceConfig) -> Instance:

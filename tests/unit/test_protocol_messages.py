@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import pytest
 
 from elastic_agent.core.protocols.messages import (
+    AccountLoginMessage,
+    AccountLoginResultMessage,
     AuthMessage,
     AuthResultMessage,
     CredentialExhaustedMessage,
@@ -369,6 +371,26 @@ class TestWorkerToManagerMessages:
 
 
 class TestParseMessageFromDict:
+    def test_account_login_request_id_defaults_for_legacy_payloads(self):
+        command = parse_message({
+            "type": "ACCOUNT_LOGIN",
+            "account_id": "acct-legacy",
+            "email": "legacy@example.com",
+            "email_token": "mail-token",
+            "config_dir": "/root/.claude-legacy",
+        })
+        result = parse_message({
+            "type": "ACCOUNT_LOGIN_RESULT",
+            "account_id": "acct-legacy",
+            "slot_index": 0,
+            "success": True,
+        })
+
+        assert isinstance(command, AccountLoginMessage)
+        assert command.login_request_id == ""
+        assert isinstance(result, AccountLoginResultMessage)
+        assert result.login_request_id == ""
+
     def test_all_types_from_dict(self):
         cases = [
             ({"type": "EXECUTE", "task_id": "t", "command": ["ls"], "cwd": "/"}, ExecuteMessage),

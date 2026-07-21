@@ -74,6 +74,23 @@ class TestBootstrapSteps:
             spec2, manager_url="u", auth_token="t", worker_id="w")]
         assert "docker-install" not in names2
 
+    def test_eip_binding_disables_ipv6_before_any_install_or_login(self):
+        spec = _spec(account={"binding": "eip", "ids": ["acct-1"]})
+        steps = compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+        )
+        names = [step.name for step in steps]
+        assert names[0] == "ipv4-only-egress"
+        assert names.index("ipv4-only-egress") < names.index("system-init")
+        command = steps[0].command
+        assert "net.ipv6.conf.all.disable_ipv6 = 1" in command
+        assert "/etc/sysctl.d/99-elastic-agent-eip-ipv4.conf" in command
+
+        unbound = compile_bootstrap_steps(
+            _spec(), manager_url="u", auth_token="t", worker_id="w",
+        )
+        assert "ipv4-only-egress" not in [step.name for step in unbound]
+
     def test_manager_rsync_skips_worker_clone(self):
         # Code is delivered by the Manager (rsync), so no worker git-clone step.
         spec = _spec(setup={"repo": "https://github.com/x/y.git", "commands": ["uv sync"],

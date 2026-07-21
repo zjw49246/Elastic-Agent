@@ -95,7 +95,7 @@ class TestRemoveNode:
         finally:
             await manager.stop()
 
-    async def test_remove_survives_terminate_failure(self, manager):
+    async def test_remove_propagates_terminate_failure_and_retains_registry(self, manager):
         manager.provider.terminate_instance = AsyncMock(side_effect=Exception("cloud error"))
         await manager.start()
         try:
@@ -107,8 +107,36 @@ class TestRemoveNode:
             )
             await manager.registry.add(node)
 
-            result = await manager.remove_node("aliyun:i-test4")
+            with pytest.raises(Exception, match="cloud error"):
+                await manager.remove_node("aliyun:i-test4")
+            assert await manager.registry.get("aliyun:i-test4") == node
+        finally:
+            await manager.stop()
+
+    async def test_remove_bound_node_uses_lease_cleanup_not_raw_terminate(
+        self, manager
+    ):
+        await manager.start()
+        try:
+            node = NodeRecord(
+                node_id="aws:i-bound",
+                instance_id="i-bound",
+                platform="aws",
+                status=NodeStatus.READY,
+                metadata={"lease_id": "lease-bound"},
+            )
+            await manager.registry.add(node)
+            manager._cleanup_bound_lease = AsyncMock()
+
+            result = await manager.remove_node(node.node_id)
+
             assert result is True
-            assert await manager.registry.get("aliyun:i-test4") is None
+            manager._cleanup_bound_lease.assert_awaited_once_with(
+                node.node_id,
+                "lease-bound",
+                reason="worker terminated by administrator",
+            )
+            manager.provider.terminate_instance.assert_not_awaited()
+            assert await manager.registry.get(node.node_id) is None
         finally:
             await manager.stop()

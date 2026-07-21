@@ -11,6 +11,33 @@ from elastic_agent.harness.base import BootstrapStep
 CLAUDE_CODE_VERSION = "2.1.181"
 
 
+def ipv4_only_egress_step(timeout: int = 60) -> BootstrapStep:
+    """Disable IPv6 before an EIP-bound account is logged in.
+
+    AWS Elastic IPs provide a stable IPv4 identity only.  A dual-stack subnet
+    could otherwise let Chrome/Claude prefer a fresh per-instance IPv6 address
+    and silently bypass the account's binding.  Persist both the current and
+    future-interface settings, then fail provisioning if the kernel did not
+    apply them.
+    """
+    return BootstrapStep(
+        name="ipv4-only-egress",
+        command=(
+            "install -d -m 0755 /etc/sysctl.d && "
+            "printf '%s\\n' "
+            "'net.ipv6.conf.all.disable_ipv6 = 1' "
+            "'net.ipv6.conf.default.disable_ipv6 = 1' "
+            "'net.ipv6.conf.lo.disable_ipv6 = 1' "
+            "> /etc/sysctl.d/99-elastic-agent-eip-ipv4.conf && "
+            "sysctl --system >/dev/null && "
+            "test \"$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)\" = 1"
+        ),
+        timeout=timeout,
+        retry_count=1,
+        description="Force EIP-bound jobs to use the account's stable IPv4 exit",
+    )
+
+
 def system_init_step(
     packages: list[str] | None = None,
     timeout: int = 300,
@@ -145,21 +172,33 @@ def runtime_deploy_from_src_step(
         "WantedBy=multi-user.target\n"
     )
     cmd = (
-        f"pip3 install -q --break-system-packages {deps} && "
+        # Keep every setup command as a simple command under ``set -e``.  An
+        # ``... && old-service-stop || true`` tail would otherwise make Bash
+        # treat an earlier pip/file-write failure as success and restart a
+        # stale runtime.
+        "set -e\n"
+        f"pip3 install -q --break-system-packages {deps}\n"
         # This step runs sudo-wrapped (root), so a bare mkdir makes ea-logs
         # root-owned — but the runtime runs as ``run_as``. It would then fail to
         # open per-task log files, crashing _monitor_process before it reports
         # the process exit → the Manager's run phase sticks at RUNNING and
         # collect/S3 never fire. chown it to the runtime user.
-        f"mkdir -p {home}/ea-logs && chown {run_as} {home}/ea-logs && "
+        f"mkdir -p {home}/ea-logs\n"
+        f"chown {run_as} {home}/ea-logs\n"
         "cat > /usr/local/bin/ea-runtime.sh << 'WRAP'\n"
         f"{wrapper}"
         "WRAP\n"
-        "chmod +x /usr/local/bin/ea-runtime.sh && "
+        "chmod +x /usr/local/bin/ea-runtime.sh\n"
         "cat > /etc/systemd/system/ea-runtime.service << 'UNIT'\n"
         f"{unit}"
         "UNIT\n"
-        "systemctl daemon-reload && systemctl enable ea-runtime && "
+        # A baked AMI may still have the old PyPI runtime unit enabled.  Stop it
+        # before starting the source-pinned runtime so connection readiness can
+        # only be satisfied by the worker that implements current login checks.
+        "(systemctl disable --now elastic-agent-runtime.service "
+        ">/dev/null 2>&1 || true)\n"
+        "systemctl daemon-reload\n"
+        "systemctl enable ea-runtime\n"
         "systemctl restart ea-runtime"
     )
     return BootstrapStep(

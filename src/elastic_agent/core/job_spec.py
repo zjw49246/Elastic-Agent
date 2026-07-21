@@ -28,10 +28,11 @@ from __future__ import annotations
 
 import re
 import shlex
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Template rendering — Manager renders {{var}} before dispatch; shell-native
@@ -125,7 +126,7 @@ class RunSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str = "."
     # None / 0 == no wall-clock limit (these jobs run for hours by design).
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=0, le=2_592_000)
     # Mode-B commands are user-authored shell one-liners ($(hostname -s), &&,
     # env expansion). When True the rendered command is wrapped as
     # ``bash -lc "<cmd>"``; when False it is shlex-split into a bare argv.
@@ -136,16 +137,50 @@ class AccountSpec(BaseModel):
     """How the Claude account is supplied on each worker."""
 
     # worker_local_login: worker runs the login flow locally (P3 ACCOUNT_LOGIN),
-    #   credentials never transit the Manager.
+    #   after the Manager sends the selected email + write-only mailbox token;
+    #   generated Claude OAuth credentials stay on the worker and are not sent
+    #   back. Remote worker transport is required to use WSS.
     # manager_distribute: Manager sends already-obtained tokens (CREDENTIAL_LOGIN).
     # none: caller has already provisioned credentials; Elastic does nothing.
     mode: Literal["worker_local_login", "manager_distribute", "none"] = "worker_local_login"
-    per_worker: int = 1
+    per_worker: int = Field(default=1, ge=1, le=32)
     group: str = "standard"
+    # eip: each account keeps a durable EIP identity while the EC2 instance is
+    # ephemeral. ``ids`` optionally pins one explicit account to each fan-out
+    # worker; an empty list lets the allocator choose from ``group``.
+    binding: Literal["none", "eip"] = "none"
+    ids: list[str] = Field(default_factory=list)
     # Where credentials are written on the worker. Empty == Claude's default
     # (~/.claude); the run command inherits it without CLAUDE_CONFIG_DIR. An
     # absolute path is required when per_worker > 1 (distinct dirs per account).
     config_dir: str = ""
+
+    @field_validator("config_dir")
+    @classmethod
+    def require_absolute_config_dir(cls, config_dir: str) -> str:
+        """Keep login and the later Job process on one credential path.
+
+        Empty means Claude's default home directory on the worker.  Every
+        explicit value is also injected into the run environment, so relative
+        paths would resolve against two different working directories.
+        """
+        value = config_dir.strip()
+        if value and not PurePosixPath(value).is_absolute():
+            raise ValueError("account.config_dir must be empty or an absolute path")
+        return value
+
+    @field_validator("ids")
+    @classmethod
+    def normalize_ids(cls, ids: list[str]) -> list[str]:
+        """Trim and stably de-duplicate explicit account IDs."""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for raw_id in ids:
+            account_id = raw_id.strip()
+            if account_id and account_id not in seen:
+                seen.add(account_id)
+                unique.append(account_id)
+        return unique
 
 
 class RotationSpec(BaseModel):
@@ -161,13 +196,16 @@ class RotationSpec(BaseModel):
     # Extra args appended verbatim (after rendering) when restarting, e.g.
     #   --resume "results/opus48_$(hostname -s)_seed128"
     resume_args: str = ""
-    max_rotations: int = 20
+    max_rotations: int = Field(default=20, ge=0, le=100)
 
 
 class FanoutSpec(BaseModel):
     """How the same job spreads across the fleet."""
 
-    workers: int = 1
+    # A single malformed/API request must not fan out an unbounded bill. The
+    # account/EIP model can be extended with a deployment-specific quota later;
+    # this hard ceiling is the last-resort control-plane guardrail.
+    workers: int = Field(default=1, ge=1, le=100)
     # hostname: each worker shards itself via $(hostname -s) in the command
     #   (zero coordination — the simplest fan-out).
     # shard_index: Manager assigns {{shard_index}}/{{num_shards}} for explicit
@@ -185,7 +223,7 @@ class FanoutSpec(BaseModel):
     # Root disk size (GiB) and spot pricing, per-job. disk_gb=0 → provider
     # default (InstanceConfig.root_disk_size_gb). Bump disk_gb for jobs whose
     # run builds heavy sandboxes/venvs (e.g. ai4sci-bench) — the default is tight.
-    disk_gb: int = 0
+    disk_gb: int = Field(default=0, ge=0, le=2048)
     spot: bool = False
 
 
@@ -197,7 +235,27 @@ class CollectSpec(BaseModel):
     # on completion — so long runs stream partial results to the Manager → S3 as
     # tasks finish, and a run that quota-outs/fails partway still yields whatever
     # completed. 0 = collect only at the end.
-    interval_seconds: int = 0
+    interval_seconds: int = Field(default=0, ge=0, le=86_400)
+
+    @field_validator("paths")
+    @classmethod
+    def safe_relative_paths(cls, paths: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in paths:
+            value = raw.strip().rstrip("/")
+            path = PurePosixPath(value)
+            if (
+                not value
+                or value == "."
+                or path.is_absolute()
+                or ".." in path.parts
+            ):
+                raise ValueError(
+                    "collect.paths entries must be non-empty relative paths "
+                    "without '..'"
+                )
+            normalized.append(value)
+        return normalized
 
 
 class CompletionSpec(BaseModel):
@@ -221,6 +279,41 @@ class JobSpec(BaseModel):
     # When set, GenericJobHarness is bypassed and the referenced Harness drives
     # bootstrap/login/execute — the declarative fields become defaults/metadata.
     harness_ref: str | None = None
+
+    @model_validator(mode="after")
+    def validate_eip_account_binding(self) -> JobSpec:
+        """Enforce the one-account/one-EIP/one-ephemeral-worker MVP."""
+        if self.account.binding != "eip":
+            return self
+        if self.account.per_worker != 1:
+            raise ValueError("account.per_worker must be 1 when account.binding is 'eip'")
+        if self.account.mode != "worker_local_login":
+            raise ValueError(
+                "account.binding 'eip' currently requires "
+                "account.mode='worker_local_login' so the selected identity "
+                "is the identity logged in on the EIP worker"
+            )
+        if self.account.ids and len(self.account.ids) != self.fanout.workers:
+            raise ValueError(
+                "account.ids must contain exactly "
+                f"{self.fanout.workers} unique account(s), one per fanout worker"
+            )
+        if self.rotation.strategy == "on_exhaust_restart_resume":
+            raise ValueError(
+                "account.binding 'eip' does not support "
+                "on_exhaust_restart_resume; changing accounts requires a new worker"
+            )
+        unsafe_identity_env = {
+            name for name in ("CLAUDE_CONFIG_DIR", "HOME")
+            if name in self.run.env
+        }
+        if unsafe_identity_env:
+            raise ValueError(
+                "account.binding 'eip' does not allow run.env to override "
+                + ", ".join(sorted(unsafe_identity_env))
+                + "; the run must use the same credential home verified at login"
+            )
+        return self
 
     # -- rendering helpers --------------------------------------------------
 
@@ -279,5 +372,12 @@ class JobSpec(BaseModel):
         env = {k: render_template(v, ctx.as_dict()) for k, v in self.run.env.items()}
         cfg = ctx.config_dir or self.account.config_dir
         if cfg:
-            env.setdefault("CLAUDE_CONFIG_DIR", cfg)
+            if self.account.binding == "eip":
+                # The selected account was authenticated and exact-email
+                # verified in this directory.  Letting user env redirect the
+                # run to another credential tree would break account→EIP
+                # affinity after the safety check had already passed.
+                env["CLAUDE_CONFIG_DIR"] = cfg
+            else:
+                env.setdefault("CLAUDE_CONFIG_DIR", cfg)
         return env

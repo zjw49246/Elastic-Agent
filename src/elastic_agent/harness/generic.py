@@ -26,6 +26,7 @@ from elastic_agent.core.bootstrap_steps import (
     credential_login_deps_step,
     docker_install_step,
     harness_code_step,
+    ipv4_only_egress_step,
     pty_install_step,
     pty_refresh_step,
     runtime_deploy_step,
@@ -149,10 +150,15 @@ def compile_bootstrap_steps(
     if include_login_deps is None:
         include_login_deps = spec.account.mode == "worker_local_login"
 
-    steps: list[BootstrapStep] = [
+    steps: list[BootstrapStep] = []
+    if spec.account.binding == "eip":
+        # The stable EIP is IPv4-only. Apply this before apt, browser login, or
+        # any job code gets a chance to prefer a subnet-assigned IPv6 address.
+        steps.append(ipv4_only_egress_step())
+    steps.extend([
         system_init_step(packages=system_packages),
         agent_install_step(),
-    ]
+    ])
     # Docker before any runtime deploy: the runtime user's docker-group
     # membership must exist when systemd starts the unit (see docker_install_step).
     if spec.setup.needs_docker:

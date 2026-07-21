@@ -20,9 +20,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlparse
 
-from elastic_agent.core.batch_orchestrator import BatchOrchestrator, LoginOutcome
+from elastic_agent.core.batch_orchestrator import (
+    BatchOrchestrator,
+    LoginOutcome,
+    WorkerAssignment,
+)
 from elastic_agent.core.credential_pool import AccountDefinition
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
@@ -32,39 +42,137 @@ from elastic_agent.harness.generic import compile_bootstrap_steps
 logger = logging.getLogger(__name__)
 
 
+async def _await_cleanup_task(task: asyncio.Task) -> None:
+    """Finish a tiny ownership cleanup even if the caller is cancelled."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done() and task.cancelled():
+                raise
+            continue
+    task.result()
+
+
 # ---------------------------------------------------------------------------
 # Account allocation (in-memory, identity-only)
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class AccountClaim:
+    claim_id: str
+    owner: str
+    account: AccountDefinition
+
+
+class AccountClaimConflictError(RuntimeError):
+    """Identity mutation was attempted while a Job owns the account."""
+
+
 class AccountAllocator:
     def __init__(self, account_store) -> None:
         self._store = account_store
-        self._by_worker: dict[str, list[str]] = {}   # worker_id -> [account_id]
-        self._assigned: set[str] = set()
+        self._claims: dict[str, AccountClaim] = {}
+        self._claim_by_account: dict[str, str] = {}
+        self._by_owner: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
+    @asynccontextmanager
+    async def mutation_guard(self, account_id: str) -> AsyncIterator[None]:
+        """Serialize account CRUD with claim selection and reject live owners.
+
+        The guard intentionally remains held while the caller re-reads and
+        mutates ``AccountStore``.  ``reserve`` uses the same lock while reading
+        that store, so a Job can only observe the complete old or new identity.
+        """
+
+        async with self._lock:
+            claim_id = self._claim_by_account.get(account_id)
+            if claim_id:
+                claim = self._claims[claim_id]
+                raise AccountClaimConflictError(
+                    f"account {account_id!r} is actively claimed by {claim.owner!r}"
+                )
+            yield
+
+    async def reserve(
+        self, owner: str, group: str, *, account_id: str = "",
+        claim_id: str = "", excluded_account_ids: set[str] | None = None,
+    ) -> AccountClaim | None:
+        """Atomically claim an explicit account, or the next account in group.
+
+        ``owner`` exists before a worker does (bound jobs use ``job:slot``), and
+        ``claim_id`` gives cleanup a precise, idempotent release handle.  An
+        explicit account still must exist and be enabled, but intentionally does
+        not need to match ``group`` — explicit selection supersedes the pool
+        filter.
+        """
+        async with self._lock:
+            accounts = await self._store.list()
+            if account_id:
+                candidates = [a for a in accounts if a.id == account_id and a.enabled]
+            else:
+                candidates = [a for a in accounts if a.enabled and a.group == group]
+
+            excluded = excluded_account_ids or set()
+            account = next(
+                (
+                    a for a in candidates
+                    if a.id not in self._claim_by_account and a.id not in excluded
+                ),
+                None,
+            )
+            if account is None:
+                return None
+
+            cid = claim_id or f"claim-{uuid.uuid4().hex}"
+            if cid in self._claims:
+                raise ValueError(f"duplicate account claim id {cid}")
+            claim = AccountClaim(claim_id=cid, owner=owner, account=account)
+            self._claims[cid] = claim
+            self._claim_by_account[account.id] = cid
+            self._by_owner.setdefault(owner, set()).add(cid)
+            return claim
+
     async def allocate(self, worker_id: str, group: str) -> AccountDefinition | None:
-        """Give ``worker_id`` a fresh, distinct account in ``group``.
+        """Backward-compatible worker allocation used by unbound jobs.
 
         Each call returns a different account (so per_worker > 1 gets several) and
         the account stays assigned to the worker for the job's lifetime — an
         exhausted account is never re-picked because it remains assigned. Freed in
         bulk by :meth:`release_worker`.
         """
+        claim = await self.reserve(worker_id, group)
+        return claim.account if claim else None
+
+    async def get_claim(self, claim_id: str) -> AccountClaim | None:
         async with self._lock:
-            for acct in await self._store.list():
-                if acct.enabled and acct.group == group and acct.id not in self._assigned:
-                    self._assigned.add(acct.id)
-                    self._by_worker.setdefault(worker_id, []).append(acct.id)
-                    return acct
-            return None
+            return self._claims.get(claim_id)
+
+    async def release_claim(self, claim_id: str) -> None:
+        async with self._lock:
+            claim = self._claims.pop(claim_id, None)
+            if claim is None:
+                return
+            self._claim_by_account.pop(claim.account.id, None)
+            owner_claims = self._by_owner.get(claim.owner)
+            if owner_claims is not None:
+                owner_claims.discard(claim_id)
+                if not owner_claims:
+                    self._by_owner.pop(claim.owner, None)
+
+    async def release_owner(self, owner: str) -> None:
+        async with self._lock:
+            claim_ids = list(self._by_owner.pop(owner, set()))
+            for claim_id in claim_ids:
+                claim = self._claims.pop(claim_id, None)
+                if claim is not None:
+                    self._claim_by_account.pop(claim.account.id, None)
 
     async def release_worker(self, worker_id: str) -> None:
         """Free all of a worker's accounts (e.g. on scale-in)."""
-        async with self._lock:
-            for acct_id in self._by_worker.pop(worker_id, []):
-                self._assigned.discard(acct_id)
+        await self.release_owner(worker_id)
 
 
 # ---------------------------------------------------------------------------
@@ -73,28 +181,68 @@ class AccountAllocator:
 
 
 class LoginCoordinator:
-    def __init__(self, connection_manager, event_bus, *, timeout: float = 300.0) -> None:
+    def __init__(self, connection_manager, event_bus, *, timeout: float = 600.0) -> None:
         self._conn = connection_manager
         self._timeout = timeout
-        self._pending: dict[str, asyncio.Future] = {}   # account_id -> future
+        self._pending: dict[
+            tuple[str, str], tuple[str, asyncio.Future, bool]
+        ] = {}
         event_bus.subscribe("ACCOUNT_LOGIN_RESULT", self._on_result)
 
     async def _on_result(self, event_type: str, worker_id: str, data: dict) -> None:
-        fut = self._pending.get(data.get("account_id", ""))
-        if fut is not None and not fut.done():
+        request_id = str(data.get("login_request_id") or "")
+        pending = self._pending.get((worker_id, request_id))
+        if pending is None and not request_id:
+            # Compatibility is deliberately opt-in for non-EIP jobs only.  An
+            # EIP job must use the current worker, whose correlated result also
+            # proves the exact-email and warm-up checks ran.  Even for legacy
+            # mode, never guess when a worker has concurrent login requests.
+            worker_pending = [
+                value
+                for (pending_worker, _pending_id), value in self._pending.items()
+                if pending_worker == worker_id
+            ]
+            if len(worker_pending) == 1:
+                candidate = worker_pending[0]
+                expected_account_id, _future, allow_legacy = candidate
+                if (
+                    allow_legacy
+                    and data.get("account_id") == expected_account_id
+                ):
+                    pending = candidate
+        if pending is None:
+            logger.warning(
+                "Ignoring stale/unmatched login result from %s request %s",
+                worker_id,
+                request_id or "<missing>",
+            )
+            return
+        expected_account_id, fut, _allow_legacy = pending
+        if data.get("account_id") != expected_account_id:
+            logger.error(
+                "Ignoring login result account mismatch for %s request %s",
+                worker_id,
+                request_id,
+            )
+            return
+        if not fut.done():
             fut.set_result(data)
 
     async def login(
         self, worker_id: str, account: AccountDefinition, config_dir: str,
         provider: str | None = None, slot_index: int = 0,
+        *, allow_legacy_result: bool = False,
     ) -> LoginOutcome:
         from elastic_agent.core.protocols.messages import AccountLoginMessage
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
-        self._pending[account.id] = fut
+        request_id = f"login-{uuid.uuid4().hex}"
+        key = (worker_id, request_id)
+        self._pending[key] = (account.id, fut, allow_legacy_result)
         try:
             await self._conn.send_command(worker_id, AccountLoginMessage(
+                login_request_id=request_id,
                 account_id=account.id, email=account.email, email_token=account.email_token,
                 config_dir=config_dir, provider=provider, slot_index=slot_index,
             ))
@@ -106,7 +254,7 @@ class LoginCoordinator:
             return LoginOutcome(success=False, account_id=account.id,
                                 account_email=account.email, error=str(exc))
         finally:
-            self._pending.pop(account.id, None)
+            self._pending.pop(key, None)
 
         return LoginOutcome(
             success=bool(data.get("success")),
@@ -130,6 +278,31 @@ def _default_manager_url(manager) -> str:
         return env
     srv = manager.config.server
     return f"ws://{srv.host}:{srv.port}/ws/runtime"
+
+
+def _account_login_transport_error(manager_url: str) -> str | None:
+    """Require TLS before mailbox tokens can cross a host boundary."""
+    parsed = urlparse(manager_url)
+    if parsed.scheme == "wss":
+        return None
+    if parsed.scheme == "ws" and parsed.hostname in {
+        "localhost", "127.0.0.1", "::1",
+    }:
+        return None
+    if os.environ.get("ELASTIC_AGENT_ALLOW_INSECURE_ACCOUNT_LOGIN", "").lower() in {
+        "1", "true", "yes",
+    }:
+        logger.warning(
+            "Account login is explicitly allowing plaintext WebSocket transport: %s",
+            manager_url,
+        )
+        return None
+    return (
+        "account login requires a wss:// Manager URL because the mailbox "
+        "authorization token crosses the worker WebSocket; configure "
+        "ELASTIC_AGENT_MANAGER_URL=wss://... (or explicitly set "
+        "ELASTIC_AGENT_ALLOW_INSECURE_ACCOUNT_LOGIN=1 only on a trusted test network)"
+    )
 
 
 def _ssh_settings(manager) -> tuple[str, str | None]:
@@ -172,7 +345,11 @@ def make_provision_hook(
         host = node.public_ip
         try:
             inst = await manager.provider.wait_until_running(node.instance_id)
-            host = (inst.public_ip if inst else None) or host
+            # Bound attach already replaced registry.public_ip with the durable
+            # EIP.  Never overwrite it with a possibly stale ephemeral address
+            # returned by the launch/wait API.
+            if getattr(spec.account, "binding", "none") != "eip":
+                host = (inst.public_ip if inst else None) or host
         except Exception:
             logger.exception("provision: wait_until_running failed for %s", worker_id)
         if not host:
@@ -184,9 +361,18 @@ def make_provision_hook(
             logger.error("provision: %s never became SSH-ready", worker_id)
             return False
 
-        # Deliver THIS branch's framework to the worker (not PyPI) when
-        # ELASTIC_AGENT_FRAMEWORK_SRC is set — the last mile for one-click auto.
+        # EIP jobs require this Manager's worker protocol and identity checks:
+        # an older PyPI worker neither correlates login requests nor verifies
+        # the exact authenticated email/warm-up result.  Always deliver the
+        # currently running package for this path.  Do not honor a deployment
+        # override for EIP jobs: it could point at an older source tree that
+        # accepts request IDs but lacks the exact-email/warm-up enforcement.
+        # Non-EIP deployments may still opt into a full source tree.
         framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
+        framework_target = "/opt/elastic-agent/framework/src"
+        if spec.account.binding == "eip":
+            framework_src = str(Path(__file__).resolve().parents[1])
+            framework_target += "/elastic_agent"
 
         steps = compile_bootstrap_steps(
             spec, manager_url=manager_url, auth_token=node.auth_token or "",
@@ -233,7 +419,7 @@ def make_provision_hook(
         if framework_src:
             from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
             fw_dir = "/opt/elastic-agent/framework/src"
-            if not await _sync.deliver(framework_src, host, fw_dir):
+            if not await _sync.deliver(framework_src, host, framework_target):
                 logger.error("framework rsync failed for %s", worker_id)
                 return False
             step = runtime_deploy_from_src_step(
@@ -245,6 +431,12 @@ def make_provision_hook(
             if rc != 0:
                 logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
                 return False
+            if spec.account.binding == "eip":
+                # The service command has completed, but a baked/stale runtime
+                # might have satisfied an earlier connection check.  Close the
+                # current socket and require the source-pinned service to prove
+                # it can reconnect before any account identity is sent.
+                await manager.connection_manager.disconnect_worker(worker_id)
 
         # S3 datasets: the worker pulls them DIRECTLY from S3 with its instance-
         # profile credentials (no Manager download+rsync relay). The worker IAM
@@ -283,16 +475,231 @@ def make_provision_hook(
 
 
 def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoordinator):
-    async def login(worker_id: str, spec: JobSpec, config_dir: str) -> LoginOutcome:
-        acct = await allocator.allocate(worker_id, spec.account.group)
-        if acct is None:
-            return LoginOutcome(success=False, error=f"no available account in group '{spec.account.group}'")
+    async def login(
+        worker_id: str, spec: JobSpec, config_dir: str,
+        account_id: str = "", claim_id: str = "",
+    ) -> LoginOutcome:
+        transport_error = _account_login_transport_error(
+            _default_manager_url(manager)
+        )
+        if transport_error:
+            return LoginOutcome(
+                success=False,
+                account_id=account_id,
+                error=transport_error,
+            )
+        if claim_id:
+            claim = await allocator.get_claim(claim_id)
+            if claim is None:
+                return LoginOutcome(
+                    success=False,
+                    account_id=account_id,
+                    error=f"account claim '{claim_id}' is not active",
+                )
+            acct = claim.account
+            if account_id and acct.id != account_id:
+                return LoginOutcome(
+                    success=False,
+                    account_id=account_id,
+                    error="account claim does not match bound assignment",
+                )
+        else:
+            acct = await allocator.allocate(worker_id, spec.account.group)
+            if acct is None:
+                return LoginOutcome(
+                    success=False,
+                    error=f"no available account in group '{spec.account.group}'",
+                )
         return await coordinator.login(
             worker_id, acct, config_dir or spec.account.config_dir,
             provider=spec.account.__dict__.get("provider") if hasattr(spec.account, "__dict__") else None,
+            allow_legacy_result=spec.account.binding != "eip",
         )
 
     return login
+
+
+def make_bound_hooks(manager, allocator: AccountAllocator):
+    """Create reserve/attach/release hooks for one-account/one-EIP jobs."""
+
+    async def reserve_bound(
+        job_id: str, slot: int, spec: JobSpec, account_id: str = "",
+    ) -> WorkerAssignment:
+        if not getattr(manager, "binding_recovery_ready", True):
+            raise RuntimeError(
+                "EIP binding recovery is still cleaning resources from a "
+                "previous Manager run"
+            )
+        if spec.account.mode != "none":
+            transport_error = _account_login_transport_error(
+                _default_manager_url(manager)
+            )
+            if transport_error:
+                # Validate before allocator claim/EIP reservation so an unsafe
+                # transport cannot cause any billable side effect.
+                raise ValueError(transport_error)
+        provider_cfg = manager.config.provider
+        if provider_cfg.type != "aws":
+            raise ValueError("account.binding='eip' requires the AWS provider")
+        manager_region = provider_cfg.aws.region
+        region = spec.fanout.region or manager_region
+        if region != manager_region:
+            raise ValueError(
+                f"EIP binding region '{region}' does not match Manager AWS region "
+                f"'{manager_region}'"
+            )
+
+        owner = f"{job_id}:{slot}"
+        attempted: set[str] = set()
+        while True:
+            claim = await allocator.reserve(
+                owner,
+                spec.account.group,
+                account_id=account_id,
+                excluded_account_ids=attempted,
+            )
+            if claim is None:
+                selector = f"account '{account_id}'" if account_id else (
+                    f"an available account in group '{spec.account.group}'"
+                )
+                raise ValueError(f"could not reserve {selector}")
+
+            acct = claim.account
+            lease = None
+            try:
+                lease = await manager.binding_manager.reserve(
+                    acct.id,
+                    email=acct.email,
+                    job_id=job_id,
+                    slot=slot,
+                    region=region,
+                )
+                binding = await manager.binding_manager.get_binding(acct.id)
+                if binding is None:
+                    raise RuntimeError(
+                        f"binding disappeared for account '{acct.id}'"
+                    )
+                break
+            except BaseException as exc:
+                # Once ``reserve`` returns, the durable lease must be released
+                # before its allocator claim.  Otherwise cancellation during
+                # the following binding read makes the lease invisible to the
+                # orchestrator while also allowing the identity to be claimed
+                # again.  Both cleanups are shielded from repeated caller
+                # cancellation; on durable cleanup failure, retain the claim
+                # fail-closed for operator/startup recovery.
+                if lease is not None:
+                    durable_cleanup = asyncio.create_task(
+                        manager.binding_manager.release(lease.lease_id)
+                    )
+                    try:
+                        await _await_cleanup_task(durable_cleanup)
+                    except BaseException as cleanup_exc:
+                        logger.exception(
+                            "Failed to roll back reserved EIP lease %s; "
+                            "retaining account claim %s",
+                            lease.lease_id,
+                            claim.claim_id,
+                        )
+                        raise RuntimeError(
+                            f"failed to roll back EIP lease {lease.lease_id!r}; "
+                            "account claim retained"
+                        ) from cleanup_exc
+
+                claim_cleanup = asyncio.create_task(
+                    allocator.release_claim(claim.claim_id)
+                )
+                await _await_cleanup_task(claim_cleanup)
+                # Explicit selection is fail-fast.  Automatic group selection
+                # skips an account whose durable lease/integrity state is busy
+                # and tries the next identity instead of wedging the whole pool.
+                from elastic_agent.core.account_binding import LeaseConflictError
+                if account_id or not isinstance(exc, LeaseConflictError):
+                    raise
+                attempted.add(acct.id)
+                logger.warning(
+                    "Skipping unavailable EIP account %s: %s", acct.id, exc
+                )
+
+        return WorkerAssignment(
+            slot=slot,
+            job_id=job_id,
+            account_id=acct.id,
+            account_email=acct.email,
+            claim_id=claim.claim_id,
+            lease_id=lease.lease_id,
+            eip_allocation_id=binding.eip_allocation_id or "",
+            eip=binding.eip_ip or "",
+            region=binding.region or region,
+        )
+
+    async def attach_bound(
+        worker_id: str, assignment: WorkerAssignment,
+    ) -> WorkerAssignment:
+        node = await manager.registry.get(worker_id)
+        if node is None:
+            raise ValueError(f"worker '{worker_id}' disappeared before EIP attach")
+        # RunInstances may return before the instance id is visible to
+        # AssociateAddress.  Use the provider's eventual-consistency waiter
+        # before touching the persistent EIP; provision will reuse the already
+        # running machine afterward.
+        await manager.provider.wait_until_running(node.instance_id)
+        await manager.binding_manager.attach_instance(
+            assignment.lease_id,
+            node.instance_id,
+            worker_id,
+        )
+        binding = await manager.binding_manager.get_binding(assignment.account_id)
+        if binding is None or not binding.eip_ip:
+            raise RuntimeError(
+                f"EIP attach returned no public IP for account '{assignment.account_id}'"
+            )
+        metadata = dict(node.metadata)
+        metadata.update({
+            "job_id": assignment.job_id,
+            "account_id": assignment.account_id,
+            "lease_id": assignment.lease_id,
+            "eip_allocation_id": binding.eip_allocation_id,
+        })
+        # Provision must resolve the newly-associated EIP, never the instance's
+        # ephemeral launch address.
+        await manager.registry.update(
+            worker_id,
+            public_ip=binding.eip_ip,
+            metadata=metadata,
+        )
+        return replace(
+            assignment,
+            eip_allocation_id=binding.eip_allocation_id or "",
+            eip=binding.eip_ip or "",
+            region=binding.region or assignment.region,
+        )
+
+    async def release_bound(
+        assignment: WorkerAssignment, worker_id: str | None,
+    ) -> None:
+        async def cleanup_worker(lease) -> None:
+            target = worker_id or getattr(lease, "worker_id", "")
+            if target:
+                # BindingManager owns provider ordering: detach EIP first, then
+                # terminate EC2, then invoke this callback.  The live hook only
+                # mirrors that completed teardown into Manager control-plane
+                # state; calling scale_in here would terminate before detach and
+                # double-call the provider.
+                from elastic_agent.core.registry import NodeStatus
+                await manager.registry.update(target, status=NodeStatus.TERMINATED)
+                await manager.connection_manager.disconnect_worker(target)
+
+        await manager.binding_manager.release(
+            assignment.lease_id,
+            cleanup_worker=cleanup_worker,
+        )
+        # Keep the in-memory claim if durable cleanup failed.  Together with the
+        # ERROR lease this prevents accidental same-process reuse until release
+        # is retried successfully.
+        await allocator.release_claim(assignment.claim_id)
+
+    return reserve_bound, attach_bound, release_bound
 
 
 async def _wait_ssh_ready(host: str, ssh_user: str, ssh_key: str | None, timeout: float = 240.0) -> bool:
@@ -338,17 +745,28 @@ def wire_batch(
     *,
     include_pty: bool = False,
     scale_in_on_complete: bool = False,
-    login_timeout: float = 300.0,
+    login_timeout: float = 600.0,
 ) -> BatchOrchestrator:
     """Build a fully-wired BatchOrchestrator and route worker events into it."""
-    allocator = AccountAllocator(manager.account_store)
+    allocator = getattr(manager, "account_allocator", None)
+    if allocator is None:
+        # Lightweight test/deployment Managers predating the shared property.
+        allocator = AccountAllocator(manager.account_store)
     coordinator = LoginCoordinator(manager.connection_manager, manager.event_bus, timeout=login_timeout)
+    bound_reserve, bound_attach, bound_release = make_bound_hooks(manager, allocator)
     driver = ManagerFleetDriver(
         manager,
         provision_hook=make_provision_hook(manager, include_pty=include_pty),
         login_hook=make_login_hook(manager, allocator, coordinator),
+        bound_reserve_hook=bound_reserve,
+        bound_attach_hook=bound_attach,
+        bound_release_hook=bound_release,
     )
-    orch = BatchOrchestrator(driver, scale_in_on_complete=scale_in_on_complete)
+    orch = BatchOrchestrator(
+        driver,
+        scale_in_on_complete=scale_in_on_complete,
+        persist_spec_hook=getattr(manager, "_persist_batch_job_spec", None),
+    )
 
     async def _on_exhausted(event_type, worker_id, data):
         await orch.handle_exhausted(data.get("worker_id") or worker_id)

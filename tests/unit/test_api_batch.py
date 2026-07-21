@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import stat
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elastic_agent.api.app import create_app
 from elastic_agent.api.auth import reset_api_keys
+from elastic_agent.core.account_binding import AccountBinding, BindingState
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
 from elastic_agent.manager.manager import ElasticAgentManager
@@ -42,30 +48,113 @@ class InMemoryProvider(CloudProvider):
 class FakeBatch:
     """Stand-in orchestrator so route logic is tested without live workers."""
 
-    def __init__(self):
+    def __init__(self, persist_spec_hook=None):
         self._jobs = {}
+        self.started: list[str] = []
+        self.before_start = None
+        self.persist_spec_hook = persist_spec_hook
 
-    async def launch(self, spec):
-        from elastic_agent.core.batch_orchestrator import BatchJob, WorkerPhase, WorkerRun
-        from elastic_agent.core.job_spec import WorkerContext
+    def prepare(self, spec):
+        from elastic_agent.core.batch_orchestrator import BatchJob
         from elastic_agent.harness.generic import resolve_harness
-        job = BatchJob(job_id=f"job-{len(self._jobs)}", spec=spec, harness=resolve_harness(spec))
-        for i in range(max(1, spec.fanout.workers)):
+
+        return BatchJob(
+            job_id=f"job-{len(self._jobs)}",
+            spec=spec,
+            harness=resolve_harness(spec),
+        )
+
+    async def submit_prepared(self, job):
+        from elastic_agent.core.batch_orchestrator import (
+            JobSpecPersistenceError,
+            WorkerPhase,
+            WorkerRun,
+        )
+        from elastic_agent.core.job_spec import WorkerContext
+
+        if self.persist_spec_hook is not None:
+            try:
+                await self.persist_spec_hook(job.job_id, job.spec)
+            except Exception as exc:  # noqa: BLE001
+                raise JobSpecPersistenceError(
+                    f"failed to persist JobSpec before launch: {exc}"
+                ) from exc
+        if self.before_start is not None:
+            self.before_start(job)
+        self.started.append(job.job_id)
+        for i in range(max(1, job.spec.fanout.workers)):
             job.runs[f"w{i}"] = WorkerRun(
-                worker_id=f"w{i}", ctx=WorkerContext(shard_index=i), phase=WorkerPhase.RUNNING,
+                worker_id=f"w{i}",
+                ctx=WorkerContext(shard_index=i),
+                phase=WorkerPhase.RUNNING,
             )
         self._jobs[job.job_id] = job
         return job
 
+    async def launch(self, spec):
+        return await self.submit_prepared(self.prepare(spec))
+
     async def submit(self, spec):
         # Route uses submit() (background bring-up); for tests it mirrors launch().
         return await self.launch(spec)
+
+    async def shutdown(self):
+        return None
 
     def list_jobs(self):
         return list(self._jobs.values())
 
     def get_job(self, jid):
         return self._jobs.get(jid)
+
+
+class FakeBindingManager:
+    """Route-level stand-in for the durable EIP binding service."""
+
+    def __init__(self):
+        self.bindings: dict[str, AccountBinding] = {}
+        self.ensure_calls: list[tuple[str, str, str]] = []
+        self.decommissioned: list[str] = []
+        self.active_accounts: set[str] = set()
+
+    async def list_bindings(self):
+        return list(self.bindings.values())
+
+    @asynccontextmanager
+    async def account_transaction(self, account_id):
+        yield
+
+    async def get_binding(self, account_id):
+        return self.bindings.get(account_id)
+
+    async def list_leases(self, *, account_id=None, active_only=False):
+        if account_id in self.active_accounts:
+            return [{"account_id": account_id, "state": "attached"}]
+        return []
+
+    async def ensure_binding(self, account_id, *, email="", region=""):
+        self.ensure_calls.append((account_id, email, region))
+        if account_id not in self.bindings:
+            n = len(self.bindings) + 1
+            self.bindings[account_id] = AccountBinding(
+                account_id=account_id,
+                email=email,
+                eip_allocation_id=f"eipalloc-{n}",
+                eip_ip=f"198.51.100.{n}",
+                region=region or "test-1",
+                state=BindingState.READY,
+            )
+        return self.bindings[account_id]
+
+    async def decommission(self, account_id, *, confirm_absent=False):
+        assert confirm_absent is True
+        if account_id in self.active_accounts:
+            raise RuntimeError(f"account {account_id} has an active lease")
+        removed = self.bindings.pop(account_id, None)
+        if removed is None:
+            return False
+        self.decommissioned.append(account_id)
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +169,12 @@ def setup_api_keys(monkeypatch):
 def manager(tmp_path):
     cfg = ElasticAgentConfig()
     cfg.registry.path = str(tmp_path / "registry.json")
-    return ElasticAgentManager(cfg, InMemoryProvider())
+    cfg.provider.type = "aws"
+    cfg.provider.aws.region = "us-west-2"
+    mgr = ElasticAgentManager(cfg, InMemoryProvider())
+    binding_manager = FakeBindingManager()
+    mgr.binding_manager = binding_manager
+    return mgr
 
 
 @pytest.fixture
@@ -91,7 +185,9 @@ async def client(manager):
         headers={"Authorization": f"Bearer {API_KEY}"},
     ) as ac:
         await manager.start()
-        manager._batch = FakeBatch()  # inject fake orchestrator
+        manager._batch = FakeBatch(
+            manager._persist_batch_job_spec
+        )  # inject fake orchestrator with the production persistence boundary
         yield ac
         await manager.stop()
 
@@ -106,14 +202,77 @@ class TestAccountsAPI:
         })
         assert r.status_code == 201
         assert r.json()["email"] == "a@x.com"
+        assert "email_token" not in r.json()
+        assert r.json()["has_email_token"] is True
 
         lst = (await client.get("/api/accounts")).json()
         assert lst["total"] == 1
         assert lst["accounts"][0]["id"] == "acc-1"
+        assert "email_token" not in lst["accounts"][0]
 
         r = await client.delete("/api/accounts/acc-1")
         assert r.status_code == 200
         assert (await client.get("/api/accounts")).json()["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_active_job_claim_blocks_identity_edit_and_delete(
+        self, client, manager,
+    ):
+        created = await client.post(
+            "/api/accounts",
+            json={"id": "claimed", "email": "old@x.com"},
+        )
+        assert created.status_code == 201
+        claim = await manager.account_allocator.reserve(
+            "job-live:0", "standard", account_id="claimed"
+        )
+        assert claim is not None
+
+        edited = await client.post(
+            "/api/accounts",
+            json={"id": "claimed", "email": "new@x.com"},
+        )
+        deleted = await client.delete("/api/accounts/claimed")
+
+        assert edited.status_code == 409
+        assert deleted.status_code == 409
+        assert "actively claimed" in edited.json()["detail"]
+        stored = await manager.account_store.get("claimed")
+        assert stored.email == "old@x.com"
+
+        await manager.account_allocator.release_claim(claim.claim_id)
+        edited = await client.post(
+            "/api/accounts",
+            json={"id": "claimed", "email": "new@x.com"},
+        )
+        assert edited.status_code == 201
+
+    @pytest.mark.asyncio
+    async def test_active_job_claim_blocks_manual_binding_ensure(
+        self, client, manager,
+    ):
+        created = await client.post(
+            "/api/accounts",
+            json={"id": "claimed", "email": "claimed@x.com"},
+        )
+        assert created.status_code == 201
+        claim = await manager.account_allocator.reserve(
+            "job-live:0", "standard", account_id="claimed"
+        )
+        assert claim is not None
+
+        blocked = await client.put("/api/accounts/claimed/binding")
+
+        assert blocked.status_code == 409
+        assert "actively claimed" in blocked.json()["detail"]
+        assert manager.binding_manager.ensure_calls == []
+
+        await manager.account_allocator.release_claim(claim.claim_id)
+        ensured = await client.put("/api/accounts/claimed/binding")
+        assert ensured.status_code == 200
+        assert manager.binding_manager.ensure_calls == [
+            ("claimed", "claimed@x.com", "us-west-2"),
+        ]
 
     @pytest.mark.asyncio
     async def test_remove_missing_404(self, client):
@@ -126,6 +285,175 @@ class TestAccountsAPI:
         lst = (await client.get("/api/accounts")).json()
         assert lst["total"] == 1
         assert lst["accounts"][0]["email"] == "two@x.com"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_email_casefold_is_rejected(self, client):
+        assert (await client.post(
+            "/api/accounts", json={"id": "a", "email": "User@x.com"}
+        )).status_code == 201
+        duplicate = await client.post(
+            "/api/accounts", json={"id": "b", "email": "user@X.com"}
+        )
+        assert duplicate.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_bound_identity_email_is_immutable_but_token_can_rotate(
+        self, client
+    ):
+        await client.post(
+            "/api/accounts",
+            json={"id": "a", "email": "one@x.com", "email_token": "old"},
+        )
+        await client.put("/api/accounts/a/binding")
+
+        changed = await client.post(
+            "/api/accounts", json={"id": "a", "email": "two@x.com"}
+        )
+        assert changed.status_code == 409
+
+        rotated = await client.post(
+            "/api/accounts",
+            json={"id": "a", "email": "ONE@x.com", "email_token": "new"},
+        )
+        assert rotated.status_code == 201
+        assert "email_token" not in rotated.json()
+
+    @pytest.mark.asyncio
+    async def test_ensure_get_and_list_eip_binding_is_idempotent(self, client, manager):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+
+        first = await client.put(
+            "/api/accounts/a/binding", json={"region": "us-west-2"},
+        )
+        second = await client.put(
+            "/api/accounts/a/binding", json={"region": "us-west-2"},
+        )
+        assert first.status_code == second.status_code == 200
+        assert first.json()["eip_allocation_id"] == "eipalloc-1"
+        assert second.json()["eip_ip"] == "198.51.100.1"
+        assert manager.binding_manager.ensure_calls == [
+            ("a", "one@x.com", "us-west-2"),
+            ("a", "one@x.com", "us-west-2"),
+        ]
+
+        got = await client.get("/api/accounts/a/binding")
+        assert got.status_code == 200
+        assert got.json()["state"] == BindingState.READY
+        listed = (await client.get("/api/accounts/bindings")).json()
+        assert listed["total"] == 1
+        assert listed["bindings"][0]["account_id"] == "a"
+
+    @pytest.mark.asyncio
+    async def test_ensure_requires_known_enabled_account(self, client):
+        assert (await client.put("/api/accounts/nope/binding")).status_code == 404
+        await client.post(
+            "/api/accounts",
+            json={"id": "off", "email": "off@x.com", "enabled": False},
+        )
+        assert (await client.put("/api/accounts/off/binding")).status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_ensure_uses_configured_region_and_rejects_other_region(
+        self, client, manager,
+    ):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+        ensured = await client.put("/api/accounts/a/binding")
+        assert ensured.status_code == 200
+        assert ensured.json()["region"] == "us-west-2"
+        assert manager.binding_manager.ensure_calls == [
+            ("a", "one@x.com", "us-west-2"),
+        ]
+
+        mismatch = await client.put(
+            "/api/accounts/a/binding", json={"region": "us-east-1"},
+        )
+        assert mismatch.status_code == 409
+        assert manager.binding_manager.ensure_calls == [
+            ("a", "one@x.com", "us-west-2"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ensure_rejects_non_aws_provider(self, client, manager):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+        manager.config.provider.type = "aliyun"
+        response = await client.put("/api/accounts/a/binding")
+        assert response.status_code == 501
+        assert manager.binding_manager.ensure_calls == []
+
+    @pytest.mark.asyncio
+    async def test_binding_get_missing_404(self, client):
+        assert (await client.get("/api/accounts/nope/binding")).status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_bound_identity_requires_explicit_decommission(
+        self, client, manager,
+    ):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+        await client.put("/api/accounts/a/binding")
+
+        blocked = await client.delete("/api/accounts/a")
+        assert blocked.status_code == 409
+        assert "decommission" in blocked.json()["detail"]
+        assert await manager.account_store.get("a") is not None
+        assert await manager.binding_manager.get_binding("a") is not None
+
+    @pytest.mark.asyncio
+    async def test_decommission_requires_double_confirmation(self, client, manager):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+        await client.put("/api/accounts/a/binding")
+
+        missing = await client.post("/api/accounts/a/binding/decommission", json={})
+        refused = await client.post(
+            "/api/accounts/a/binding/decommission",
+            json={"release_eip": False, "confirm_account_id": "a"},
+        )
+        mismatch = await client.post(
+            "/api/accounts/a/binding/decommission",
+            json={"release_eip": True, "confirm_account_id": "someone-else"},
+        )
+        assert missing.status_code == 422
+        assert refused.status_code == 422
+        assert mismatch.status_code == 400
+        assert await manager.binding_manager.get_binding("a") is not None
+
+    @pytest.mark.asyncio
+    async def test_decommission_rejects_active_lease_then_releases_eip(
+        self, client, manager,
+    ):
+        await client.post("/api/accounts", json={"id": "a", "email": "one@x.com"})
+        await client.put("/api/accounts/a/binding")
+        manager.binding_manager.active_accounts.add("a")
+        body = {"release_eip": True, "confirm_account_id": "a"}
+
+        active = await client.post(
+            "/api/accounts/a/binding/decommission", json=body,
+        )
+        assert active.status_code == 409
+        assert "active lease" in active.json()["detail"]
+
+        manager.binding_manager.active_accounts.clear()
+        released = await client.post(
+            "/api/accounts/a/binding/decommission", json=body,
+        )
+        assert released.status_code == 200
+        assert released.json() == {
+            "account_id": "a",
+            "status": "decommissioned",
+            "eip_released": True,
+        }
+        assert manager.binding_manager.decommissioned == ["a"]
+        assert (await client.get("/api/accounts/a/binding")).status_code == 404
+        # Identity CRUD stays separate and becomes available after explicit
+        # infrastructure decommissioning.
+        assert (await client.delete("/api/accounts/a")).status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_decommission_missing_binding_404(self, client):
+        response = await client.post(
+            "/api/accounts/nope/binding/decommission",
+            json={"release_eip": True, "confirm_account_id": "nope"},
+        )
+        assert response.status_code == 404
 
 
 class TestJobsAPI:
@@ -144,6 +472,56 @@ class TestJobsAPI:
         assert body["workers"] == 3
         assert len(body["workers_detail"]) == 3
         assert all(w["phase"] == "running" for w in body["workers_detail"])
+
+    @pytest.mark.asyncio
+    async def test_submit_fsyncs_spec_before_starting_job(self, client, manager, monkeypatch):
+        from elastic_agent.core import job_spec_store
+
+        fsync_kinds = []
+        real_fsync = job_spec_store.os.fsync
+
+        def recording_fsync(fd):
+            fsync_kinds.append(
+                "dir" if stat.S_ISDIR(job_spec_store.os.fstat(fd).st_mode) else "file"
+            )
+            return real_fsync(fd)
+
+        monkeypatch.setattr(job_spec_store.os, "fsync", recording_fsync)
+
+        def assert_persisted(job):
+            path = Path(manager.config.registry.path).with_name("specs") / f"{job.job_id}.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert data["job_id"] == job.job_id
+            assert data["spec"]["name"] == "ai4sci"
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+        manager.batch.before_start = assert_persisted
+        response = await client.post("/api/jobs", json=self._SPEC)
+
+        assert response.status_code == 201
+        assert manager.batch.started == [response.json()["job_id"]]
+        assert fsync_kinds == ["file", "dir"]
+        assert list(Path(manager.config.registry.path).with_name("specs").glob("*.tmp")) == []
+
+    @pytest.mark.asyncio
+    async def test_submit_persistence_failure_never_starts_job(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core import job_spec_store
+
+        def fail_replace(_src, _dest):
+            raise OSError("disk is read-only")
+
+        monkeypatch.setattr(job_spec_store.os, "replace", fail_replace)
+        response = await client.post("/api/jobs", json=self._SPEC)
+
+        assert response.status_code == 500
+        assert "persist" in response.json()["detail"]
+        assert manager.batch.started == []
+        assert manager.batch.list_jobs() == []
+        assert manager.provider._n == 0
+        specs = Path(manager.config.registry.path).with_name("specs")
+        assert list(specs.iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_list_and_get(self, client):

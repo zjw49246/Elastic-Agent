@@ -13,10 +13,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from elastic_agent.core.providers.base import (
+    CloudIdentity,
     CloudProvider,
     ElasticIp,
     Instance,
     InstanceConfig,
+    InstanceNotFoundError,
     InstanceState,
 )
 
@@ -51,6 +53,11 @@ class DryRunProvider(CloudProvider):
     """
 
     PLATFORM = "dryrun"
+
+    async def get_identity(self) -> CloudIdentity:
+        return CloudIdentity(
+            provider="dryrun", account_id="dryrun-account", region=""
+        )
 
     def __init__(
         self,
@@ -209,7 +216,7 @@ class DryRunProvider(CloudProvider):
         async with self._lock:
             inst = self.instances.get(instance_id)
         if inst is None:
-            raise ValueError(f"Instance {instance_id} not found")
+            raise InstanceNotFoundError(f"Instance {instance_id} not found")
         return inst
 
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:
@@ -229,7 +236,14 @@ class DryRunProvider(CloudProvider):
             self._counter += 1
             alloc_id = f"eipalloc-{self._counter:04d}"
             public_ip = f"52.0.0.{self._counter}"
-            eip = ElasticIp(allocation_id=alloc_id, public_ip=public_ip)
+            eip = ElasticIp(
+                allocation_id=alloc_id,
+                public_ip=public_ip,
+                tags={
+                    **(tags or {}),
+                    self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE,
+                },
+            )
             self.eips[alloc_id] = eip
         self._record("allocate_eip", alloc_id, public_ip=public_ip)
         return eip.model_copy()
@@ -240,6 +254,10 @@ class DryRunProvider(CloudProvider):
             eip = self.eips.get(allocation_id)
             if eip is None:
                 raise ValueError(f"EIP {allocation_id} not found")
+            if eip.instance_id is not None and eip.instance_id != instance_id:
+                raise RuntimeError(
+                    f"EIP {allocation_id} is already attached to {eip.instance_id}"
+                )
             eip.instance_id = instance_id
             eip.association_id = f"eipassoc-{allocation_id[-4:]}"
             # A bound instance always shows the EIP as its public IP, and it
@@ -250,12 +268,27 @@ class DryRunProvider(CloudProvider):
         self._record("associate_eip", instance_id, allocation_id=allocation_id)
         return eip.model_copy()
 
-    async def disassociate_eip(self, allocation_id: str) -> None:
+    async def disassociate_eip(
+        self,
+        allocation_id: str,
+        *,
+        association_id: str | None = None,
+        expected_instance_id: str | None = None,
+    ) -> None:
         self._check_failure("disassociate_eip")
         async with self._lock:
             eip = self.eips.get(allocation_id)
             if eip is None:
                 return
+            if expected_instance_id and eip.instance_id != expected_instance_id:
+                raise RuntimeError(
+                    f"EIP {allocation_id} is attached to {eip.instance_id}, "
+                    f"not {expected_instance_id}"
+                )
+            if association_id and eip.association_id != association_id:
+                raise RuntimeError(
+                    f"EIP {allocation_id} association changed to {eip.association_id}"
+                )
             eip.instance_id = None
             eip.association_id = None
         self._record("disassociate_eip", allocation_id)
@@ -266,8 +299,33 @@ class DryRunProvider(CloudProvider):
             self.eips.pop(allocation_id, None)
         self._record("release_eip", allocation_id)
 
+    async def tag_eip(
+        self, allocation_id: str, tags: dict[str, str]
+    ) -> None:
+        self._check_failure("tag_eip")
+        async with self._lock:
+            eip = self.eips.get(allocation_id)
+            if eip is None:
+                raise ValueError(f"EIP {allocation_id} not found")
+            eip.tags.update({
+                **tags,
+                self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE,
+            })
+        self._record("tag_eip", allocation_id, tags=dict(tags))
+
     async def describe_eip(self, allocation_id: str) -> ElasticIp | None:
         self._check_failure("describe_eip")
         async with self._lock:
             eip = self.eips.get(allocation_id)
             return eip.model_copy() if eip else None
+
+    async def list_eips(self, filters: dict[str, str] | None = None) -> list[ElasticIp]:
+        self._check_failure("list_eips")
+        async with self._lock:
+            values = list(self.eips.values())
+            if filters:
+                values = [
+                    eip for eip in values
+                    if all(eip.tags.get(key) == value for key, value in filters.items())
+                ]
+            return [eip.model_copy(deep=True) for eip in values]
