@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -76,6 +78,7 @@ class AccountAllocator:
         self._claims: dict[str, AccountClaim] = {}
         self._claim_by_account: dict[str, str] = {}
         self._by_owner: dict[str, set[str]] = {}
+        self._quarantined_account_ids: set[str] = set()
         self._lock = asyncio.Lock()
 
     @asynccontextmanager
@@ -99,6 +102,7 @@ class AccountAllocator:
     async def reserve(
         self, owner: str, group: str, *, account_id: str = "",
         claim_id: str = "", excluded_account_ids: set[str] | None = None,
+        agent_type: str = "claude",
     ) -> AccountClaim | None:
         """Atomically claim an explicit account, or the next account in group.
 
@@ -111,15 +115,27 @@ class AccountAllocator:
         async with self._lock:
             accounts = await self._store.list()
             if account_id:
-                candidates = [a for a in accounts if a.id == account_id and a.enabled]
+                candidates = [
+                    a for a in accounts
+                    if a.id == account_id
+                    and a.enabled
+                    and a.agent_type == agent_type
+                ]
             else:
-                candidates = [a for a in accounts if a.enabled and a.group == group]
+                candidates = [
+                    a for a in accounts
+                    if a.enabled
+                    and a.group == group
+                    and a.agent_type == agent_type
+                ]
 
             excluded = excluded_account_ids or set()
             account = next(
                 (
                     a for a in candidates
-                    if a.id not in self._claim_by_account and a.id not in excluded
+                    if a.id not in self._claim_by_account
+                    and a.id not in self._quarantined_account_ids
+                    and a.id not in excluded
                 ),
                 None,
             )
@@ -135,7 +151,9 @@ class AccountAllocator:
             self._by_owner.setdefault(owner, set()).add(cid)
             return claim
 
-    async def allocate(self, worker_id: str, group: str) -> AccountDefinition | None:
+    async def allocate(
+        self, worker_id: str, group: str, *, agent_type: str = "claude",
+    ) -> AccountDefinition | None:
         """Backward-compatible worker allocation used by unbound jobs.
 
         Each call returns a different account (so per_worker > 1 gets several) and
@@ -143,7 +161,7 @@ class AccountAllocator:
         exhausted account is never re-picked because it remains assigned. Freed in
         bulk by :meth:`release_worker`.
         """
-        claim = await self.reserve(worker_id, group)
+        claim = await self.reserve(worker_id, group, agent_type=agent_type)
         return claim.account if claim else None
 
     async def get_claim(self, claim_id: str) -> AccountClaim | None:
@@ -174,6 +192,20 @@ class AccountAllocator:
         """Free all of a worker's accounts (e.g. on scale-in)."""
         await self.release_owner(worker_id)
 
+    async def quarantine(self, account_id: str) -> None:
+        """Keep an account unavailable after worker cleanup became uncertain."""
+        async with self._lock:
+            self._quarantined_account_ids.add(account_id)
+
+    async def clear_quarantine(self, account_id: str) -> None:
+        """Explicitly make an account selectable after external cleanup."""
+        async with self._lock:
+            self._quarantined_account_ids.discard(account_id)
+
+    async def is_quarantined(self, account_id: str) -> bool:
+        async with self._lock:
+            return account_id in self._quarantined_account_ids
+
 
 # ---------------------------------------------------------------------------
 # Login coordination (ACCOUNT_LOGIN → await ACCOUNT_LOGIN_RESULT)
@@ -181,13 +213,192 @@ class AccountAllocator:
 
 
 class LoginCoordinator:
-    def __init__(self, connection_manager, event_bus, *, timeout: float = 600.0) -> None:
+    def __init__(
+        self,
+        connection_manager,
+        event_bus,
+        *,
+        timeout: float = 2700.0,
+        cancel_timeout: float = 60.0,
+        quarantine_account: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._conn = connection_manager
         self._timeout = timeout
+        self._cancel_timeout = cancel_timeout
+        self._quarantine_account = quarantine_account
         self._pending: dict[
             tuple[str, str], tuple[str, asyncio.Future, bool]
         ] = {}
+        self._cancel_acks: dict[
+            tuple[str, str], tuple[str, asyncio.Future]
+        ] = {}
+        self._otp_challenges: dict[str, dict[str, object]] = {}
         event_bus.subscribe("ACCOUNT_LOGIN_RESULT", self._on_result)
+        event_bus.subscribe(
+            "ACCOUNT_LOGIN_OTP_REQUIRED", self._on_otp_required
+        )
+        event_bus.subscribe("ACCOUNT_LOGIN_CANCELLED", self._on_cancelled)
+        event_bus.subscribe("WORKER_DISCONNECTED", self._on_worker_disconnected)
+
+    async def _on_cancelled(
+        self, event_type: str, worker_id: str, data: dict,
+    ) -> None:
+        request_id = str(data.get("login_request_id") or "")
+        pending = self._cancel_acks.get((worker_id, request_id))
+        if pending is None:
+            logger.warning(
+                "Ignoring stale/unmatched login cleanup ACK from %s request %s",
+                worker_id,
+                request_id or "<missing>",
+            )
+            return
+        expected_account_id, future = pending
+        if data.get("account_id") != expected_account_id:
+            logger.error(
+                "Ignoring login cleanup ACK account mismatch for %s request %s",
+                worker_id,
+                request_id,
+            )
+            return
+        if not future.done():
+            future.set_result(bool(data.get("cleanup_complete")))
+
+    async def _on_worker_disconnected(
+        self, event_type: str, worker_id: str, data: dict,
+    ) -> None:
+        """End login waits immediately; a disconnected browser may still run."""
+        for (pending_worker, request_id), (account_id, future, _legacy) in list(
+            self._pending.items()
+        ):
+            if pending_worker != worker_id or future.done():
+                continue
+            future.set_result({
+                "login_request_id": request_id,
+                "account_id": account_id,
+                "success": False,
+                "error": "worker disconnected during account login",
+                "cleanup_complete": False,
+            })
+            self._otp_challenges.pop(request_id, None)
+        for (pending_worker, _request_id), (_account_id, future) in list(
+            self._cancel_acks.items()
+        ):
+            if pending_worker == worker_id and not future.done():
+                future.set_result(False)
+
+    async def _quarantine_if_uncertain(
+        self, account_id: str, *, enabled: bool, reason: str,
+    ) -> None:
+        if not enabled or self._quarantine_account is None:
+            return
+        try:
+            await self._quarantine_account(account_id)
+        except Exception:
+            logger.exception(
+                "Failed to quarantine account %s after %s",
+                account_id,
+                reason,
+            )
+            return
+        logger.error(
+            "Quarantined account %s because worker login cleanup was not confirmed (%s)",
+            account_id,
+            reason,
+        )
+
+    async def _on_otp_required(
+        self, event_type: str, worker_id: str, data: dict,
+    ) -> None:
+        """Record a correlated, non-secret OTP challenge from a worker."""
+        request_id = str(data.get("login_request_id") or "")
+        challenge_id = str(data.get("challenge_id") or "")
+        pending = self._pending.get((worker_id, request_id))
+        if (
+            pending is None
+            or not request_id
+            or not re.fullmatch(r"[0-9a-f]{32}", challenge_id)
+        ):
+            logger.warning(
+                "Ignoring stale/unmatched OTP challenge from %s request %s",
+                worker_id,
+                request_id or "<missing>",
+            )
+            return
+        expected_account_id, future, _allow_legacy = pending
+        if (
+            future.done()
+            or data.get("account_id") != expected_account_id
+        ):
+            logger.warning(
+                "Ignoring mismatched OTP challenge from %s request %s",
+                worker_id,
+                request_id,
+            )
+            return
+        expires_at = int(data.get("expires_at") or 0)
+        if expires_at <= int(time.time()):
+            return
+        self._otp_challenges[request_id] = {
+            "login_request_id": request_id,
+            "worker_id": worker_id,
+            "account_id": expected_account_id,
+            "challenge_id": challenge_id,
+            "expires_at": expires_at,
+            "status": "awaiting_otp",
+        }
+
+    def list_otp_challenges(self) -> list[dict[str, object]]:
+        """Return live challenge metadata; passwords and OTPs never enter it."""
+        now = int(time.time())
+        stale = [
+            request_id
+            for request_id, challenge in self._otp_challenges.items()
+            if int(challenge["expires_at"]) <= now
+            or not any(key[1] == request_id for key in self._pending)
+        ]
+        for request_id in stale:
+            self._otp_challenges.pop(request_id, None)
+        return [dict(challenge) for challenge in self._otp_challenges.values()]
+
+    async def submit_otp(
+        self, login_request_id: str, challenge_id: str, code: str,
+    ) -> dict[str, object]:
+        """Forward one six-digit code to the worker that owns the challenge."""
+        from elastic_agent.core.protocols.messages import AccountLoginOtpMessage
+
+        normalized_code = code.strip()
+        if not re.fullmatch(r"\d{6}", normalized_code):
+            raise ValueError("verification code must be exactly 6 digits")
+        challenge = self._otp_challenges.get(login_request_id)
+        if challenge is None:
+            raise KeyError("login challenge is not active")
+        if challenge["challenge_id"] != challenge_id:
+            raise ValueError("login challenge id does not match")
+        if int(challenge["expires_at"]) <= int(time.time()):
+            self._otp_challenges.pop(login_request_id, None)
+            raise TimeoutError("login challenge has expired")
+
+        worker_id = str(challenge["worker_id"])
+        account_id = str(challenge["account_id"])
+        if (worker_id, login_request_id) not in self._pending:
+            self._otp_challenges.pop(login_request_id, None)
+            raise KeyError("login request is no longer active")
+        await self._conn.send_command(worker_id, AccountLoginOtpMessage(
+            login_request_id=login_request_id,
+            account_id=account_id,
+            challenge_id=challenge_id,
+            code=normalized_code,
+        ))
+        # Never retain the submitted code. A visibly rejected code causes the
+        # worker to publish a fresh challenge with a fresh challenge_id.
+        latest = self._otp_challenges.get(login_request_id)
+        if latest is not None and latest.get("challenge_id") == challenge_id:
+            self._otp_challenges.pop(login_request_id, None)
+        return {
+            "login_request_id": login_request_id,
+            "account_id": account_id,
+            "status": "verifying_otp",
+        }
 
     async def _on_result(self, event_type: str, worker_id: str, data: dict) -> None:
         request_id = str(data.get("login_request_id") or "")
@@ -227,34 +438,109 @@ class LoginCoordinator:
             return
         if not fut.done():
             fut.set_result(data)
+        self._otp_challenges.pop(request_id, None)
 
     async def login(
         self, worker_id: str, account: AccountDefinition, config_dir: str,
         provider: str | None = None, slot_index: int = 0,
         *, allow_legacy_result: bool = False,
+        quarantine_on_uncertain_cleanup: bool = True,
     ) -> LoginOutcome:
-        from elastic_agent.core.protocols.messages import AccountLoginMessage
+        from elastic_agent.core.protocols.messages import (
+            AccountLoginCancelMessage,
+            AccountLoginMessage,
+        )
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         request_id = f"login-{uuid.uuid4().hex}"
         key = (worker_id, request_id)
+
+        async def cancel_worker(reason: str) -> bool:
+            ack_future: asyncio.Future = loop.create_future()
+            self._cancel_acks[key] = (account.id, ack_future)
+            try:
+                try:
+                    await self._conn.send_command(
+                        worker_id,
+                        AccountLoginCancelMessage(
+                            login_request_id=request_id,
+                            account_id=account.id,
+                            reason=reason,
+                        ),
+                    )
+                except Exception:
+                    # The worker may already be disconnected/terminated. Never
+                    # let cleanup transport failure mask the original failure.
+                    logger.warning(
+                        "Could not cancel account login %s on worker %s",
+                        request_id,
+                        worker_id,
+                    )
+                    return False
+                try:
+                    return bool(await asyncio.wait_for(
+                        asyncio.shield(ack_future),
+                        timeout=self._cancel_timeout,
+                    ))
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Timed out waiting for login cleanup ACK %s from worker %s",
+                        request_id,
+                        worker_id,
+                    )
+                    return False
+            finally:
+                self._cancel_acks.pop(key, None)
+
+        async def cancel_and_protect(reason: str) -> bool:
+            cleanup_confirmed = await cancel_worker(reason)
+            if not cleanup_confirmed:
+                await self._quarantine_if_uncertain(
+                    account.id,
+                    enabled=quarantine_on_uncertain_cleanup,
+                    reason=reason,
+                )
+            return cleanup_confirmed
+
         self._pending[key] = (account.id, fut, allow_legacy_result)
         try:
             await self._conn.send_command(worker_id, AccountLoginMessage(
                 login_request_id=request_id,
                 account_id=account.id, email=account.email, email_token=account.email_token,
+                password=account.password, agent_type=account.agent_type,
                 config_dir=config_dir, provider=provider, slot_index=slot_index,
             ))
             data = await asyncio.wait_for(fut, timeout=self._timeout)
         except asyncio.TimeoutError:
+            await cancel_and_protect("manager_timeout")
             return LoginOutcome(success=False, account_id=account.id,
                                 account_email=account.email, error="login timed out")
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                cancel_and_protect("manager_cancelled")
+            )
+            await _await_cleanup_task(cleanup_task)
+            raise
         except Exception as exc:  # pragma: no cover - defensive
+            await cancel_and_protect("manager_cancelled")
             return LoginOutcome(success=False, account_id=account.id,
-                                account_email=account.email, error=str(exc))
+                                account_email=account.email,
+                                error=(
+                                    "account login transport failed "
+                                    f"({type(exc).__name__})"
+                                ))
         finally:
             self._pending.pop(key, None)
+            self._cancel_acks.pop(key, None)
+            self._otp_challenges.pop(request_id, None)
+
+        if data.get("cleanup_complete") is False:
+            await self._quarantine_if_uncertain(
+                account.id,
+                enabled=quarantine_on_uncertain_cleanup,
+                reason="worker_disconnect",
+            )
 
         return LoginOutcome(
             success=bool(data.get("success")),
@@ -281,7 +567,7 @@ def _default_manager_url(manager) -> str:
 
 
 def _account_login_transport_error(manager_url: str) -> str | None:
-    """Require TLS before mailbox tokens can cross a host boundary."""
+    """Require TLS before account-login secrets cross a host boundary."""
     parsed = urlparse(manager_url)
     if parsed.scheme == "wss":
         return None
@@ -298,8 +584,8 @@ def _account_login_transport_error(manager_url: str) -> str | None:
         )
         return None
     return (
-        "account login requires a wss:// Manager URL because the mailbox "
-        "authorization token crosses the worker WebSocket; configure "
+        "account login requires a wss:// Manager URL because login secrets "
+        "cross the worker WebSocket; configure "
         "ELASTIC_AGENT_MANAGER_URL=wss://... (or explicitly set "
         "ELASTIC_AGENT_ALLOW_INSECURE_ACCOUNT_LOGIN=1 only on a trusted test network)"
     )
@@ -361,16 +647,21 @@ def make_provision_hook(
             logger.error("provision: %s never became SSH-ready", worker_id)
             return False
 
-        # EIP jobs require this Manager's worker protocol and identity checks:
-        # an older PyPI worker neither correlates login requests nor verifies
-        # the exact authenticated email/warm-up result.  Always deliver the
-        # currently running package for this path.  Do not honor a deployment
-        # override for EIP jobs: it could point at an older source tree that
-        # accepts request IDs but lacks the exact-email/warm-up enforcement.
-        # Non-EIP deployments may still opt into a full source tree.
+        # EIP and Codex jobs require this Manager's worker protocol and identity
+        # checks.  An older PyPI worker neither understands Codex password/OTP
+        # fields nor verifies the selected Codex identity, and could interpret
+        # the message as a legacy Claude login.  Always deliver the currently
+        # running package for these paths.  Do not honor a deployment override:
+        # it could point at an older source tree that accepts request IDs but
+        # lacks the exact-email/smoke-test enforcement.  Other non-EIP jobs may
+        # still opt into a full source tree.
         framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
         framework_target = "/opt/elastic-agent/framework/src"
-        if spec.account.binding == "eip":
+        protocol_pinned = (
+            spec.account.binding == "eip"
+            or spec.account.agent_type == "codex"
+        )
+        if protocol_pinned:
             framework_src = str(Path(__file__).resolve().parents[1])
             framework_target += "/elastic_agent"
 
@@ -425,13 +716,14 @@ def make_provision_hook(
             step = runtime_deploy_from_src_step(
                 manager_url=manager_url, auth_token=node.auth_token or "",
                 worker_id=worker_id, src_dir=fw_dir, run_as=ssh_user,
+                agent_type=spec.account.agent_type,
             )
             ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key)
             rc, _out, _err = await ex.execute(step.command, timeout=step.timeout)
             if rc != 0:
                 logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
                 return False
-            if spec.account.binding == "eip":
+            if protocol_pinned:
                 # The service command has completed, but a baked/stale runtime
                 # might have satisfied an earlier connection check.  Close the
                 # current socket and require the source-pinned service to prove
@@ -504,7 +796,11 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
                     error="account claim does not match bound assignment",
                 )
         else:
-            acct = await allocator.allocate(worker_id, spec.account.group)
+            acct = await allocator.allocate(
+                worker_id,
+                spec.account.group,
+                agent_type=spec.account.agent_type,
+            )
             if acct is None:
                 return LoginOutcome(
                     success=False,
@@ -513,7 +809,16 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
         return await coordinator.login(
             worker_id, acct, config_dir or spec.account.config_dir,
             provider=spec.account.__dict__.get("provider") if hasattr(spec.account, "__dict__") else None,
-            allow_legacy_result=spec.account.binding != "eip",
+            # A legacy Claude worker cannot perform Codex's password/OTP flow;
+            # accepting its uncorrelated result could validate the wrong agent.
+            allow_legacy_result=(
+                spec.account.binding != "eip"
+                and spec.account.agent_type == "claude"
+            ),
+            # EIP cleanup terminates the temporary instance before releasing
+            # its durable claim. Ordinary workers remain alive, so uncertain
+            # browser cleanup must quarantine the account from future jobs.
+            quarantine_on_uncertain_cleanup=spec.account.binding != "eip",
         )
 
     return login
@@ -557,6 +862,7 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 spec.account.group,
                 account_id=account_id,
                 excluded_account_ids=attempted,
+                agent_type=spec.account.agent_type,
             )
             if claim is None:
                 selector = f"account '{account_id}'" if account_id else (
@@ -745,14 +1051,20 @@ def wire_batch(
     *,
     include_pty: bool = False,
     scale_in_on_complete: bool = False,
-    login_timeout: float = 600.0,
+    login_timeout: float = 2700.0,
 ) -> BatchOrchestrator:
     """Build a fully-wired BatchOrchestrator and route worker events into it."""
     allocator = getattr(manager, "account_allocator", None)
     if allocator is None:
         # Lightweight test/deployment Managers predating the shared property.
         allocator = AccountAllocator(manager.account_store)
-    coordinator = LoginCoordinator(manager.connection_manager, manager.event_bus, timeout=login_timeout)
+    coordinator = LoginCoordinator(
+        manager.connection_manager,
+        manager.event_bus,
+        timeout=login_timeout,
+        quarantine_account=allocator.quarantine,
+    )
+    manager._account_login_coordinator = coordinator
     bound_reserve, bound_attach, bound_release = make_bound_hooks(manager, allocator)
     driver = ManagerFleetDriver(
         manager,

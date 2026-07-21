@@ -16,7 +16,7 @@ Elastic-Agent is a Python library that provides:
 - **Worker Runtime** — WebSocket-based communication between Manager and Workers
 - **Task scheduling** — Capacity-aware task distribution with pluggable Harness interface
 - **File sync** — Automatic file synchronization from Workers to OSS/S3
-- **Credential management** — Account pool with auto-login, quota monitoring, and rotation
+- **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
 - **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
 
@@ -118,22 +118,85 @@ job = await manager.batch.launch(spec)   # scale → bootstrap → login → run
 Template `{{shard_index}}` / `{{num_shards}}` / `{{hostname}}` are rendered by the
 Manager; shell constructs like `$(hostname -s)` are evaluated on the worker.
 
-### Account data and auto-login scope
+### Account data and worker-local auto-login
 
-The Manager stores account ID, email, group, and the mailbox/接码 authorization
-token in its accounts JSON file with mode `0600`. The token is write-only in
-REST responses (`has_email_token` only). `ACCOUNT_LOGIN` sends it to the chosen
-worker; a cross-host Manager URL must be `wss://` unless
+Declarative Mode-B Jobs support worker-local login for both Claude and Codex.
+Select the implementation with `account.agent_type` (`"claude"` by default):
+
+```python
+"account": {
+    "agent_type": "codex",
+    "mode": "worker_local_login",
+    "group": "standard",
+    "config_dir": "",  # Codex uses the runtime user's ~/.codex
+}
+```
+
+A Codex account must contain its OpenAI login password. `email_token` is
+optional and is used only to query a supported mailbox backend when OpenAI asks
+for an email verification code:
+
+```json
+{
+  "id": "codex-001",
+  "agent_type": "codex",
+  "email": "user@example.com",
+  "password": "<OpenAI account password>",
+  "email_token": "<optional mailbox query token>",
+  "group": "standard"
+}
+```
+
+The password is the OpenAI account password; it is not an IMAP/app password.
+The optional mailbox token is not an OpenAI API/OAuth token. Passwords and
+mailbox tokens are stored in the Manager's mode-`0600` accounts file and are
+write-only over REST: account responses expose only `has_password` and
+`has_email_token`. Cross-host `ACCOUNT_LOGIN` traffic must use `wss://` unless
 `ELASTIC_AGENT_ALLOW_INSECURE_ACCOUNT_LOGIN=1` is deliberately enabled on a
-trusted test network. The worker generates the Claude OAuth credentials, never
-returns them, verifies that `claude auth status` reports the selected email
-exactly (case-insensitive), and runs a successful warm-up command before the Job.
+trusted test network.
 
-Automatic login currently supports **Claude only**. A group named `codex` is
-only a pool label; there is no `codex login`, `CODEX_HOME`, or Codex execution
-path yet. The implemented mailbox backends are 171mail and mail.com relay/Web,
-not generic IMAP. A future IMAP integration (for example QQ Mail) should use an
-app-specific mailbox authorization code/password, not the normal web password.
+On update, blank secret fields preserve their current write-only values. Send
+`clear_email_token: true` to deliberately remove a stored mailbox query token.
+
+Claude continues to use the Chrome-CDP flow, exact-email `claude auth status`
+verification, and a successful `claude -p` warm-up. For Codex, the worker starts
+`codex login` and drives the OpenAI email/password OAuth page with Playwright
+under Xvfb; the CLI and browser stay on the same worker because the OAuth
+callback is local. The resulting `CODEX_HOME/auth.json` is accepted only when
+it contains ChatGPT OAuth tokens, its id-token email exactly matches the
+selected account case-insensitively, and a real `codex exec` smoke test
+succeeds. Failure or cancellation restores the previous auth file. OAuth
+credentials are never returned to the Manager.
+
+With one Codex account per worker, an empty `config_dir` resolves to that
+runtime user's `~/.codex` (including non-root workers). Codex Jobs that use
+multiple pre-logged accounts or restart/resume rotation must provide an explicit
+absolute `config_dir` writable by the runtime user; Elastic does not guess
+`/root`. Manager timeout or orchestration cancellation sends a correlated
+worker cancel and waits for the worker's cleanup acknowledgement, so the
+still-running browser/CLI cannot commit credentials later. A disconnect ends
+the Manager wait immediately. If an ordinary worker cannot confirm cleanup
+within 60 seconds, that account is quarantined from further allocation; an EIP
+Job instead remains protected by terminating its temporary instance before the
+account claim is released.
+
+If no mailbox token is configured, or automatic mailbox polling fails, the
+Batch Console displays the live OTP challenge. The corresponding API is:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/accounts/login-attempts` | List active, correlated OTP challenges |
+| `POST` | `/api/accounts/login-attempts/{login_request_id}/otp` | Forward `{"challenge_id":"...","code":"123456"}` to the owning worker |
+
+Submitted verification codes are not persisted. Codex mailbox polling currently
+supports 171mail and the MailCatcher-backed 163.com, mail.com, onet.pl, and
+gazeta.pl flows; generic IMAP is not implemented.
+
+Codex support here is for declarative Mode-B `worker_local_login` Jobs.
+`manager_distribute` is rejected for Codex because `auth.json` must be minted
+and verified on the worker. Codex Jobs also deploy the current Manager's worker
+source so an older runtime cannot interpret the login as a legacy Claude flow.
+Mode-A PTY-hosted execution remains Claude-only.
 
 ### One account, one AWS EIP
 
@@ -191,9 +254,10 @@ Current EIP-binding constraints:
   source, stops any legacy runtime, and requires a fresh WebSocket reconnect, so
   request correlation, exact-email verification, and warm-up checks cannot
   silently fall back to an older PyPI worker. EIP specs reject `run.env.HOME`
-  and `run.env.CLAUDE_CONFIG_DIR`; the verified credential directory is injected
-  by the orchestrator. Only the generated Claude OAuth credentials stay
-  worker-local; the mailbox token follows the boundary above.
+  and the selected agent's credential variable (`CLAUDE_CONFIG_DIR` or
+  `CODEX_HOME`); the verified directory is injected by the orchestrator.
+  Generated Claude/Codex OAuth credentials stay worker-local; the write-only
+  login inputs follow the protected Manager-to-worker boundary.
 - Releasing a Job keeps the EIP allocated and billable. AWS charges public IPv4
   addresses whether attached or idle, and the default EIP quota is commonly
   five per Region; request a quota increase and review current
@@ -231,12 +295,11 @@ the Job failed but does not retain the billable EC2 indefinitely.
 `harness_ref: "module:Class"` (or upload a `.py` via `POST /api/jobs/harness`) to
 drive the job with a real `Harness` subclass instead.
 
-**Frontend**: the Manager serves a **Batch Console** at `/batch` — an Accounts
-panel (email + 接码 token pool), a Job form (both the declarative and upload-code
-paths), and a live per-worker Job monitor. REST: `/api/accounts`, `/api/jobs`,
-`/api/jobs/harness`. The mailbox token is entered through this UI, stored by the
-Manager as a write-only field, and sent over the protected login channel; only
-the generated Claude OAuth credentials stay on the worker.
+**Frontend**: the Batch Console at `/batch` manages Claude and Codex identities,
+accepts write-only OpenAI passwords and optional mailbox query tokens, filters
+Job account choices by `agent_type`, and displays active Codex OTP challenges
+with a six-digit submission form. REST includes `/api/accounts`,
+`/api/accounts/login-attempts`, `/api/jobs`, and `/api/jobs/harness`.
 
 Live batch runs require provision/login hooks wired at deployment:
 `manager.configure_batch(provision_hook=..., login_hook=...)`.

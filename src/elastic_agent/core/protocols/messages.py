@@ -6,7 +6,7 @@ import enum
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 
 def _utcnow() -> datetime:
@@ -139,19 +139,41 @@ class AccountLoginMessage(Message):
     """Manager -> Worker: log this account in ON the worker (worker-autonomous).
 
     Unlike CREDENTIAL_LOGIN (which pushes already-obtained tokens down), this
-    carries only the account identity + 接码 token; the worker runs the vendored
-    login flow locally and the credentials are written on the worker and never
-    sent back up.
+    carries only the account identity + login inputs; the worker runs the
+    provider-specific login flow locally and the resulting OAuth credentials
+    are written on the worker and never sent back up. ``provider`` continues to
+    select the mailbox backend; ``agent_type`` selects Claude versus Codex.
     """
 
     type: Literal["ACCOUNT_LOGIN"] = "ACCOUNT_LOGIN"
     login_request_id: str = ""
     account_id: str
     email: str
-    email_token: str
+    agent_type: Literal["claude", "codex"] = "claude"
+    email_token: str = Field(default="", repr=False)
+    password: str = Field(default="", repr=False)
     config_dir: str
     provider: str | None = None
     slot_index: int = 0
+
+
+class AccountLoginOtpMessage(Message):
+    """Manager -> Worker: answer the OTP challenge for one login request."""
+
+    type: Literal["ACCOUNT_LOGIN_OTP"] = "ACCOUNT_LOGIN_OTP"
+    login_request_id: str = ""
+    account_id: str
+    challenge_id: str = ""
+    code: str = Field(repr=False)
+
+
+class AccountLoginCancelMessage(Message):
+    """Manager -> Worker: cancel one correlated worker-local login."""
+
+    type: Literal["ACCOUNT_LOGIN_CANCEL"] = "ACCOUNT_LOGIN_CANCEL"
+    login_request_id: str
+    account_id: str
+    reason: Literal["manager_timeout", "manager_cancelled"]
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +220,13 @@ class StatusMessage(Message):
     active_processes: list[str] = Field(default_factory=list)
     runtime_ready: bool = True
     runtime_error: str | None = None
+    agent_type: Literal["claude", "codex"] = "claude"
     claude_cli_ok: bool = True
     claude_version: str | None = None
     claude_path: str | None = None
+    codex_cli_ok: bool | None = None
+    codex_version: str | None = None
+    codex_path: str | None = None
 
 
 class HeartbeatMessage(Message):
@@ -270,6 +296,25 @@ class AccountLoginResultMessage(Message):
     error: str | None = None
 
 
+class AccountLoginOtpRequiredMessage(Message):
+    """Worker -> Manager: interactive login is waiting for an OTP code."""
+
+    type: Literal["ACCOUNT_LOGIN_OTP_REQUIRED"] = "ACCOUNT_LOGIN_OTP_REQUIRED"
+    login_request_id: str = ""
+    account_id: str
+    challenge_id: str = ""
+    expires_at: int = 0
+
+
+class AccountLoginCancelledMessage(Message):
+    """Worker -> Manager: correlated login cleanup has reached a safe point."""
+
+    type: Literal["ACCOUNT_LOGIN_CANCELLED"] = "ACCOUNT_LOGIN_CANCELLED"
+    login_request_id: str
+    account_id: str
+    cleanup_complete: bool = True
+
+
 class CredentialExhaustedMessage(Message):
     type: Literal["CREDENTIAL_EXHAUSTED"] = "CREDENTIAL_EXHAUSTED"
     worker_id: str
@@ -331,6 +376,8 @@ ManagerToWorkerMessage = Annotated[
         CredentialLoginMessage,
         CredentialRotateMessage,
         AccountLoginMessage,
+        AccountLoginOtpMessage,
+        AccountLoginCancelMessage,
         AuthResultMessage,
     ],
     Field(discriminator="type"),
@@ -350,6 +397,8 @@ WorkerToManagerMessage = Annotated[
         QuotaStatusMessage,
         CredentialLoginResultMessage,
         AccountLoginResultMessage,
+        AccountLoginOtpRequiredMessage,
+        AccountLoginCancelledMessage,
         CredentialExhaustedMessage,
         RunExhaustedMessage,
         AuthMessage,
@@ -373,6 +422,8 @@ AnyMessage = Annotated[
         CredentialLoginMessage,
         CredentialRotateMessage,
         AccountLoginMessage,
+        AccountLoginOtpMessage,
+        AccountLoginCancelMessage,
         AuthResultMessage,
         LogMessage,
         ProcessExitMessage,
@@ -386,6 +437,8 @@ AnyMessage = Annotated[
         QuotaStatusMessage,
         CredentialLoginResultMessage,
         AccountLoginResultMessage,
+        AccountLoginOtpRequiredMessage,
+        AccountLoginCancelledMessage,
         CredentialExhaustedMessage,
         RunExhaustedMessage,
         AuthMessage,
@@ -398,8 +451,6 @@ AnyMessage = Annotated[
 # Parsing helper
 # ---------------------------------------------------------------------------
 
-
-from pydantic import TypeAdapter
 
 _any_adapter = TypeAdapter(AnyMessage)
 

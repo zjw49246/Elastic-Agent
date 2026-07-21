@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +32,18 @@ async def _store(tmp_path, accounts):
     return s
 
 
-def _acct(i, group="standard", enabled=True):
-    return AccountDefinition(id=f"a{i}", email=f"a{i}@x.com", email_token=f"t{i}",
-                             group=group, enabled=enabled)
+def _acct(
+    i, group="standard", enabled=True, agent_type="claude", password="",
+):
+    return AccountDefinition(
+        id=f"a{i}",
+        email=f"a{i}@x.com",
+        email_token=f"t{i}",
+        password=password,
+        agent_type=agent_type,
+        group=group,
+        enabled=enabled,
+    )
 
 
 class FakeConn:
@@ -115,6 +125,23 @@ class TestAccountAllocator:
         assert (await alloc.allocate("w1", "standard")) is not None
         assert (await alloc.allocate("w2", "standard")) is None
 
+    async def test_agent_type_is_part_of_automatic_and_explicit_selection(
+        self, tmp_path,
+    ):
+        store = await _store(tmp_path, [
+            _acct(1, agent_type="claude"),
+            _acct(2, agent_type="codex", password="openai-secret"),
+        ])
+        alloc = AccountAllocator(store)
+
+        codex = await alloc.allocate(
+            "codex-worker", "standard", agent_type="codex"
+        )
+        assert codex is not None and codex.id == "a2"
+        assert await alloc.reserve(
+            "wrong-agent", "standard", account_id="a1", agent_type="codex"
+        ) is None
+
     async def test_group_and_enabled_filter(self, tmp_path):
         alloc = AccountAllocator(await _store(tmp_path, [
             _acct(1, group="other"), _acct(2, enabled=False), _acct(3),
@@ -127,6 +154,20 @@ class TestAccountAllocator:
         await alloc.allocate("w1", "standard")
         await alloc.release_worker("w1")
         assert (await alloc.allocate("w2", "standard")).id == "a1"
+
+    async def test_quarantine_survives_claim_release_until_explicit_clear(
+        self, tmp_path,
+    ):
+        alloc = AccountAllocator(await _store(tmp_path, [_acct(1)]))
+        claim = await alloc.reserve("job-1", "standard")
+        await alloc.quarantine(claim.account.id)
+        await alloc.release_claim(claim.claim_id)
+
+        assert await alloc.is_quarantined("a1") is True
+        assert await alloc.reserve("job-2", "standard") is None
+
+        await alloc.clear_quarantine("a1")
+        assert (await alloc.reserve("job-2", "standard")).account.id == "a1"
 
     async def test_explicit_account_claim_uses_id_not_group(self, tmp_path):
         alloc = AccountAllocator(await _store(tmp_path, [
@@ -215,16 +256,287 @@ class TestLoginCoordinator:
         assert not outcome.success
         assert outcome.error == "boom"
 
+    async def test_codex_password_and_agent_type_are_sent_to_worker(self):
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(
+            2, agent_type="codex", password="openai-secret"
+        )
+        task = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex")
+        )
+        await asyncio.sleep(0)
+
+        message = conn.sent[0][1]
+        assert message.agent_type == "codex"
+        assert message.password == "openai-secret"
+        assert message.config_dir == "/root/.codex"
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": message.login_request_id,
+            "account_id": account.id,
+            "success": True,
+        })
+        assert (await task).success is True
+
+    async def test_correlated_otp_is_forwarded_without_being_retained(self):
+        from elastic_agent.core.protocols.messages import AccountLoginOtpMessage
+
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        task = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex")
+        )
+        await asyncio.sleep(0)
+        login_message = conn.sent[0][1]
+
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": login_message.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "a" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+        attempts = coord.list_otp_challenges()
+        assert attempts == [{
+            "login_request_id": login_message.login_request_id,
+            "worker_id": "w1",
+            "account_id": account.id,
+            "challenge_id": "a" * 32,
+            "expires_at": attempts[0]["expires_at"],
+            "status": "awaiting_otp",
+        }]
+
+        result = await coord.submit_otp(
+            login_message.login_request_id, "a" * 32, "123456"
+        )
+        otp_message = conn.sent[-1][1]
+        assert isinstance(otp_message, AccountLoginOtpMessage)
+        assert otp_message.code == "123456"
+        assert result["status"] == "verifying_otp"
+        assert coord.list_otp_challenges() == []
+
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": login_message.login_request_id,
+            "account_id": account.id,
+            "success": True,
+        })
+        assert (await task).success is True
+
+    async def test_otp_rejects_wrong_challenge_without_sending_code(self):
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        task = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex")
+        )
+        await asyncio.sleep(0)
+        login_message = conn.sent[0][1]
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": login_message.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "b" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+
+        with pytest.raises(ValueError, match="does not match"):
+            await coord.submit_otp(
+                login_message.login_request_id, "c" * 32, "123456"
+            )
+        assert len(conn.sent) == 1
+
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": login_message.login_request_id,
+            "account_id": account.id,
+            "success": False,
+        })
+        assert (await task).success is False
+
     async def test_login_timeout(self, tmp_path):
-        coord = LoginCoordinator(FakeConn(), EventBus(), timeout=0.05)
-        outcome = await coord.login("w1", _acct(1), "/root/.claude")
+        from elastic_agent.core.protocols.messages import (
+            AccountLoginCancelMessage,
+        )
+
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=0.02, cancel_timeout=1)
+        login = asyncio.create_task(
+            coord.login("w1", _acct(1), "/root/.claude")
+        )
+        await asyncio.sleep(0.03)
+        cancel = conn.sent[-1][1]
+        assert isinstance(cancel, AccountLoginCancelMessage)
+        await bus.emit("ACCOUNT_LOGIN_CANCELLED", "w1", {
+            "login_request_id": cancel.login_request_id,
+            "account_id": cancel.account_id,
+            "cleanup_complete": True,
+        })
+
+        outcome = await login
         assert not outcome.success
         assert "timed out" in outcome.error
+        assert cancel.reason == "manager_timeout"
+
+    async def test_manager_task_cancellation_cancels_worker_login(self):
+        from elastic_agent.core.protocols.messages import AccountLoginCancelMessage
+
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5, cancel_timeout=1)
+        login = asyncio.create_task(
+            coord.login("w1", _acct(1), "/root/.claude")
+        )
+        await asyncio.sleep(0)
+
+        login.cancel()
+        for _ in range(20):
+            if len(conn.sent) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        cancel = conn.sent[-1][1]
+        assert isinstance(cancel, AccountLoginCancelMessage)
+        await bus.emit("ACCOUNT_LOGIN_CANCELLED", "w1", {
+            "login_request_id": cancel.login_request_id,
+            "account_id": cancel.account_id,
+            "cleanup_complete": True,
+        })
+        with pytest.raises(asyncio.CancelledError):
+            await login
+
+        assert cancel.reason == "manager_cancelled"
+
+    async def test_disconnect_fails_immediately_and_quarantines_account(self):
+        bus = EventBus()
+        conn = FakeConn()
+        quarantined = []
+        coord = LoginCoordinator(
+            conn,
+            bus,
+            timeout=30,
+            quarantine_account=lambda account_id: (
+                quarantined.append(account_id) or asyncio.sleep(0)
+            ),
+        )
+        login = asyncio.create_task(
+            coord.login("w1", _acct(1), "/root/.claude")
+        )
+        await asyncio.sleep(0)
+
+        await bus.emit("WORKER_DISCONNECTED", "w1", {})
+
+        outcome = await asyncio.wait_for(login, timeout=0.2)
+        assert outcome.success is False
+        assert outcome.error == "worker disconnected during account login"
+        assert quarantined == ["a1"]
+
+    async def test_unconfirmed_cancel_quarantines_only_when_requested(self):
+        first_quarantine = []
+        bus = EventBus()
+        coord = LoginCoordinator(
+            FakeConn(),
+            bus,
+            timeout=0.01,
+            cancel_timeout=0.01,
+            quarantine_account=lambda account_id: (
+                first_quarantine.append(account_id) or asyncio.sleep(0)
+            ),
+        )
+        outcome = await coord.login("w1", _acct(1), "/root/.claude")
+        assert outcome.success is False
+        assert first_quarantine == ["a1"]
+
+        eip_quarantine = []
+        coord = LoginCoordinator(
+            FakeConn(),
+            EventBus(),
+            timeout=0.01,
+            cancel_timeout=0.01,
+            quarantine_account=lambda account_id: (
+                eip_quarantine.append(account_id) or asyncio.sleep(0)
+            ),
+        )
+        outcome = await coord.login(
+            "w2",
+            _acct(1),
+            "/root/.claude",
+            quarantine_on_uncertain_cleanup=False,
+        )
+        assert outcome.success is False
+        assert eip_quarantine == []
+
+    async def test_otp_send_does_not_delete_a_newer_retry_challenge(self):
+        bus = EventBus()
+
+        class RacingConn(FakeConn):
+            async def send_command(self, worker_id, message):
+                await super().send_command(worker_id, message)
+                if message.type == "ACCOUNT_LOGIN_OTP":
+                    await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", worker_id, {
+                        "login_request_id": message.login_request_id,
+                        "account_id": message.account_id,
+                        "challenge_id": "d" * 32,
+                        "expires_at": int(time.time()) + 60,
+                    })
+
+        conn = RacingConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        login = asyncio.create_task(
+            coord.login("w1", account, "/home/ubuntu/.codex")
+        )
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "e" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+
+        await coord.submit_otp(request.login_request_id, "e" * 32, "123456")
+
+        assert coord.list_otp_challenges()[0]["challenge_id"] == "d" * 32
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "success": False,
+        })
+        assert (await login).success is False
+
+    async def test_malicious_otp_challenge_id_is_ignored(self):
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        login = asyncio.create_task(
+            coord.login("w1", account, "/home/ubuntu/.codex")
+        )
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "</div><script>alert(1)</script>",
+            "expires_at": int(time.time()) + 60,
+        })
+
+        assert coord.list_otp_challenges() == []
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "success": False,
+        })
+        assert (await login).success is False
 
     async def test_late_result_cannot_complete_a_new_login_for_same_account(self):
         bus = EventBus()
         conn = FakeConn()
-        coord = LoginCoordinator(conn, bus, timeout=0.02)
+        coord = LoginCoordinator(
+            conn, bus, timeout=0.02, cancel_timeout=0.01,
+        )
 
         first = await coord.login("w1", _acct(1), "/root/.claude-old")
         assert not first.success
@@ -348,6 +660,38 @@ class TestLoginHook:
         })
         outcome = await task
         assert outcome.success and outcome.account_id == "a1"
+
+    async def test_codex_rejects_uncorrelated_legacy_login_result(self, tmp_path):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        store = await _store(tmp_path, [
+            _acct(1, agent_type="codex", password="openai-password"),
+        ])
+        mgr = FakeManager(tmp_path, store)
+        coord = LoginCoordinator(mgr.connection_manager, mgr.event_bus, timeout=5)
+        hook = make_login_hook(mgr, AccountAllocator(store), coord)
+        spec = JobSpec(
+            name="codex-job",
+            run=RunSpec(command="x"),
+            account={"agent_type": "codex"},
+        )
+
+        task = asyncio.create_task(hook("w1", spec, "/root/.codex"))
+        await asyncio.sleep(0.01)
+        message = mgr.connection_manager.sent[0][1]
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "account_id": "a1",
+            "success": True,
+        })
+        await asyncio.sleep(0)
+        assert task.done() is False
+
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": message.login_request_id,
+            "account_id": "a1",
+            "success": True,
+        })
+        assert (await task).success is True
 
     async def test_no_account_fails(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
@@ -669,6 +1013,61 @@ class TestProvisionHook:
         assert "disable --now elastic-agent-runtime.service" in (
             captured["runtime_command"]
         )
+        assert mgr.connection_manager.disconnected == ["w1"]
+
+    async def test_codex_job_always_bootstraps_current_worker_source(
+        self, tmp_path, monkeypatch,
+    ):
+        """An old PyPI worker could misread Codex login as legacy Claude login."""
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        import elastic_agent.core.code_sync as code_sync_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        captured = {"deliveries": []}
+
+        class FakeSync:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def deliver(self, local, host, target):
+                captured["deliveries"].append((local, host, target))
+                return True
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None):
+                captured["runtime_command"] = command
+                return 0, "", ""
+
+        # Codex ignores an explicitly configured stale framework for the same
+        # identity-verification reason as an EIP-bound login.
+        monkeypatch.setenv("ELASTIC_AGENT_FRAMEWORK_SRC", "/tmp/stale-framework")
+        monkeypatch.setattr(code_sync_mod, "ManagerCodeSync", FakeSync)
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(node_id, host, steps, user, key):
+            captured["steps"] = [step.name for step in steps]
+            return True
+
+        spec = JobSpec(
+            name="codex-job",
+            run=RunSpec(command="x"),
+            account={"agent_type": "codex"},
+        )
+        hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=1)
+
+        assert await hook("w1", None, spec) is True
+        assert "runtime-deploy" not in captured["steps"]
+        assert "credential-login-deps" in captured["steps"]
+        local, delivered_host, target = captured["deliveries"][0]
+        assert delivered_host == "1.2.3.4"
+        assert local.endswith("/elastic_agent")
+        assert target == "/opt/elastic-agent/framework/src/elastic_agent"
+        assert "runtime_main" in captured["runtime_command"]
+        assert "ELASTIC_AGENT_AGENT_TYPE=codex" in captured["runtime_command"]
         assert mgr.connection_manager.disconnected == ["w1"]
 
     async def test_ws_never_connects(self, tmp_path):

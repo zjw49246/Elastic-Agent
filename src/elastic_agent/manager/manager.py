@@ -112,6 +112,7 @@ class ElasticAgentManager:
         self._inflight_instance_creates = 0
         self._instance_capacity_holds: dict[str, int] = {}
         self._account_allocator: Any = None
+        self._account_login_coordinator: Any = None
         self._batch: Any = None
 
         # Optional S3 result upload: collected/<job_id>/ → s3://<bucket>/<prefix>/.
@@ -925,6 +926,16 @@ class ElasticAgentManager:
             self._batch = wire_batch(self)
         return self._batch
 
+    @property
+    def account_login_coordinator(self):
+        """Coordinator backing password login and interactive OTP challenges."""
+
+        if self._account_login_coordinator is None:
+            # Default batch wiring owns the coordinator because its lifetime
+            # must match the login hooks that wait for worker results.
+            _ = self.batch
+        return self._account_login_coordinator
+
     def configure_batch(self, *, provision_hook=None, login_hook=None,
                         scale_in_on_complete: bool = False, include_pty: bool = False) -> None:
         """Rewire the batch orchestrator.
@@ -947,7 +958,12 @@ class ElasticAgentManager:
         from elastic_agent.core.batch_orchestrator import BatchOrchestrator
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
         allocator = self.account_allocator
-        coordinator = LoginCoordinator(self.connection_manager, self.event_bus)
+        coordinator = LoginCoordinator(
+            self.connection_manager,
+            self.event_bus,
+            quarantine_account=allocator.quarantine,
+        )
+        self._account_login_coordinator = coordinator
         bound_reserve, bound_attach, bound_release = make_bound_hooks(self, allocator)
         driver = ManagerFleetDriver(
             self,

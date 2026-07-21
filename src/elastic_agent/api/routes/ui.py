@@ -410,21 +410,31 @@ _BATCH_HTML = """\
   <div class="card">
     <h2>Accounts</h2>
     <p class="hint">
-      Manager 会把 email + 接码/邮箱授权 token 保存到权限 0600 的账号文件；token 提交后不回显。
-      Claude OAuth 凭证在 worker 生成且不回传。当前自动登录仅支持 Claude（171mail、mail.com）；
-      group=codex 只是账号池标签，尚无 Codex 登录/执行链路，也未实现通用 IMAP。
+      Manager 会把登录密码与可选的接码查询 token 保存到权限 0600 的账号文件，提交后均不回显。
+      Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 使用 OpenAI 密码登录；若仍要求 OTP，
+      有接码 token 时自动读取，否则会在下方等待管理员输入 6 位验证码。
     </p>
-    <table><thead><tr><th>ID</th><th>Email</th><th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
+    <table><thead><tr><th>ID</th><th>Agent</th><th>Email</th><th>Secrets</th>
+      <th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
       <tbody id="acctRows"></tbody></table>
     <div class="grid3" style="margin-top:12px">
       <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
       <div><label>Email</label><input id="acctEmail" placeholder="a@x.com"></div>
-      <div><label>接码/邮箱授权 Token（写入后不回显）</label><input id="acctToken" placeholder="optional"></div>
+      <div><label>Agent</label><select id="acctAgent">
+        <option value="claude">Claude</option><option value="codex">Codex</option>
+      </select></div>
     </div>
-    <div class="grid2">
+    <div class="grid3">
+      <div><label>登录密码（Codex 必填，写入后不回显）</label>
+        <input id="acctPassword" type="password" placeholder="OpenAI password"></div>
+      <div><label>接码查询 Token（可选，写入后不回显）</label>
+        <input id="acctToken" type="password" placeholder="171mail / MailCatcher query token">
+        <label style="margin-top:5px"><input id="acctClearToken" type="checkbox" style="width:auto">
+          清除该账号已有查询 token</label></div>
       <div><label>Group</label><input id="acctGroup" value="standard"></div>
     </div>
     <button class="btn" onclick="addAccount()">Add Account</button>
+    <div id="loginAttempts" style="margin-top:12px"></div>
   </div>
 
   <!-- Job submission -->
@@ -500,8 +510,14 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       <div><label>Account mode</label>
         <select id="jAcctMode"><option value="worker_local_login">worker_local_login</option>
           <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
+      <div><label>Agent</label><select id="jAgentType" onchange="updateAgentUI()">
+        <option value="claude">Claude</option><option value="codex">Codex</option>
+      </select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
-      <div><label>config_dir (blank = ~/.claude)</label><input id="jConfigDir" value="/home/ubuntu/.claude"></div>
+    </div>
+    <div class="grid2">
+      <div><label>config_dir（空 = Agent 默认目录）</label>
+        <input id="jConfigDir" placeholder="~/.claude / ~/.codex"></div>
     </div>
     <div class="grid2">
       <div><label>账号固定 EIP</label>
@@ -515,7 +531,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     <div class="hint" id="jEipHint">
       启用后，一个账号固定绑定一个 IPv4 EIP，每台临时 EC2 只使用一个账号；如指定账号，
       选中账号数必须等于 Workers。新 EC2 仍会重新登录 Claude，任务结束先收集结果再销毁 EC2，
-      但保留 EIP。
+      但保留 EIP。Claude 与 Codex 账号都按 account_id 绑定各自 EIP。
     </div>
     <div class="grid2">
       <div><label>Rotation strategy</label>
@@ -608,21 +624,28 @@ async function refreshAccounts() {
       const bind = b.length
         ? b.map(x => `${(x.worker_id||'').replace('aws:','')} <span class="muted">(${x.job_name||x.job_id}·${x.phase}${x.active?'·当前':''})</span>`).join('<br>')
         : '<span class="muted">空闲</span>';
-      return `<tr><td>${a.id}</td><td>${a.email}</td><td>${a.group}</td><td>${a.enabled}</td>
+      const secrets = `${a.has_password ? 'password' : ''}`
+        + `${a.has_password && a.has_email_token ? ' + ' : ''}`
+        + `${a.has_email_token ? 'mail token' : ''}` || '—';
+      return `<tr><td>${a.id}</td><td>${a.agent_type}</td><td>${a.email}</td>
+        <td>${secrets}</td><td>${a.group}</td><td>${a.enabled}</td>
         <td style="font-size:.72rem">${bind}</td>
         <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
             onclick="removeAccount('${a.id}')">✕</button></td></tr>`;
-    }).join('') || '<tr><td colspan="6" class="muted">No accounts.</td></tr>';
+    }).join('') || '<tr><td colspan="8" class="muted">No accounts.</td></tr>';
 
     const picker = document.getElementById('jAcctIds');
+    const selectedAgent = document.getElementById('jAgentType').value;
     const selected = new Set(Array.from(picker.selectedOptions).map(o => o.value));
     picker.replaceChildren();
     accounts.forEach(a => {
       const option = document.createElement('option');
       option.value = a.id;
-      option.textContent = `${a.email || a.id} · ${a.group || 'standard'} (${a.id})`;
-      option.disabled = !a.enabled;
-      option.selected = selected.has(a.id) && a.enabled;
+      option.dataset.agentType = a.agent_type;
+      option.dataset.enabled = String(Boolean(a.enabled));
+      option.textContent = `${a.agent_type} · ${a.email || a.id} · ${a.group || 'standard'} (${a.id})`;
+      option.disabled = !a.enabled || a.agent_type !== selectedAgent;
+      option.selected = selected.has(a.id) && !option.disabled;
       picker.appendChild(option);
     });
     updateEipBindingUI();
@@ -631,14 +654,62 @@ async function refreshAccounts() {
 async function addAccount() {
   const id = document.getElementById('acctId').value.trim();
   const email = document.getElementById('acctEmail').value.trim();
+  const agentType = document.getElementById('acctAgent').value;
+  const password = document.getElementById('acctPassword').value;
   if (!id || !email) return toast('id + email required', 'error');
+  if (agentType === 'codex' && !password) return toast('Codex account requires OpenAI password', 'error');
   try {
     await api('POST', '/accounts', {id, email,
+      agent_type: agentType,
+      password: password,
       email_token: document.getElementById('acctToken').value.trim(),
+      clear_email_token: document.getElementById('acctClearToken').checked,
       group: document.getElementById('acctGroup').value.trim() || 'standard'});
     document.getElementById('acctId').value = ''; document.getElementById('acctEmail').value = '';
+    document.getElementById('acctPassword').value = '';
     document.getElementById('acctToken').value = '';
+    document.getElementById('acctClearToken').checked = false;
     toast('Account added'); refreshAccounts();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function refreshLoginAttempts() {
+  try {
+    const data = await api('GET', '/accounts/login-attempts');
+    const attempts = data.attempts || [];
+    const container = document.getElementById('loginAttempts');
+    container.replaceChildren();
+    attempts.forEach(a => {
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:6px';
+      const title = document.createElement('b');
+      title.textContent = `Codex OTP · ${a.account_id}`;
+      const worker = document.createElement('span');
+      worker.className = 'muted'; worker.textContent = ` ${a.worker_id}`;
+      const controls = document.createElement('div');
+      controls.className = 'grid2'; controls.style.marginTop = '6px';
+      const input = document.createElement('input');
+      input.id = 'otp-' + a.challenge_id; input.inputMode = 'numeric';
+      input.maxLength = 6; input.placeholder = '6 位验证码';
+      const button = document.createElement('button');
+      button.className = 'btn'; button.style.margin = '0';
+      button.textContent = '提交验证码';
+      button.addEventListener('click', () =>
+        submitLoginOtp(String(a.login_request_id), String(a.challenge_id)));
+      controls.append(input, button); card.append(title, worker, controls);
+      container.appendChild(card);
+    });
+  } catch(e) { /* coordinator may not be initialized until the first Job */ }
+}
+async function submitLoginOtp(requestId, challengeId) {
+  const input = document.getElementById('otp-' + challengeId);
+  const code = (input?.value || '').trim();
+  if (!/^\\d{6}$/.test(code)) return toast('验证码必须是 6 位数字', 'error');
+  try {
+    await api('POST', '/accounts/login-attempts/' + encodeURIComponent(requestId) + '/otp',
+      {challenge_id: challengeId, code: code});
+    if (input) input.value = '';
+    toast('验证码已提交'); refreshLoginAttempts();
   } catch(e) { toast(e.message, 'error'); }
 }
 async function terminateWorker(wid) {
@@ -679,6 +750,23 @@ function updateEipBindingUI() {
   if (restartOption) restartOption.disabled = enabled;
   if (enabled && rotation.value === 'on_exhaust_restart_resume') rotation.value = 'none';
 }
+function updateAgentUI() {
+  const agentType = document.getElementById('jAgentType').value;
+  const picker = document.getElementById('jAcctIds');
+  const accountMode = document.getElementById('jAcctMode');
+  const distribute = Array.from(accountMode.options)
+    .find(option => option.value === 'manager_distribute');
+  if (distribute) distribute.disabled = agentType === 'codex';
+  if (agentType === 'codex' && accountMode.value === 'manager_distribute') {
+    accountMode.value = 'worker_local_login';
+  }
+  Array.from(picker.options).forEach(option => {
+    option.disabled = option.dataset.enabled !== 'true' || option.dataset.agentType !== agentType;
+    if (option.disabled) option.selected = false;
+  });
+  document.getElementById('jConfigDir').placeholder =
+    agentType === 'codex' ? '~/.codex (CODEX_HOME)' : '~/.claude (CLAUDE_CONFIG_DIR)';
+}
 async function submitJob() {
   const ref = document.getElementById('jHarnessRef').value.trim();
   const workers = parseInt(document.getElementById('jWorkers').value) || 1;
@@ -699,6 +787,7 @@ async function submitJob() {
     run: {command: document.getElementById('jRun').value.trim(),
           cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
     account: {mode: document.getElementById('jAcctMode').value,
+              agent_type: document.getElementById('jAgentType').value,
               group: document.getElementById('jAcctGroup').value.trim() || 'standard',
               config_dir: document.getElementById('jConfigDir').value.trim(),
               binding: accountBinding,
@@ -837,8 +926,8 @@ async function refreshResults() {
   } catch(e) { /* silent */ }
 }
 
-updateEipBindingUI(); refreshAccounts(); refreshJobs(); refreshResults();
-setInterval(() => { refreshJobs(); refreshResults(); }, 5000);
+updateEipBindingUI(); updateAgentUI(); refreshAccounts(); refreshJobs(); refreshResults(); refreshLoginAttempts();
+setInterval(() => { refreshJobs(); refreshResults(); refreshLoginAttempts(); }, 5000);
 </script>
 </body>
 </html>

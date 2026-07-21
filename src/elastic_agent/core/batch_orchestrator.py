@@ -233,8 +233,9 @@ class FleetDriver(Protocol):
     ) -> LoginOutcome:
         """Allocate an account and have the worker log it in locally.
 
-        ``ACCOUNT_LOGIN`` carries the mailbox authorization token from the
-        Manager; generated Claude OAuth credentials are not returned.
+        ``ACCOUNT_LOGIN`` carries the selected agent's write-only login inputs
+        from the Manager; generated Claude/Codex OAuth credentials are not
+        returned.
         """
         ...
 
@@ -1077,7 +1078,15 @@ class BatchOrchestrator:
     @staticmethod
     def _extra_dir(job: BatchJob, run: WorkerRun) -> str:
         """A fresh config_dir for a rotation beyond the pre-logged pool."""
-        base = run.config_dirs[0] or job.spec.account.config_dir or "/root/.claude"
+        base = run.config_dirs[0] or job.spec.account.config_dir
+        if not base and job.spec.account.agent_type == "codex":
+            # JobSpec rejects this configuration for managed rotation. Keep the
+            # runtime guard for custom Harness implementations rather than
+            # guessing that a non-root worker can write /root.
+            raise RuntimeError(
+                "Codex rotation requires an explicit worker-writable config_dir"
+            )
+        base = base or "/root/.claude"
         return f"{base}-rot-{run.rotations}"
 
     @_tracked_lifecycle

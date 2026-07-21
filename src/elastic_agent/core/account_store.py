@@ -2,9 +2,9 @@
 
 A thin CRUD layer over ``accounts.json`` (the same file CredentialPool reads for
 allocation). The frontend's Accounts panel adds/removes account *identities*
-(email + mailbox/接码 authorization token + group). The mailbox token is stored
-write-only in a mode-0600 file and sent to the selected worker over a protected
-transport; Claude OAuth access/refresh credentials are minted only on that
+(agent type + email + login secrets + group). Passwords and mailbox tokens are
+stored write-only in a mode-0600 file and sent to the selected worker over a
+protected transport; OAuth access/refresh credentials are minted only on that
 worker and are never stored here. Kept deliberately separate from
 CredentialPool, which owns runtime allocation/quota state.
 """
@@ -37,9 +37,9 @@ class AccountStore:
     def _load_sync(self) -> None:
         if self._path.exists():
             try:
-                # The file contains mailbox/IMAP authorization tokens. Tighten
-                # legacy permissions before reading; refusing to run is safer
-                # than continuing with a world-readable credential source.
+                # The file contains passwords and mailbox authorization tokens.
+                # Tighten legacy permissions before reading; refusing to run is
+                # safer than continuing with a world-readable credential source.
                 os.chmod(self._path, 0o600)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 self._config = AccountsConfig.model_validate(raw)
@@ -110,13 +110,15 @@ class AccountStore:
                     existing
                     for existing in self._config.accounts
                     if existing.id != account.id
+                    and existing.agent_type == account.agent_type
                     and existing.email.casefold() == account.email.casefold()
                 ),
                 None,
             )
             if collision is not None:
                 raise ValueError(
-                    f"email {account.email!r} is already account {collision.id!r}"
+                    f"{account.agent_type} email {account.email!r} is already "
+                    f"account {collision.id!r}"
                 )
             candidate = self._config.model_copy(deep=True)
             candidate.accounts = [

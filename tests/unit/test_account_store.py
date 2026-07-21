@@ -23,10 +23,19 @@ async def test_empty_initially(tmp_path):
 
 async def test_add_and_list(tmp_path):
     s = _store(tmp_path)
-    await s.add(AccountDefinition(id="a", email="a@x.com", email_token="t", group="prod"))
+    await s.add(AccountDefinition(
+        id="a",
+        email="a@x.com",
+        email_token="t",
+        password="secret-password",
+        agent_type="codex",
+        group="prod",
+    ))
     accts = await s.list()
     assert len(accts) == 1
     assert accts[0].id == "a"
+    assert accts[0].agent_type == "codex"
+    assert accts[0].password == "secret-password"
     assert accts[0].group == "prod"
 
 
@@ -71,6 +80,46 @@ async def test_same_email_cannot_be_registered_under_two_ids(tmp_path):
     with pytest.raises(ValueError, match="already account"):
         await s.add(AccountDefinition(id="b", email="user@example.COM"))
     assert [account.id for account in await s.list()] == ["a"]
+
+
+async def test_same_email_may_identify_one_account_per_agent_type(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(
+        id="claude-a", email="User@Example.com", agent_type="claude"
+    ))
+    await s.add(AccountDefinition(
+        id="codex-a", email="user@example.COM", agent_type="codex",
+        password="openai-password",
+    ))
+
+    accounts = await s.list()
+    assert [(account.id, account.agent_type) for account in accounts] == [
+        ("claude-a", "claude"),
+        ("codex-a", "codex"),
+    ]
+
+
+async def test_codex_account_requires_password(tmp_path):
+    with pytest.raises(ValueError, match="OpenAI password"):
+        AccountDefinition(
+            id="codex-a", email="user@example.com", agent_type="codex"
+        )
+
+
+async def test_duplicate_email_for_same_agent_type_on_disk_fails_closed(tmp_path):
+    path = tmp_path / "accounts.json"
+    source = json.dumps({
+        "accounts": [
+            {"id": "a", "email": "same@example.com", "agent_type": "codex", "password": "p1"},
+            {"id": "b", "email": "SAME@example.com", "agent_type": "codex", "password": "p2"},
+        ],
+        "groups": {},
+    })
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AccountStoreCorruptError, match="account store is corrupt"):
+        await AccountStore(str(path)).load()
+    assert path.read_text(encoding="utf-8") == source
 
 
 async def test_duplicate_email_on_disk_fails_closed(tmp_path):

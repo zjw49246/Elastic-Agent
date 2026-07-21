@@ -933,6 +933,16 @@ class TestMultiAccountPerWorker:
         await orch.on_worker_exhausted(job.job_id, wid)
         assert d.dispatched[-1]["env"]["CLAUDE_CONFIG_DIR"] == "/root/.claude-slot-1"
 
+    async def test_codex_rotation_never_guesses_root_home(self):
+        from types import SimpleNamespace
+
+        spec = _spec(account={"agent_type": "codex"})
+        job = SimpleNamespace(spec=spec)
+        run = SimpleNamespace(config_dirs=[""], rotations=2)
+
+        with pytest.raises(RuntimeError, match="worker-writable config_dir"):
+            BatchOrchestrator._extra_dir(job, run)
+
 
 class TestCompletion:
     async def test_exit_zero_marks_done(self):

@@ -48,10 +48,18 @@ class TestDashboardEndpoint:
         assert "binding: accountBinding" in html
         assert "ids: accountIds" in html
         assert "选中账号数必须等于 Workers" in html
-        assert "token 提交后不回显" in html
-        assert "group=codex 只是账号池标签" in html
-        assert "尚无 Codex 登录/执行链路" in html
-        assert "未实现通用 IMAP" in html
+        assert "提交后均不回显" in html
+        assert 'id="acctPassword"' in html
+        assert 'id="acctClearToken"' in html
+        assert 'id="jAgentType"' in html
+        assert "Codex 使用 OpenAI 密码登录" in html
+        assert "/accounts/login-attempts/" in html
+        assert "agent_type:" in html
+        assert "clear_email_token:" in html
+        assert "manager_distribute" in html
+        assert "distribute.disabled = agentType === 'codex'" in html
+        assert "container.replaceChildren()" in html
+        assert "title.textContent = `Codex OTP" in html
         assert "worker 用实例角色直拉，不经 Manager" in html
 
     @pytest.mark.asyncio

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
-import pytest
-
 from elastic_agent.core.protocols.messages import (
+    AccountLoginCancelledMessage,
+    AccountLoginCancelMessage,
     AccountLoginMessage,
+    AccountLoginOtpMessage,
+    AccountLoginOtpRequiredMessage,
     AccountLoginResultMessage,
     AuthMessage,
     AuthResultMessage,
@@ -16,8 +17,8 @@ from elastic_agent.core.protocols.messages import (
     CredentialLoginMessage,
     CredentialLoginResultMessage,
     CredentialRotateMessage,
-    ExecuteMessage,
     ErrorMessage,
+    ExecuteMessage,
     FileChangeMessage,
     FileContentMessage,
     FileSyncedMessage,
@@ -179,6 +180,38 @@ class TestManagerToWorkerMessages:
         assert restored.old_account_id == "acct-old"
         assert restored.new_credentials["email"] == "new@b.com"
 
+    def test_codex_account_login_roundtrip(self):
+        msg = AccountLoginMessage(
+            login_request_id="login-1",
+            account_id="codex-a",
+            agent_type="codex",
+            email="user@example.com",
+            password="correct horse battery staple",
+            email_token="",
+            config_dir="/root/.codex-a",
+            provider="imap",
+        )
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, AccountLoginMessage)
+        assert restored.agent_type == "codex"
+        assert restored.password == "correct horse battery staple"
+        assert restored.provider == "imap"
+        assert "correct horse battery staple" not in repr(msg)
+
+    def test_account_login_otp_roundtrip(self):
+        msg = AccountLoginOtpMessage(
+            login_request_id="login-1",
+            account_id="codex-a",
+            challenge_id="challenge-1",
+            code="123456",
+        )
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, AccountLoginOtpMessage)
+        assert restored.login_request_id == "login-1"
+        assert restored.challenge_id == "challenge-1"
+        assert restored.code == "123456"
+        assert "123456" not in repr(msg)
+
     def test_auth_result_roundtrip(self):
         msg = AuthResultMessage(success=True, worker_id="w-1")
         restored = parse_message(msg.model_dump_json())
@@ -284,6 +317,25 @@ class TestWorkerToManagerMessages:
         msg = StatusMessage(cpu=0.0, mem=0.0, disk=0.0)
         assert msg.active_processes == []
 
+    def test_codex_status_roundtrip(self):
+        msg = StatusMessage(
+            cpu=0.0,
+            mem=0.0,
+            disk=0.0,
+            agent_type="codex",
+            runtime_ready=True,
+            claude_cli_ok=False,
+            codex_cli_ok=True,
+            codex_version="codex-cli 0.144.6",
+            codex_path="/usr/local/bin/codex",
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert restored.agent_type == "codex"
+        assert restored.codex_cli_ok is True
+        assert restored.codex_version == "codex-cli 0.144.6"
+
     def test_heartbeat_roundtrip(self):
         msg = HeartbeatMessage(uptime_seconds=3600)
         restored = parse_message(msg.model_dump_json())
@@ -347,6 +399,43 @@ class TestWorkerToManagerMessages:
         assert isinstance(restored, CredentialLoginResultMessage)
         assert restored.success is True
 
+    def test_account_login_otp_required_roundtrip(self):
+        expires_at = 1_774_355_200
+        msg = AccountLoginOtpRequiredMessage(
+            login_request_id="login-1",
+            account_id="codex-a",
+            challenge_id="challenge-1",
+            expires_at=expires_at,
+        )
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, AccountLoginOtpRequiredMessage)
+        assert restored.challenge_id == "challenge-1"
+        assert restored.expires_at == expires_at
+
+    def test_account_login_cancel_roundtrip(self):
+        msg = AccountLoginCancelMessage(
+            login_request_id="login-abc",
+            account_id="codex-a",
+            reason="manager_timeout",
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AccountLoginCancelMessage)
+        assert restored.reason == "manager_timeout"
+
+    def test_account_login_cancelled_roundtrip(self):
+        msg = AccountLoginCancelledMessage(
+            login_request_id="login-abc",
+            account_id="codex-a",
+            cleanup_complete=False,
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AccountLoginCancelledMessage)
+        assert restored.cleanup_complete is False
+
     def test_credential_exhausted_roundtrip(self):
         msg = CredentialExhaustedMessage(
             worker_id="w-1",
@@ -388,8 +477,29 @@ class TestParseMessageFromDict:
 
         assert isinstance(command, AccountLoginMessage)
         assert command.login_request_id == ""
+        assert command.agent_type == "claude"
+        assert command.password == ""
         assert isinstance(result, AccountLoginResultMessage)
         assert result.login_request_id == ""
+
+    def test_account_login_otp_fields_default_for_legacy_payloads(self):
+        command = parse_message({
+            "type": "ACCOUNT_LOGIN_OTP",
+            "account_id": "codex-a",
+            "code": "123456",
+        })
+        event = parse_message({
+            "type": "ACCOUNT_LOGIN_OTP_REQUIRED",
+            "account_id": "codex-a",
+        })
+
+        assert isinstance(command, AccountLoginOtpMessage)
+        assert command.login_request_id == ""
+        assert command.challenge_id == ""
+        assert isinstance(event, AccountLoginOtpRequiredMessage)
+        assert event.login_request_id == ""
+        assert event.challenge_id == ""
+        assert event.expires_at == 0
 
     def test_all_types_from_dict(self):
         cases = [
@@ -405,6 +515,16 @@ class TestParseMessageFromDict:
             ({"type": "UNREGISTER_SYNC_MAPPING", "task_id": "t"}, UnregisterSyncMappingMessage),
             ({"type": "CREDENTIAL_LOGIN", "task_id": "t", "slot_index": 0, "credentials": {}, "config_dir": "/c"}, CredentialLoginMessage),
             ({"type": "CREDENTIAL_ROTATE", "task_id": "t", "slot_index": 0, "old_account_id": "o", "new_credentials": {}, "config_dir": "/c"}, CredentialRotateMessage),
+            ({"type": "ACCOUNT_LOGIN_OTP", "account_id": "a", "code": "123456"}, AccountLoginOtpMessage),
+            (
+                {
+                    "type": "ACCOUNT_LOGIN_CANCEL",
+                    "login_request_id": "r",
+                    "account_id": "a",
+                    "reason": "manager_timeout",
+                },
+                AccountLoginCancelMessage,
+            ),
             ({"type": "AUTH_RESULT", "success": True}, AuthResultMessage),
             ({"type": "LOG", "task_id": "t", "stream": "stdout", "data": "x"}, LogMessage),
             ({"type": "PROCESS_EXIT", "task_id": "t", "exit_code": 0}, ProcessExitMessage),
@@ -416,6 +536,16 @@ class TestParseMessageFromDict:
             ({"type": "FILE_SYNCED", "task_id": "t", "path": "/a", "oss_key": "k", "synced_at": "2026-05-20T00:00:00Z", "md5": "m"}, FileSyncedMessage),
             ({"type": "QUOTA_STATUS", "task_id": "t", "account_id": "a", "usage_percent": 50.0}, QuotaStatusMessage),
             ({"type": "CREDENTIAL_LOGIN_RESULT", "account_id": "a", "slot_index": 0, "success": True}, CredentialLoginResultMessage),
+            (
+                {
+                    "type": "ACCOUNT_LOGIN_CANCELLED",
+                    "login_request_id": "r",
+                    "account_id": "a",
+                    "cleanup_complete": True,
+                },
+                AccountLoginCancelledMessage,
+            ),
+            ({"type": "ACCOUNT_LOGIN_OTP_REQUIRED", "account_id": "a"}, AccountLoginOtpRequiredMessage),
             ({"type": "CREDENTIAL_EXHAUSTED", "worker_id": "w", "slot_index": 0, "account_id": "a", "reason": "r"}, CredentialExhaustedMessage),
             ({"type": "AUTH", "token": "t"}, AuthMessage),
         ]

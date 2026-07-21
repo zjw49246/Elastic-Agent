@@ -107,6 +107,47 @@ class TestBootstrapSteps:
         assert "pty-install" not in names
         assert "pty-refresh-hook" not in names
 
+    def test_codex_installs_pinned_cli_and_playwright_login_deps(self):
+        spec = _spec(account={"agent_type": "codex"})
+        steps = compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+        )
+
+        install = next(step for step in steps if step.name == "agent-install")
+        login_deps = next(
+            step for step in steps if step.name == "credential-login-deps"
+        )
+        assert "@openai/codex@0.144.6" in install.command
+        assert "codex --version" in install.command
+        assert "@anthropic-ai/claude-code" not in install.command
+        assert "playwright" in login_deps.command
+        assert "playwright-stealth" not in login_deps.command
+        assert "google-chrome" in login_deps.command
+
+    def test_codex_safely_skips_claude_only_pty_steps(self):
+        spec = _spec(account={"agent_type": "codex"})
+        names = [step.name for step in compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+            include_pty=True,
+        )]
+
+        assert "pty-install" not in names
+        assert "pty-refresh-hook" not in names
+        assert "claude-cli-health-hook" not in names
+
+    def test_claude_bootstrap_remains_the_default(self):
+        steps = compile_bootstrap_steps(
+            _spec(), manager_url="u", auth_token="t", worker_id="w",
+        )
+
+        install = next(step for step in steps if step.name == "agent-install")
+        login_deps = next(
+            step for step in steps if step.name == "credential-login-deps"
+        )
+        assert "@anthropic-ai/claude-code@2.1.181" in install.command
+        assert "@openai/codex" not in install.command
+        assert "playwright" not in login_deps.command
+
 
 class TestCredentialSlots:
     def test_single_slot_uses_configured_dir(self):
@@ -125,6 +166,27 @@ class TestCredentialSlots:
     def test_account_none_yields_no_slots(self):
         spec = _spec(account={"mode": "none"})
         assert GenericJobHarness(spec).get_credential_slots() == []
+
+    def test_codex_single_slot_leaves_home_for_runtime_user_to_resolve(self):
+        spec = _spec(account={"agent_type": "codex", "group": "codex"})
+
+        assert GenericJobHarness(spec).get_credential_slots() == [
+            {"slot_type": "codex", "config_dir": ""}
+        ]
+
+    def test_codex_multi_slot_uses_explicit_worker_writable_prefix(self):
+        spec = _spec(account={
+            "agent_type": "codex",
+            "per_worker": 3,
+            "config_dir": "/home/ubuntu/.codex",
+        })
+        slots = GenericJobHarness(spec).get_credential_slots()
+
+        assert [slot["config_dir"] for slot in slots] == [
+            "/home/ubuntu/.codex-slot-0",
+            "/home/ubuntu/.codex-slot-1",
+            "/home/ubuntu/.codex-slot-2",
+        ]
 
 
 class TestScalingSignal:

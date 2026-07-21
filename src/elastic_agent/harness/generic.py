@@ -86,9 +86,11 @@ class GenericJobHarness(Harness):
         """One login slot per account-per-worker.
 
         With ``per_worker == 1`` the single slot uses the configured
-        ``config_dir`` (empty → Claude's default ~/.claude). With multiple
-        accounts per worker each slot gets a distinct dir so credentials don't
-        clobber each other.
+        ``config_dir``. An empty single-slot value lets the selected CLI resolve
+        its default from the runtime user's actual HOME. With multiple accounts
+        each slot gets a distinct directory; Codex validation requires an
+        explicit writable base because the Manager does not guess a remote
+        user's home directory.
         """
         acct = self.spec.account
         if acct.mode == "none":
@@ -149,6 +151,10 @@ def compile_bootstrap_steps(
     """
     if include_login_deps is None:
         include_login_deps = spec.account.mode == "worker_local_login"
+    # claude-pty and its health/refresh hooks host Claude Code only.  `include_pty`
+    # is a Manager-wide provisioning option, so silently narrowing it here keeps
+    # a Codex Job usable without installing or invoking Claude-only machinery.
+    include_claude_pty = include_pty and spec.account.agent_type == "claude"
 
     steps: list[BootstrapStep] = []
     if spec.account.binding == "eip":
@@ -157,7 +163,7 @@ def compile_bootstrap_steps(
         steps.append(ipv4_only_egress_step())
     steps.extend([
         system_init_step(packages=system_packages),
-        agent_install_step(),
+        agent_install_step(agent_type=spec.account.agent_type),
     ])
     # Docker before any runtime deploy: the runtime user's docker-group
     # membership must exist when systemd starts the unit (see docker_install_step).
@@ -171,7 +177,7 @@ def compile_bootstrap_steps(
             runtime_port=runtime_port,
             heartbeat_interval=heartbeat_interval,
         ))
-    if include_pty:
+    if include_claude_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
     # Job-specific provisioning. For manager_rsync delivery the Manager clones +
@@ -186,11 +192,14 @@ def compile_bootstrap_steps(
             git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
         ))
 
-    if include_pty and not runtime_from_src:
+    if include_claude_pty and not runtime_from_src:
         steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
     if include_login_deps:
-        steps.append(credential_login_deps_step())
+        login_dependencies = (
+            ["playwright"] if spec.account.agent_type == "codex" else None
+        )
+        steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps
 
 

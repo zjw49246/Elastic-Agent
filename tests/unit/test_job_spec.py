@@ -150,6 +150,80 @@ class TestRenderEnv:
         env = spec.render_env(WorkerContext(config_dir="/root/.claude-slot-1"))
         assert env["CLAUDE_CONFIG_DIR"] == "/root/.claude-slot-1"
 
+    def test_codex_injects_codex_home_instead_of_claude_config_dir(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="x"),
+            account={"agent_type": "codex", "config_dir": "/root/.codex-prod"},
+        )
+
+        env = spec.render_env(WorkerContext(config_dir="/root/.codex-slot-1"))
+
+        assert env["CODEX_HOME"] == "/root/.codex-slot-1"
+        assert "CLAUDE_CONFIG_DIR" not in env
+
+    @pytest.mark.parametrize(
+        "account",
+        [
+            {"agent_type": "codex", "per_worker": 2},
+            {"agent_type": "codex"},
+        ],
+    )
+    def test_codex_multi_account_or_rotation_requires_explicit_writable_home(
+        self, account,
+    ):
+        rotation = (
+            {"strategy": "on_exhaust_restart_resume", "resume_args": "--resume"}
+            if account.get("per_worker", 1) == 1
+            else {}
+        )
+
+        with pytest.raises(ValidationError, match="explicit absolute"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="x"),
+                account=account,
+                rotation=rotation,
+            )
+
+    def test_codex_single_account_default_home_is_valid_for_non_root_worker(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="x"),
+            account={"agent_type": "codex"},
+        )
+
+        assert spec.account.config_dir == ""
+        assert "CODEX_HOME" not in spec.render_env(WorkerContext())
+
+    @pytest.mark.parametrize("unsafe_name", ["CODEX_HOME", "HOME"])
+    def test_codex_default_worker_login_rejects_run_credential_redirect(
+        self, unsafe_name,
+    ):
+        with pytest.raises(ValidationError, match="managed credential paths"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="x", env={unsafe_name: "/tmp/wrong"}),
+                account={"agent_type": "codex"},
+            )
+
+    def test_codex_explicit_home_forces_verified_config_dir(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="x", env={"HOME": "/tmp/job-home"}),
+            account={
+                "agent_type": "codex",
+                "config_dir": "/home/ubuntu/.codex-selected",
+            },
+        )
+
+        env = spec.render_env(WorkerContext(
+            config_dir="/home/ubuntu/.codex-verified"
+        ))
+
+        assert env["HOME"] == "/tmp/job-home"
+        assert env["CODEX_HOME"] == "/home/ubuntu/.codex-verified"
+
     def test_eip_run_env_cannot_override_verified_account_directory(self):
         spec = JobSpec(
             name="j",
@@ -167,17 +241,40 @@ class TestRenderEnv:
 
         assert env["CLAUDE_CONFIG_DIR"] == "/root/.claude-verified"
 
-    @pytest.mark.parametrize("unsafe_name", ["CLAUDE_CONFIG_DIR", "HOME"])
+    @pytest.mark.parametrize(
+        ("agent_type", "unsafe_name"),
+        [
+            ("claude", "CLAUDE_CONFIG_DIR"),
+            ("claude", "HOME"),
+            ("codex", "CODEX_HOME"),
+            ("codex", "HOME"),
+        ],
+    )
     def test_eip_rejects_run_env_that_can_redirect_authenticated_home(
-        self, unsafe_name
+        self, agent_type, unsafe_name
     ):
         with pytest.raises(ValidationError, match="does not allow run.env"):
             JobSpec(
                 name="j",
                 run=RunSpec(command="x", env={unsafe_name: "/tmp/wrong"}),
-                account={"binding": "eip"},
+                account={"binding": "eip", "agent_type": agent_type},
                 fanout={"workers": 1},
             )
+
+    @pytest.mark.parametrize(
+        ("agent_type", "unrelated_name"),
+        [("claude", "CODEX_HOME"), ("codex", "CLAUDE_CONFIG_DIR")],
+    )
+    def test_eip_allows_other_agent_credential_env(
+        self, agent_type, unrelated_name
+    ):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="x", env={unrelated_name: "/tmp/unused"}),
+            account={"binding": "eip", "agent_type": agent_type},
+        )
+
+        assert spec.run.env[unrelated_name] == "/tmp/unused"
 
 
 class TestResolvedCwd:
@@ -219,12 +316,37 @@ class TestJobSpecDefaults:
         assert spec.fanout.workers == 1
         assert spec.fanout.shard_by == "hostname"
         assert spec.account.mode == "worker_local_login"
+        assert spec.account.agent_type == "claude"
         assert spec.account.per_worker == 1
         assert spec.account.binding == "none"
         assert spec.account.ids == []
         assert spec.rotation.strategy == "none"
         assert spec.run.shell is True
         assert spec.harness_ref is None
+
+    def test_codex_agent_type_is_supported(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="echo hi"),
+            account={"agent_type": "codex"},
+        )
+
+        assert spec.account.agent_type == "codex"
+
+    def test_unknown_agent_type_is_rejected(self):
+        with pytest.raises(ValidationError):
+            AccountSpec(agent_type="other")
+
+    def test_codex_rejects_manager_token_distribution(self):
+        with pytest.raises(ValidationError, match="worker_local_login"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="codex exec task"),
+                account={
+                    "agent_type": "codex",
+                    "mode": "manager_distribute",
+                },
+            )
 
 
 class TestEipAccountBinding:

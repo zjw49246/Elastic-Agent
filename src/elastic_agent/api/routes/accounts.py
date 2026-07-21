@@ -1,8 +1,8 @@
 """Account pool REST API — the frontend's Accounts panel.
 
-Manages account *identities* (email + 接码 token + group). Mailbox tokens are
-write-only API fields stored mode-0600 and never returned. Claude OAuth tokens
-are minted on the worker at login time and never enter this API.
+Manages account *identities* and their worker-side login inputs. Passwords and
+mailbox tokens are write-only API fields stored mode-0600 and never returned.
+OAuth tokens are minted on the worker at login time and never enter this API.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from elastic_agent.api.auth import require_api_key
 from elastic_agent.core.account_binding import AccountBinding, LeaseConflictError
@@ -42,7 +42,10 @@ def _account_allocator():
 class AccountRequest(BaseModel):
     id: str
     email: str
-    email_token: str = ""
+    agent_type: Literal["claude", "codex"] = "claude"
+    email_token: str = Field(default="", repr=False)
+    password: str = Field(default="", repr=False)
+    clear_email_token: bool = False
     group: str = "standard"
     enabled: bool = True
 
@@ -61,22 +64,26 @@ class AccountListResponse(BaseModel):
 
 
 class AccountResponse(BaseModel):
-    """Public account metadata; the mailbox token is always write-only."""
+    """Public account metadata; login secrets are always write-only."""
 
     id: str
     email: str
+    agent_type: Literal["claude", "codex"]
     group: str
     enabled: bool
     has_email_token: bool = False
+    has_password: bool = False
 
 
 def _public_account(account: AccountDefinition) -> AccountResponse:
     return AccountResponse(
         id=account.id,
         email=account.email,
+        agent_type=account.agent_type,
         group=account.group,
         enabled=account.enabled,
         has_email_token=bool(account.email_token),
+        has_password=bool(account.password),
     )
 
 
@@ -293,7 +300,6 @@ async def decommission_account_binding(
 @router.post("/accounts", response_model=AccountResponse, status_code=201)
 async def add_account(req: AccountRequest) -> AccountResponse:
     manager = _mgr()
-    defn = AccountDefinition(**req.model_dump())
     try:
         async with _account_allocator().mutation_guard(req.id):
             # Lock order is allocator -> binding account transaction. Re-read
@@ -304,17 +310,59 @@ async def add_account(req: AccountRequest) -> AccountResponse:
                 active_leases = await _binding_manager().list_leases(
                     account_id=req.id, active_only=True,
                 )
+                incoming = req.model_dump()
+                clear_email_token = bool(incoming.pop("clear_email_token"))
+                if clear_email_token:
+                    incoming["email_token"] = ""
+                if existing is not None:
+                    if "agent_type" not in req.model_fields_set:
+                        # Older clients do not know agent_type. Preserve it
+                        # instead of silently converting a Codex account.
+                        incoming["agent_type"] = existing.agent_type
+                    same_agent = incoming["agent_type"] == existing.agent_type
+                    # Blank secret fields mean "keep the write-only value" so
+                    # metadata can be edited without reading a secret that the
+                    # API deliberately never returns. Non-empty values rotate.
+                    # A platform change is a new login identity, so it must not
+                    # inherit either platform's old secrets.
+                    if same_agent:
+                        for secret_name in ("email_token", "password"):
+                            explicitly_cleared = (
+                                secret_name == "email_token"
+                                and clear_email_token
+                            )
+                            if not incoming[secret_name] and not explicitly_cleared:
+                                incoming[secret_name] = getattr(
+                                    existing, secret_name
+                                )
                 if (
                     existing is not None
-                    and existing.email.casefold() != req.email.casefold()
+                    and (
+                        existing.email.casefold() != req.email.casefold()
+                        or existing.agent_type != incoming["agent_type"]
+                    )
                     and (binding is not None or active_leases)
                 ):
                     raise HTTPException(
                         409,
-                        "cannot change the email of an EIP-bound/leased account; "
+                        "cannot change the email or agent type of an "
+                        "EIP-bound/leased account; "
                         "finish its Job and decommission the binding first",
                     )
+                if incoming["agent_type"] == "codex" and not incoming["password"]:
+                    # Keep the useful validation error without constructing a
+                    # Pydantic ValidationError whose default text can include
+                    # other write-only inputs from the request.
+                    raise HTTPException(
+                        409, "Codex accounts require an OpenAI password"
+                    )
+                defn = AccountDefinition(**incoming)
                 saved = await manager.account_store.add(defn)
+    except ValidationError as exc:
+        # Pydantic's default ValidationError string includes the rejected input
+        # value.  That value can be a write-only mailbox token/password, so the
+        # REST error must stay deliberately generic.
+        raise HTTPException(409, "invalid account definition") from exc
     except (AccountClaimConflictError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
     return _public_account(saved)

@@ -215,6 +215,119 @@ class TestAccountsAPI:
         assert (await client.get("/api/accounts")).json()["total"] == 0
 
     @pytest.mark.asyncio
+    async def test_codex_password_is_write_only_and_persisted_mode_0600(
+        self, client, manager
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "codex-1",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "password": "first-password",
+            "email_token": "mail-secret",
+        })
+
+        assert created.status_code == 201
+        assert created.json()["agent_type"] == "codex"
+        assert created.json()["has_password"] is True
+        assert created.json()["has_email_token"] is True
+        assert "password" not in created.json()
+        assert "email_token" not in created.json()
+
+        listed = (await client.get("/api/accounts")).json()["accounts"][0]
+        assert listed["has_password"] is True
+        assert "password" not in listed
+        path = Path(manager.config.registry.path).with_name("accounts.json")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["accounts"][0]["password"] == "first-password"
+
+    @pytest.mark.asyncio
+    async def test_empty_secrets_preserve_existing_and_nonempty_values_rotate(
+        self, client, manager
+    ):
+        await client.post("/api/accounts", json={
+            "id": "codex-1",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "password": "first-password",
+            "email_token": "first-mail-token",
+        })
+
+        preserved = await client.post("/api/accounts", json={
+            "id": "codex-1",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "password": "",
+            "email_token": "",
+            "group": "new-group",
+        })
+        assert preserved.status_code == 201
+        stored = await manager.account_store.get("codex-1")
+        assert stored.password == "first-password"
+        assert stored.email_token == "first-mail-token"
+        assert stored.group == "new-group"
+
+        rotated = await client.post("/api/accounts", json={
+            "id": "codex-1",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "password": "second-password",
+            "email_token": "second-mail-token",
+        })
+        assert rotated.status_code == 201
+        stored = await manager.account_store.get("codex-1")
+        assert stored.password == "second-password"
+        assert stored.email_token == "second-mail-token"
+
+        cleared = await client.post("/api/accounts", json={
+            "id": "codex-1",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "password": "",
+            "email_token": "",
+            "clear_email_token": True,
+        })
+        assert cleared.status_code == 201
+        stored = await manager.account_store.get("codex-1")
+        assert stored.password == "second-password"
+        assert stored.email_token == ""
+        assert cleared.json()["has_email_token"] is False
+
+    @pytest.mark.asyncio
+    async def test_invalid_codex_account_error_never_echoes_mail_token(self, client):
+        secret = "mail-token-that-must-not-echo"
+
+        response = await client.post("/api/accounts", json={
+            "id": "codex-no-password",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "email_token": secret,
+        })
+
+        assert response.status_code == 409
+        assert secret not in response.text
+        assert response.json()["detail"] == (
+            "Codex accounts require an OpenAI password"
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_email_is_unique_per_agent_type(self, client):
+        claude = await client.post("/api/accounts", json={
+            "id": "claude-a", "email": "User@example.com", "agent_type": "claude",
+        })
+        codex = await client.post("/api/accounts", json={
+            "id": "codex-a", "email": "user@EXAMPLE.com", "agent_type": "codex",
+            "password": "codex-password-a",
+        })
+        duplicate = await client.post("/api/accounts", json={
+            "id": "codex-b", "email": "USER@example.com", "agent_type": "codex",
+            "password": "codex-password-b",
+        })
+
+        assert claude.status_code == codex.status_code == 201
+        assert duplicate.status_code == 409
+
+    @pytest.mark.asyncio
     async def test_active_job_claim_blocks_identity_edit_and_delete(
         self, client, manager,
     ):
@@ -310,6 +423,17 @@ class TestAccountsAPI:
             "/api/accounts", json={"id": "a", "email": "two@x.com"}
         )
         assert changed.status_code == 409
+
+        changed_agent = await client.post(
+            "/api/accounts",
+            json={
+                "id": "a",
+                "email": "one@x.com",
+                "agent_type": "codex",
+                "password": "openai-password",
+            },
+        )
+        assert changed_agent.status_code == 409
 
         rotated = await client.post(
             "/api/accounts",

@@ -120,7 +120,7 @@ class SetupSpec(BaseModel):
 
 
 class RunSpec(BaseModel):
-    """The long-running command that consumes the Claude account."""
+    """The long-running command that consumes the selected agent account."""
 
     command: str
     env: dict[str, str] = Field(default_factory=dict)
@@ -134,7 +134,12 @@ class RunSpec(BaseModel):
 
 
 class AccountSpec(BaseModel):
-    """How the Claude account is supplied on each worker."""
+    """How the selected agent account is supplied on each worker."""
+
+    # Selects both the worker-local login implementation and the CLI credential
+    # environment used by the later run.  Keep Claude as the compatibility
+    # default for existing JobSpec payloads.
+    agent_type: Literal["claude", "codex"] = "claude"
 
     # worker_local_login: worker runs the login flow locally (P3 ACCOUNT_LOGIN),
     #   after the Manager sends the selected email + write-only mailbox token;
@@ -150,9 +155,9 @@ class AccountSpec(BaseModel):
     # worker; an empty list lets the allocator choose from ``group``.
     binding: Literal["none", "eip"] = "none"
     ids: list[str] = Field(default_factory=list)
-    # Where credentials are written on the worker. Empty == Claude's default
-    # (~/.claude); the run command inherits it without CLAUDE_CONFIG_DIR. An
-    # absolute path is required when per_worker > 1 (distinct dirs per account).
+    # Where credentials are written on the worker. Empty == the selected CLI's
+    # default (~/.claude or ~/.codex). An absolute path is required when
+    # per_worker > 1 (distinct dirs per account).
     config_dir: str = ""
 
     @field_validator("config_dir")
@@ -160,7 +165,7 @@ class AccountSpec(BaseModel):
     def require_absolute_config_dir(cls, config_dir: str) -> str:
         """Keep login and the later Job process on one credential path.
 
-        Empty means Claude's default home directory on the worker.  Every
+        Empty means the selected agent's default directory on the worker. Every
         explicit value is also injected into the run environment, so relative
         paths would resolve against two different working directories.
         """
@@ -281,6 +286,45 @@ class JobSpec(BaseModel):
     harness_ref: str | None = None
 
     @model_validator(mode="after")
+    def validate_agent_account_mode(self) -> JobSpec:
+        if (
+            self.account.agent_type == "codex"
+            and self.account.mode == "manager_distribute"
+        ):
+            raise ValueError(
+                "Codex accounts do not support manager_distribute; use "
+                "worker_local_login so auth.json is minted on the worker"
+            )
+        if (
+            self.account.agent_type == "codex"
+            and self.account.mode == "worker_local_login"
+            and not self.account.config_dir
+            and (
+                self.account.per_worker > 1
+                or self.rotation.strategy == "on_exhaust_restart_resume"
+            )
+        ):
+            raise ValueError(
+                "Codex multi-account/rotation jobs require an explicit absolute "
+                "account.config_dir writable by the worker user"
+            )
+        if (
+            self.account.agent_type == "codex"
+            and self.account.mode == "worker_local_login"
+        ):
+            controlled_env = {"CODEX_HOME"}
+            if not self.account.config_dir:
+                controlled_env.add("HOME")
+            overridden = controlled_env.intersection(self.run.env)
+            if overridden:
+                names = ", ".join(sorted(overridden))
+                raise ValueError(
+                    "Codex worker_local_login does not allow run.env to "
+                    f"override managed credential paths: {names}"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_eip_account_binding(self) -> JobSpec:
         """Enforce the one-account/one-EIP/one-ephemeral-worker MVP."""
         if self.account.binding != "eip":
@@ -303,8 +347,12 @@ class JobSpec(BaseModel):
                 "account.binding 'eip' does not support "
                 "on_exhaust_restart_resume; changing accounts requires a new worker"
             )
+        credential_env = (
+            "CODEX_HOME" if self.account.agent_type == "codex"
+            else "CLAUDE_CONFIG_DIR"
+        )
         unsafe_identity_env = {
-            name for name in ("CLAUDE_CONFIG_DIR", "HOME")
+            name for name in (credential_env, "HOME")
             if name in self.run.env
         }
         if unsafe_identity_env:
@@ -367,17 +415,26 @@ class JobSpec(BaseModel):
         return shlex.split(rendered)
 
     def render_env(self, ctx: WorkerContext) -> dict[str, str]:
-        """Env for the run command, with CLAUDE_CONFIG_DIR injected when a
-        non-default config_dir is configured."""
+        """Render run env and inject the selected CLI's credential directory."""
         env = {k: render_template(v, ctx.as_dict()) for k, v in self.run.env.items()}
         cfg = ctx.config_dir or self.account.config_dir
         if cfg:
-            if self.account.binding == "eip":
+            credential_env = (
+                "CODEX_HOME" if self.account.agent_type == "codex"
+                else "CLAUDE_CONFIG_DIR"
+            )
+            if (
+                self.account.binding == "eip"
+                or (
+                    self.account.agent_type == "codex"
+                    and self.account.mode == "worker_local_login"
+                )
+            ):
                 # The selected account was authenticated and exact-email
                 # verified in this directory.  Letting user env redirect the
                 # run to another credential tree would break account→EIP
                 # affinity after the safety check had already passed.
-                env["CLAUDE_CONFIG_DIR"] = cfg
+                env[credential_env] = cfg
             else:
-                env.setdefault("CLAUDE_CONFIG_DIR", cfg)
+                env.setdefault(credential_env, cfg)
         return env

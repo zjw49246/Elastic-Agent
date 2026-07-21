@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from elastic_agent.core.bootstrap_steps import (
     agent_install_step,
     build_default_bootstrap_steps,
@@ -49,6 +47,13 @@ class TestAgentInstallStep:
     def test_custom_list_command(self) -> None:
         step = agent_install_step(agent_install_command=["pip", "install", "my-agent"])
         assert step.command == "pip install my-agent"
+
+    def test_codex_command_is_version_pinned(self) -> None:
+        step = agent_install_step(agent_type="codex")
+
+        assert "@openai/codex@0.144.6" in step.command
+        assert "codex --version" in step.command
+        assert "@anthropic-ai/claude-code" not in step.command
 
 
 class TestRuntimeDeployStep:
@@ -133,6 +138,7 @@ class TestRuntimeDeployFromSrc:
         assert "ea-runtime.service" in c and "Restart=always" in c
         assert "User=ubuntu" in c
         assert "PYTHONPATH=/opt/ea/src" in c
+        assert "ELASTIC_AGENT_AGENT_TYPE=claude" in c
         assert "elastic_agent.worker.runtime_main" in c
         # --opt=value form (not space) so leading-'-' tokens don't break argparse
         assert "--manager-url=ws://1.2.3.4:8080/ws/runtime" in c and "--token=tok" in c
@@ -165,6 +171,15 @@ class TestRuntimeDeployFromSrc:
         step = runtime_deploy_from_src_step("u", "t", "w", run_as="root")
         assert "IS_SANDBOX=1" in step.command
         assert "User=root" in step.command
+
+    def test_codex_runtime_declares_expected_agent_capability(self) -> None:
+        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
+
+        step = runtime_deploy_from_src_step(
+            "u", "t", "w", agent_type="codex",
+        )
+
+        assert "ELASTIC_AGENT_AGENT_TYPE=codex" in step.command
 
 
 class TestBuildDefaultSteps:

@@ -489,6 +489,34 @@ class TestHealthCheck:
         assert s["claude_cli_ok"] is True
         assert s["claude_version"] == "2.1.181 (Claude Code)"
 
+    @pytest.mark.asyncio
+    async def test_codex_worker_health_uses_codex_cli(
+        self, runtime, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import HealthCheckMessage
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+        runtime._check_claude_cli = MagicMock(side_effect=AssertionError(
+            "Codex worker must not require Claude"
+        ))
+        runtime._check_codex_cli = lambda: {
+            "ok": True,
+            "path": "/usr/local/bin/codex",
+            "version": "codex-cli 0.144.6",
+            "error": None,
+        }
+        monkeypatch.setenv("ELASTIC_AGENT_AGENT_TYPE", "codex")
+
+        await runtime._handle_health_check(HealthCheckMessage())
+
+        status = sent[0]
+        assert status.runtime_ready is True
+        assert status.agent_type == "codex"
+        assert status.codex_cli_ok is True
+        assert status.codex_version == "codex-cli 0.144.6"
+        assert status.claude_cli_ok is False
+
 
 class TestForceSyncOnExit:
     @pytest.mark.asyncio
@@ -666,6 +694,7 @@ class TestHandleAccountLogin:
         base = dict(
             login_request_id="login-request-1",
             account_id="a1", email="u@foo.com", email_token="tok",
+            password="", agent_type="claude",
             config_dir="/root/.claude-prod", provider="171mail", slot_index=2,
         )
         base.update(over)
@@ -829,6 +858,232 @@ class TestHandleAccountLogin:
             await runtime._handle_account_login(self._msg())
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
         assert not res.success and "boom" in res.error
+
+    @pytest.mark.asyncio
+    async def test_codex_password_login_uses_codex_home_and_reports_success(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+        login = AsyncMock(return_value={"ok": True, "logs": []})
+        message = self._msg(
+            agent_type="codex",
+            email_token="",
+            password="openai-secret",
+            config_dir="/root/.codex-a1",
+        )
+
+        with patch(
+            "elastic_agent.worker.login.codex_login.codex_login", new=login,
+        ):
+            await runtime._handle_account_login(message)
+
+        kwargs = login.await_args.kwargs
+        assert kwargs["email"] == "u@foo.com"
+        assert kwargs["password"] == "openai-secret"
+        assert kwargs["token_171"] == ""
+        assert kwargs["codex_home"] == "/root/.codex-a1"
+        assert kwargs["attempt_id"] == "login-request-1"
+        result = next(
+            item for item in sent if isinstance(item, AccountLoginResultMessage)
+        )
+        assert result.success is True
+        assert runtime._account_login_otp_readers == {}
+
+    @pytest.mark.asyncio
+    async def test_codex_blank_home_uses_actual_runtime_user_home(
+        self, runtime, tmp_path,
+    ):
+        login = AsyncMock(return_value={"ok": True, "logs": []})
+        runtime._send_event = AsyncMock()
+        message = self._msg(
+            agent_type="codex",
+            email_token="",
+            password="openai-secret",
+            config_dir="",
+        )
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch(
+                "elastic_agent.worker.login.codex_login.codex_login",
+                new=login,
+            ),
+        ):
+            await runtime._handle_account_login(message)
+
+        assert login.await_args.kwargs["codex_home"] == str(tmp_path / ".codex")
+
+    @pytest.mark.asyncio
+    async def test_codex_password_only_otp_reuses_live_login_request(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import (
+            AccountLoginOtpMessage,
+            AccountLoginOtpRequiredMessage,
+        )
+        from elastic_agent.worker.runtime import _WorkerLoginOtpReader
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+        request = self._msg(
+            agent_type="codex",
+            email_token="",
+            password="openai-secret",
+            config_dir="/root/.codex-a1",
+        )
+        reader = _WorkerLoginOtpReader(runtime, request)
+        waiting = asyncio.create_task(reader.read_code(
+            attempt_id=request.login_request_id,
+            timeout_s=5,
+            logs=[],
+        ))
+        await asyncio.sleep(0)
+        challenge = next(
+            item for item in sent
+            if isinstance(item, AccountLoginOtpRequiredMessage)
+        )
+        response = AccountLoginOtpMessage(
+            login_request_id=request.login_request_id,
+            account_id=request.account_id,
+            challenge_id=challenge.challenge_id,
+            code="123456",
+        )
+
+        assert reader.submit(response) is True
+        assert await waiting == "123456"
+        assert reader.submit(response) is False
+
+    @pytest.mark.asyncio
+    async def test_codex_login_requires_openai_password(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+        await runtime._handle_account_login(self._msg(
+            agent_type="codex",
+            email_token="",
+            password="",
+            config_dir="/root/.codex-a1",
+        ))
+
+        result = next(
+            item for item in sent if isinstance(item, AccountLoginResultMessage)
+        )
+        assert result.success is False
+        assert "OpenAI password" in result.error
+
+    @pytest.mark.asyncio
+    async def test_background_login_exception_sends_correlated_safe_failure(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+
+        async def fail(_message):
+            raise RuntimeError("secret-that-must-not-be-returned")
+
+        runtime._handle_account_login = fail
+        message = self._msg(
+            agent_type="codex",
+            password="openai-secret",
+        )
+
+        await runtime._dispatch(message)
+        task = runtime._account_login_tasks[message.login_request_id]
+        await task
+
+        result = next(
+            item for item in sent if isinstance(item, AccountLoginResultMessage)
+        )
+        assert result.login_request_id == message.login_request_id
+        assert result.success is False
+        assert result.error == "account login failed unexpectedly"
+        assert "secret-that-must-not-be-returned" not in result.error
+
+    @pytest.mark.asyncio
+    async def test_correlated_cancel_stops_background_login(self, runtime):
+        from elastic_agent.core.protocols.messages import (
+            AccountLoginCancelledMessage,
+            AccountLoginCancelMessage,
+        )
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        sent = []
+        runtime._send_event = (
+            lambda message: sent.append(message) or asyncio.sleep(0)
+        )
+
+        async def block(_message):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        runtime._handle_account_login = block
+        message = self._msg(
+            agent_type="codex",
+            password="openai-secret",
+        )
+        await runtime._dispatch(message)
+        await started.wait()
+        task = runtime._account_login_tasks[message.login_request_id]
+
+        await runtime._dispatch(AccountLoginCancelMessage(
+            login_request_id=message.login_request_id,
+            account_id=message.account_id,
+            reason="manager_timeout",
+        ))
+        await cancelled.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        await asyncio.sleep(0)
+        assert message.login_request_id not in runtime._account_login_tasks
+        acknowledgement = next(
+            item for item in sent
+            if isinstance(item, AccountLoginCancelledMessage)
+        )
+        assert acknowledgement.login_request_id == message.login_request_id
+        assert acknowledgement.cleanup_complete is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_mismatch_reports_cleanup_not_confirmed(self, runtime):
+        from elastic_agent.core.protocols.messages import (
+            AccountLoginCancelledMessage,
+            AccountLoginCancelMessage,
+        )
+
+        sent = []
+        runtime._send_event = (
+            lambda message: sent.append(message) or asyncio.sleep(0)
+        )
+        blocker = asyncio.ensure_future(asyncio.Future())
+        runtime._account_login_tasks["login-request-1"] = blocker
+        runtime._account_login_accounts["login-request-1"] = "other-account"
+
+        await runtime._handle_account_login_cancel(AccountLoginCancelMessage(
+            login_request_id="login-request-1",
+            account_id="a1",
+            reason="manager_timeout",
+        ))
+
+        acknowledgement = next(
+            item for item in sent
+            if isinstance(item, AccountLoginCancelledMessage)
+        )
+        assert acknowledgement.cleanup_complete is False
+        assert blocker.done() is False
+        blocker.cancel()
+        await asyncio.gather(blocker, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_warmup_requires_zero_exit_status(self, runtime):

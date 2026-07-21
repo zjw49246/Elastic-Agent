@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -30,7 +30,9 @@ class AccountDefinition(BaseModel):
 
     id: str
     email: str
-    email_token: str = ""
+    agent_type: Literal["claude", "codex"] = "claude"
+    email_token: str = Field(default="", repr=False)
+    password: str = Field(default="", repr=False)
     group: str = "standard"
     enabled: bool = True
 
@@ -41,6 +43,12 @@ class AccountDefinition(BaseModel):
         if not normalized:
             raise ValueError("account id, email, and group must be non-empty")
         return normalized
+
+    @model_validator(mode="after")
+    def codex_requires_password(self) -> AccountDefinition:
+        if self.agent_type == "codex" and not self.password:
+            raise ValueError("Codex accounts require an OpenAI password")
+        return self
 
 
 class GroupDefinition(BaseModel):
@@ -57,18 +65,24 @@ class AccountsConfig(BaseModel):
 
     @model_validator(mode="after")
     def unique_real_identities(self) -> AccountsConfig:
-        """One real mailbox/account identity may appear only once.
+        """One agent-specific login identity may appear only once.
 
         ``AccountDefinition.id`` is an administrator label, so it cannot by
-        itself enforce one account ↔ one EIP.  Case-folded email uniqueness
-        prevents the same login from being assigned two ids and two exits.
+        itself enforce one account ↔ one EIP. Case-folded email uniqueness per
+        agent type prevents one Claude or Codex login from receiving two ids
+        and two exits, while allowing the same mailbox for both products.
         """
         ids = [account.id for account in self.accounts]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate account id in accounts config")
-        emails = [account.email.casefold() for account in self.accounts]
-        if len(emails) != len(set(emails)):
-            raise ValueError("duplicate account email in accounts config")
+        identities = [
+            (account.agent_type, account.email.casefold())
+            for account in self.accounts
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError(
+                "duplicate account email for agent type in accounts config"
+            )
         return self
 
 

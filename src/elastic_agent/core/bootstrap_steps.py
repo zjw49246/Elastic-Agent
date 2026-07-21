@@ -6,9 +6,12 @@ to form a complete bootstrap pipeline.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from elastic_agent.harness.base import BootstrapStep
 
 CLAUDE_CODE_VERSION = "2.1.181"
+CODEX_CLI_VERSION = "0.144.6"
 
 
 def ipv4_only_egress_step(timeout: int = 60) -> BootstrapStep:
@@ -96,14 +99,23 @@ def docker_install_step(run_as: str = "ubuntu", timeout: int = 420) -> Bootstrap
 def agent_install_step(
     agent_install_command: str | list[str] | None = None,
     timeout: int = 300,
+    *,
+    agent_type: Literal["claude", "codex"] = "claude",
 ) -> BootstrapStep:
-    """T-020: Agent installation — install the agent binary (e.g. Claude Code CLI)."""
+    """T-020: Install the selected, version-pinned coding-agent CLI."""
     if agent_install_command is None:
-        cmd = (
-            f"npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} "
-            "--include=optional --foreground-scripts --force && "
-            "claude --version"
-        )
+        if agent_type == "codex":
+            cmd = (
+                f"npm install -g @openai/codex@{CODEX_CLI_VERSION} "
+                "--include=optional --foreground-scripts --force && "
+                "codex --version"
+            )
+        else:
+            cmd = (
+                f"npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} "
+                "--include=optional --foreground-scripts --force && "
+                "claude --version"
+            )
     elif isinstance(agent_install_command, list):
         cmd = " ".join(agent_install_command)
     else:
@@ -126,6 +138,7 @@ def runtime_deploy_from_src_step(
     run_as: str = "ubuntu",
     display: str = ":99",
     runtime_deps: list[str] | None = None,
+    agent_type: Literal["claude", "codex"] = "claude",
     timeout: int = 300,
 ) -> BootstrapStep:
     """Run the Worker Runtime from rsync'd framework source (not PyPI).
@@ -143,6 +156,7 @@ def runtime_deploy_from_src_step(
         "set -u\n"
         f"export HOME={home}\n"
         f"export DISPLAY={display}\n"
+        f"export ELASTIC_AGENT_AGENT_TYPE={agent_type}\n"
         f"export PYTHONPATH={src_dir}\n"
         f"export PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\n"
         + ("export IS_SANDBOX=1\n" if run_as == "root" else "")
@@ -315,9 +329,9 @@ def credential_login_deps_step(
 
     The vendored CCM login flow (``worker/login/cdp_login.py``) drives the real
     ``google-chrome`` binary over CDP and clicks with ``xdotool`` under an Xvfb
-    display — it does NOT use Playwright/chromium/mitmproxy. Verified on a live
-    Ubuntu 26.04 worker: with only playwright-chromium the login fails because
-    the code execs ``google-chrome`` (not on PATH). Extra pip packages can be
+    display. Codex's CCM-derived flow drives that same system Chrome through
+    Playwright, supplied through ``login_dependencies=["playwright"]``; it does
+    not require Playwright's bundled Chromium. Extra pip packages can be
     appended via ``login_dependencies``.
     """
     apt = (

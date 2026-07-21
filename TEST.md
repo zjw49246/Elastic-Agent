@@ -28,6 +28,10 @@ uv run pytest -q \
   tests/unit/test_api_batch.py \
   tests/unit/test_manager.py \
   tests/unit/test_account_store.py \
+  tests/unit/test_account_login_api.py \
+  tests/unit/test_codex_login.py \
+  tests/unit/test_generic_harness.py \
+  tests/unit/test_protocol_messages.py \
   tests/unit/test_worker_runtime.py \
   tests/unit/test_bootstrap_steps.py \
   tests/unit/test_web_ui.py
@@ -53,6 +57,16 @@ The focused suite covers:
   credential warm-up;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
+- agent-type-aware account uniqueness/allocation, required Codex password, and
+  write-only `has_password`/`has_email_token` REST behavior;
+- correlated OTP-required events, six-digit validation, stale/mismatched
+  challenge rejection, 32-hex injection protection, one-shot forwarding, retry
+  races, Manager timeout/cancel propagation, cleanup acknowledgement, immediate
+  disconnect failure, uncertain-cleanup account quarantine, and no retained OTP;
+- Codex `CODEX_HOME` injection, pinned CLI/current-source bootstrap, exact
+  JWT-email validation, mandatory `codex exec` smoke test, secret redaction, and
+  transactional auth rollback on failure/cancellation, including non-root
+  single-slot HOME resolution and Codex-specific runtime health reporting.
 
 ## Management API smoke test
 
@@ -102,14 +116,17 @@ Verify the Region has EIP quota available and remember that allocated public
 IPv4 addresses incur hourly charges even while detached.
 
 1. Add the test account to `/api/accounts` and ensure its binding with `PUT
-   /api/accounts/{id}/binding`.
+   /api/accounts/{id}/binding`. The account and Job must use the same
+   `agent_type`; a Codex account requires its OpenAI password, while its mailbox
+   query token may be left empty to exercise manual OTP.
 2. Submit a one-worker Job with `account.binding="eip"`, `per_worker=1`, the
-   test account in `ids`, `rotation.strategy="none"`, and a matching
-   `fanout.region`.
+   test account in `ids`, `rotation.strategy="none"`, the matching
+   `account.agent_type`, and a matching `fanout.region`.
 3. Confirm the lease is reserved before `RunInstances`, and the new EC2 has
    tags for the Job/account/lease.
 4. Confirm the worker's observed public IP equals the binding returned by the
-   API, then allow the worker-local login and command to finish.
+   API, then allow the worker-local login and command to finish. For Codex,
+   confirm the fresh instance creates and verifies its own `CODEX_HOME/auth.json`.
 5. Confirm final results are collected before cleanup, the EIP becomes
    detached, and the EC2 plus its root EBS are terminated.
 6. Query the binding again: the same EIP allocation must still exist and be
@@ -123,9 +140,18 @@ Do not infer login persistence from a repeated EIP. Each new instance must run
 the worker-local login again; this feature does not persist auth files, browser
 state, or device identity.
 
-Automatic login in this repository is Claude-only. `group=codex` does not add a
-Codex login/runtime path. The supported mail flows are 171mail and mail.com;
-generic IMAP is not implemented, and a future IMAP test must use an app-specific
-mailbox authorization code rather than a normal web password. For cross-host
-workers, set `ELASTIC_AGENT_MANAGER_URL=wss://...`; the plaintext override is
-for trusted test networks only.
+Automatic worker-local login supports Claude and Codex. For Codex, create an
+account with `agent_type="codex"` and an OpenAI password; leave `email_token`
+empty to exercise the manual OTP path. Submit a Job with the same
+`account.agent_type`, then poll `GET /api/accounts/login-attempts` and forward
+the current six-digit code with
+`POST /api/accounts/login-attempts/{login_request_id}/otp`. Verify the Job does
+not start before identity verification and the `codex exec` smoke test passes,
+REST/logs never expose the password, mailbox token, OTP, or authorization URL,
+and a failed/cancelled/timed-out login restores the previous
+`CODEX_HOME/auth.json` rather than completing after the Job has failed.
+
+The optional Codex `email_token` is only a supported mailbox-query token.
+Generic IMAP is not implemented. For cross-host workers, set
+`ELASTIC_AGENT_MANAGER_URL=wss://...`; the plaintext override is for trusted
+test networks only.

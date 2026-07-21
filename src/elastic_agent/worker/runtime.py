@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,11 @@ import websockets
 import websockets.exceptions
 
 from elastic_agent.core.protocols.messages import (
+    AccountLoginCancelMessage,
+    AccountLoginCancelledMessage,
     AccountLoginMessage,
+    AccountLoginOtpMessage,
+    AccountLoginOtpRequiredMessage,
     AccountLoginResultMessage,
     AuthMessage,
     AuthResultMessage,
@@ -69,6 +74,60 @@ _EXIT_DRAIN_TIMEOUT = 10.0
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class _WorkerLoginOtpReader:
+    """Bridge a Codex browser OTP field to a correlated Manager command."""
+
+    def __init__(self, runtime: "WorkerRuntime", message: AccountLoginMessage) -> None:
+        self._runtime = runtime
+        self._message = message
+        self._challenge_id = ""
+        self._expires_at = 0
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+    async def read_code(
+        self,
+        *,
+        attempt_id: str,
+        timeout_s: int,
+        logs: list[str],
+    ) -> str:
+        if attempt_id != self._message.login_request_id:
+            raise RuntimeError("login attempt id does not match worker request")
+        self._challenge_id = uuid.uuid4().hex
+        self._expires_at = int(time.time() + timeout_s)
+        await self._runtime._send_event(AccountLoginOtpRequiredMessage(
+            login_request_id=self._message.login_request_id,
+            account_id=self._message.account_id,
+            challenge_id=self._challenge_id,
+            expires_at=self._expires_at,
+        ))
+        logs.append("Waiting for a user-supplied email verification code")
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Timed out waiting for a user-supplied verification code"
+            ) from exc
+        finally:
+            self._challenge_id = ""
+            self._expires_at = 0
+
+    def submit(self, message: AccountLoginOtpMessage) -> bool:
+        """Accept exactly one live six-digit response without retaining it."""
+        if (
+            message.login_request_id != self._message.login_request_id
+            or message.account_id != self._message.account_id
+            or not self._challenge_id
+            or message.challenge_id != self._challenge_id
+            or self._expires_at <= int(time.time())
+            or not re.fullmatch(r"\d{6}", message.code)
+            or self._queue.full()
+        ):
+            return False
+        self._queue.put_nowait(message.code)
+        return True
 
 
 class WorkerRuntime:
@@ -113,6 +172,15 @@ class WorkerRuntime:
         self._pty_backend: Any = None
         self._pty_timeouts: dict[str, asyncio.Task] = {}
         self._pty_session_ids: dict[str, str] = {}
+
+        # ACCOUNT_LOGIN runs in a background task so the receiver can accept a
+        # correlated ACCOUNT_LOGIN_OTP while the same Codex browser/PKCE flow
+        # remains alive. A lock preserves the old one-login-at-a-time behavior
+        # for Chrome profiles and credential directories.
+        self._account_login_lock = asyncio.Lock()
+        self._account_login_tasks: dict[str, asyncio.Task] = {}
+        self._account_login_accounts: dict[str, str] = {}
+        self._account_login_otp_readers: dict[str, _WorkerLoginOtpReader] = {}
 
     @property
     def connected(self) -> bool:
@@ -195,6 +263,14 @@ class WorkerRuntime:
             await self._file_sync_manager.stop()
         for task_id in list(self._processes.keys()):
             await self._stop_process(task_id, "SIGTERM")
+        login_tasks = list(self._account_login_tasks.values())
+        for task in login_tasks:
+            task.cancel()
+        if login_tasks:
+            await asyncio.gather(*login_tasks, return_exceptions=True)
+        self._account_login_tasks.clear()
+        self._account_login_accounts.clear()
+        self._account_login_otp_readers.clear()
         if self._pty_backend is not None:
             for timer in self._pty_timeouts.values():
                 timer.cancel()
@@ -260,10 +336,50 @@ class WorkerRuntime:
             "FORCE_SYNC": self._handle_force_sync,
             "CREDENTIAL_LOGIN": self._handle_credential_login,
             "ACCOUNT_LOGIN": self._handle_account_login,
+            "ACCOUNT_LOGIN_OTP": self._handle_account_login_otp,
+            "ACCOUNT_LOGIN_CANCEL": self._handle_account_login_cancel,
         }
         handler = handlers.get(msg.type)
         if handler:
             try:
+                if isinstance(msg, AccountLoginMessage):
+                    request_id = msg.login_request_id
+                    existing = self._account_login_tasks.get(request_id)
+                    if existing is not None and not existing.done():
+                        await self._send_event(AccountLoginResultMessage(
+                            login_request_id=request_id,
+                            account_id=msg.account_id,
+                            slot_index=msg.slot_index,
+                            success=False,
+                            error="duplicate account login request",
+                        ))
+                        return
+                    task = asyncio.create_task(
+                        self._run_account_login_task(msg)
+                    )
+                    self._account_login_tasks[request_id] = task
+                    self._account_login_accounts[request_id] = msg.account_id
+
+                    def _forget_login(completed: asyncio.Task) -> None:
+                        if self._account_login_tasks.get(request_id) is completed:
+                            self._account_login_tasks.pop(request_id, None)
+                            self._account_login_accounts.pop(request_id, None)
+                        if completed.cancelled():
+                            return
+                        error = completed.exception()
+                        if error is not None:
+                            # Retrieve the exception so asyncio does not emit an
+                            # unstructured "Task exception was never retrieved"
+                            # warning.  Do not include exception text: a third-
+                            # party browser error could contain login inputs.
+                            logger.error(
+                                "Account login task %s failed unexpectedly (%s)",
+                                request_id,
+                                type(error).__name__,
+                            )
+
+                    task.add_done_callback(_forget_login)
+                    return
                 await handler(msg)
             except Exception:
                 logger.exception("Error handling %s message", msg.type)
@@ -730,6 +846,47 @@ class WorkerRuntime:
             "error": None,
         }
 
+    def _check_codex_cli(self) -> dict[str, Any]:
+        path = shutil.which("codex")
+        if not path:
+            return {
+                "ok": False,
+                "path": None,
+                "version": None,
+                "error": "codex command not found in PATH",
+            }
+
+        try:
+            result = subprocess.run(
+                [path, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "path": path,
+                "version": None,
+                "error": f"codex --version failed: {type(exc).__name__}",
+            }
+
+        output = (result.stdout or result.stderr or "").strip()
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "path": path,
+                "version": output or None,
+                "error": f"codex --version exited {result.returncode}",
+            }
+        return {
+            "ok": True,
+            "path": path,
+            "version": output or None,
+            "error": None,
+        }
+
     async def _send_status(self) -> None:
         cpu = mem = disk = 0.0
         try:
@@ -759,8 +916,19 @@ class WorkerRuntime:
         except Exception:
             pass
 
-        claude = self._check_claude_cli()
-        runtime_ready = bool(claude["ok"])
+        expected_agent = os.environ.get(
+            "ELASTIC_AGENT_AGENT_TYPE", "claude"
+        ).strip().lower()
+        if expected_agent == "codex":
+            codex = self._check_codex_cli()
+            claude = {"ok": False, "path": None, "version": None}
+            selected = codex
+        else:
+            expected_agent = "claude"
+            claude = self._check_claude_cli()
+            codex = {"ok": False, "path": None, "version": None}
+            selected = claude
+        runtime_ready = bool(selected["ok"])
 
         await self._send_event(StatusMessage(
             cpu=round(cpu, 1),
@@ -768,10 +936,14 @@ class WorkerRuntime:
             disk=round(disk, 1),
             active_processes=self.active_processes,
             runtime_ready=runtime_ready,
-            runtime_error=None if runtime_ready else claude["error"],
+            runtime_error=None if runtime_ready else selected["error"],
+            agent_type=expected_agent,
             claude_cli_ok=bool(claude["ok"]),
             claude_version=claude["version"],
             claude_path=claude["path"],
+            codex_cli_ok=bool(codex["ok"]),
+            codex_version=codex["version"],
+            codex_path=codex["path"],
         ))
 
     async def _handle_upload_file(self, msg: UploadFileMessage) -> None:
@@ -1042,6 +1214,39 @@ class WorkerRuntime:
         ))
 
     async def _handle_account_login(self, msg: AccountLoginMessage) -> None:
+        """Run one worker-local login while keeping OTP commands receivable."""
+        async with self._account_login_lock:
+            if msg.agent_type == "codex":
+                await self._handle_codex_account_login(msg)
+            else:
+                await self._handle_claude_account_login(msg)
+
+    async def _run_account_login_task(self, msg: AccountLoginMessage) -> None:
+        """Convert every unexpected background failure into a safe result."""
+        try:
+            await self._handle_account_login(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Browser/subprocess exception strings may contain a URL or input
+            # value. Keep both the log and correlated result deliberately
+            # generic while ensuring the Manager does not wait for its timeout.
+            logger.error(
+                "Unexpected account login task failure for request %s (%s)",
+                msg.login_request_id,
+                type(exc).__name__,
+            )
+            await self._send_event(AccountLoginResultMessage(
+                login_request_id=msg.login_request_id,
+                account_id=msg.account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error="account login failed unexpectedly",
+            ))
+
+    async def _handle_claude_account_login(
+        self, msg: AccountLoginMessage,
+    ) -> None:
         """Worker-autonomous login: the Manager sends the account identity +
         接码 token; the worker runs the vendored login flow locally (Chrome/CDP
         on this machine) and the credentials are written here, never sent up.
@@ -1118,6 +1323,121 @@ class WorkerRuntime:
             slot_index=msg.slot_index,
             success=result.success,
             error=result.error,
+        ))
+
+    async def _handle_codex_account_login(
+        self, msg: AccountLoginMessage,
+    ) -> None:
+        """Password-first Codex OAuth login in this worker's CODEX_HOME."""
+        from elastic_agent.worker.login.codex_login import codex_login
+
+        raw_home = Path(msg.config_dir).expanduser() if msg.config_dir else None
+        codex_home = (
+            raw_home
+            if raw_home is not None and raw_home.is_absolute()
+            else Path.home() / ".codex"
+        )
+        if not msg.password:
+            await self._send_event(AccountLoginResultMessage(
+                login_request_id=msg.login_request_id,
+                account_id=msg.account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error="Codex login requires an OpenAI password",
+            ))
+            return
+
+        otp_reader = _WorkerLoginOtpReader(self, msg)
+        self._account_login_otp_readers[msg.login_request_id] = otp_reader
+        try:
+            result = await codex_login(
+                email=msg.email,
+                password=msg.password,
+                token_171=msg.email_token,
+                codex_home=str(codex_home),
+                mail_provider=msg.provider,
+                attempt_id=msg.login_request_id,
+                manual_otp_reader=otp_reader,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Codex account login failed for %s (%s)",
+                msg.account_id,
+                type(exc).__name__,
+            )
+            await self._send_event(AccountLoginResultMessage(
+                login_request_id=msg.login_request_id,
+                account_id=msg.account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error="Codex login automation failed unexpectedly",
+            ))
+            return
+        finally:
+            self._account_login_otp_readers.pop(msg.login_request_id, None)
+
+        success = bool(result.get("ok"))
+        if success:
+            logger.info(
+                "Codex account %s logged in and validated on this worker (%s)",
+                msg.account_id,
+                codex_home,
+            )
+        await self._send_event(AccountLoginResultMessage(
+            login_request_id=msg.login_request_id,
+            account_id=msg.account_id,
+            slot_index=msg.slot_index,
+            success=success,
+            error=None if success else str(result.get("error") or "Codex login failed"),
+        ))
+
+    async def _handle_account_login_otp(
+        self, msg: AccountLoginOtpMessage,
+    ) -> None:
+        """Deliver a correlated OTP to a live Codex browser without logging it."""
+        reader = self._account_login_otp_readers.get(msg.login_request_id)
+        if reader is None or not reader.submit(msg):
+            await self._send_event(ErrorMessage(
+                error_type="invalid_account_login_otp",
+                message="Login verification challenge is stale or mismatched",
+                recoverable=True,
+            ))
+
+    async def _handle_account_login_cancel(
+        self, msg: AccountLoginCancelMessage,
+    ) -> None:
+        """Cancel one login and acknowledge only after its cleanup finishes."""
+        task = self._account_login_tasks.get(msg.login_request_id)
+        account_id = self._account_login_accounts.get(msg.login_request_id)
+        cleanup_complete = account_id in (None, msg.account_id)
+        if task is not None and not task.done() and account_id == msg.account_id:
+            logger.info(
+                "Cancelling account login request %s (%s)",
+                msg.login_request_id,
+                msg.reason,
+            )
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=60.0)
+            except asyncio.CancelledError:
+                # A finished child raises CancelledError through ``shield``.
+                # If the receiver itself was cancelled on WS shutdown, do not
+                # claim that the still-running child's cleanup is complete.
+                if not task.done():
+                    raise
+            except asyncio.TimeoutError:
+                cleanup_complete = False
+            except Exception:
+                # A completed task has run its transactional rollback even if
+                # its handler failed. The wrapper has already redacted/logged it.
+                pass
+
+        await self._send_event(AccountLoginCancelledMessage(
+            login_request_id=msg.login_request_id,
+            account_id=msg.account_id,
+            cleanup_complete=cleanup_complete,
         ))
 
     @staticmethod
