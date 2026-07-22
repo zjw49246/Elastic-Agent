@@ -328,3 +328,13 @@
 **验证**：部署/IAM/Golden/私网路径聚焦测试 158 passed；AWS Access Analyzer 对 Manager/Worker 两份策略均为零 finding，按动作切片的 IAM allow/deny 模拟全部通过；完整套件 2010 passed / 12 skipped，8 个失败均为本任务前已有的 credential-rotation 断言 3、server 默认端口断言 2、file-sync 角色/本机 `/root` 权限 3，本次未改对应实现且无新增失败。Ruff、`bash -n`、diff check 与四轮真实 AWS canary 均通过。
 
 **经验**：IAM 资源 ARN 不能凭控制台 ID 猜。EC2 Key Pair 的 ARN 资源段使用 key name，首轮 Job `job-06cd63e5cdf5a0954264059e6a4402b1` 因把 KeyPairId 写进策略而在创建实例前安全失败、无资源泄漏。修复时先加红测，再用真实 ARN 做 allow、旧 ARN 做 implicit-deny，并跑真实 create/upload/terminate canary。`SimulateCustomPolicy` 的 `PolicyInputList` 单份上限是 131,072 字符；完整 Manager policy 只有约 7 KiB，应直接模拟完整策略以保留 future explicit Deny/跨 statement 约束，并对 RunInstances 的全部 resource evaluation 逐项断言 allowed。
+
+## 2026-07-22 EIP 终态对账与身份原子性（commit `1fdaa48`）
+
+**问题**：AWS 会继续枚举已经终止的 EC2。旧 reconciler 把带 lease tag 的历史行重新收养并重复清理，EIP Job 正常 release 后的 TERMINATED Node 也要等下一轮 reconcile 才消失。进一步故障注入发现，缺失/错配的 durable lease、worker→instance 映射或 allocator claim 若被当作幂等成功，可能提前丢失仍需重试的 Node/账号句柄；显式 disconnect 后排队中的 STATUS 还能复活缓存。
+
+**解决**：terminated 历史只有在 durable lease 对 lease/instance/account/Job 精确匹配，且 detach/terminate/必要 worker cleanup/`released_at` 全部提交后才跳过；任何 active-by-instance 冲突、未知或不完整状态都 quarantine 并禁止云变更。release 必须返回身份匹配的 `RELEASED` 才立即清 Task/Node/WS status 和精确 claim；worker 存在但 instance id 缺失从 journal invariant、startup、live hook 到 BindingManager 全链 fail closed。`begin_release` 在 store 单锁内原子比较七项身份并写 `RELEASING`，之后冻结身份字段，关闭晚到 attach/recovery 改写销毁目标的窗口。connection 显式断开同时清状态/event，旧连接排队消息不能重新写回。
+
+**以后避免**：云 API 的 terminated row 是历史事实，不是新的待清理资源；忽略它必须依赖本地正向、完整、精确的完成证明。资源 release 的“前置读取”和“写入销毁意图”不能分成两个锁窗口，且 Node、durable lease、allocator claim 三张所有权表必须分别核对稳定身份后再释放。缺失返回值或缺失 instance id 不是幂等成功，而是应保留控制面句柄的故障。
+
+**验证**：新增与受影响核心测试 253 项、EIP/Job 聚焦矩阵 726 项全绿；完整套件 2039 passed / 12 skipped，8 个失败与既有基线相同（credential rotation 3、server 默认端口 2、file sync 3），无新增失败；变更文件 Ruff 与 `git diff --check` 通过，安全和生命周期并发复核均无 blocker。
