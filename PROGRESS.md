@@ -255,3 +255,13 @@
 **以后避免**：浏览器登录不能只以“页面走完”为成功，必须同时验证最终账号身份和 CLI 真调用；异步取消也不能把“已发 cancel”当作“已清理”，资源/账号复用前必须有 ACK、实例销毁或隔离兜底。秘密字段的 REST、日志、异常和 UI 都要逐层检查，OTP 元数据用 DOM text 节点渲染，不能直接拼 HTML。
 
 **验证**：相关回归 389 项全绿；全量为 1770 passed / 12 skipped / 8 个既有基线失败（凭证轮换 3、端口默认值 2、文件同步 3），无新增失败；ruff、`compileall`、diff check 与 Batch Console JavaScript 语法检查通过。未使用真实 OpenAI 账号做线上登录，也未创建 AWS 资源。
+
+## 2026-07-22 Codex token-only / email-code 登录（commit `5206410`）
+
+**问题**：CCM 已支持 OpenAI password 或邮箱查询 token 二选一，但 Elastic-Agent 仍在账号模型、REST 和 worker runtime 三层强制 password；即使有 163 MailCatcher token 也无法进入登录。FastAPI 默认 422 还会把类型错误的秘密输入放回响应。
+
+**解决**：Codex 账号改为至少配置 `password`/`email_token` 之一；token-only worker 在密码页或登录方式选择页进入 email-code，支持 “Try another method” 二级菜单，再沿用受支持邮箱后端自动取 OTP。若页面无 email-code 入口则安全失败并要求 password；原 `auth.json` 事务性回滚、身份校验与 `codex exec` smoke test 不变。API 新增 `clear_password`，且禁止清掉唯一登录输入；全局请求校验响应移除原始 `input`/validator context，避免 malformed secret 回显。
+
+**以后避免**：同步上游登录实现时必须逐层核对账号 schema、REST、协议、runtime 守卫和真实浏览器状态机，不能只复制取码函数。页面跳转成功必须以目标 OTP 控件出现为准，不能用“密码框消失”推断；所有写入后不回显字段还要覆盖框架级 422 路径。
+
+**验证**：token/password、REST、Manager→worker、method picker、OTP、回滚、脱敏与旧密码路径相关 253 项全绿；全量 1784 passed / 12 skipped，8 个失败与既有基线相同（凭证轮换 3、端口默认值 2、文件同步 3），无新增失败；Ruff、`compileall`、diff check 和 Batch Console JavaScript 语法检查通过。完整 AWS EIP/EC2/真实账号结果见后续实盘记录。
