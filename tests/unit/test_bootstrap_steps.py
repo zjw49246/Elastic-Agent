@@ -6,7 +6,10 @@ from elastic_agent.core.bootstrap_steps import (
     agent_install_step,
     build_default_bootstrap_steps,
     credential_login_deps_step,
+    docker_install_step,
     harness_code_step,
+    pty_install_step,
+    runtime_deploy_from_src_step,
     runtime_deploy_step,
     system_init_step,
 )
@@ -16,6 +19,8 @@ class TestSystemInitStep:
     def test_default_packages(self) -> None:
         step = system_init_step()
         assert step.name == "system-init"
+        assert "elastic-agent-image-verify system" in step.command
+        assert "golden image system packages verified" in step.command
         assert "apt-get" in step.command and "update" in step.command
         assert "python3" in step.command
         assert "cloud-init status --wait" in step.command   # fresh-boot apt lock
@@ -35,6 +40,7 @@ class TestAgentInstallStep:
     def test_default_command(self) -> None:
         step = agent_install_step()
         assert step.name == "agent-install"
+        assert "elastic-agent-image-verify agent claude 2.1.181" in step.command
         assert "npm install -g" in step.command
         assert "@anthropic-ai/claude-code@2.1.181" in step.command
         assert "--include=optional" in step.command
@@ -51,6 +57,7 @@ class TestAgentInstallStep:
     def test_codex_command_is_version_pinned(self) -> None:
         step = agent_install_step(agent_type="codex")
 
+        assert "elastic-agent-image-verify agent codex 0.144.6" in step.command
         assert "@openai/codex@0.144.6" in step.command
         assert "codex --version" in step.command
         assert "@anthropic-ai/claude-code" not in step.command
@@ -128,7 +135,6 @@ class TestHarnessCodeStep:
 
 class TestRuntimeDeployFromSrc:
     def test_systemd_unit_from_src(self) -> None:
-        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
         step = runtime_deploy_from_src_step(
             manager_url="ws://1.2.3.4:8080/ws/runtime", auth_token="tok",
             worker_id="w1", src_dir="/opt/ea/src", run_as="ubuntu",
@@ -144,6 +150,9 @@ class TestRuntimeDeployFromSrc:
         assert "--manager-url=ws://1.2.3.4:8080/ws/runtime" in c and "--token=tok" in c
         assert "Xvfb :99" in c                      # display for the login flow
         assert "systemctl restart ea-runtime" in c
+        assert "elastic-agent-image-verify python" in c
+        assert "golden image runtime Python dependencies verified" in c
+        assert "pip3 install" in c  # complete fallback remains available
         assert c.startswith("set -e\n")
         assert (
             "(systemctl disable --now elastic-agent-runtime.service "
@@ -158,7 +167,6 @@ class TestRuntimeDeployFromSrc:
         # (`--token -Cu2...`) argparse reads the value as another option and dies with
         # "argument --token: expected one argument" → runtime crash-loops → worker
         # never connects → provision fails ("never connected within 300s").
-        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
         tok = "-Cu2AifsKw6IW8G1T704zqv2S3CJrNvL1wgFYoAxmSI"
         c = runtime_deploy_from_src_step(
             manager_url="ws://1.2.3.4:8080/ws/runtime", auth_token=tok, worker_id="w1",
@@ -167,13 +175,11 @@ class TestRuntimeDeployFromSrc:
         assert f"--token {tok}" not in c            # never the ambiguous space form
 
     def test_root_gets_is_sandbox(self) -> None:
-        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
         step = runtime_deploy_from_src_step("u", "t", "w", run_as="root")
         assert "IS_SANDBOX=1" in step.command
         assert "User=root" in step.command
 
     def test_codex_runtime_declares_expected_agent_capability(self) -> None:
-        from elastic_agent.core.bootstrap_steps import runtime_deploy_from_src_step
 
         step = runtime_deploy_from_src_step(
             "u", "t", "w", agent_type="codex",
@@ -231,6 +237,7 @@ class TestCredentialLoginDepsStep:
         # playwright/chromium.
         step = credential_login_deps_step()
         assert step.name == "credential-login-deps"
+        assert "elastic-agent-image-verify login httpx websockets" in step.command
         assert "google-chrome" in step.command
         assert "xdotool" in step.command
         assert "xvfb" in step.command
@@ -241,6 +248,10 @@ class TestCredentialLoginDepsStep:
     def test_custom_deps_appended_as_pip(self) -> None:
         step = credential_login_deps_step(login_dependencies=["some-extra-pkg"])
         assert "some-extra-pkg" in step.command
+        assert (
+            "elastic-agent-image-verify login httpx websockets some-extra-pkg"
+            in step.command
+        )
         # base deps still present
         assert "google-chrome" in step.command
 
@@ -251,14 +262,33 @@ class TestCredentialLoginDepsStep:
 
 class TestDockerInstallStep:
     def test_installs_docker_and_grants_user(self) -> None:
-        from elastic_agent.core.bootstrap_steps import docker_install_step
         step = docker_install_step(run_as="ubuntu")
         assert step.name == "docker-install"
+        assert "elastic-agent-image-verify docker" in step.command
+        assert "golden image Docker dependencies verified" in step.command
         assert "docker.io" in step.command
         assert "docker-buildx" in step.command  # BuildKit builds (--sandbox os)
         assert "usermod -aG docker ubuntu" in step.command
         assert "enable --now docker" in step.command
 
     def test_run_as_is_parameterised(self) -> None:
-        from elastic_agent.core.bootstrap_steps import docker_install_step
         assert "usermod -aG docker ec2-user" in docker_install_step(run_as="ec2-user").command
+
+
+class TestPtyInstallStep:
+    def test_pinned_git_commit_can_use_golden_fast_path(self) -> None:
+        commit = "d6ff732d633b8b7bdb3ada717ffd1cbc9e701163"
+        step = pty_install_step(
+            f"git+https://github.com/zjw49246/Claude-Code-PTY@{commit}"
+        )
+
+        assert f"elastic-agent-image-verify pty {commit}" in step.command
+        assert "pip3 install" in step.command
+
+    def test_unpinned_git_source_always_uses_install_fallback(self) -> None:
+        step = pty_install_step(
+            "git+https://github.com/zjw49246/Claude-Code-PTY.git"
+        )
+
+        assert "elastic-agent-image-verify pty" not in step.command
+        assert "pip3 install" in step.command

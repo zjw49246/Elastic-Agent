@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from elastic_agent.api.auth import require_api_key
+from elastic_agent.core.network import worker_management_host
 from elastic_agent.core.registry import NodeStatus
 
 router = APIRouter(tags=["nodes"], dependencies=[Depends(require_api_key)])
@@ -189,12 +190,12 @@ async def node_logs(
     node = await mgr.registry.get(node_id)
     if node is None:
         raise HTTPException(404, f"Node {node_id} not found")
-    host = node.public_ip or node.private_ip
+    pc = mgr.config.provider
+    host = worker_management_host(node, provider_type=pc.type)
     if not host:
         raise HTTPException(409, f"Node {node_id} has no address yet")
 
     from elastic_agent.core.bootstrap import SSHExecutor
-    pc = mgr.config.provider
     ssh_user = mgr.config.worker.ssh_user
     key = pc.aliyun.ssh_key_path if pc.type == "aliyun" else pc.aws.ssh_key_path
     # journalctl needs root; SSHExecutor sudo-wraps non-root users by default.

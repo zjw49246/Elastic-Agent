@@ -118,6 +118,8 @@ async def test_local_collect_isolated_by_shard_and_writes_manifest(
     assert len(set(destinations)) == 2
     assert all("--safe-links" in args for args in calls)
     assert all("-azc" in args for args in calls)
+    assert any("ubuntu@10.0.0.10:" in args[-2] for args in calls)
+    assert any("ubuntu@10.0.0.11:" in args[-2] for args in calls)
 
     manifest = Path(manager.collected_root) / (
         "job-1/workers/shard-00000/_elastic_agent/collection.json"
@@ -142,10 +144,11 @@ async def test_worker_direct_s3_uses_isolated_prefix_and_manifest(
     monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
     monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_PREFIX", "batch-results")
     commands = []
+    hosts = []
 
     class FakeSSHExecutor:
-        def __init__(self, *args, **kwargs):
-            pass
+        def __init__(self, host, *args, **kwargs):
+            hosts.append(host)
 
         async def execute(self, command, timeout=None):
             commands.append(command)
@@ -160,6 +163,7 @@ async def test_worker_direct_s3_uses_isolated_prefix_and_manifest(
         "worker-b", _spec(tmp_path), "job-1",
     )
 
+    assert hosts and set(hosts) == {"10.0.0.11"}
     assert any(
         "s3://result-bucket/batch-results/job-1/workers/"
         "shard-00001/results/" in command

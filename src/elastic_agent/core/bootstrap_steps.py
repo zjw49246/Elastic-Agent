@@ -6,12 +6,42 @@ to form a complete bootstrap pipeline.
 
 from __future__ import annotations
 
+import re
+import shlex
 from typing import Literal
 
 from elastic_agent.harness.base import BootstrapStep
 
 CLAUDE_CODE_VERSION = "2.1.181"
 CODEX_CLI_VERSION = "0.144.6"
+GOLDEN_IMAGE_VERIFY_PATH = "/usr/local/bin/elastic-agent-image-verify"
+
+
+def _golden_verify_command(component: str, args: list[str] | None = None) -> str:
+    """Return a shell-safe, fail-closed golden-image verifier invocation."""
+    return shlex.join([GOLDEN_IMAGE_VERIFY_PATH, component, *(args or [])])
+
+
+def _golden_fast_path(
+    component: str,
+    args: list[str],
+    success_message: str,
+    fallback: str,
+) -> str:
+    """Use baked state only after manifest *and* live-state verification.
+
+    A missing verifier, stale manifest, version drift, broken command, or failed
+    Python import all select the complete legacy install path.  The marker is
+    never trusted by itself.
+    """
+    verify = _golden_verify_command(component, args)
+    return (
+        f"if test -x {shlex.quote(GOLDEN_IMAGE_VERIFY_PATH)} && {verify}; then\n"
+        f"  echo {shlex.quote(success_message)}\n"
+        "else\n"
+        f"  {fallback}\n"
+        "fi"
+    )
 
 
 def ipv4_only_egress_step(timeout: int = 60) -> BootstrapStep:
@@ -50,17 +80,29 @@ def system_init_step(
     Defaults include node/npm (Claude Code CLI is an npm package) and rsync
     (manager_rsync code delivery) so a blank Ubuntu image is provisionable.
     """
-    pkg_list = " ".join(packages) if packages else "python3 python3-pip git curl rsync nodejs npm"
+    package_names = packages or [
+        "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
+    ]
+    pkg_list = shlex.join(package_names)
+    fallback = (
+        "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+        f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
+    )
     return BootstrapStep(
         name="system-init",
         command=(
-            "export DEBIAN_FRONTEND=noninteractive && "
+            "set -e\n"
+            "export DEBIAN_FRONTEND=noninteractive\n"
             # A fresh instance runs cloud-init / unattended-upgrades on boot,
             # holding the apt lock — wait for it, and give apt a lock timeout so
             # install doesn't fail instantly on a just-booted machine.
-            "cloud-init status --wait 2>/dev/null || true; "
-            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
-            f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
+            "cloud-init status --wait 2>/dev/null || true\n"
+            + _golden_fast_path(
+                "system",
+                package_names,
+                "golden image system packages verified",
+                fallback,
+            )
         ),
         timeout=timeout,
         retry_count=2,
@@ -76,19 +118,27 @@ def docker_install_step(run_as: str = "ubuntu", timeout: int = 420) -> Bootstrap
     resolves a service's supplementary groups at start time, so the runtime (and
     its child run command) only gets docker-socket access if ``usermod`` ran
     first. Runs sudo-wrapped (SSHExecutor sudoes non-root users)."""
+    fallback = (
+        "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+        # docker-buildx too: Docker 29 builds images with BuildKit, which
+        # needs the buildx component — docker.io alone makes builds fail.
+        "apt-get -o DPkg::Lock::Timeout=600 install -y -qq "
+        "docker.io docker-buildx"
+    )
+    install_or_verify = _golden_fast_path(
+        "docker", [], "golden image Docker dependencies verified", fallback,
+    )
     return BootstrapStep(
         name="docker-install",
         command=(
-            "export DEBIAN_FRONTEND=noninteractive && "
-            "cloud-init status --wait 2>/dev/null || true; "
-            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
-            # docker-buildx too: Docker 29 builds images with BuildKit, which
-            # needs the buildx component — docker.io alone → `docker build` fails
-            # with "buildx component is missing" (e.g. ai4sci --sandbox os).
-            "apt-get -o DPkg::Lock::Timeout=600 install -y -qq docker.io docker-buildx && "
-            f"usermod -aG docker {run_as} && "
-            "systemctl enable --now docker && "
-            "docker --version && docker buildx version"
+            "set -e\n"
+            "export DEBIAN_FRONTEND=noninteractive\n"
+            "cloud-init status --wait 2>/dev/null || true\n"
+            f"{install_or_verify}\n"
+            f"usermod -aG docker {shlex.quote(run_as)}\n"
+            "systemctl enable --now docker\n"
+            "docker --version\n"
+            "docker buildx version"
         ),
         timeout=timeout,
         retry_count=2,
@@ -105,16 +155,28 @@ def agent_install_step(
     """T-020: Install the selected, version-pinned coding-agent CLI."""
     if agent_install_command is None:
         if agent_type == "codex":
-            cmd = (
+            fallback = (
                 f"npm install -g @openai/codex@{CODEX_CLI_VERSION} "
                 "--include=optional --foreground-scripts --force && "
                 "codex --version"
             )
+            cmd = _golden_fast_path(
+                "agent",
+                ["codex", CODEX_CLI_VERSION],
+                "golden image Codex CLI verified",
+                fallback,
+            )
         else:
-            cmd = (
+            fallback = (
                 f"npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} "
                 "--include=optional --foreground-scripts --force && "
                 "claude --version"
+            )
+            cmd = _golden_fast_path(
+                "agent",
+                ["claude", CLAUDE_CODE_VERSION],
+                "golden image Claude CLI verified",
+                fallback,
             )
     elif isinstance(agent_install_command, list):
         cmd = " ".join(agent_install_command)
@@ -149,7 +211,16 @@ def runtime_deploy_from_src_step(
     (``Restart=always``, ``User=run_as``) so the worker stays connected across SSH
     disconnects — the robust replacement for a foreground-held SSH session.
     """
-    deps = " ".join(runtime_deps or ["pydantic", "pydantic-settings", "websockets", "httpx", "psutil"])
+    dependency_names = runtime_deps or [
+        "pydantic", "pydantic-settings", "websockets", "httpx", "psutil",
+    ]
+    deps = shlex.join(dependency_names)
+    dependency_install = _golden_fast_path(
+        "python",
+        dependency_names,
+        "golden image runtime Python dependencies verified",
+        f"pip3 install -q --break-system-packages {deps}",
+    )
     home = "/root" if run_as == "root" else f"/home/{run_as}"
     wrapper = (
         "#!/bin/bash\n"
@@ -191,7 +262,7 @@ def runtime_deploy_from_src_step(
         # treat an earlier pip/file-write failure as success and restart a
         # stale runtime.
         "set -e\n"
-        f"pip3 install -q --break-system-packages {deps}\n"
+        f"{dependency_install}\n"
         # This step runs sudo-wrapped (root), so a bare mkdir makes ea-logs
         # root-owned — but the runtime runs as ``run_as``. It would then fail to
         # open per-task log files, crashing _monitor_process before it reports
@@ -337,6 +408,7 @@ def credential_login_deps_step(
     apt = (
         "export DEBIAN_FRONTEND=noninteractive && "
         "cloud-init status --wait 2>/dev/null || true; "
+        "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
         "apt-get -o DPkg::Lock::Timeout=600 install -y -qq xvfb xdotool wget ca-certificates python3-pip && "
         "wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb "
         "-O /tmp/google-chrome.deb && "
@@ -346,11 +418,17 @@ def credential_login_deps_step(
     for dep in (login_dependencies or []):
         if dep not in pip_pkgs and dep not in ("chrome", "google-chrome", "xvfb", "xdotool"):
             pip_pkgs.append(dep)
-    pip = f"pip3 install -q --break-system-packages {' '.join(pip_pkgs)}"
+    pip = f"pip3 install -q --break-system-packages {shlex.join(pip_pkgs)}"
+    install_or_verify = _golden_fast_path(
+        "login",
+        pip_pkgs,
+        "golden image login dependencies verified",
+        f"{apt} && {pip}",
+    )
 
     return BootstrapStep(
         name="credential-login-deps",
-        command=f"{apt} && {pip}",
+        command=install_or_verify,
         timeout=timeout,
         retry_count=1,
         description="Install worker-local login deps (Google Chrome, Xvfb, xdotool, httpx/websockets)",
@@ -362,9 +440,23 @@ def pty_install_step(
     timeout: int = 300,
 ) -> BootstrapStep:
     """Install claude-pty so the Worker can host agents in PTY sessions."""
+    fallback = (
+        "pip3 install -q --break-system-packages "
+        f"{shlex.quote(pty_package)}"
+    )
+    # An unpinned branch cannot safely use a baked commit: upstream may have
+    # advanced since image creation.  Only a full commit in the requested VCS
+    # URL is eligible for the offline fast path.
+    match = re.search(r"(?:@|#)([0-9a-fA-F]{40})(?:$|[&#])", pty_package)
+    command = fallback
+    if match:
+        commit = match.group(1).lower()
+        command = _golden_fast_path(
+            "pty", [commit], "golden image claude-pty commit verified", fallback,
+        )
     return BootstrapStep(
         name="pty-install",
-        command=f"pip3 install -q --break-system-packages {pty_package}",
+        command=command,
         timeout=timeout,
         retry_count=1,
         description="Install claude-pty for PTY-hosted agent execution",
@@ -452,7 +544,8 @@ fi
 echo "claude-cli-health: repairing @anthropic-ai/claude-code@$VERSION" >&2
 backup="/root/claude-code-broken-backup-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$backup"
-find /usr/lib/node_modules/@anthropic-ai -maxdepth 1 -name '.claude-code-*' -exec mv {} "$backup"/ \\; 2>/dev/null || true
+find /usr/lib/node_modules/@anthropic-ai -maxdepth 1 -name '.claude-code-*' \
+  -exec mv {} "$backup"/ \\; 2>/dev/null || true
 find /usr/bin -maxdepth 1 -name '.claude-*' -exec mv {} "$backup"/ \\; 2>/dev/null || true
 npm install -g "@anthropic-ai/claude-code@$VERSION" --include=optional --foreground-scripts --force
 health

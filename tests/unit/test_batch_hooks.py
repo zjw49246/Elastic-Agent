@@ -967,6 +967,27 @@ class TestProvisionHook:
         assert ran["host"] == "1.2.3.4"
         assert "runtime-deploy" in ran["steps"]
 
+    async def test_aws_bootstrap_uses_private_worker_address(self, tmp_path):
+        """SG-to-SG SSH rules only apply reliably on the VPC/private path."""
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        mgr.config.provider.type = "aws"
+        captured = {}
+
+        async def runner(node_id, host, steps, user, key):
+            captured["host"] = host
+            return True
+
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook(
+            "w1", None, JobSpec(name="j", run=RunSpec(command="x")),
+        ) is True
+        assert captured["host"] == "10.0.0.1"
+
     async def test_bootstrap_failure(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
         mgr = FakeManager(tmp_path, await _store(tmp_path, []))
@@ -977,7 +998,7 @@ class TestProvisionHook:
         hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=1)
         assert await hook("w1", None, JobSpec(name="j", run=RunSpec(command="x"))) is False
 
-    async def test_bound_job_bootstraps_via_registry_eip_and_current_source(
+    async def test_bound_job_bootstraps_via_private_vpc_and_current_source(
         self, tmp_path, monkeypatch,
     ):
         import elastic_agent.core.bootstrap as bootstrap_mod
@@ -988,10 +1009,14 @@ class TestProvisionHook:
             tmp_path, await _store(tmp_path, []), connected=True,
             host="198.51.100.42",
         )
+        mgr.config.provider.type = "aws"
         # Provider wait returns an old/ephemeral address; attach_bound already
-        # made registry.public_ip authoritative.
+        # made registry.public_ip authoritative for the Worker's outbound EIP.
+        # Manager-initiated SSH must still use the registry private address.
         mgr.provider.wait_until_running = lambda iid: _async(
-            SimpleNamespace(public_ip="203.0.113.9")
+            SimpleNamespace(
+                public_ip="203.0.113.9", private_ip="10.0.0.99",
+            )
         )
         captured = {"deliveries": []}
 
@@ -1029,10 +1054,10 @@ class TestProvisionHook:
         )
         hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=1)
         assert await hook("w1", None, spec) is True
-        assert captured["host"] == "198.51.100.42"
+        assert captured["host"] == "10.0.0.1"
         assert "runtime-deploy" not in captured["steps"]
         local, delivered_host, target = captured["deliveries"][0]
-        assert delivered_host == "198.51.100.42"
+        assert delivered_host == "10.0.0.1"
         assert local.endswith("/elastic_agent")
         assert target == "/opt/elastic-agent/framework/src/elastic_agent"
         assert "runtime_main" in captured["runtime_command"]

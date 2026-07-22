@@ -319,10 +319,12 @@ class TestNodeLogs:
                 return 0, "LOGDATA\nline2", ""
 
         monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSH)
+        manager.config.provider.type = "aws"
         rec = (await manager.scale_out(count=1))[0]
         resp = await client.get(f"/api/nodes/{rec.node_id}/logs?lines=50")
         assert resp.status_code == 200
         assert resp.json()["logs"] == "LOGDATA\nline2"
+        assert captured["host"] == "10.0.0.1"
         assert "journalctl -u ea-runtime" in captured["cmd"]
         assert "-n 50" in captured["cmd"]
 

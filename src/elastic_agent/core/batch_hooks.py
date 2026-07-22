@@ -38,6 +38,7 @@ from elastic_agent.core.batch_orchestrator import (
 from elastic_agent.core.credential_pool import AccountDefinition
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+from elastic_agent.core.network import worker_management_host
 from elastic_agent.harness.base import Harness
 from elastic_agent.harness.generic import (
     compile_bootstrap_steps,
@@ -631,14 +632,24 @@ def make_provision_hook(
         if node is None:
             return False
         # Ensure the instance is running and has an address before SSH.
-        host = node.public_ip
+        provider_type = getattr(manager.config.provider, "type", "")
+        host = worker_management_host(node, provider_type=provider_type)
         try:
             inst = await manager.provider.wait_until_running(node.instance_id)
             # Bound attach already replaced registry.public_ip with the durable
             # EIP.  Never overwrite it with a possibly stale ephemeral address
             # returned by the launch/wait API.
             if getattr(spec.account, "binding", "none") != "eip":
-                host = (inst.public_ip if inst else None) or host
+                host = worker_management_host(
+                    inst, node, provider_type=provider_type,
+                )
+            elif provider_type == "aws":
+                # The EIP remains the Worker's outbound identity.  Manager SSH
+                # stays on the VPC path so the Worker SG can authorize only the
+                # Manager SG instead of opening port 22 to the internet.
+                host = worker_management_host(
+                    node, inst, provider_type=provider_type,
+                )
         except Exception:
             logger.exception("provision: wait_until_running failed for %s", worker_id)
         if not host:

@@ -14,6 +14,47 @@ Run the complete suite before merging:
 uv run pytest -q
 ```
 
+Validate the production AWS launcher's fail-closed environment and AMI policy
+without making cloud calls:
+
+```bash
+uv run pytest -q tests/unit/test_aws_manager_launcher.py
+```
+
+These tests cover required environment-only configuration, secret-free
+settings/errors, WSS enforcement, local state/key permissions, and AMI
+availability/architecture/HVM/ENA/IMDSv2/encryption/provenance checks including
+the explicit Canonical break-glass path.
+
+Validate AWS private management-path selection across bootstrap, login, logs,
+and collection:
+
+```bash
+uv run pytest -q \
+  tests/unit/test_network.py \
+  tests/unit/test_batch_hooks.py \
+  tests/unit/test_manager_fleet_driver.py \
+  tests/unit/test_oauth_race_and_retry.py \
+  tests/unit/test_api.py
+```
+
+Validate the golden worker image's fail-closed fast paths and build-script
+safety contract without making AWS writes:
+
+```bash
+uv run pytest -q \
+  tests/unit/test_bootstrap_steps.py \
+  tests/unit/test_golden_image_verify.py \
+  tests/unit/test_golden_ami_script.py
+bash -n scripts/build_golden_ami.sh
+```
+
+The marker alone is never sufficient: these tests cover exact dpkg versions,
+commands, agent CLIs, Python distributions/imports, Chrome, Docker/buildx, and
+the claude-pty VCS commit, plus complete fallback installers. Real promotion
+also requires the standard/Docker/login/S3/EIP canaries documented in
+`docs/operations/golden-worker-ami.md`.
+
 Run only the account/EIP lifecycle surface while developing this feature:
 
 ```bash

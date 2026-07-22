@@ -412,6 +412,60 @@ with a six-digit submission form. API keys are accepted only in the
 Live batch runs require provision/login hooks wired at deployment:
 `manager.configure_batch(provision_hook=..., login_hook=...)`.
 
+## AWS production launcher
+
+Run the Manager from the version-controlled `deploy/aws_manager.py` entry point
+instead of a machine-local Python file. It does not discover credentials from
+local CLIs or contain deployment fallbacks: the Manager instance profile
+supplies AWS credentials, while a mode-`0600` systemd `EnvironmentFile` must set
+these non-secret deployment values:
+
+```text
+ELASTIC_AGENT_AWS_REGION
+ELASTIC_AGENT_AWS_AMI_ID
+ELASTIC_AGENT_AWS_INSTANCE_TYPE
+ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS
+ELASTIC_AGENT_AWS_SUBNET_ID
+ELASTIC_AGENT_AWS_KEY_PAIR_NAME
+ELASTIC_AGENT_AWS_SSH_KEY_PATH
+ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE
+ELASTIC_AGENT_AWS_MAX_INSTANCES
+ELASTIC_AGENT_STATE_DIR
+ELASTIC_AGENT_MANAGER_URL
+ELASTIC_AGENT_FRAMEWORK_SRC
+ELASTIC_AGENT_SERVER_HOST
+ELASTIC_AGENT_SERVER_PORT
+ELASTIC_AGENT_WORKER_SSH_USER
+ELASTIC_AGENT_LOG_LEVEL
+ELASTIC_AGENT_RESULTS_S3_BUCKET
+ELASTIC_AGENT_RESULTS_S3_PREFIX
+ELASTIC_AGENT_RESULTS_S3_INTERVAL
+```
+
+Set `ELASTIC_AGENT_EXTERNAL_API_KEYS` in the same protected file; the launcher
+refuses to start without it and never places its value in the parsed settings or
+startup logs. Optional Git access comes only from `ELASTIC_AGENT_GIT_TOKEN`—the
+launcher never falls back to a local `gh` login. Start one process with
+`uv run python deploy/aws_manager.py`.
+
+Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
+IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,
+and has `ManagedBy=elastic-agent` plus `Role=worker-golden` tags. Emergency
+rollback to an official Canonical image (`099720109477`) is rejected unless
+`ELASTIC_AGENT_ALLOW_CANONICAL_BASE_AMI=true` is explicitly set. That
+break-glass path may use Canonical's unencrypted publisher snapshot; workers
+still request encrypted root volumes, and the tagged golden image should be
+restored immediately.
+
+On AWS, Manager-initiated SSH traffic (bootstrap, login, logs, code delivery,
+and collection) prefers the Worker's VPC-private address. The Worker's EIP is
+only its stable outbound identity, so port 22 can be restricted to the Manager
+security group. A least-privilege Manager/Worker policy and a staged
+cutover/rollback procedure are maintained in
+[`deploy/aws/iam-cutover.md`](deploy/aws/iam-cutover.md). The supplied Worker
+policy intentionally writes only to the configured results prefix; S3 datasets
+and additional EC2 instance types require explicit policy allow-list updates.
+
 ## Development
 
 ```bash

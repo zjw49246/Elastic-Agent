@@ -131,6 +131,29 @@ class TestCredentialValidity:
             )
 
 
+class TestWorkerHostResolution:
+    @pytest.mark.asyncio
+    async def test_aws_worker_uses_private_address_for_ssh(self):
+        class Registry:
+            async def get(self, worker_id):
+                assert worker_id == "aws:i-123"
+                return SimpleNamespace(
+                    platform="aws",
+                    public_ip="198.51.100.10",
+                    private_ip="10.0.0.10",
+                )
+
+        service = CredentialLoginService(
+            credential_pool=MagicMock(),
+            credential_config=SimpleNamespace(login_timeout=60),
+            credential_binding=MagicMock(),
+            event_bus=MagicMock(),
+            node_registry=Registry(),
+        )
+
+        assert await service._resolve_host("aws:i-123") == "10.0.0.10"
+
+
 class TestActiveWorkerCredentialRestore:
     def test_affinity_falls_back_to_persisted_last_assigned_worker(self):
         newer = datetime.now(timezone.utc)

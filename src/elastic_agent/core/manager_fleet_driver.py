@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 
 from elastic_agent.core.batch_orchestrator import LoginOutcome, WorkerAssignment
 from elastic_agent.core.job_spec import JobSpec
+from elastic_agent.core.network import worker_management_host
 from elastic_agent.core.secret_env import resolve_secret_env as resolve_aws_secret_env
 from elastic_agent.harness.base import Harness
 
@@ -340,12 +341,12 @@ class ManagerFleetDriver:
             return
 
         node = await self._mgr.registry.get(worker_id)
-        host = (node.public_ip or node.private_ip) if node else None
+        pc = self._mgr.config.provider
+        host = worker_management_host(node, provider_type=pc.type)
         if not host:
             raise RuntimeError(
                 f"cannot collect worker {worker_id!r}: no registry host address"
             )
-        pc = self._mgr.config.provider
         ssh_user = self._mgr.config.worker.ssh_user
         ssh_key = pc.aliyun.ssh_key_path if pc.type == "aliyun" else pc.aws.ssh_key_path
         namespace, shard_index = await self._collection_identity(

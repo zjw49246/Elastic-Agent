@@ -25,6 +25,7 @@ from elastic_agent.core.credential_binding import CredentialBinding
 from elastic_agent.core.credential_login_step import CredentialLoginStep
 from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
 from elastic_agent.core.event_bus import EventBus
+from elastic_agent.core.network import worker_management_host
 from elastic_agent.core.registry import NodeRegistry
 
 logger = logging.getLogger(__name__)
@@ -444,7 +445,8 @@ class CredentialLoginService:
                 "  if command -v systemctl >/dev/null && [ -f /etc/systemd/system/xvfb.service ]; then "
                 "    systemctl start xvfb.service openbox.service && echo XVFB_STARTED; "
                 "  else "
-                "    ( pgrep -x Xvfb || (Xvfb :99 -screen 0 1365x900x24 -ac +extension GLX +render -noreset >/dev/null 2>&1 &) ) && "
+                "    ( pgrep -x Xvfb || (Xvfb :99 -screen 0 1365x900x24 -ac "
+                "+extension GLX +render -noreset >/dev/null 2>&1 &) ) && "
                 "    sleep 1 && "
                 "    ( pgrep openbox || (DISPLAY=:99 openbox --sm-disable >/dev/null 2>&1 &) ) && "
                 "    echo XVFB_STARTED_MANUAL; "
@@ -575,10 +577,9 @@ class CredentialLoginService:
         """Resolve SSH-reachable host (IP) from worker_id via NodeRegistry."""
         if self._registry:
             node = await self._registry.get(worker_id)
-            if node and node.public_ip:
-                return node.public_ip
-            if node and node.private_ip:
-                return node.private_ip
+            host = worker_management_host(node)
+            if host:
+                return host
 
         # Fallback: if worker_id looks like an IP or contains one after ":"
         if ":" in worker_id:
