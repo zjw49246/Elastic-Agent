@@ -46,7 +46,8 @@ and failed multipart cleanup map to `PutObject` and `AbortMultipartUpload`.
 ## 1. Prepare the concrete policy and read-only preflight
 
 Set the final golden AMI and dedicated Worker security group. The deployed
-`serve_manager.py` values must match these IDs before the first Job launch.
+`deploy/aws_manager.py` environment must match these IDs before the first Job
+launch.
 The IAM policy also intentionally pins `ec2:InstanceType` to `t3.large`, which
 matches the production Job allowlist. Before enabling another per-Job instance
 type, add it to both allowlists, re-run simulation for that type, and deploy the
@@ -58,20 +59,16 @@ export EA_MANAGER_INSTANCE=i-07988886030e168cc
 export EA_MANAGER_ROLE=elastic-agent-manager
 export EA_MANAGER_PROFILE=elastic-agent-manager
 export EA_WORKER_ROLE=elastic-agent-worker
-export FINAL_AMI_ID=ami-REPLACE_ME
+export FINAL_AMI_ID=ami-0aec7ffcbe44c6f7a
 export FINAL_WORKER_SECURITY_GROUP_ID=sg-05c68220f901fb555
 
 [[ "$FINAL_AMI_ID" =~ ^ami-[0-9a-f]{17}$ ]]
 [[ "$FINAL_WORKER_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]{17}$ ]]
 
 EA_IAM_TMP=$(mktemp -d)
-sed \
-  -e "s/FINAL_AMI_ID/$FINAL_AMI_ID/g" \
-  deploy/aws/elastic-agent-manager-policy.json \
-  > "$EA_IAM_TMP/manager-policy.json"
+cp deploy/aws/elastic-agent-manager-policy.json "$EA_IAM_TMP/manager-policy.json"
 cp deploy/aws/elastic-agent-worker-policy.json "$EA_IAM_TMP/worker-policy.json"
 jq -e . "$EA_IAM_TMP/manager-policy.json" "$EA_IAM_TMP/worker-policy.json"
-! grep -q 'FINAL_' "$EA_IAM_TMP/manager-policy.json"
 
 # Manager policy is intentionally inline: its compact form is above the
 # 6,144-character customer-managed-policy limit but below the 10,240-character
@@ -95,12 +92,39 @@ test "$(aws ec2 describe-instances --region "$AWS_REGION" \
   --filters Name=tag:ManagedBy,Values=elastic-agent \
             Name=instance-state-name,Values=pending,running,stopping,stopped \
   --query 'length(Reservations[].Instances[])' --output text)" = 0
+test "$(aws ec2 describe-addresses --region "$AWS_REGION" \
+  --filters Name=tag:ManagedBy,Values=elastic-agent \
+  --query 'length(Addresses[?AssociationId!=null])' --output text)" = 0
 
 ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes \
   ubuntu@172.31.46.129 \
   'systemctl is-active --quiet elastic-agent-manager.service'
 curl --fail --silent --show-error \
   https://elastic-agent.claude-code-manager.com/api/health >/dev/null
+
+# The versioned launcher/unit and both protected environments must already be
+# deployed. Source both files inside a privileged remote shell and compare only;
+# this emits none of the API/Git secret values carried by the secret file.
+ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes \
+  ubuntu@172.31.46.129 \
+  sudo bash -s -- "$FINAL_AMI_ID" "$FINAL_WORKER_SECURITY_GROUP_ID" <<'REMOTE'
+set -Eeuo pipefail
+set -a
+source /etc/elastic-agent-manager.env
+source /etc/elastic-agent-manager.aws.env
+set +a
+test "$ELASTIC_AGENT_AWS_REGION" = ap-northeast-1
+test "$ELASTIC_AGENT_AWS_AMI_ID" = "$1"
+test "$ELASTIC_AGENT_AWS_INSTANCE_TYPE" = t3.large
+test "$ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS" = "$2"
+test "$ELASTIC_AGENT_AWS_SUBNET_ID" = subnet-0c1db80817d054277
+test "$ELASTIC_AGENT_AWS_KEY_PAIR_NAME" = interview-key
+test "$ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE" = elastic-agent-worker
+test "$ELASTIC_AGENT_RESULTS_S3_BUCKET" = elastic-agent-results-297645381734
+test "$ELASTIC_AGENT_RESULTS_S3_PREFIX" = jobs
+systemctl show elastic-agent-manager.service -p ExecStart --value \
+  | grep -Fq /home/ubuntu/elastic-agent/deploy/aws_manager.py
+REMOTE
 ```
 
 Do not proceed if a Job, account lease, EIP attachment, Worker bootstrap, or
@@ -270,7 +294,11 @@ test "$state" = associated
 for attempt in $(seq 1 30); do
   role_arn=$(ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes \
     ubuntu@172.31.46.129 \
-    "aws sts get-caller-identity --query Arn --output text")
+    "env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+      -u AWS_SESSION_TOKEN -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
+      AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_CONFIG_FILE=/dev/null \
+      /home/ubuntu/elastic-agent/.venv/bin/python -c \
+      'import boto3; print(boto3.client(\"sts\", region_name=\"ap-northeast-1\").get_caller_identity()[\"Arn\"])'")
   [[ "$role_arn" == arn:aws:sts::297645381734:assumed-role/elastic-agent-manager/* ]] \
     && break
   sleep 2

@@ -1,0 +1,40 @@
+[Unit]
+Description=Elastic-Agent AWS Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/elastic-agent
+EnvironmentFile=/etc/elastic-agent-manager.env
+EnvironmentFile=/etc/elastic-agent-manager.aws.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/elastic-agent/.venv/bin/python /home/ubuntu/elastic-agent/deploy/aws_manager.py
+Restart=always
+RestartSec=5
+TimeoutStartSec=150
+TimeoutStopSec=330
+UMask=0077
+
+# The Manager needs network access and one state directory, but it does not
+# need to mutate its release, SSH key, host configuration, or kernel state.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.elastic-agent-demo
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

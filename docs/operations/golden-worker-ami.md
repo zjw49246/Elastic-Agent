@@ -35,6 +35,12 @@ Run `--help` for all options. The script:
 5. stops the builder, creates an AMI from its encrypted volume, tags both the
    AMI and snapshot, verifies the launch invariants, and terminates the builder.
 
+AMI creation uses an explicit 15-second poll for up to 60 minutes because an
+encrypted 20-GiB snapshot can exceed the AWS CLI waiter's default window.
+`available` is the only success state; terminal failure or an unknown state
+fails immediately, while a real timeout reports the AMI ID and last state. The
+builder cleanup trap still runs on every outcome.
+
 The last stdout line is JSON containing the AMI and snapshot IDs. Build progress
 goes to stderr. The script never copies an AWS key, API key, OAuth credential,
 account file, Manager URL, or worker token into the image.

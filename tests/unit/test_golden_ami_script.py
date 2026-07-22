@@ -70,3 +70,20 @@ def test_existing_instance_must_have_builder_ownership_tags_before_cleanup() -> 
     assert "BUILDER_OWNED" in source
     assert '"$ROLE_TAG" == "ami-builder"' in source
     assert '"$NAME_TAG" == elastic-agent-ami-builder*' in source
+
+
+def test_image_wait_handles_slow_encrypted_snapshot_creation() -> None:
+    source = SCRIPT.read_text()
+    # The AWS CLI waiter's fixed default window is too short for a cold,
+    # encrypted 20-GiB snapshot in ap-northeast-1. Keep the builder cleanup
+    # bounded while allowing the already-created image enough time to finish.
+    assert "aws ec2 wait image-available" not in source
+    assert 'IMAGE_WAIT_ATTEMPTS=240' in source
+    assert 'IMAGE_WAIT_SECONDS=15' in source
+    assert 'for attempt in $(seq 1 "$IMAGE_WAIT_ATTEMPTS")' in source
+    assert '"$IMAGE_STATE" == "available"' in source
+    assert "failed|error|invalid|deregistered" in source
+    assert "entered terminal state" in source
+    assert "returned unexpected state" in source
+    assert "last state=$IMAGE_STATE" in source
+    assert '((attempt == IMAGE_WAIT_ATTEMPTS)) || sleep "$IMAGE_WAIT_SECONDS"' in source

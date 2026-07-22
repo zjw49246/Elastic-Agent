@@ -3,7 +3,7 @@
 Use the locked development environment for every test run:
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra pty
 ```
 
 ## Standard suites
@@ -48,6 +48,10 @@ uv run pytest -q \
   tests/unit/test_golden_ami_script.py
 bash -n scripts/build_golden_ami.sh
 ```
+
+After installing a production release at `/home/ubuntu/elastic-agent`, validate
+the shipped unit on that host with `systemd-analyze verify
+deploy/aws/elastic-agent-manager.service` before replacing the active unit.
 
 The marker alone is never sufficient: these tests cover exact dpkg versions,
 commands, agent CLIs, Python distributions/imports, Chrome, Docker/buildx, and

@@ -27,6 +27,11 @@ KEEP_BUILDER_ON_FAILURE=false
 SOURCE_COMMIT=""
 IMAGE_NAME=""
 IMAGE_PROFILE="elastic-agent-worker-union-v1"
+# Encrypted EBS snapshots can exceed the AWS CLI waiter's fixed ~10 minute
+# window. Poll for up to one hour, while still failing immediately on a
+# terminal image state and always letting the EXIT trap settle builder cost.
+IMAGE_WAIT_ATTEMPTS=240
+IMAGE_WAIT_SECONDS=15
 
 CLAUDE_VERSION="2.1.181"
 CODEX_VERSION="0.144.6"
@@ -496,7 +501,34 @@ IMAGE_ID=$(aws ec2 create-image \
   --no-reboot \
   --tag-specifications "$TAG_SPEC" \
   --query ImageId --output text)
-aws ec2 wait image-available --region "$REGION" --image-ids "$IMAGE_ID"
+IMAGE_STATE=""
+for attempt in $(seq 1 "$IMAGE_WAIT_ATTEMPTS"); do
+  if ! IMAGE_STATE=$(aws ec2 describe-images \
+    --region "$REGION" --image-ids "$IMAGE_ID" \
+    --query 'Images[0].State' --output text 2>/dev/null); then
+    IMAGE_STATE="not-visible"
+  fi
+  if [[ "$IMAGE_STATE" == "available" ]]; then
+    break
+  fi
+  case "$IMAGE_STATE" in
+    failed|error|invalid|deregistered)
+      IMAGE_REASON=$(aws ec2 describe-images \
+        --region "$REGION" --image-ids "$IMAGE_ID" \
+        --query 'Images[0].StateReason.[Code,Message]' --output text \
+        2>/dev/null || true)
+      die "created AMI entered terminal state $IMAGE_STATE: $IMAGE_ID (${IMAGE_REASON:-no reason reported})"
+      ;;
+    pending|transient|not-visible|None|"") ;;
+    *) die "created AMI returned unexpected state $IMAGE_STATE: $IMAGE_ID" ;;
+  esac
+  if ((attempt == 1 || attempt % 4 == 0)); then
+    log "waiting for image $IMAGE_ID (state=$IMAGE_STATE, attempt=$attempt/$IMAGE_WAIT_ATTEMPTS)"
+  fi
+  ((attempt == IMAGE_WAIT_ATTEMPTS)) || sleep "$IMAGE_WAIT_SECONDS"
+done
+[[ "$IMAGE_STATE" == "available" ]] \
+  || die "created AMI did not become available within $((IMAGE_WAIT_ATTEMPTS * IMAGE_WAIT_SECONDS)) seconds: $IMAGE_ID (last state=$IMAGE_STATE)"
 
 IMAGE_CHECK=$(aws ec2 describe-images --region "$REGION" --image-ids "$IMAGE_ID" \
   --query 'Images[0].[State,Architecture,VirtualizationType,RootDeviceType,EnaSupport,ImdsSupport,Tags[?Key==`ManagedBy`]|[0].Value,Tags[?Key==`Role`]|[0].Value]' \

@@ -415,10 +415,12 @@ Live batch runs require provision/login hooks wired at deployment:
 ## AWS production launcher
 
 Run the Manager from the version-controlled `deploy/aws_manager.py` entry point
-instead of a machine-local Python file. It does not discover credentials from
-local CLIs or contain deployment fallbacks: the Manager instance profile
-supplies AWS credentials, while a mode-`0600` systemd `EnvironmentFile` must set
-these non-secret deployment values:
+and `deploy/aws/elastic-agent-manager.service` unit instead of machine-local
+Python/unit files. The unit keeps the release and home directory read-only and
+allows writes only below the configured production state directory. It does not
+discover credentials from local CLIs or contain deployment fallbacks: the
+Manager instance profile supplies AWS credentials, while a mode-`0600` systemd
+`EnvironmentFile` must set these non-secret deployment values:
 
 ```text
 ELASTIC_AGENT_AWS_REGION
@@ -442,11 +444,16 @@ ELASTIC_AGENT_RESULTS_S3_PREFIX
 ELASTIC_AGENT_RESULTS_S3_INTERVAL
 ```
 
-Set `ELASTIC_AGENT_EXTERNAL_API_KEYS` in the same protected file; the launcher
+Keep secrets such as `ELASTIC_AGENT_EXTERNAL_API_KEYS` in
+`/etc/elastic-agent-manager.env`; keep the non-secret AWS deployment settings in
+the separately managed `/etc/elastic-agent-manager.aws.env` (the checked-in
+production source is `deploy/aws/elastic-agent-manager.aws.env`). Both files are
+mandatory and mode `0600`, so a partial deployment fails closed. The launcher
 refuses to start without it and never places its value in the parsed settings or
 startup logs. Optional Git access comes only from `ELASTIC_AGENT_GIT_TOKEN`—the
 launcher never falls back to a local `gh` login. Start one process with
-`uv run python deploy/aws_manager.py`.
+the supplied systemd unit (or use `uv run python deploy/aws_manager.py` for an
+interactive preflight).
 
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,
@@ -469,7 +476,7 @@ and additional EC2 instance types require explicit policy allow-list updates.
 ## Development
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra pty
 uv run pytest -q
 ```
 
