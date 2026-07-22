@@ -132,17 +132,16 @@ Select the implementation with `account.agent_type` (`"claude"` by default):
 }
 ```
 
-A Codex account must contain its OpenAI login password. `email_token` is
-optional and is used only to query a supported mailbox backend when OpenAI asks
-for an email verification code:
+A Codex account must contain at least one of its OpenAI login password or a
+supported mailbox-query `email_token`; both may be configured:
 
 ```json
 {
   "id": "codex-001",
   "agent_type": "codex",
   "email": "user@example.com",
-  "password": "<OpenAI account password>",
-  "email_token": "<optional mailbox query token>",
+  "password": "<optional OpenAI account password>",
+  "email_token": "<optional mailbox query token; required without password>",
   "group": "standard"
 }
 ```
@@ -156,13 +155,19 @@ write-only over REST: account responses expose only `has_password` and
 trusted test network.
 
 On update, blank secret fields preserve their current write-only values. Send
-`clear_email_token: true` to deliberately remove a stored mailbox query token.
+`clear_email_token: true` or `clear_password: true` to deliberately remove the
+corresponding stored input. The API rejects an update that would leave a Codex
+account with neither login input.
 
 Claude continues to use the Chrome-CDP flow, exact-email `claude auth status`
 verification, and a successful `claude -p` warm-up. For Codex, the worker starts
-`codex login` and drives the OpenAI email/password OAuth page with Playwright
-under Xvfb; the CLI and browser stay on the same worker because the OAuth
-callback is local. The resulting `CODEX_HOME/auth.json` is accepted only when
+`codex login` and drives OpenAI OAuth with Playwright under Xvfb. Password-only
+accounts use the password page and request manual OTP if needed; token-only
+accounts switch to OpenAI's email-code path and query the OTP automatically;
+with both configured, the password is used and the token handles any OTP. If
+OpenAI does not offer an email-code action, token-only login fails clearly and
+requires the password. The CLI and browser stay on the same worker because the
+OAuth callback is local. The resulting `CODEX_HOME/auth.json` is accepted only when
 it contains ChatGPT OAuth tokens, its id-token email exactly matches the
 selected account case-insensitively, and a real `codex exec` smoke test
 succeeds. Failure or cancellation restores the previous auth file. OAuth
@@ -296,7 +301,7 @@ the Job failed but does not retain the billable EC2 indefinitely.
 drive the job with a real `Harness` subclass instead.
 
 **Frontend**: the Batch Console at `/batch` manages Claude and Codex identities,
-accepts write-only OpenAI passwords and optional mailbox query tokens, filters
+accepts write-only OpenAI passwords/mailbox query tokens (at least one for Codex), filters
 Job account choices by `agent_type`, and displays active Codex OTP challenges
 with a six-digit submission form. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, and `/api/jobs/harness`.

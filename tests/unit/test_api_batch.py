@@ -294,21 +294,125 @@ class TestAccountsAPI:
         assert cleared.json()["has_email_token"] is False
 
     @pytest.mark.asyncio
-    async def test_invalid_codex_account_error_never_echoes_mail_token(self, client):
-        secret = "mail-token-that-must-not-echo"
-
+    async def test_codex_email_token_without_password_is_write_only(
+        self, client, manager
+    ):
         response = await client.post("/api/accounts", json={
-            "id": "codex-no-password",
+            "id": "codex-token-only",
             "agent_type": "codex",
             "email": "codex@example.com",
-            "email_token": secret,
+            "email_token": "mail-token-that-must-not-echo",
+        })
+
+        assert response.status_code == 201
+        assert response.json()["has_email_token"] is True
+        assert response.json()["has_password"] is False
+        assert "mail-token-that-must-not-echo" not in response.text
+        assert "email_token" not in response.json()
+        assert "password" not in response.json()
+        stored = await manager.account_store.get("codex-token-only")
+        assert stored.email_token == "mail-token-that-must-not-echo"
+        assert stored.password == ""
+
+    @pytest.mark.asyncio
+    async def test_clear_password_switches_codex_account_to_token_only(
+        self, client, manager
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "codex-both",
+            "agent_type": "codex",
+            "email": "codex-both@example.com",
+            "password": "password-that-must-be-removed",
+            "email_token": "mail-token-that-must-remain",
+        })
+        assert created.status_code == 201
+
+        cleared = await client.post("/api/accounts", json={
+            "id": "codex-both",
+            "agent_type": "codex",
+            "email": "codex-both@example.com",
+            "clear_password": True,
+        })
+
+        assert cleared.status_code == 201
+        assert cleared.json()["has_password"] is False
+        assert cleared.json()["has_email_token"] is True
+        stored = await manager.account_store.get("codex-both")
+        assert stored.password == ""
+        assert stored.email_token == "mail-token-that-must-remain"
+
+    @pytest.mark.asyncio
+    async def test_codex_without_email_token_or_password_is_rejected(self, client):
+        response = await client.post("/api/accounts", json={
+            "id": "codex-no-credentials",
+            "agent_type": "codex",
+            "email": "codex@example.com",
         })
 
         assert response.status_code == 409
-        assert secret not in response.text
         assert response.json()["detail"] == (
-            "Codex accounts require an OpenAI password"
+            "Codex accounts require an email token or OpenAI password"
         )
+
+    @pytest.mark.asyncio
+    async def test_malformed_secret_validation_never_echoes_input(self, client):
+        token_marker = "mail-token-that-must-not-echo-from-422"
+        password_marker = "password-that-must-not-echo-from-422"
+        response = await client.post("/api/accounts", json={
+            "id": "codex-malformed",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "email_token": {"secret": token_marker},
+            "password": [password_marker],
+        })
+
+        assert response.status_code == 422
+        assert token_marker not in response.text
+        assert password_marker not in response.text
+
+    @pytest.mark.asyncio
+    async def test_cannot_clear_only_codex_login_credential(
+        self, client, manager
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "codex-token-only",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "email_token": "mail-token-that-must-survive",
+        })
+        assert created.status_code == 201
+
+        cleared = await client.post("/api/accounts", json={
+            "id": "codex-token-only",
+            "agent_type": "codex",
+            "email": "codex@example.com",
+            "clear_email_token": True,
+        })
+
+        assert cleared.status_code == 409
+        assert "mail-token-that-must-survive" not in cleared.text
+        stored = await manager.account_store.get("codex-token-only")
+        assert stored.email_token == "mail-token-that-must-survive"
+
+        created = await client.post("/api/accounts", json={
+            "id": "codex-password-only",
+            "agent_type": "codex",
+            "email": "password-only@example.com",
+            "password": "password-that-must-survive",
+        })
+        assert created.status_code == 201
+
+        cleared = await client.post("/api/accounts", json={
+            "id": "codex-password-only",
+            "agent_type": "codex",
+            "email": "password-only@example.com",
+            "clear_password": True,
+        })
+
+        assert cleared.status_code == 409
+        assert "password-that-must-survive" not in cleared.text
+        stored = await manager.account_store.get("codex-password-only")
+        assert stored.password == "password-that-must-survive"
 
     @pytest.mark.asyncio
     async def test_same_email_is_unique_per_agent_type(self, client):

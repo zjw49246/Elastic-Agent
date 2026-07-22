@@ -50,9 +50,11 @@ class TestDashboardEndpoint:
         assert "选中账号数必须等于 Workers" in html
         assert "提交后均不回显" in html
         assert 'id="acctPassword"' in html
+        assert 'id="acctClearPassword"' in html
         assert 'id="acctClearToken"' in html
         assert 'id="jAgentType"' in html
-        assert "Codex 使用 OpenAI 密码登录" in html
+        assert "Codex 可使用 OpenAI 密码或接码查询 Token 登录" in html
+        assert "Codex 与接码 Token 二选一" in html
         assert "/accounts/login-attempts/" in html
         assert "agent_type:" in html
         assert "clear_email_token:" in html

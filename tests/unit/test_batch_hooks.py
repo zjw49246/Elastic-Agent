@@ -279,6 +279,32 @@ class TestLoginCoordinator:
         })
         assert (await task).success is True
 
+    async def test_codex_token_only_credential_is_sent_to_worker(self):
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = AccountDefinition(
+            id="codex-token-only",
+            email="token-only@163.com",
+            agent_type="codex",
+            email_token="mail-query-token",
+        )
+        task = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex-token-only")
+        )
+        await asyncio.sleep(0)
+
+        message = conn.sent[0][1]
+        assert message.agent_type == "codex"
+        assert message.email_token == "mail-query-token"
+        assert message.password == ""
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": message.login_request_id,
+            "account_id": account.id,
+            "success": True,
+        })
+        assert (await task).success is True
+
     async def test_correlated_otp_is_forwarded_without_being_retained(self):
         from elastic_agent.core.protocols.messages import AccountLoginOtpMessage
 

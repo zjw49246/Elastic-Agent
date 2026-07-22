@@ -957,7 +957,35 @@ class TestHandleAccountLogin:
         assert reader.submit(response) is False
 
     @pytest.mark.asyncio
-    async def test_codex_login_requires_openai_password(
+    async def test_codex_email_token_only_login_is_forwarded(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = lambda message: sent.append(message) or asyncio.sleep(0)
+        login = AsyncMock(return_value={"ok": True, "logs": []})
+        message = self._msg(
+            agent_type="codex",
+            email_token="mail-query-token",
+            password="",
+            config_dir="/root/.codex-a1",
+        )
+
+        with patch(
+            "elastic_agent.worker.login.codex_login.codex_login", new=login,
+        ):
+            await runtime._handle_account_login(message)
+
+        assert login.await_args.kwargs["password"] == ""
+        assert login.await_args.kwargs["token_171"] == "mail-query-token"
+        result = next(
+            item for item in sent if isinstance(item, AccountLoginResultMessage)
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_codex_login_requires_password_or_email_token(
         self, runtime,
     ):
         from elastic_agent.core.protocols.messages import AccountLoginResultMessage
@@ -975,7 +1003,7 @@ class TestHandleAccountLogin:
             item for item in sent if isinstance(item, AccountLoginResultMessage)
         )
         assert result.success is False
-        assert "OpenAI password" in result.error
+        assert "email token or OpenAI password" in result.error
 
     @pytest.mark.asyncio
     async def test_background_login_exception_sends_correlated_safe_failure(

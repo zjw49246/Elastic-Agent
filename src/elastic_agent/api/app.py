@@ -10,7 +10,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocket
 
 from elastic_agent.manager.manager import ElasticAgentManager
@@ -45,6 +48,32 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_request_validation_error(
+        _request: Request, exc: RequestValidationError,
+    ) -> JSONResponse:
+        """Return useful validation locations without reflecting request data.
+
+        FastAPI's default 422 body includes Pydantic's ``input`` member.  That
+        can echo malformed write-only passwords, mailbox tokens, OTPs, or Job
+        environment secrets.  Type/location/message are sufficient for API
+        clients and deliberately omit both the rejected input and validator
+        context.
+        """
+
+        errors = [
+            {
+                key: value
+                for key, value in error.items()
+                if key in {"type", "loc", "msg", "url"}
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content=jsonable_encoder({"detail": errors}),
+        )
 
     from elastic_agent.api.routes.account_login import router as account_login_router
     from elastic_agent.api.routes.accounts import router as accounts_router

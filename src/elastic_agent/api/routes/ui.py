@@ -410,9 +410,10 @@ _BATCH_HTML = """\
   <div class="card">
     <h2>Accounts</h2>
     <p class="hint">
-      Manager 会把登录密码与可选的接码查询 token 保存到权限 0600 的账号文件，提交后均不回显。
-      Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 使用 OpenAI 密码登录；若仍要求 OTP，
-      有接码 token 时自动读取，否则会在下方等待管理员输入 6 位验证码。
+      Manager 会把登录密码与接码查询 token 保存到权限 0600 的账号文件，提交后均不回显。
+      Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 可使用 OpenAI 密码或接码查询 Token 登录；
+      仅有 Token 时会切换到邮箱验证码并自动取码。密码登录没有 Token，或自动查询失败时，
+      会在下方等待管理员输入 6 位验证码。
     </p>
     <table><thead><tr><th>ID</th><th>Agent</th><th>Email</th><th>Secrets</th>
       <th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
@@ -425,9 +426,11 @@ _BATCH_HTML = """\
       </select></div>
     </div>
     <div class="grid3">
-      <div><label>登录密码（Codex 必填，写入后不回显）</label>
-        <input id="acctPassword" type="password" placeholder="OpenAI password"></div>
-      <div><label>接码查询 Token（可选，写入后不回显）</label>
+      <div><label>登录密码（Codex 与接码 Token 二选一，写入后不回显）</label>
+        <input id="acctPassword" type="password" placeholder="OpenAI password">
+        <label style="margin-top:5px"><input id="acctClearPassword" type="checkbox" style="width:auto">
+          清除该账号已有登录密码</label></div>
+      <div><label>接码查询 Token（Codex 与密码二选一，写入后不回显）</label>
         <input id="acctToken" type="password" placeholder="171mail / MailCatcher query token">
         <label style="margin-top:5px"><input id="acctClearToken" type="checkbox" style="width:auto">
           清除该账号已有查询 token</label></div>
@@ -656,17 +659,19 @@ async function addAccount() {
   const email = document.getElementById('acctEmail').value.trim();
   const agentType = document.getElementById('acctAgent').value;
   const password = document.getElementById('acctPassword').value;
+  const emailToken = document.getElementById('acctToken').value.trim();
   if (!id || !email) return toast('id + email required', 'error');
-  if (agentType === 'codex' && !password) return toast('Codex account requires OpenAI password', 'error');
   try {
     await api('POST', '/accounts', {id, email,
       agent_type: agentType,
       password: password,
-      email_token: document.getElementById('acctToken').value.trim(),
+      clear_password: document.getElementById('acctClearPassword').checked,
+      email_token: emailToken,
       clear_email_token: document.getElementById('acctClearToken').checked,
       group: document.getElementById('acctGroup').value.trim() || 'standard'});
     document.getElementById('acctId').value = ''; document.getElementById('acctEmail').value = '';
     document.getElementById('acctPassword').value = '';
+    document.getElementById('acctClearPassword').checked = false;
     document.getElementById('acctToken').value = '';
     document.getElementById('acctClearToken').checked = false;
     toast('Account added'); refreshAccounts();

@@ -44,10 +44,22 @@ class AccountDefinition(BaseModel):
             raise ValueError("account id, email, and group must be non-empty")
         return normalized
 
+    @field_validator("email_token")
+    @classmethod
+    def normalize_email_token(cls, value: str) -> str:
+        """Mailbox query tokens are opaque, but surrounding whitespace is not."""
+        return value.strip()
+
     @model_validator(mode="after")
-    def codex_requires_password(self) -> AccountDefinition:
-        if self.agent_type == "codex" and not self.password:
-            raise ValueError("Codex accounts require an OpenAI password")
+    def codex_requires_login_credential(self) -> AccountDefinition:
+        if (
+            self.agent_type == "codex"
+            and not self.email_token
+            and not self.password
+        ):
+            raise ValueError(
+                "Codex accounts require an email token or OpenAI password"
+            )
         return self
 
 

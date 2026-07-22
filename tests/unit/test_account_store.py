@@ -99,10 +99,30 @@ async def test_same_email_may_identify_one_account_per_agent_type(tmp_path):
     ]
 
 
-async def test_codex_account_requires_password(tmp_path):
-    with pytest.raises(ValueError, match="OpenAI password"):
+async def test_codex_account_accepts_email_token_without_password(tmp_path):
+    account = AccountDefinition(
+        id="codex-a",
+        email="user@example.com",
+        agent_type="codex",
+        email_token="mail-query-token",
+    )
+
+    assert account.email_token == "mail-query-token"
+    assert account.password == ""
+
+
+async def test_codex_account_requires_email_token_or_password(tmp_path):
+    with pytest.raises(ValueError, match="email token or OpenAI password"):
         AccountDefinition(
             id="codex-a", email="user@example.com", agent_type="codex"
+        )
+
+    with pytest.raises(ValueError, match="email token or OpenAI password"):
+        AccountDefinition(
+            id="codex-a",
+            email="user@example.com",
+            agent_type="codex",
+            email_token="   ",
         )
 
 

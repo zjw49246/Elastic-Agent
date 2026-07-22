@@ -1328,7 +1328,7 @@ class WorkerRuntime:
     async def _handle_codex_account_login(
         self, msg: AccountLoginMessage,
     ) -> None:
-        """Password-first Codex OAuth login in this worker's CODEX_HOME."""
+        """Codex OAuth login in this worker's CODEX_HOME."""
         from elastic_agent.worker.login.codex_login import codex_login
 
         raw_home = Path(msg.config_dir).expanduser() if msg.config_dir else None
@@ -1337,13 +1337,13 @@ class WorkerRuntime:
             if raw_home is not None and raw_home.is_absolute()
             else Path.home() / ".codex"
         )
-        if not msg.password:
+        if not msg.password and not msg.email_token.strip():
             await self._send_event(AccountLoginResultMessage(
                 login_request_id=msg.login_request_id,
                 account_id=msg.account_id,
                 slot_index=msg.slot_index,
                 success=False,
-                error="Codex login requires an OpenAI password",
+                error="Codex login requires an email token or OpenAI password",
             ))
             return
 

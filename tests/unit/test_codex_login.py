@@ -14,6 +14,10 @@ import pytest
 login_module = importlib.import_module("elastic_agent.worker.login.codex_login")
 
 
+def test_163_email_uses_mailcatcher_backend():
+    assert login_module.detect_mail_provider("user@163.com") == "mailcatcher"
+
+
 def _jwt(email: str) -> str:
     def encode(value: dict) -> str:
         raw = json.dumps(value, separators=(",", ":")).encode()
@@ -111,6 +115,109 @@ async def test_password_login_runs_codex_on_worker_and_commits_private_auth(tmp_
     assert stat.S_IMODE(home.stat().st_mode) == 0o700
     assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
     assert not list(home.glob(".auth.json.login-backup-*"))
+
+
+@pytest.mark.asyncio
+async def test_mail_token_only_login_runs_codex_and_commits_private_auth(tmp_path, monkeypatch):
+    home = tmp_path / "codex-home"
+
+    async def drive_browser(**kwargs):
+        assert kwargs["password"] == ""
+        assert kwargs["email_token"] == "mail-query-token"
+        _write_auth(kwargs["auth_path"], "user@example.com")
+
+    spawned, process, smoke = _install_login_fakes(
+        monkeypatch,
+        drive_browser=drive_browser,
+    )
+
+    result = await login_module.codex_login(
+        email="user@example.com",
+        password="",
+        token_171="mail-query-token",
+        codex_home=str(home),
+    )
+
+    assert result["ok"] is True
+    assert spawned["args"] == ("/usr/bin/codex", "login")
+    smoke.assert_awaited_once_with("/usr/bin/codex", str(home), result["logs"])
+    assert process.killed is True
+    assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_token_only_password_page_without_email_code_restores_auth_and_redacts_token(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    auth_path = home / "auth.json"
+    old_auth = b'{"old":"credential"}\n'
+    auth_path.write_bytes(old_auth)
+    mail_token = "mail-query-token-that-must-not-leak"
+
+    class PasswordField:
+        async def is_visible(self):
+            return True
+
+        async def input_value(self):
+            return ""
+
+        async def fill(self, _value):
+            raise AssertionError("token-only login must not fill the password field")
+
+    class Locator:
+        def __init__(self, elements=()):
+            self.elements = list(elements)
+
+        async def count(self):
+            return len(self.elements)
+
+        def nth(self, index):
+            return self.elements[index]
+
+    class Page:
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+        def locator(self, selector):
+            if selector == login_module.PASSWORD_SELECTOR:
+                return Locator([PasswordField()])
+            return Locator()
+
+    async def drive_browser(**kwargs):
+        await login_module._run_state_machine(
+            page=Page(),
+            email=kwargs["email"],
+            password=kwargs["password"],
+            email_token=kwargs["email_token"],
+            timeout=kwargs["timeout"],
+            auth_path=kwargs["auth_path"],
+            logs=kwargs["logs"],
+            mail_provider=kwargs["mail_provider"],
+            attempt_id=kwargs["attempt_id"],
+            manual_otp_reader=kwargs["manual_otp_reader"],
+        )
+
+    _, process, smoke = _install_login_fakes(
+        monkeypatch,
+        drive_browser=drive_browser,
+    )
+
+    result = await login_module.codex_login(
+        email="user@example.com",
+        password="",
+        token_171=mail_token,
+        codex_home=str(home),
+    )
+
+    assert result["ok"] is False
+    assert "no email-code option" in result["error"]
+    assert mail_token not in json.dumps(result)
+    assert auth_path.read_bytes() == old_auth
+    assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+    assert process.killed is True
+    smoke.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -447,6 +554,251 @@ async def test_optional_mail_token_is_used_for_otp_without_manual_reader(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_token_only_state_machine_switches_password_page_to_email_code(
+    tmp_path, monkeypatch,
+):
+    auth_path = tmp_path / "auth.json"
+    page = SimpleNamespace(state="password", wait_for_timeout=AsyncMock())
+
+    class Field:
+        def __init__(self):
+            self.value = ""
+            self.fills: list[str] = []
+
+        async def input_value(self):
+            return self.value
+
+        async def fill(self, value):
+            self.value = value
+            self.fills.append(value)
+
+    password_field = Field()
+    otp_field = Field()
+
+    async def first_visible(_page, selector):
+        if page.state == "password" and selector == login_module.PASSWORD_SELECTOR:
+            return password_field
+        if page.state == "otp" and selector == login_module.OTP_SELECTOR:
+            return otp_field
+        return None
+
+    async def switch_to_email_code(_page, _logs):
+        page.state = "otp"
+        return True
+
+    async def click_continue(_page, _logs):
+        page.state = "done"
+        auth_path.write_text("{}", encoding="utf-8")
+        return True
+
+    poll = AsyncMock(return_value="123456")
+    reader = SimpleNamespace(
+        read_code=AsyncMock(side_effect=AssertionError("manual OTP not expected"))
+    )
+    monkeypatch.setattr(login_module, "_first_visible", first_visible)
+    monkeypatch.setattr(login_module, "_switch_to_email_code", switch_to_email_code)
+    monkeypatch.setattr(login_module, "_click_continue", click_continue)
+    monkeypatch.setattr(login_module, "poll_verification_code", poll)
+
+    await login_module._run_state_machine(
+        page=page,
+        email="user@example.com",
+        password="",
+        email_token="mail-query-token",
+        timeout=30,
+        auth_path=auth_path,
+        logs=[],
+        attempt_id="attempt-token-only",
+        manual_otp_reader=reader,
+    )
+
+    assert password_field.fills == []
+    assert otp_field.fills == ["123456"]
+    poll.assert_awaited_once()
+    reader.read_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_token_only_state_machine_handles_direct_method_picker(
+    tmp_path, monkeypatch,
+):
+    auth_path = tmp_path / "auth.json"
+    page = SimpleNamespace(state="method-menu", wait_for_timeout=AsyncMock())
+
+    class OtpField:
+        async def input_value(self):
+            return ""
+
+        async def fill(self, _value):
+            return None
+
+    otp_field = OtpField()
+
+    async def first_visible(_page, selector):
+        if page.state == "otp" and selector == login_module.OTP_SELECTOR:
+            return otp_field
+        return None
+
+    async def switch_to_email_code(_page, _logs):
+        page.state = "otp"
+        return True
+
+    async def click_continue(_page, _logs):
+        auth_path.write_text("{}", encoding="utf-8")
+        return True
+
+    switch = AsyncMock(side_effect=switch_to_email_code)
+    monkeypatch.setattr(login_module, "_first_visible", first_visible)
+    monkeypatch.setattr(login_module, "_switch_to_email_code", switch)
+    monkeypatch.setattr(login_module, "_click_continue", click_continue)
+    monkeypatch.setattr(
+        login_module, "poll_verification_code", AsyncMock(return_value="123456")
+    )
+
+    await login_module._run_state_machine(
+        page=page,
+        email="user@example.com",
+        password="",
+        email_token="mail-query-token",
+        timeout=30,
+        auth_path=auth_path,
+        logs=[],
+        manual_otp_reader=SimpleNamespace(
+            read_code=AsyncMock(side_effect=AssertionError("manual OTP not expected"))
+        ),
+    )
+
+    switch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_switch_to_email_code_clicks_visible_matching_action():
+    class Element:
+        def __init__(self, *, text="", visible=True, on_click=None):
+            self.text = text
+            self.visible = visible
+            self.on_click = on_click
+            self.clicked = False
+
+        async def is_visible(self):
+            return self.visible
+
+        async def inner_text(self):
+            return self.text
+
+        async def get_attribute(self, _name):
+            return None
+
+        async def click(self):
+            self.clicked = True
+            if self.on_click:
+                self.on_click()
+
+    class Locator:
+        def __init__(self, elements):
+            self.elements = elements
+
+        async def count(self):
+            return len(self.elements)
+
+        def nth(self, index):
+            return self.elements[index]
+
+    page = SimpleNamespace(state="password", wait_for_timeout=AsyncMock())
+    password_field = Element()
+    otp_field = Element()
+    hidden = Element(text="Continue with email code", visible=False)
+    inert = Element(text="Continue with email code")
+    action = Element(
+        text="Continue with email code",
+        on_click=lambda: setattr(page, "state", "otp"),
+    )
+
+    def locator(selector):
+        if selector == "button, a, [role=button]":
+            return Locator([hidden, inert, action])
+        if selector == login_module.PASSWORD_SELECTOR:
+            return Locator([password_field] if page.state == "password" else [])
+        if selector == login_module.OTP_SELECTOR:
+            return Locator([otp_field] if page.state == "otp" else [])
+        return Locator([])
+
+    page.locator = locator
+    logs: list[str] = []
+
+    assert await login_module._switch_to_email_code(page, logs) is True
+    assert hidden.clicked is False
+    assert inert.clicked is True
+    assert action.clicked is True
+    assert logs[-1] == "Switched to email-code login via 'Continue with email code'"
+
+
+@pytest.mark.asyncio
+async def test_switch_to_email_code_handles_intermediate_method_menu():
+    class Element:
+        def __init__(self, text, on_click):
+            self.text = text
+            self.on_click = on_click
+            self.clicked = False
+
+        async def is_visible(self):
+            return True
+
+        async def inner_text(self):
+            return self.text
+
+        async def get_attribute(self, _name):
+            return None
+
+        async def click(self):
+            self.clicked = True
+            self.on_click()
+
+    class Locator:
+        def __init__(self, elements):
+            self.elements = elements
+
+        async def count(self):
+            return len(self.elements)
+
+        def nth(self, index):
+            return self.elements[index]
+
+    page = SimpleNamespace(state="password", wait_for_timeout=AsyncMock())
+    password_field = Element("", lambda: None)
+    otp_field = Element("", lambda: None)
+    alternate = Element(
+        "Try another method",
+        lambda: setattr(page, "state", "method-menu"),
+    )
+    email_code = Element(
+        "Email me a code",
+        lambda: setattr(page, "state", "otp"),
+    )
+
+    def locator(selector):
+        if selector == "button, a, [role=button]":
+            actions = {
+                "password": [alternate],
+                "method-menu": [email_code],
+            }
+            return Locator(actions.get(page.state, []))
+        if selector == login_module.PASSWORD_SELECTOR:
+            return Locator([password_field] if page.state == "password" else [])
+        if selector == login_module.OTP_SELECTOR:
+            return Locator([otp_field] if page.state == "otp" else [])
+        return Locator([])
+
+    page.locator = locator
+    logs: list[str] = []
+
+    assert await login_module._switch_to_email_code(page, logs) is True
+    assert alternate.clicked is True
+    assert email_code.clicked is True
+    assert page.state == "otp"
+
+
+@pytest.mark.asyncio
 async def test_rejected_mailbox_otp_switches_to_manual_instead_of_reusing_it(
     tmp_path, monkeypatch,
 ):
@@ -690,7 +1042,9 @@ async def test_smoke_test_requires_zero_exit_status(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_password_is_required_before_existing_auth_is_touched(tmp_path, monkeypatch):
+async def test_password_or_mail_token_is_required_before_existing_auth_is_touched(
+    tmp_path, monkeypatch,
+):
     home = tmp_path / "codex-home"
     home.mkdir()
     auth_path = home / "auth.json"
@@ -701,10 +1055,10 @@ async def test_password_is_required_before_existing_auth_is_touched(tmp_path, mo
     result = await login_module.codex_login(
         email="user@example.com",
         password="",
-        token_171="mail-query-token",
+        token_171="",
         codex_home=str(home),
     )
 
     assert result["ok"] is False
-    assert "password" in result["error"].lower()
+    assert "password or mailbox query token" in result["error"].lower()
     assert auth_path.read_bytes() == b"old-auth"

@@ -46,6 +46,7 @@ class AccountRequest(BaseModel):
     email_token: str = Field(default="", repr=False)
     password: str = Field(default="", repr=False)
     clear_email_token: bool = False
+    clear_password: bool = False
     group: str = "standard"
     enabled: bool = True
 
@@ -312,8 +313,11 @@ async def add_account(req: AccountRequest) -> AccountResponse:
                 )
                 incoming = req.model_dump()
                 clear_email_token = bool(incoming.pop("clear_email_token"))
+                clear_password = bool(incoming.pop("clear_password"))
                 if clear_email_token:
                     incoming["email_token"] = ""
+                if clear_password:
+                    incoming["password"] = ""
                 if existing is not None:
                     if "agent_type" not in req.model_fields_set:
                         # Older clients do not know agent_type. Preserve it
@@ -328,8 +332,8 @@ async def add_account(req: AccountRequest) -> AccountResponse:
                     if same_agent:
                         for secret_name in ("email_token", "password"):
                             explicitly_cleared = (
-                                secret_name == "email_token"
-                                and clear_email_token
+                                (secret_name == "email_token" and clear_email_token)
+                                or (secret_name == "password" and clear_password)
                             )
                             if not incoming[secret_name] and not explicitly_cleared:
                                 incoming[secret_name] = getattr(
@@ -349,12 +353,17 @@ async def add_account(req: AccountRequest) -> AccountResponse:
                         "EIP-bound/leased account; "
                         "finish its Job and decommission the binding first",
                     )
-                if incoming["agent_type"] == "codex" and not incoming["password"]:
+                if (
+                    incoming["agent_type"] == "codex"
+                    and not incoming["email_token"].strip()
+                    and not incoming["password"]
+                ):
                     # Keep the useful validation error without constructing a
                     # Pydantic ValidationError whose default text can include
                     # other write-only inputs from the request.
                     raise HTTPException(
-                        409, "Codex accounts require an OpenAI password"
+                        409,
+                        "Codex accounts require an email token or OpenAI password",
                     )
                 defn = AccountDefinition(**incoming)
                 saved = await manager.account_store.add(defn)

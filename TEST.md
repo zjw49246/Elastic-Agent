@@ -57,7 +57,8 @@ The focused suite covers:
   credential warm-up;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
-- agent-type-aware account uniqueness/allocation, required Codex password, and
+- agent-type-aware account uniqueness/allocation, Codex password/email-token
+  one-of validation, explicit secret clearing, and token-only email-code switching, and
   write-only `has_password`/`has_email_token` REST behavior;
 - correlated OTP-required events, six-digit validation, stale/mismatched
   challenge rejection, 32-hex injection protection, one-shot forwarding, retry
@@ -117,8 +118,9 @@ IPv4 addresses incur hourly charges even while detached.
 
 1. Add the test account to `/api/accounts` and ensure its binding with `PUT
    /api/accounts/{id}/binding`. The account and Job must use the same
-   `agent_type`; a Codex account requires its OpenAI password, while its mailbox
-   query token may be left empty to exercise manual OTP.
+   `agent_type`; a Codex account requires an OpenAI password or supported
+   mailbox query token. Use password-only to exercise manual OTP, or a 163.com
+   token-only account to exercise MailCatcher email-code login.
 2. Submit a one-worker Job with `account.binding="eip"`, `per_worker=1`, the
    test account in `ids`, `rotation.strategy="none"`, the matching
    `account.agent_type`, and a matching `fanout.region`.
@@ -141,8 +143,10 @@ the worker-local login again; this feature does not persist auth files, browser
 state, or device identity.
 
 Automatic worker-local login supports Claude and Codex. For Codex, create an
-account with `agent_type="codex"` and an OpenAI password; leave `email_token`
-empty to exercise the manual OTP path. Submit a Job with the same
+account with `agent_type="codex"` and at least one of an OpenAI password or
+supported mailbox-query `email_token`. Leave `email_token` empty to exercise
+password plus manual OTP; use a token-only 163.com account to verify the
+email-code switch and MailCatcher lookup. Submit a Job with the same
 `account.agent_type`, then poll `GET /api/accounts/login-attempts` and forward
 the current six-digit code with
 `POST /api/accounts/login-attempts/{login_request_id}/otp`. Verify the Job does
@@ -151,7 +155,10 @@ REST/logs never expose the password, mailbox token, OTP, or authorization URL,
 and a failed/cancelled/timed-out login restores the previous
 `CODEX_HOME/auth.json` rather than completing after the Job has failed.
 
-The optional Codex `email_token` is only a supported mailbox-query token.
+The Codex `email_token` is only a supported mailbox-query token; it is not an
+OpenAI API/OAuth token or a password. If OpenAI does not expose an email-code
+action for a token-only account, the login must fail safely and request the
+OpenAI password.
 Generic IMAP is not implemented. For cross-host workers, set
 `ELASTIC_AGENT_MANAGER_URL=wss://...`; the plaintext override is for trusted
 test networks only.

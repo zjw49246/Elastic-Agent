@@ -1,8 +1,9 @@
 """Worker-local Codex login through the OpenAI browser OAuth flow.
 
-The OpenAI account password is the primary credential.  A mailbox query token
-is optional and is used only when OpenAI asks for an email OTP; without one (or
-when mailbox polling fails), an injected/manual OTP reader supplies the code.
+An OpenAI password or mailbox query token can initiate login.  When only the
+mailbox token is available, the browser switches the password page to OpenAI's
+email-code flow and retrieves the OTP from the mailbox backend.  Mailbox lookup
+failure still falls back to an injected/manual OTP reader.
 
 Credentials never leave ``CODEX_HOME``.  A login is committed only after the
 new ``auth.json`` belongs to the requested email and a real ``codex exec``
@@ -78,6 +79,15 @@ OTP_ERROR_RE = re.compile(
     r"could(?: not|n't) verify.*\bcode\b|"
     r"too many (?:verification )?attempts)",
     re.IGNORECASE,
+)
+EMAIL_CODE_ACTION_RE = re.compile(
+    r"continue with (?:email )?code|use (?:an? )?(?:email )?code|"
+    r"email me a code|log in with (?:an? )?(?:one[- ]time )?code|"
+    r"sign in with (?:an? )?(?:one[- ]time )?code",
+    re.IGNORECASE,
+)
+ALTERNATE_LOGIN_ACTION_RE = re.compile(
+    r"try another (?:way|method)", re.IGNORECASE
 )
 CONTINUE_BUTTON_TEXTS = (
     "Continue",
@@ -333,6 +343,60 @@ async def _first_visible(page: Any, selectors: str) -> Any | None:
     return None
 
 
+async def _switch_to_email_code(page: Any, logs: list[str]) -> bool:
+    """Switch an OpenAI password page to its passwordless email-code path."""
+
+    # "Try another method" opens a second method-picker on some OpenAI pages;
+    # disappearing from the password form is therefore not proof that an OTP
+    # was requested.  Rescan a bounded number of page states and only succeed
+    # once the OTP input is actually visible.
+    clicked: set[str] = set()
+    for _stage in range(4):
+        candidates = page.locator("button, a, [role=button]")
+        actions: list[tuple[int, str, str, Any]] = []
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            if not await candidate.is_visible():
+                continue
+            text = " ".join(
+                filter(
+                    None,
+                    [
+                        await candidate.inner_text(),
+                        await candidate.get_attribute("aria-label"),
+                    ],
+                )
+            ).strip()
+            if EMAIL_CODE_ACTION_RE.search(text):
+                priority = 0
+            elif ALTERNATE_LOGIN_ACTION_RE.search(text):
+                priority = 1
+            else:
+                continue
+            key = f"{priority}:{index}:{text.casefold()}"
+            if key not in clicked:
+                actions.append((priority, key, text, candidate))
+
+        if not actions:
+            return False
+
+        # Prefer a direct email-code action over a generic method picker.
+        _priority, key, text, candidate = min(actions, key=lambda item: item[0])
+        clicked.add(key)
+        await candidate.click()
+        for _ in range(10):
+            await page.wait_for_timeout(500)
+            if await _first_visible(page, OTP_SELECTOR):
+                logs.append(f"Switched to email-code login via '{text[:60]}'")
+                return True
+
+        # The action may have opened a method-picker, or another matching
+        # action on the same page may be the effective one.  Rescan instead of
+        # treating the missing password field as success or failing early.
+        logs.append(f"Login action did not open email-code input: '{text[:60]}'")
+    return False
+
+
 async def _visible_action_labels(page: Any) -> list[str]:
     labels: list[str] = []
     candidates = page.locator("button, a, [role=button]")
@@ -403,6 +467,16 @@ async def _run_state_machine(
 
             password_field = await _first_visible(page, PASSWORD_SELECTOR)
             if password_field and not await password_field.input_value():
+                if not password:
+                    if await _switch_to_email_code(page, logs):
+                        await page.wait_for_timeout(1_500)
+                        continue
+                    labels = await _visible_action_labels(page)
+                    logs.append(f"Password page actions: {labels}")
+                    raise CodexLoginError(
+                        "OpenAI login shows a password field and no email-code option; "
+                        "provide the OpenAI password"
+                    )
                 await password_field.fill(password)
                 logs.append("Password filled")
                 await _click_continue(page, logs)
@@ -468,6 +542,14 @@ async def _run_state_machine(
                 otp_submitted = True
                 logs.append("OTP entered")
                 await _click_continue(page, logs)
+                continue
+
+            # OpenAI can present the login-method picker immediately after the
+            # email step, without ever rendering a password input.  In a
+            # token-only flow, detect that explicit state before the generic
+            # Continue-button fallback.
+            if not password and await _switch_to_email_code(page, logs):
+                await page.wait_for_timeout(1_500)
                 continue
 
             await _click_continue(page, logs)
@@ -742,14 +824,18 @@ async def codex_login(
     attempt_id: str = "",
     manual_otp_reader: Any = None,
 ) -> dict[str, Any]:
-    """Run password-based Codex login locally and transactionally commit auth."""
+    """Run password or mailbox-token Codex login and transactionally commit auth."""
 
     started_at = time.time()
     logs: list[str] = []
     if not email.strip():
         return {"ok": False, "error": "OpenAI email is required", "logs": logs}
-    if not password:
-        return {"ok": False, "error": "OpenAI password is required", "logs": logs}
+    if not password and not token_171.strip():
+        return {
+            "ok": False,
+            "error": "OpenAI password or mailbox query token is required",
+            "logs": logs,
+        }
     if not codex_home:
         return {"ok": False, "error": "CODEX_HOME is required", "logs": logs}
 
