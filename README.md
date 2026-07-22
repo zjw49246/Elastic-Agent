@@ -475,8 +475,11 @@ and has `ManagedBy=elastic-agent` plus `Role=worker-golden` tags. Emergency
 rollback to an official Canonical image (`099720109477`) is rejected unless
 `ELASTIC_AGENT_ALLOW_CANONICAL_BASE_AMI=true` is explicitly set. That
 break-glass path may use Canonical's unencrypted publisher snapshot; workers
-still request encrypted root volumes, and the tagged golden image should be
-restored immediately.
+still request encrypted root volumes. The dedicated Manager IAM policy also
+pins allowed image ARNs, so the flag alone is insufficient: an administrator
+must update the exact IAM image pin and environment together, run Access
+Analyzer/full-policy simulation, and complete a launch/upload/terminate canary.
+Restore a tagged golden image and its narrow IAM pin immediately.
 
 On AWS, Manager-initiated SSH traffic (bootstrap, login, logs, code delivery,
 and collection) prefers the Worker's VPC-private address. The Worker's EIP is
@@ -484,8 +487,9 @@ only its stable outbound identity, so port 22 can be restricted to the Manager
 security group. A least-privilege Manager/Worker policy and a staged
 cutover/rollback procedure are maintained in
 [`deploy/aws/iam-cutover.md`](deploy/aws/iam-cutover.md). The supplied Worker
-policy intentionally writes only to the configured results prefix; S3 datasets
-and additional EC2 instance types require explicit policy allow-list updates.
+policy intentionally writes only to the configured results prefix, and the
+results bucket policy denies plaintext transport. S3 datasets and additional
+EC2 instance types require explicit policy allow-list updates.
 
 ## Development
 

@@ -24,9 +24,11 @@ uv run pytest -q tests/unit/test_aws_manager_launcher.py
 These tests cover required environment-only configuration, secret-free
 settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
 Manager-role identity, local state/key permissions, systemd readiness/teardown
-bounds, and AMI
-availability/architecture/HVM/ENA/IMDSv2/encryption/provenance checks including
-the explicit Canonical break-glass path.
+bounds, exact production IAM resource pins, complete IAM simulator coverage,
+the Worker's write-only result-prefix policy, S3 plaintext-transport
+denial, and AMI availability,
+architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
+explicit Canonical break-glass path.
 
 Validate AWS private management-path selection across bootstrap, login, logs,
 and collection:
@@ -106,6 +108,9 @@ The focused suite covers:
   and no in-place account rotation);
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
   the temporary instance/root disk, release the lease, retain the EIP;
+- managed primary-ENI tagging plus tagged EIP/ENI detach authorization, and a
+  reconciler guard that ignores terminated unleased cloud history while still
+  recovering terminated leased orphans;
 - bounded final collection (three attempts/300 seconds by default), IPv6
   disablement before login, current-source worker deployment, WSS enforcement,
   forced fresh runtime reconnect, strict request correlation, protected

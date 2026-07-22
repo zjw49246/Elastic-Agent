@@ -95,6 +95,7 @@
       "Action": "ec2:CreateTags",
       "Resource": [
         "arn:aws:ec2:ap-northeast-1:297645381734:instance/*",
+        "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*",
         "arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/*"
       ],
       "Condition": {
@@ -173,12 +174,24 @@
       }
     },
     {
-      "Sid": "DetachOrReleaseOnlyManagedEips",
+      "Sid": "DisassociateManagedEips",
       "Effect": "Allow",
-      "Action": [
-        "ec2:DisassociateAddress",
-        "ec2:ReleaseAddress"
+      "Action": "ec2:DisassociateAddress",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/*",
+        "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*"
       ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-northeast-1",
+          "ec2:ResourceTag/ManagedBy": "elastic-agent"
+        }
+      }
+    },
+    {
+      "Sid": "ReleaseManagedEips",
+      "Effect": "Allow",
+      "Action": "ec2:ReleaseAddress",
       "Resource": "arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/*",
       "Condition": {
         "StringEquals": {

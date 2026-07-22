@@ -5,19 +5,31 @@ This runbook is intentionally scoped to account `297645381734`, Region
 `elastic-agent-results-297645381734`, and Worker role/profile
 `elastic-agent-worker`.
 
+**Status (2026-07-22): completed.** The target now uses association
+`iip-assoc-01f75381926371ea2` and profile `elastic-agent-manager`; the shared
+`Manager` profile remains on six other instances. Sections 1–5 preserve the
+original one-time cutover procedure and its pre-cutover guard values; do not
+blindly rerun its create/replace commands against the completed deployment.
+Policy updates should repeat the validation and canaries, then update the
+existing inline policies in place. The rollback section is deliberately
+self-contained for a fresh administrator shell.
+
 Run every mutating command from a separate administrator/control instance, not
 from `i-07988886030e168cc`. The new Manager role deliberately cannot replace
 its own instance profile or edit IAM.
 
 ## Why the existing Manager role must not be tightened
 
-The instance profile `Manager` is currently attached to seven instances:
+Before cutover, the instance profile `Manager` was attached to seven instances:
 
 ```text
 i-0e0eb4d47c6e3a075  i-03e9984e1c983a1a0  i-06c940fa448e9059c
 i-0351fab2f447ebfaf  i-0b1a45f7f632c07f0  i-0f51cc51d16bbda74
 i-07988886030e168cc
 ```
+
+The target on the last line has since moved to the dedicated profile, leaving
+the first six on `Manager`.
 
 Its role has `AdministratorAccess`, `AmazonEC2FullAccess`, and
 `AmazonS3FullAccess`, plus unrelated inline policies. Detaching any of those
@@ -59,6 +71,7 @@ export EA_MANAGER_INSTANCE=i-07988886030e168cc
 export EA_MANAGER_ROLE=elastic-agent-manager
 export EA_MANAGER_PROFILE=elastic-agent-manager
 export EA_WORKER_ROLE=elastic-agent-worker
+export EA_RESULTS_BUCKET=elastic-agent-results-297645381734
 export FINAL_AMI_ID=ami-0aec7ffcbe44c6f7a
 export FINAL_WORKER_SECURITY_GROUP_ID=sg-05c68220f901fb555
 
@@ -68,7 +81,10 @@ export FINAL_WORKER_SECURITY_GROUP_ID=sg-05c68220f901fb555
 EA_IAM_TMP=$(mktemp -d)
 cp deploy/aws/elastic-agent-manager-policy.json "$EA_IAM_TMP/manager-policy.json"
 cp deploy/aws/elastic-agent-worker-policy.json "$EA_IAM_TMP/worker-policy.json"
-jq -e . "$EA_IAM_TMP/manager-policy.json" "$EA_IAM_TMP/worker-policy.json"
+cp deploy/aws/elastic-agent-results-bucket-policy.json \
+  "$EA_IAM_TMP/results-bucket-policy.json"
+jq -e . "$EA_IAM_TMP/manager-policy.json" "$EA_IAM_TMP/worker-policy.json" \
+  "$EA_IAM_TMP/results-bucket-policy.json"
 
 # Manager policy is intentionally inline: its compact form is above the
 # 6,144-character customer-managed-policy limit but below the 10,240-character
@@ -119,9 +135,16 @@ aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
 aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
   --policy-document "file://$EA_IAM_TMP/worker-policy.json" \
   | jq -e '.findings | length == 0'
+aws accessanalyzer validate-policy --policy-type RESOURCE_POLICY \
+  --validate-policy-resource-type AWS::S3::Bucket \
+  --policy-document "file://$EA_IAM_TMP/results-bucket-policy.json" \
+  | jq -e '.findings | length == 0'
 
-MANAGER_POLICY=$(jq -c . "$EA_IAM_TMP/manager-policy.json")
 WORKER_POLICY=$(jq -c . "$EA_IAM_TMP/worker-policy.json")
+MANAGER_POLICY=$(jq -c . "$EA_IAM_TMP/manager-policy.json")
+# IAM's PolicyInputList member limit is 131,072 characters. Simulate the full
+# policy so future explicit Deny/cross-statement constraints remain effective.
+test "$(printf %s "$MANAGER_POLICY" | wc -c)" -le 131072
 
 # Worker: result upload is allowed, while listing, cross-prefix writes, object
 # reads, and deletes are denied.
@@ -175,6 +198,39 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
     'ContextKeyName=ec2:ResourceTag/ManagedBy,ContextKeyValues=foreign,ContextKeyType=string' \
   --query 'EvaluationResults[0].EvalDecision' --output text)" = implicitDeny
 
+# EIP-bound RunInstances may tag its primary ENI, and detach requires both the
+# tagged EIP and tagged ENI. A foreign tag must deny both resources.
+test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
+  --action-names ec2:CreateTags \
+  --resource-arns \
+    arn:aws:ec2:ap-northeast-1:297645381734:network-interface/eni-0123456789abcdef0 \
+  --context-entries \
+    'ContextKeyName=aws:RequestedRegion,ContextKeyValues=ap-northeast-1,ContextKeyType=string' \
+    'ContextKeyName=aws:RequestTag/ManagedBy,ContextKeyValues=elastic-agent,ContextKeyType=string' \
+    'ContextKeyName=aws:TagKeys,ContextKeyValues=ManagedBy,ElasticAgentJob,ElasticAgentController,ElasticAgentLease,ElasticAgentAccount,AccountId,Role,ContextKeyType=stringList' \
+    'ContextKeyName=ec2:CreateAction,ContextKeyValues=RunInstances,ContextKeyType=string' \
+  --query 'EvaluationResults[0].EvalDecision' --output text)" = allowed
+test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
+  --action-names ec2:DisassociateAddress \
+  --resource-arns \
+    arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/eipalloc-0123456789abcdef0 \
+    arn:aws:ec2:ap-northeast-1:297645381734:network-interface/eni-0123456789abcdef0 \
+  --context-entries \
+    'ContextKeyName=aws:RequestedRegion,ContextKeyValues=ap-northeast-1,ContextKeyType=string' \
+    'ContextKeyName=ec2:ResourceTag/ManagedBy,ContextKeyValues=elastic-agent,ContextKeyType=string' \
+  --query 'length(EvaluationResults[?EvalDecision!=`allowed`])' \
+  --output text)" = 0
+test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
+  --action-names ec2:DisassociateAddress \
+  --resource-arns \
+    arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/eipalloc-0123456789abcdef0 \
+    arn:aws:ec2:ap-northeast-1:297645381734:network-interface/eni-0123456789abcdef0 \
+  --context-entries \
+    'ContextKeyName=aws:RequestedRegion,ContextKeyValues=ap-northeast-1,ContextKeyType=string' \
+    'ContextKeyName=ec2:ResourceTag/ManagedBy,ContextKeyValues=foreign,ContextKeyType=string' \
+  --query 'length(EvaluationResults[?EvalDecision!=`implicitDeny`])' \
+  --output text)" = 0
+
 # A representative valid launch must be allowed across every resource type.
 test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
   --action-names ec2:RunInstances \
@@ -197,7 +253,8 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
     'ContextKeyName=ec2:MetadataHttpTokens,ContextKeyValues=required,ContextKeyType=string' \
     'ContextKeyName=ec2:MetadataHttpPutResponseHopLimit,ContextKeyValues=1,ContextKeyType=numeric' \
     'ContextKeyName=ec2:InstanceProfile,ContextKeyValues=arn:aws:iam::297645381734:instance-profile/elastic-agent-worker,ContextKeyType=string' \
-  --query 'EvaluationResults[0].EvalDecision' --output text)" = allowed
+  --query 'length(EvaluationResults[?EvalDecision!=`allowed`])' \
+  --output text)" = 0
 ```
 
 Also change the simulated AMI or instance type and confirm `implicitDeny` before
@@ -378,6 +435,14 @@ aws iam detach-role-policy \
 aws iam list-attached-role-policies --role-name "$EA_WORKER_ROLE"
 aws iam get-role-policy --role-name "$EA_WORKER_ROLE" \
   --policy-name ElasticAgentWorkerResultsOnly >/dev/null
+
+# Explicitly deny plaintext S3 transport; this does not grant new access.
+aws s3api put-bucket-policy \
+  --bucket "$EA_RESULTS_BUCKET" \
+  --policy "file://$EA_IAM_TMP/results-bucket-policy.json"
+aws s3api get-bucket-policy --bucket "$EA_RESULTS_BUCKET" \
+  --query Policy --output text | jq -e \
+  '.Statement[] | select(.Sid == "DenyInsecureTransport")'
 ```
 
 Run a second one-Worker canary. Verify upload and final result download, then
@@ -393,11 +458,49 @@ not an IAM-policy-only change.
 
 ## Rollback
 
-Rollback Manager and Worker independently from the administrator/control host.
-Do not edit or detach policies on the shared `Manager` role.
+Prefer an application-release rollback that keeps the dedicated Manager role,
+private SGs, narrow Worker policy, and bucket TLS policy. Run from a fresh
+administrator shell: explicitly choose a backup suffix, discover the current
+association, and verify every target before changing state. A safe backup must
+contain the hardened unit and AWS env; the original `pre-7627c81` backup does
+not and is intentionally rejected by these guards.
 
 ```bash
-# Restore launcher/unit/env while the dedicated role is still available.
+export AWS_REGION=ap-northeast-1
+export EA_MANAGER_INSTANCE=i-07988886030e168cc
+export EA_WORKER_ROLE=elastic-agent-worker
+export BACKUP_SUFFIX=pre-<rollback-target-sha>
+
+CURRENT_ASSOCIATION_ID=$(aws ec2 \
+  describe-iam-instance-profile-associations \
+  --region "$AWS_REGION" \
+  --query "IamInstanceProfileAssociations[?InstanceId=='$EA_MANAGER_INSTANCE'].AssociationId | [0]" \
+  --output text)
+CURRENT_PROFILE_ARN=$(aws ec2 \
+  describe-iam-instance-profile-associations \
+  --region "$AWS_REGION" --association-ids "$CURRENT_ASSOCIATION_ID" \
+  --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+  --output text)
+test "$CURRENT_PROFILE_ARN" = \
+  arn:aws:iam::297645381734:instance-profile/elastic-agent-manager
+
+# Refuse a legacy backup that would silently drop the hardened launcher/env.
+ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
+  sudo bash -s -- "$BACKUP_SUFFIX" <<'REMOTE'
+set -Eeuo pipefail
+suffix=$1
+test -f "/etc/systemd/system/elastic-agent-manager.service.$suffix"
+test -f "/etc/elastic-agent-manager.env.$suffix"
+test -f "/etc/elastic-agent-manager.aws.env.$suffix"
+test ! -e "/etc/elastic-agent-manager.aws.env.$suffix.absent"
+rollback_release=$(readlink -f "/home/ubuntu/elastic-agent.rollback-$suffix")
+test -x "$rollback_release/.venv/bin/python"
+test -f "$rollback_release/deploy/aws_manager.py"
+grep -q '^ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME=elastic-agent-manager$' \
+  "/etc/elastic-agent-manager.aws.env.$suffix"
+REMOTE
+
+# Restore application/unit/env while retaining every hardened AWS boundary.
 ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
   sudo bash -s -- "$BACKUP_SUFFIX" <<'REMOTE'
 set -Eeuo pipefail
@@ -405,12 +508,8 @@ suffix=$1
 cp -a "/etc/systemd/system/elastic-agent-manager.service.$suffix" \
   /etc/systemd/system/elastic-agent-manager.service
 cp -a "/etc/elastic-agent-manager.env.$suffix" /etc/elastic-agent-manager.env
-if test -e "/etc/elastic-agent-manager.aws.env.$suffix.absent"; then
-  rm -f /etc/elastic-agent-manager.aws.env
-else
-  cp -a "/etc/elastic-agent-manager.aws.env.$suffix" \
-    /etc/elastic-agent-manager.aws.env
-fi
+cp -a "/etc/elastic-agent-manager.aws.env.$suffix" \
+  /etc/elastic-agent-manager.aws.env
 rollback_release=$(readlink -f "/home/ubuntu/elastic-agent.rollback-$suffix")
 ln -sfn "$rollback_release" /home/ubuntu/elastic-agent.next
 mv -Tf /home/ubuntu/elastic-agent.next /home/ubuntu/elastic-agent
@@ -418,25 +517,58 @@ systemctl daemon-reload
 systemctl restart elastic-agent-manager.service
 curl -fsS http://127.0.0.1:8080/api/health >/dev/null
 REMOTE
+curl --fail --silent --show-error \
+  https://elastic-agent.claude-code-manager.com/api/health >/dev/null
+```
 
-# Then restore the original Manager profile with the current association ID.
+If the dedicated role itself is the proven cause of an outage, replacing it
+with shared profile `Manager` is a **break-glass security downgrade**: that role
+has administrator/EC2/S3-wide permissions and is shared by six other machines.
+Discover the association again in the same fresh shell; never reuse a stale
+`NEW_ASSOCIATION_ID`. Similarly, restoring `AmazonS3FullAccess` is only for a
+proven Worker-policy failure. These actions do not restore application
+compatibility by themselves and must not be part of a routine release rollback.
+
+```bash
+CURRENT_ASSOCIATION_ID=$(aws ec2 \
+  describe-iam-instance-profile-associations \
+  --region "$AWS_REGION" \
+  --query "IamInstanceProfileAssociations[?InstanceId=='$EA_MANAGER_INSTANCE'].AssociationId | [0]" \
+  --output text)
+test "$(aws ec2 describe-iam-instance-profile-associations \
+  --region "$AWS_REGION" --association-ids "$CURRENT_ASSOCIATION_ID" \
+  --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+  --output text)" = \
+  arn:aws:iam::297645381734:instance-profile/elastic-agent-manager
+
 ROLLBACK_JSON=$(aws ec2 replace-iam-instance-profile-association \
   --region "$AWS_REGION" \
-  --association-id "$NEW_ASSOCIATION_ID" \
+  --association-id "$CURRENT_ASSOCIATION_ID" \
   --iam-instance-profile Name=Manager)
 ROLLBACK_ASSOCIATION_ID=$(jq -r \
   '.IamInstanceProfileAssociation.AssociationId' <<<"$ROLLBACK_JSON")
+test -n "$ROLLBACK_ASSOCIATION_ID"
 ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
   'sudo systemctl restart elastic-agent-manager.service && \
    curl -fsS http://127.0.0.1:8080/api/health >/dev/null'
 
-# Worker rollback: restore only the previous managed policy.
+# Separate Worker break glass, only if its narrow policy is the proven cause.
 aws iam attach-role-policy \
   --role-name "$EA_WORKER_ROLE" \
   --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
 ```
 
-Keep the dedicated role/profile and narrow inline policies for at least one
-full Job cycle and an observation window. Do not delete rollback resources in
-the same change. The original `Manager` profile remains necessary for the other
-six machines.
+Do not restore the old shared SG `sg-056408de7cf971e02`: it exposes SSH and
+multiple ports to `0.0.0.0/0`. Do not assume a healthy Manager means Worker
+launches work. If a rollback selects another AMI, update the AMI resource pin in
+the Manager IAM policy and `ELASTIC_AGENT_AWS_AMI_ID` together, run Access
+Analyzer/full-policy simulation, and complete a create/upload/terminate canary.
+The Canonical break-glass image also requires the launcher flag and an explicit
+IAM image pin; the flag alone is insufficient. After any role/S3 break glass,
+restore the dedicated/narrow policies immediately and repeat both ordinary and
+EIP canaries.
+
+Keep the dedicated role/profile, narrow inline policies, and recoverable release
+backups through an observation window. Do not delete rollback resources in the
+same change. The original `Manager` profile remains necessary for the other six
+machines.

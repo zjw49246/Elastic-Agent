@@ -241,6 +241,17 @@ class CloudReconciler:
                 for tag_key, metadata_key in _LIFECYCLE_TAG_TO_METADATA.items()
                 if (value := inst.tags.get(tag_key))
             }
+            if status == NodeStatus.TERMINATED and not metadata.get("lease_id"):
+                # EC2 keeps terminated instances visible for a while.  A
+                # disposable Job removes its NodeRecord immediately after
+                # termination; adopting that historical cloud row on every
+                # periodic scan would make the registry grow without bound.
+                # Leased/EIP-bound rows are different: their durable tags are
+                # needed to resume detach/terminate cleanup after a crash.
+                logger.debug(
+                    "Reconciler: ignored terminated unbound orphan %s", oid
+                )
+                continue
             record = NodeRecord(
                 node_id=oid,
                 instance_id=inst.instance_id,

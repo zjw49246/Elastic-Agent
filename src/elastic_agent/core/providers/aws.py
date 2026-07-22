@@ -150,12 +150,22 @@ class AWSProvider(CloudProvider):
 
     async def create_instance(self, config: InstanceConfig) -> Instance:
         tags = {**config.tags, self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE}
+        is_eip_bound_worker = bool(config.tags.get("ElasticAgentLease"))
         tag_specs = [
             {
                 "ResourceType": "instance",
                 "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
             }
         ]
+        if is_eip_bound_worker:
+            # DisassociateAddress authorization evaluates both the EIP and its
+            # ENI.  Give the freshly-created primary ENI the same ownership
+            # tags so IAM can require ManagedBy on both resources instead of
+            # granting an unconditioned network-interface wildcard.
+            tag_specs.append({
+                "ResourceType": "network-interface",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            })
 
         kwargs: dict = dict(
             ImageId=config.image_id or self._config.ami_id,
@@ -175,7 +185,6 @@ class AWSProvider(CloudProvider):
 
         sg_ids = config.security_group_ids or self._config.security_group_ids
         subnet_id = config.subnet_id or self._config.subnet_id
-        is_eip_bound_worker = bool(config.tags.get("ElasticAgentLease"))
 
         if is_eip_bound_worker:
             # The account's durable EIP is attached before SSH bootstrap.  Do

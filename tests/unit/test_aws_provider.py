@@ -157,6 +157,16 @@ async def test_eip_bound_worker_does_not_get_transient_public_ip():
         "SubnetId": "subnet-private",
         "Groups": ["sg-worker"],
     }]
+    tag_specs = {
+        item["ResourceType"]: {
+            tag["Key"]: tag["Value"] for tag in item["Tags"]
+        }
+        for item in kwargs["TagSpecifications"]
+    }
+    assert tag_specs["network-interface"] == {
+        "ElasticAgentLease": "lease-1",
+        "ManagedBy": "elastic-agent",
+    }
 
 
 @pytest.mark.asyncio
@@ -180,6 +190,9 @@ async def test_unbound_worker_preserves_existing_subnet_public_ip_policy():
     assert kwargs["SubnetId"] == "subnet-worker"
     assert kwargs["SecurityGroupIds"] == ["sg-worker"]
     assert "NetworkInterfaces" not in kwargs
+    assert [
+        item["ResourceType"] for item in kwargs["TagSpecifications"]
+    ] == ["instance"]
 
 
 @pytest.mark.asyncio

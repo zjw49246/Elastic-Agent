@@ -24,6 +24,14 @@ MANAGER_POLICY = (
     Path(__file__).resolve().parents[2]
     / "deploy/aws/elastic-agent-manager-policy.json"
 )
+WORKER_POLICY = (
+    Path(__file__).resolve().parents[2]
+    / "deploy/aws/elastic-agent-worker-policy.json"
+)
+RESULTS_BUCKET_POLICY = (
+    Path(__file__).resolve().parents[2]
+    / "deploy/aws/elastic-agent-results-bucket-policy.json"
+)
 IAM_CUTOVER = Path(__file__).resolve().parents[2] / "deploy/aws/iam-cutover.md"
 
 
@@ -117,6 +125,88 @@ def test_manager_policy_and_cutover_pin_real_key_pair_name():
     assert expected in launch["Resource"]
     assert expected in IAM_CUTOVER.read_text(encoding="utf-8")
     assert not any("key-pair/key-" in resource for resource in launch["Resource"])
+
+
+def test_iam_cutover_simulates_complete_manager_policy():
+    policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
+    compact = json.dumps(policy, separators=(",", ":"))
+    cutover = IAM_CUTOVER.read_text(encoding="utf-8")
+
+    assert len(compact) < 131_072
+    assert "MANAGER_POLICY=$(jq -c ." in cutover
+    assert 'MANAGER_RUN_POLICY=' not in cutover
+    assert '--policy-input-list "$MANAGER_POLICY"' in cutover
+    assert "EvaluationResults[?EvalDecision!=`allowed`]" in cutover
+
+
+def test_iam_cutover_rollback_is_fresh_shell_and_fail_closed():
+    cutover = IAM_CUTOVER.read_text(encoding="utf-8")
+
+    assert "Status (2026-07-22): completed" in cutover
+    assert "CURRENT_ASSOCIATION_ID=$(aws ec2" in cutover
+    assert '--association-id "$NEW_ASSOCIATION_ID"' not in cutover
+    assert "test ! -e" in cutover
+    assert "flag alone is insufficient" in cutover
+    assert "Do not restore the old shared SG" in cutover
+
+
+def test_manager_policy_tags_and_detaches_only_managed_network_interfaces():
+    policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
+    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
+
+    create_tags = statements["TagManagedResourcesAtCreation"]
+    assert (
+        "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*"
+        in create_tags["Resource"]
+    )
+    disassociate = statements["DisassociateManagedEips"]
+    assert disassociate["Action"] == "ec2:DisassociateAddress"
+    assert set(disassociate["Resource"]) == {
+        "arn:aws:ec2:ap-northeast-1:297645381734:elastic-ip/*",
+        "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*",
+    }
+    assert disassociate["Condition"]["StringEquals"] == {
+        "aws:RequestedRegion": "ap-northeast-1",
+        "ec2:ResourceTag/ManagedBy": "elastic-agent",
+    }
+    release = statements["ReleaseManagedEips"]
+    assert release["Action"] == "ec2:ReleaseAddress"
+    assert release["Resource"].endswith(":elastic-ip/*")
+
+
+def test_worker_policy_is_write_only_for_the_results_prefix():
+    policy = json.loads(WORKER_POLICY.read_text(encoding="utf-8"))
+    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
+
+    assert statements["LocateResultsBucket"] == {
+        "Sid": "LocateResultsBucket",
+        "Effect": "Allow",
+        "Action": "s3:GetBucketLocation",
+        "Resource": "arn:aws:s3:::elastic-agent-results-297645381734",
+    }
+    assert set(statements["WriteOnlyResultsObjects"]["Action"]) == {
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+    }
+    assert statements["WriteOnlyResultsObjects"]["Resource"] == (
+        "arn:aws:s3:::elastic-agent-results-297645381734/jobs/*"
+    )
+
+
+def test_results_bucket_policy_denies_plaintext_transport():
+    policy = json.loads(RESULTS_BUCKET_POLICY.read_text(encoding="utf-8"))
+
+    assert policy["Statement"] == [{
+        "Sid": "DenyInsecureTransport",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [
+            "arn:aws:s3:::elastic-agent-results-297645381734",
+            "arn:aws:s3:::elastic-agent-results-297645381734/*",
+        ],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }]
 
 
 def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):

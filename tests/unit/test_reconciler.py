@@ -93,6 +93,25 @@ async def test_orphan_adoption(registry: NodeRegistry, provider: AsyncMock) -> N
     assert rec.status == NodeStatus.READY
 
 
+async def test_terminated_unbound_orphan_is_not_adopted(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """Completed disposable workers must not repopulate the Node registry."""
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-complete",
+            state="terminated",
+            platform="aws",
+            tags={"ElasticAgentJob": "job-complete"},
+        )
+    ]
+
+    result = await CloudReconciler(provider, registry).reconcile()
+
+    assert result.orphans_adopted == []
+    assert await registry.get("aws:i-complete") is None
+
+
 async def test_orphan_adoption_uses_canonical_id_and_restores_lifecycle_metadata(
     registry: NodeRegistry, provider: AsyncMock
 ) -> None:
