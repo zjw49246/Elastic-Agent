@@ -307,3 +307,24 @@
 两轮 `account.mode=none`、单 `t3.large` 真 Job 分别为 `job-bc85c36570121c8abe1ff41634a97c39` 与 `job-8029babb8c9162fa7dd001d77ba5cb31`：从零创建 EC2、bootstrap 当前源码、执行 repo-less shell、Worker 实例角色直推 `jobs/<job>/workers/shard-00000/results/`，manifest+4 个数据文件均可经 S3 优先 results/list/download API 读取；Job `succeeded/done=true/cleanup_pending=0`，EC2 终止且 root EBS DeleteOnTermination。重复首轮 Idempotency-Key 返回同 job 且 AWS 始终只有一台实例。第二轮验证 `c3c25d8` 后 `/api/nodes` 自动回到 0，无 TERMINATED registry 残留；首轮旧记录在确认云实例 terminated 后通过标准 API 删除。
 
 冷启动主要耗时仍是 Ubuntu 现场安装 Node/npm（展开 500+ deb）；下一步最高收益是用当前 bootstrap 产出版本化 golden AMI，并保留现有 profile/commit 校验作为漂移与回滚边界。生产侧另有三项需单独变更窗口：Manager/Worker 拆 SG 并封 origin 8080、Worker S3 FullAccess 收敛到结果桶/prefix、为结果桶确定 retention 后启用 lifecycle/versioning。
+
+## 2026-07-22 AWS 生产加固、Golden AMI 与四轮真机验收
+
+**代码与发布**：`378398b` 增加私网管理路径、Golden AMI 构建/校验、生产 launcher、IAM/SG runbook 和回归测试；`32f0217` 固定东京生产资源；`7627c81` 把 Manager 启动凭证链收紧为 IMDSv2 专用实例角色并启用 systemd 沙箱；`5832c5e` 修正 EC2 Key Pair ARN 必须使用名称 `interview-key` 而不是 KeyPairId。Manager 当前运行不可变 release `/home/ubuntu/elastic-agent.release-7627c81`，域名健康，持久状态未迁移，旧 release/配置保留作回滚。
+
+**AWS 落地状态**：Golden AMI `ami-0aec7ffcbe44c6f7a` 可用、私有、自有、x86_64/HVM/ENA/IMDSv2-only；加密 snapshot `snap-095e5fef3ae78fce0`（20 GiB，KMS `94512b70-8710-409f-ae17-5770f7562668`）完成，builder 已终止。Manager 独占 role/profile `elastic-agent-manager`，目标实例的 profile association 为 `iip-assoc-01f75381926371ea2`，共享 `Manager` role 未改。Manager ENI 只保留 `sg-02a0d62d1a8d082c9`，22/8080 仅允许 Connector SG `sg-050b918ed465816c8`；Worker 只用 `sg-05c68220f901fb555`，22 仅允许 Manager SG。域名/私网 SSH 正常，Manager 公网 22 与 8080 均超时不可达。
+
+结果桶 `elastic-agent-results-297645381734` 已启用 versioning、全量 public block、SSE-S3，以及未完成 multipart 7 天清理、30 天 Standard-IA、90 天 Glacier 和同样的 noncurrent transition（不自动删除结果）。Worker role 已移除 `AmazonS3FullAccess`，无 AWS managed policy，只保留 `ElasticAgentWorkerResultsOnly`：允许指定桶 `jobs/*` 的 Put/Abort 和 bucket-location，拒绝 List/Get/Delete/跨前缀写。EIP quota 已批准为 20；继续按账号懒分配而不预建空闲、持续计费的地址。
+
+**真实验收（全部终态 `succeeded`）**：
+
+- 标准 profile `job-a743ae66659751839ef7c38821823f74`：Golden AMI、专用 SG/role、加密 gp3/IMDSv2 创建，结果直传 S3，EC2 `i-09e3ce1208e187b39` 与 root EBS 删除。
+- 最小 S3 权限复测 `job-c440c9b46a2f221013d0382427d3d9fa`：移除 FullAccess 后仍完成 worker-direct upload，EC2 `i-0904cfbd70a551735` 与 root EBS 删除。
+- Docker profile `job-95d4b8ff9c99fb4a16cc675ac3fe5c96`：Job 用户成功访问 Docker Engine 29.1.3，结果直传，EC2 `i-0ebb8c18a42d7e427` 与 root EBS 删除。
+- token-only Codex+EIP `job-c66a472aa16f5ff4391a6c4327e564f6`：EC2 `i-04c1f305f125967d3` 绑定 `13.112.54.251`，自动 email-code 登录，无人工 OTP challenge，预热和 Job 内真实 `codex exec` 均成功并返回 `EIP_CODEX_OK`；S3 记录的公网 IPv4 与绑定完全一致。终态先 final collect，再解绑 EIP、终止 EC2/删除 EBS、清 Node/lease；EIP 保留且 binding 回到 `ready`。结果 list/download API 从 S3 返回 200。
+
+最终检查为零活动 Elastic-Agent EC2、零附着 root volume、零 Node 残留、零 login challenge；Codex EIP 已分离但保留。当前账号池没有可用于本轮发布的 Claude 账号，因此没有新跑 Claude 登录 canary；此前 2026-07-15 的真实 Claude worker-local 登录记录仍有效。
+
+**验证**：部署/IAM/Golden/私网路径聚焦测试 158 passed；AWS Access Analyzer 对 Manager/Worker 两份策略均为零 finding，按动作切片的 IAM allow/deny 模拟全部通过；完整套件 2010 passed / 12 skipped，8 个失败均为本任务前已有的 credential-rotation 断言 3、server 默认端口断言 2、file-sync 角色/本机 `/root` 权限 3，本次未改对应实现且无新增失败。Ruff、`bash -n`、diff check 与四轮真实 AWS canary 均通过。
+
+**经验**：IAM 资源 ARN 不能凭控制台 ID 猜。EC2 Key Pair 的 ARN 资源段使用 key name，首轮 Job `job-06cd63e5cdf5a0954264059e6a4402b1` 因把 KeyPairId 写进策略而在创建实例前安全失败、无资源泄漏。修复时先加红测，再用真实 ARN 做 allow、旧 ARN 做 implicit-deny，并跑真实 create/upload/terminate canary。`SimulateCustomPolicy` 的 `PolicyInputList` 单份上限是 131,072 字符；完整 Manager policy 只有约 7 KiB，应直接模拟完整策略以保留 future explicit Deny/跨 statement 约束，并对 RunInstances 的全部 resource evaluation 逐项断言 allowed。

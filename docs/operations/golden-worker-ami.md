@@ -69,10 +69,35 @@ standard profile, Docker profile, S3 collection, Claude login, Codex login, and
 one EIP-bound Job. Confirm each EC2/root EBS is destroyed and its EIP retained.
 
 Select a fixed AMI ID through the Manager deployment configuration; never use a
-moving alias. Rollback selects the previous fixed ID and restarts the Manager;
-already-running workers are unaffected. Retain at least two known-good image
-versions for 7–14 days before deregistering an old AMI and deleting its snapshot.
+moving alias. Rollback must update the Manager IAM image ARN pin and deployment
+AMI ID together, validate the complete policy, then restart and run a canary;
+changing only the environment leaves a healthy Manager whose `RunInstances`
+calls are denied. Already-running workers are unaffected. After a second golden
+build exists, retain at least two known-good versions for 7–14 days before
+deregistering an old AMI and deleting its snapshot.
 
 Rebuild whenever the base OS security image, pinned Claude/Codex/claude-pty,
 Chrome, Docker, Node, or Python dependency set changes. The manifest and image
 tags retain the source AMI, source commit, build timestamp, and build-tree hash.
+
+## Current production promotion (2026-07-22)
+
+Tokyo production currently pins `ami-0aec7ffcbe44c6f7a`. It is a private,
+self-owned x86_64/HVM/ENA image with IMDSv2 required. Its encrypted 20-GiB
+snapshot is `snap-095e5fef3ae78fce0`, using the account's EBS KMS key. Image
+tags record source commit `378398b`, Claude `2.1.181`, Codex `0.144.6`, and
+claude-pty commit `d6ff732`; the disposable builder was terminated after the
+snapshot became available.
+
+This is the first retained golden version. Until its successor is built and
+promoted, the Canonical base image is break glass rather than a second golden:
+using it requires both `ELASTIC_AGENT_ALLOW_CANONICAL_BASE_AMI=true` and a
+coordinated IAM image-pin update, followed by the same canary and immediate
+return to a tagged golden image.
+
+Promotion canaries passed for the standard profile, the standard profile after
+removing `AmazonS3FullAccess` from the Worker role, the Docker profile, and a
+token-only Codex login bound to its retained EIP. Every canary uploaded its
+explicit result paths to S3, terminated its EC2/root EBS, and removed its Node
+record. The Codex canary also verified its observed IPv4 address against the
+account binding and completed a real `codex exec` without a manual OTP.
