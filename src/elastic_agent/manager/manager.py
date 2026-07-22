@@ -128,6 +128,7 @@ class ElasticAgentManager:
             registry=self.registry,
             reconcile_interval=config.monitor.reconcile_interval,
             on_bound_lost=self._on_reconciler_bound_lost,
+            is_bound_released=self._is_reconciler_bound_released,
         )
 
         self.task_registry = TaskRegistry(config.task_registry.path)
@@ -447,6 +448,8 @@ class ElasticAgentManager:
             if tagged_account and tagged_account != lease.account_id:
                 return "legacy instance account tag conflicts with durable lease"
             return None
+        if lease.instance_id and lease.instance_id != instance.instance_id:
+            return "cloud instance conflicts with durable lease instance"
         if controller != self.account_binding_store.controller_id:
             return "instance controller tag does not match durable store"
         if tagged_lease != lease.lease_id:
@@ -529,6 +532,48 @@ class ElasticAgentManager:
                         or lease_id in self._recovery_lease_ids
                     ):
                         lease = await self.binding_manager.get_lease(lease_id)
+                        claimed = (
+                            await self.account_binding_store.get_lease_by_instance(
+                                instance.instance_id
+                            )
+                        )
+                        if (
+                            claimed is not None
+                            and (
+                                lease is None
+                                or claimed.lease_id != lease.lease_id
+                            )
+                        ):
+                            self._recovery_unsafe_lease_ids.add(
+                                claimed.lease_id
+                            )
+                            logger.error(
+                                "Refusing tagged recovery instance %s: cloud "
+                                "lease %s conflicts with active durable lease %s",
+                                instance.instance_id,
+                                lease_id,
+                                claimed.lease_id,
+                            )
+                            continue
+                        if (
+                            instance.state == InstanceState.TERMINATED
+                            and self._lease_proves_released_instance(
+                                lease,
+                                instance_id=instance.instance_id,
+                                account_id=str(
+                                    instance.tags.get(
+                                        "ElasticAgentAccount", ""
+                                    )
+                                ),
+                                job_id=str(
+                                    instance.tags.get("ElasticAgentJob", "")
+                                ),
+                            )
+                        ):
+                            # AWS still enumerates terminated instances after a
+                            # fully committed release. They are history, not a
+                            # new crash-window orphan.
+                            continue
                         validation_error = self._recovery_instance_validation_error(
                             instance, lease
                         )
@@ -555,8 +600,27 @@ class ElasticAgentManager:
                     if (
                         lease is None
                         or not lease.instance_id
-                        or lease.instance_id in self._recovery_instances
                     ):
+                        continue
+                    recovered_candidate = self._recovery_instances.get(
+                        lease.instance_id
+                    )
+                    if recovered_candidate is not None:
+                        validation_error = self._recovery_instance_validation_error(
+                            recovered_candidate, lease
+                        )
+                        if validation_error:
+                            self._recovery_unsafe_lease_ids.add(lease_id)
+                            self._recovery_instances.pop(
+                                lease.instance_id, None
+                            )
+                            logger.error(
+                                "Refusing tagged recovery instance %s for "
+                                "lease %s: %s",
+                                lease.instance_id,
+                                lease_id,
+                                validation_error,
+                            )
                         continue
                     try:
                         exact = await self.provider.get_instance(lease.instance_id)
@@ -651,7 +715,9 @@ class ElasticAgentManager:
                 self._binding_recovery_scan_pending = False
 
         async def cleanup_control_plane(lease) -> None:
-            worker_id = lease.worker_id or lease.instance_id or ""
+            worker_id = self._durable_lease_worker_target(
+                lease, expected_lease_id=lease.lease_id
+            )
             if worker_id:
                 await self.registry.update(worker_id, status=NodeStatus.TERMINATED)
                 await self.connection_manager.disconnect_worker(worker_id)
@@ -663,6 +729,33 @@ class ElasticAgentManager:
             ):
                 return
             current = await self.binding_manager.get_lease(lease_id)
+            if current is not None:
+                if current.worker_id and not current.instance_id:
+                    self._recovery_unsafe_lease_ids.add(lease_id)
+                    logger.error(
+                        "Refusing startup recovery for lease %s: durable "
+                        "worker %s has no instance id",
+                        lease_id,
+                        current.worker_id,
+                    )
+                    return
+                worker_id = current.worker_id or current.instance_id or ""
+                node = await self.registry.get(worker_id) if worker_id else None
+                if (
+                    node is not None
+                    and current.instance_id
+                    and node.instance_id != current.instance_id
+                ):
+                    self._recovery_unsafe_lease_ids.add(lease_id)
+                    logger.error(
+                        "Refusing startup recovery for lease %s: durable "
+                        "worker %s maps to registry instance %s, not %s",
+                        lease_id,
+                        worker_id,
+                        node.instance_id,
+                        current.instance_id,
+                    )
+                    return
             if (
                 current is not None
                 and self._binding_recovery_scan_pending
@@ -696,12 +789,23 @@ class ElasticAgentManager:
                 ):
                     await self._collect_recovered_lease(current)
                 released = await self.binding_manager.release(
-                    lease_id, cleanup_worker=cleanup_control_plane
+                    lease_id,
+                    cleanup_worker=cleanup_control_plane,
+                    expected_lease=current,
                 )
-                if released is None or released.state == "released":
-                    self._recovery_lease_ids.discard(lease_id)
-                    if released and released.instance_id:
-                        self._recovery_instances.pop(released.instance_id, None)
+                if released is None or released.state != "released":
+                    raise RuntimeError(
+                        f"startup cleanup for lease {lease_id!r} did not "
+                        "return a released lease"
+                    )
+                worker_id = self._durable_lease_worker_target(
+                    released, expected_lease_id=lease_id
+                )
+                if worker_id:
+                    await self.remove_terminated_node_record(worker_id)
+                self._recovery_lease_ids.discard(lease_id)
+                if released.instance_id:
+                    self._recovery_instances.pop(released.instance_id, None)
             except Exception:  # noqa: BLE001
                 logger.exception("Startup cleanup failed for EIP lease %s", lease_id)
 
@@ -751,6 +855,35 @@ class ElasticAgentManager:
         for instance_id, instance in list(self._recovery_instances.items()):
             lease_id = instance.tags.get("ElasticAgentLease", "")
             lease = await self.binding_manager.get_lease(lease_id) if lease_id else None
+            claimed = await self.account_binding_store.get_lease_by_instance(
+                instance_id
+            )
+            if (
+                claimed is not None
+                and claimed.lease_id != lease_id
+            ):
+                self._recovery_unsafe_lease_ids.add(claimed.lease_id)
+                logger.error(
+                    "Refusing raw orphan cleanup for %s: cloud lease %s "
+                    "conflicts with active durable lease %s",
+                    instance_id,
+                    lease_id,
+                    claimed.lease_id,
+                )
+                continue
+            if (
+                instance.state == InstanceState.TERMINATED
+                and self._lease_proves_released_instance(
+                    lease,
+                    instance_id=instance_id,
+                    account_id=str(
+                        instance.tags.get("ElasticAgentAccount", "")
+                    ),
+                    job_id=str(instance.tags.get("ElasticAgentJob", "")),
+                )
+            ):
+                self._recovery_instances.pop(instance_id, None)
+                continue
             if lease is not None and lease.state != "released" and lease.instance_id == instance_id:
                 continue  # its durable release above will retry
             try:
@@ -1558,7 +1691,35 @@ class ElasticAgentManager:
             )
 
         lease = await self.binding_manager.get_lease(lease_id)
+        claimed = await self.account_binding_store.get_lease_by_instance(
+            node.instance_id
+        )
+        if claimed is not None and claimed.lease_id != lease_id:
+            raise RuntimeError(
+                f"refusing cleanup for {worker_id}: cloud lease {lease_id!r} "
+                f"conflicts with active durable lease {claimed.lease_id!r}"
+            )
+        if (
+            node.status == NodeStatus.TERMINATED
+            and self._lease_proves_released_instance(
+                lease,
+                instance_id=node.instance_id,
+                account_id=str(node.metadata.get("account_id") or ""),
+                job_id=str(node.metadata.get("job_id") or ""),
+            )
+        ):
+            # BindingManager persisted every teardown phase before RELEASED.
+            # This row is only EC2's short-lived terminated history, not work
+            # that should invoke detach/terminate a second time.
+            await self.connection_manager.disconnect_worker(worker_id)
+            await self.remove_terminated_node_record(worker_id)
+            return
         if lease is not None and lease.state != LeaseState.RELEASED:
+            if lease.instance_id and lease.instance_id != node.instance_id:
+                raise RuntimeError(
+                    f"refusing cleanup for {worker_id}: durable lease "
+                    "references another instance"
+                )
             tagged_controller = str(
                 node.metadata.get("controller_id") or ""
             )
@@ -1647,7 +1808,60 @@ class ElasticAgentManager:
         # Reconciler deliberately retains leased records until this callback
         # succeeds.  Removing only now prevents a failed detach/termination
         # from being silently forgotten on the next scan.
-        await self.registry.remove(worker_id)
+        await self.remove_terminated_node_record(worker_id)
+
+    @staticmethod
+    def _lease_proves_released_instance(
+        lease: Any,
+        *,
+        instance_id: str,
+        account_id: str,
+        job_id: str,
+    ) -> bool:
+        """Return true only for an exact, fully committed teardown record."""
+        from elastic_agent.core.account_binding import LeaseState
+
+        return bool(
+            lease is not None
+            and lease.state == LeaseState.RELEASED
+            and lease.lease_id
+            and lease.instance_id == instance_id
+            and account_id
+            and lease.account_id == account_id
+            and job_id
+            and lease.job_id == job_id
+            and lease.eip_detached
+            and lease.instance_terminated
+            and (
+                not lease.worker_cleanup_required
+                or lease.worker_cleanup_done
+            )
+            and lease.released_at is not None
+        )
+
+    async def _is_reconciler_bound_released(
+        self,
+        lease_id: str,
+        instance_id: str,
+        account_id: str,
+        job_id: str,
+    ) -> bool:
+        """Positively prove a terminated cloud row is settled history."""
+        claimed = await self.account_binding_store.get_lease_by_instance(
+            instance_id
+        )
+        if claimed is not None:
+            # A released historical tag must never suppress the callback for
+            # an instance that is now claimed by any active durable lease. The
+            # callback will quarantine mismatched ownership without mutation.
+            return False
+        lease = await self.binding_manager.get_lease(lease_id)
+        return self._lease_proves_released_instance(
+            lease,
+            instance_id=instance_id,
+            account_id=account_id,
+            job_id=job_id,
+        )
 
     async def _lease_id_for_node(self, node: NodeRecord) -> str:
         """Resolve durable ownership even for old/reconciler registry rows."""
@@ -1681,21 +1895,108 @@ class ElasticAgentManager:
                 )
             return
 
+        node = await self.registry.get(worker_id)
+        expected_instance_id = node.instance_id if node is not None else ""
+
         async def cleanup_control_plane(lease) -> None:
-            target = lease.worker_id or worker_id
+            target = self._durable_lease_worker_target(
+                lease,
+                expected_lease_id=lease_id,
+                expected_worker_id=worker_id,
+                expected_instance_id=expected_instance_id,
+            )
             await self.registry.update(target, status=NodeStatus.TERMINATED)
             await self.connection_manager.disconnect_worker(target)
 
+        current = await self.binding_manager.get_lease(lease_id)
+        if current is None:
+            raise RuntimeError(
+                f"bound worker {worker_id} durable lease {lease_id!r} "
+                "disappeared before cleanup"
+            )
+        self._durable_lease_worker_target(
+            current,
+            expected_lease_id=lease_id,
+            expected_worker_id=worker_id,
+            expected_instance_id=expected_instance_id,
+        )
         released = await self.binding_manager.release(
-            lease_id, cleanup_worker=cleanup_control_plane
+            lease_id,
+            cleanup_worker=cleanup_control_plane,
+            expected_lease=current,
         )
         if released is None or released.state != "released":
             raise RuntimeError(
                 f"bound worker {worker_id} lease cleanup did not complete"
             )
+        target = self._durable_lease_worker_target(
+            released,
+            expected_lease_id=lease_id,
+            expected_worker_id=worker_id,
+            expected_instance_id=expected_instance_id,
+        )
+        await self.remove_terminated_node_record(target)
         allocator = getattr(orchestrator, "_allocator", None) if orchestrator else None
         if allocator is not None:
-            await allocator.release_owner(f"{released.job_id}:{released.slot}")
+            await allocator.release_owner_account(
+                f"{released.job_id}:{released.slot}", released.account_id
+            )
+
+    @staticmethod
+    def _durable_lease_worker_target(
+        lease: Any,
+        *,
+        expected_lease_id: str,
+        expected_worker_id: str = "",
+        expected_instance_id: str = "",
+    ) -> str:
+        """Resolve one lease's Node id without crossing durable identities."""
+        durable_lease_id = str(getattr(lease, "lease_id", "") or "")
+        if durable_lease_id != expected_lease_id:
+            raise RuntimeError(
+                f"expected lease {expected_lease_id!r}, got durable lease "
+                f"{durable_lease_id!r}"
+            )
+        durable_worker = str(getattr(lease, "worker_id", "") or "")
+        durable_instance = str(getattr(lease, "instance_id", "") or "")
+        if (expected_worker_id or durable_worker) and not durable_instance:
+            raise RuntimeError(
+                f"durable lease {expected_lease_id!r} identifies a worker "
+                "but has no instance id"
+            )
+        if expected_worker_id:
+            if not durable_worker and not durable_instance:
+                raise RuntimeError(
+                    f"durable lease {expected_lease_id!r} does not identify "
+                    f"worker {expected_worker_id!r}"
+                )
+            if (
+                not durable_worker
+                and durable_instance
+                and not expected_instance_id
+            ):
+                raise RuntimeError(
+                    f"cannot prove worker {expected_worker_id!r} maps to "
+                    f"durable instance {durable_instance!r} for lease "
+                    f"{expected_lease_id!r}"
+                )
+            if durable_worker and durable_worker != expected_worker_id:
+                raise RuntimeError(
+                    f"worker {expected_worker_id!r} conflicts with durable "
+                    f"worker {durable_worker!r} for lease {expected_lease_id!r}"
+                )
+            if (
+                durable_instance
+                and expected_instance_id
+                and durable_instance != expected_instance_id
+            ):
+                raise RuntimeError(
+                    f"worker {expected_worker_id!r} instance "
+                    f"{expected_instance_id!r} conflicts with durable instance "
+                    f"{durable_instance!r} for lease {expected_lease_id!r}"
+                )
+            return expected_worker_id
+        return durable_worker or durable_instance
 
     async def resume_node(self, node_id: str) -> NodeRecord | None:
         """Start a stopped ECS instance and mark it as CREATING.
@@ -1795,11 +2096,24 @@ class ElasticAgentManager:
                 )
                 raise
             await self.connection_manager.disconnect_worker(node_id)
-        await self.task_registry.cleanup_worker(node_id)
-        await self.registry.remove(node_id)
-        await self.event_bus.emit("NODE_REMOVED", node_id, {"instance_id": node.instance_id})
-        logger.info("Node %s removed from registry", node_id)
+        await self.remove_terminated_node_record(node_id)
         return True
+
+    async def remove_terminated_node_record(self, node_id: str) -> bool:
+        """Forget a cloud-terminal worker without re-entering lease teardown."""
+        node = await self.registry.get(node_id)
+        await self.task_registry.cleanup_worker(node_id)
+        if node is None:
+            return False
+        if node.status not in (NodeStatus.TERMINATED, NodeStatus.FAILED):
+            await self.registry.update(node_id, status=NodeStatus.TERMINATED)
+        removed = await self.registry.remove(node_id)
+        if removed:
+            await self.event_bus.emit(
+                "NODE_REMOVED", node_id, {"instance_id": node.instance_id}
+            )
+            logger.info("Node %s removed from registry", node_id)
+        return removed
 
     async def get_node_status(self, node_id: str) -> dict[str, Any] | None:
         node = await self.registry.get(node_id)

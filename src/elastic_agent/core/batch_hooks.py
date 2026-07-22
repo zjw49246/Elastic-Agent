@@ -27,7 +27,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from elastic_agent.core.batch_orchestrator import (
@@ -48,7 +48,7 @@ from elastic_agent.harness.generic import (
 logger = logging.getLogger(__name__)
 
 
-async def _await_cleanup_task(task: asyncio.Task) -> None:
+async def _await_cleanup_task(task: asyncio.Task) -> Any:
     """Finish a tiny ownership cleanup even if the caller is cancelled."""
     while not task.done():
         try:
@@ -57,7 +57,7 @@ async def _await_cleanup_task(task: asyncio.Task) -> None:
             if task.done() and task.cancelled():
                 raise
             continue
-    task.result()
+    return task.result()
 
 
 # ---------------------------------------------------------------------------
@@ -172,17 +172,60 @@ class AccountAllocator:
         async with self._lock:
             return self._claims.get(claim_id)
 
-    async def release_claim(self, claim_id: str) -> None:
+    async def release_claim(
+        self,
+        claim_id: str,
+        *,
+        expected_owner: str | None = None,
+        expected_account_id: str | None = None,
+    ) -> None:
+        """Release one claim, optionally proving its immutable ownership.
+
+        Bound cleanup carries a claim id across several cloud calls.  Refuse to
+        free a claim that was replaced or crossed with another assignment;
+        a missing claim remains an idempotent success.
+        """
         async with self._lock:
-            claim = self._claims.pop(claim_id, None)
+            claim = self._claims.get(claim_id)
             if claim is None:
                 return
+            if (
+                expected_owner is not None
+                and claim.owner != expected_owner
+            ) or (
+                expected_account_id is not None
+                and claim.account.id != expected_account_id
+            ):
+                raise AccountClaimConflictError(
+                    f"claim {claim_id!r} belongs to {claim.owner!r}/"
+                    f"{claim.account.id!r}, not {expected_owner!r}/"
+                    f"{expected_account_id!r}"
+                )
+            self._claims.pop(claim_id)
             self._claim_by_account.pop(claim.account.id, None)
             owner_claims = self._by_owner.get(claim.owner)
             if owner_claims is not None:
                 owner_claims.discard(claim_id)
                 if not owner_claims:
                     self._by_owner.pop(claim.owner, None)
+
+    async def release_owner_account(self, owner: str, account_id: str) -> None:
+        """Release only ``owner`` claims for one exact account identity."""
+        async with self._lock:
+            owner_claims = self._by_owner.get(owner)
+            if not owner_claims:
+                return
+            matching = [
+                claim_id
+                for claim_id in owner_claims
+                if self._claims[claim_id].account.id == account_id
+            ]
+            for claim_id in matching:
+                claim = self._claims.pop(claim_id)
+                self._claim_by_account.pop(claim.account.id, None)
+                owner_claims.discard(claim_id)
+            if not owner_claims:
+                self._by_owner.pop(owner, None)
 
     async def release_owner(self, owner: str) -> None:
         async with self._lock:
@@ -952,10 +995,24 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 # fail-closed for operator/startup recovery.
                 if lease is not None:
                     durable_cleanup = asyncio.create_task(
-                        manager.binding_manager.release(lease.lease_id)
+                        manager.binding_manager.release(
+                            lease.lease_id, expected_lease=lease
+                        )
                     )
                     try:
-                        await _await_cleanup_task(durable_cleanup)
+                        rolled_back = await _await_cleanup_task(
+                            durable_cleanup
+                        )
+                        from elastic_agent.core.account_binding import LeaseState
+
+                        if (
+                            rolled_back is None
+                            or rolled_back.state != LeaseState.RELEASED
+                        ):
+                            raise RuntimeError(
+                                f"lease {lease.lease_id!r} rollback did not "
+                                "commit RELEASED"
+                            )
                     except BaseException as cleanup_exc:
                         logger.exception(
                             "Failed to roll back reserved EIP lease %s; "
@@ -969,7 +1026,11 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                         ) from cleanup_exc
 
                 claim_cleanup = asyncio.create_task(
-                    allocator.release_claim(claim.claim_id)
+                    allocator.release_claim(
+                        claim.claim_id,
+                        expected_owner=claim.owner,
+                        expected_account_id=claim.account.id,
+                    )
                 )
                 await _await_cleanup_task(claim_cleanup)
                 # Explicit selection is fail-fast.  Automatic group selection
@@ -1040,8 +1101,106 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
     async def release_bound(
         assignment: WorkerAssignment, worker_id: str | None,
     ) -> None:
+        expected_claim_owner = f"{assignment.job_id}:{assignment.slot}"
+        claim = await allocator.get_claim(assignment.claim_id)
+        if claim is not None and (
+            claim.owner != expected_claim_owner
+            or claim.account.id != assignment.account_id
+        ):
+            raise AccountClaimConflictError(
+                f"claim {assignment.claim_id!r} does not belong to "
+                f"assignment {expected_claim_owner!r}/"
+                f"{assignment.account_id!r}"
+            )
+
+        node = await manager.registry.get(worker_id) if worker_id else None
+        expected_instance_id = str(
+            getattr(node, "instance_id", "") or ""
+        )
+
+        def released_worker_target(lease) -> str:
+            durable_lease_id = str(getattr(lease, "lease_id", "") or "")
+            if durable_lease_id != assignment.lease_id:
+                raise RuntimeError(
+                    f"release for lease {assignment.lease_id!r} returned "
+                    f"conflicting durable lease {durable_lease_id!r}"
+                )
+            durable_account = str(
+                getattr(lease, "account_id", "") or ""
+            )
+            durable_job = str(getattr(lease, "job_id", "") or "")
+            if (
+                durable_account != assignment.account_id
+                or durable_job != assignment.job_id
+            ):
+                raise RuntimeError(
+                    f"durable ownership for lease {assignment.lease_id!r} "
+                    "does not match its worker assignment"
+                )
+            durable_worker = str(getattr(lease, "worker_id", "") or "")
+            durable_instance = str(
+                getattr(lease, "instance_id", "") or ""
+            )
+            if (worker_id or durable_worker) and not durable_instance:
+                raise RuntimeError(
+                    f"durable lease {assignment.lease_id!r} identifies a "
+                    "worker but has no instance id"
+                )
+            if worker_id:
+                if not durable_worker and not durable_instance:
+                    raise RuntimeError(
+                        f"durable lease {assignment.lease_id!r} does not "
+                        f"identify worker {worker_id!r}"
+                    )
+                if (
+                    not durable_worker
+                    and durable_instance
+                    and not expected_instance_id
+                ):
+                    raise RuntimeError(
+                        f"cannot prove worker {worker_id!r} maps to durable "
+                        f"instance {durable_instance!r} for lease "
+                        f"{assignment.lease_id!r}"
+                    )
+                if durable_worker and durable_worker != worker_id:
+                    raise RuntimeError(
+                        f"worker {worker_id!r} conflicts with durable worker "
+                        f"{durable_worker!r} for lease {assignment.lease_id!r}"
+                    )
+                if (
+                    durable_instance
+                    and expected_instance_id
+                    and durable_instance != expected_instance_id
+                ):
+                    raise RuntimeError(
+                        f"worker {worker_id!r} instance "
+                        f"{expected_instance_id!r} conflicts with durable "
+                        f"instance {durable_instance!r} for lease "
+                        f"{assignment.lease_id!r}"
+                    )
+                return worker_id
+            return durable_worker or durable_instance
+
+        current = await manager.binding_manager.get_lease(
+            assignment.lease_id
+        )
+        if current is None:
+            raise RuntimeError(
+                f"durable lease {assignment.lease_id!r} disappeared before "
+                "release"
+            )
+        if (
+            current.account_id != assignment.account_id
+            or current.job_id != assignment.job_id
+        ):
+            raise RuntimeError(
+                f"durable ownership for lease {assignment.lease_id!r} "
+                "does not match its worker assignment"
+            )
+        released_worker_target(current)
+
         async def cleanup_worker(lease) -> None:
-            target = worker_id or getattr(lease, "worker_id", "")
+            target = released_worker_target(lease)
             if target:
                 # BindingManager owns provider ordering: detach EIP first, then
                 # terminate EC2, then invoke this callback.  The live hook only
@@ -1052,14 +1211,36 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 await manager.registry.update(target, status=NodeStatus.TERMINATED)
                 await manager.connection_manager.disconnect_worker(target)
 
-        await manager.binding_manager.release(
+        released = await manager.binding_manager.release(
             assignment.lease_id,
             cleanup_worker=cleanup_worker,
+            expected_lease=current,
         )
+        from elastic_agent.core.account_binding import LeaseState
+
+        if (
+            released is None
+            or getattr(released, "state", None) != LeaseState.RELEASED
+        ):
+            raise RuntimeError(
+                f"release for lease {assignment.lease_id!r} did not return "
+                "a released lease"
+            )
+        target = released_worker_target(released)
+        if target:
+            # RELEASED is written only after detach, terminal EC2 readback and
+            # required control-plane cleanup.  Remove the disposable worker
+            # immediately instead of leaving it visible until the next cloud
+            # reconciliation pass.
+            await manager.remove_terminated_node_record(target)
         # Keep the in-memory claim if durable cleanup failed.  Together with the
         # ERROR lease this prevents accidental same-process reuse until release
         # is retried successfully.
-        await allocator.release_claim(assignment.claim_id)
+        await allocator.release_claim(
+            assignment.claim_id,
+            expected_owner=expected_claim_owner,
+            expected_account_id=assignment.account_id,
+        )
 
     return reserve_bound, attach_bound, release_bound
 

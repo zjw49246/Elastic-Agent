@@ -46,6 +46,9 @@ _LIFECYCLE_TAG_TO_METADATA = {
 }
 
 BoundNodeLostCallback = Callable[[str, str], Awaitable[None]]
+BoundLeaseReleasedCallback = Callable[
+    [str, str, str, str], Awaitable[bool]
+]
 _DEFINITIVE_MISSING_SCANS = 3
 
 
@@ -72,6 +75,9 @@ class CloudReconciler:
     can run the lease's detach/terminate cleanup before removing control-plane
     state. A failed callback is deliberately non-fatal to the scan; retaining
     the record makes the cleanup retryable on the next reconciliation pass.
+    The optional ``is_bound_released`` callback is positive proof that an exact
+    terminated row is already settled history; absence, false, or lookup error
+    always falls back to the normal fail-closed recovery path.
     """
 
     def __init__(
@@ -80,12 +86,14 @@ class CloudReconciler:
         registry: NodeRegistry,
         reconcile_interval: int = 300,
         on_bound_lost: BoundNodeLostCallback | None = None,
+        is_bound_released: BoundLeaseReleasedCallback | None = None,
         controller_id: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._reconcile_interval = reconcile_interval
         self._on_bound_lost = on_bound_lost
+        self._is_bound_released = is_bound_released
         self._controller_id = controller_id
         self._task: asyncio.Task | None = None
         self._running = False
@@ -241,7 +249,8 @@ class CloudReconciler:
                 for tag_key, metadata_key in _LIFECYCLE_TAG_TO_METADATA.items()
                 if (value := inst.tags.get(tag_key))
             }
-            if status == NodeStatus.TERMINATED and not metadata.get("lease_id"):
+            lease_id = str(metadata.get("lease_id") or "")
+            if status == NodeStatus.TERMINATED and not lease_id:
                 # EC2 keeps terminated instances visible for a while.  A
                 # disposable Job removes its NodeRecord immediately after
                 # termination; adopting that historical cloud row on every
@@ -252,6 +261,37 @@ class CloudReconciler:
                     "Reconciler: ignored terminated unbound orphan %s", oid
                 )
                 continue
+            if (
+                status == NodeStatus.TERMINATED
+                and lease_id
+                and self._is_bound_released is not None
+            ):
+                try:
+                    released = await self._is_bound_released(
+                        lease_id,
+                        inst.instance_id,
+                        str(metadata.get("account_id") or ""),
+                        str(metadata.get("job_id") or ""),
+                    )
+                except Exception:  # noqa: BLE001
+                    # The predicate is positive proof, never an availability
+                    # dependency.  Missing/corrupt/unreadable durable state is
+                    # UNKNOWN and must continue through adoption + cleanup.
+                    logger.exception(
+                        "Reconciler: cannot prove terminated bound orphan %s "
+                        "lease %s is released; recovering fail-closed",
+                        oid,
+                        lease_id,
+                    )
+                else:
+                    if released:
+                        logger.debug(
+                            "Reconciler: ignored terminated released orphan %s "
+                            "lease %s",
+                            oid,
+                            lease_id,
+                        )
+                        continue
             record = NodeRecord(
                 node_id=oid,
                 instance_id=inst.instance_id,

@@ -277,7 +277,7 @@ EC2 instances and attaches the addresses. Its terminal lifecycle is:
 
 ```text
 final collect → detach EIP → terminate EC2 and its root EBS → release lease
-                                                           ↳ retain EIP
+              → remove disposable Node record              ↳ retain EIP
 ```
 
 For example, explicitly assign two configured accounts to two workers:
@@ -332,6 +332,18 @@ Current EIP-binding constraints:
   [VPC pricing](https://aws.amazon.com/vpc/pricing/) and
   [VPC quotas](https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html)
   before provisioning a large account pool.
+
+EC2 may continue listing a terminated instance for several minutes. The
+Manager ignores that row only when the durable released lease proves an exact
+lease/instance/account/Job match and every teardown phase is committed.
+Unknown, incomplete, or mismatched state remains on the fail-closed recovery
+path. If another active lease already claims the same instance, reconciliation
+quarantines the conflict and performs no detach or termination.
+Node/task/runtime-status state and the account claim are removed only after an
+identity-matched durable lease returns `RELEASED`; otherwise they are retained
+so cleanup remains observable and retryable. A durable worker without an exact
+instance ID is treated as corrupt state, and claim cleanup additionally proves
+the exact claim owner and account before making that identity reusable.
 
 Bindings are created lazily on first EIP Job or explicitly through the
 authenticated management API:
@@ -508,6 +520,8 @@ uv run pytest -q \
   tests/unit/test_aws_provider.py \
   tests/unit/test_batch_hooks.py \
   tests/unit/test_batch_orchestrator.py \
+  tests/unit/test_reconciler.py \
+  tests/unit/test_manager.py \
   tests/unit/test_job_spec.py \
   tests/unit/test_api_batch.py
 ```

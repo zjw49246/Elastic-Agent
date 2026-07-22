@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -65,9 +66,14 @@ class FakeConn:
 class FakeRegistry:
     def __init__(self, node):
         self.node = node
+        self.removed = []
 
     async def get(self, worker_id):
-        return self.node if worker_id == self.node.node_id else None
+        return (
+            self.node
+            if self.node is not None and worker_id == self.node.node_id
+            else None
+        )
 
     async def update(self, worker_id, **fields):
         node = await self.get(worker_id)
@@ -76,6 +82,14 @@ class FakeRegistry:
         for key, value in fields.items():
             setattr(node, key, value)
         return node
+
+    async def remove(self, worker_id):
+        node = await self.get(worker_id)
+        if node is None:
+            return False
+        self.removed.append(worker_id)
+        self.node = None
+        return True
 
 
 class FakeManager:
@@ -92,6 +106,9 @@ class FakeManager:
         self.registry = FakeRegistry(node)
         self.provider = SimpleNamespace(
             wait_until_running=lambda iid: _async(SimpleNamespace(public_ip=host)))
+
+    async def remove_terminated_node_record(self, worker_id):
+        return await self.registry.remove(worker_id)
 
 
 async def _async(v):
@@ -184,6 +201,29 @@ class TestAccountAllocator:
         await alloc.release_claim(first.claim_id)
         reused = await alloc.reserve("job-2", "standard", account_id=first.account.id)
         assert reused.account.id == first.account.id
+        assert await alloc.get_claim(second.claim_id) is second
+
+    async def test_release_claim_refuses_crossed_identity(self, tmp_path):
+        alloc = AccountAllocator(await _store(tmp_path, [_acct(1)]))
+        claim = await alloc.reserve("job-1:0", "standard", account_id="a1")
+
+        with pytest.raises(AccountClaimConflictError, match="belongs to"):
+            await alloc.release_claim(
+                claim.claim_id,
+                expected_owner="job-other:0",
+                expected_account_id="a1",
+            )
+
+        assert await alloc.get_claim(claim.claim_id) is claim
+
+    async def test_release_owner_account_keeps_other_account_claims(self, tmp_path):
+        alloc = AccountAllocator(await _store(tmp_path, [_acct(1), _acct(2)]))
+        first = await alloc.reserve("job-1:0", "standard", account_id="a1")
+        second = await alloc.reserve("job-1:0", "standard", account_id="a2")
+
+        await alloc.release_owner_account("job-1:0", "a1")
+
+        assert await alloc.get_claim(first.claim_id) is None
         assert await alloc.get_claim(second.claim_id) is second
 
     async def test_mutation_guard_rejects_active_claim(self, tmp_path):
@@ -741,6 +781,7 @@ class FakeBindingManager:
         self.binding = None
         self.release_error = None
         self.released: set[str] = set()
+        self.leases = {}
 
     async def reserve(self, account_id, *, email, job_id, slot, region):
         self.calls.append(("reserve", account_id, job_id, slot, region))
@@ -751,23 +792,44 @@ class FakeBindingManager:
             eip_ip="198.51.100.42",
             region=region,
         )
-        return SimpleNamespace(lease_id=f"lease-{account_id}")
+        lease = SimpleNamespace(
+            lease_id=f"lease-{account_id}",
+            account_id=account_id,
+            job_id=job_id,
+            worker_id="",
+            instance_id=None,
+            state="reserved",
+        )
+        self.leases[lease.lease_id] = lease
+        return lease
+
+    async def get_lease(self, lease_id):
+        return self.leases.get(lease_id)
 
     async def get_binding(self, account_id):
         return self.binding if self.binding and self.binding.account_id == account_id else None
 
     async def attach_instance(self, lease_id, instance_id, worker_id):
         self.calls.append(("attach", lease_id, instance_id, worker_id))
-        return SimpleNamespace(lease_id=lease_id, instance_id=instance_id, worker_id=worker_id)
+        lease = self.leases[lease_id]
+        lease.instance_id = instance_id
+        lease.worker_id = worker_id
+        lease.state = "attached"
+        return lease
 
-    async def release(self, lease_id, cleanup_worker=None):
+    async def release(
+        self, lease_id, cleanup_worker=None, *, expected_lease=None
+    ):
         self.calls.append(("release", lease_id))
         if self.release_error:
             raise self.release_error
         self.released.add(lease_id)
-        lease = SimpleNamespace(lease_id=lease_id, worker_id="w1", instance_id="i-1")
+        lease = self.leases.get(lease_id)
+        if lease is None:
+            return None
         if cleanup_worker:
             await cleanup_worker(lease)
+        lease.state = "released"
         return lease
 
 
@@ -793,8 +855,6 @@ class TestBoundHooks:
         return mgr, alloc, hooks
 
     async def test_explicit_reserve_attach_updates_registry_then_release(self, tmp_path):
-        from elastic_agent.core.registry import NodeStatus
-
         mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
         assignment = await reserve("job-1", 0, self._spec(), "a1")
         assert assignment.account_id == "a1"
@@ -807,7 +867,7 @@ class TestBoundHooks:
         assert mgr.binding_manager.calls[1] == ("attach", "lease-a1", "i-1", "w1")
 
         await release(attached, "w1")
-        assert mgr.registry.node.status == NodeStatus.TERMINATED
+        assert mgr.registry.removed == ["w1"]
         assert mgr.connection_manager.disconnected == ["w1"]
         assert await alloc.get_claim(attached.claim_id) is None
 
@@ -852,13 +912,140 @@ class TestBoundHooks:
         assert assignment.account_id == "a1"
 
     async def test_durable_release_failure_retains_allocator_claim(self, tmp_path):
-        mgr, alloc, (reserve, _attach, release) = await self._setup(tmp_path)
+        mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
         assignment = await reserve("job-1", 0, self._spec(), "a1")
+        assignment = await attach("w1", assignment)
         mgr.binding_manager.release_error = RuntimeError("detach failed")
         with pytest.raises(RuntimeError, match="detach failed"):
             await release(assignment, "w1")
         assert await alloc.get_claim(assignment.claim_id) is not None
         assert mgr.connection_manager.disconnected == []
+
+    async def test_missing_durable_release_retains_node_and_allocator_claim(
+        self, tmp_path
+    ):
+        mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        assignment = await attach("w1", assignment)
+
+        async def missing_release(
+            _lease_id, cleanup_worker=None, *, expected_lease=None
+        ):
+            return None
+
+        mgr.binding_manager.release = missing_release
+
+        with pytest.raises(RuntimeError, match="did not return a released lease"):
+            await release(assignment, "w1")
+
+        assert mgr.registry.removed == []
+        assert mgr.registry.node is not None
+        assert mgr.connection_manager.disconnected == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
+
+    async def test_durable_worker_mismatch_retains_node_and_allocator_claim(
+        self, tmp_path
+    ):
+        mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        assignment = await attach("w1", assignment)
+
+        async def mismatched_release(
+            _lease_id, cleanup_worker=None, *, expected_lease=None
+        ):
+            lease = SimpleNamespace(
+                lease_id=assignment.lease_id,
+                account_id=assignment.account_id,
+                job_id=assignment.job_id,
+                worker_id="w-other",
+                instance_id="i-other",
+                state="releasing",
+            )
+            if cleanup_worker:
+                await cleanup_worker(lease)
+            return lease
+
+        mgr.binding_manager.release = mismatched_release
+
+        with pytest.raises(RuntimeError, match="conflicts with durable worker"):
+            await release(assignment, "w1")
+
+        assert mgr.registry.removed == []
+        assert mgr.registry.node is not None
+        assert mgr.connection_manager.disconnected == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
+
+    async def test_missing_durable_instance_retains_live_node_and_claim(
+        self, tmp_path
+    ):
+        mgr, alloc, (reserve, _attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        lease = mgr.binding_manager.leases[assignment.lease_id]
+        lease.worker_id = "w1"
+        lease.instance_id = None
+        release_calls = list(mgr.binding_manager.calls)
+
+        with pytest.raises(RuntimeError, match="has no instance id"):
+            await release(assignment, "w1")
+
+        assert mgr.binding_manager.calls == release_calls
+        assert mgr.registry.removed == []
+        assert mgr.registry.node is not None
+        assert mgr.connection_manager.disconnected == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
+
+    async def test_crossed_claim_refuses_cloud_release(self, tmp_path):
+        mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        assignment = await attach("w1", assignment)
+        crossed = await alloc.reserve(
+            "job-other:0", "standard", account_id="a2"
+        )
+        crossed_assignment = replace(
+            assignment, claim_id=crossed.claim_id
+        )
+        release_calls = list(mgr.binding_manager.calls)
+
+        with pytest.raises(AccountClaimConflictError, match="does not belong"):
+            await release(crossed_assignment, "w1")
+
+        assert mgr.binding_manager.calls == release_calls
+        assert mgr.registry.removed == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
+        assert await alloc.get_claim(crossed.claim_id) is crossed
+
+    async def test_durable_instance_mismatch_retains_node_and_allocator_claim(
+        self, tmp_path
+    ):
+        mgr, alloc, (reserve, _attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        lease = mgr.binding_manager.leases[assignment.lease_id]
+        lease.worker_id = "w1"
+        lease.instance_id = "i-other"
+
+        with pytest.raises(RuntimeError, match="conflicts with durable instance"):
+            await release(assignment, "w1")
+
+        assert mgr.registry.removed == []
+        assert mgr.registry.node is not None
+        assert mgr.connection_manager.disconnected == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
+
+    async def test_durable_assignment_mismatch_retains_node_and_allocator_claim(
+        self, tmp_path
+    ):
+        mgr, alloc, (reserve, attach, release) = await self._setup(tmp_path)
+        assignment = await reserve("job-1", 0, self._spec(), "a1")
+        assignment = await attach("w1", assignment)
+        mgr.binding_manager.leases[assignment.lease_id].account_id = "a2"
+
+        with pytest.raises(RuntimeError, match="does not match its worker assignment"):
+            await release(assignment, "w1")
+
+        assert mgr.registry.removed == []
+        assert mgr.registry.node is not None
+        assert mgr.connection_manager.disconnected == []
+        assert await alloc.get_claim(assignment.claim_id) is not None
 
     async def test_cancelled_durable_reserve_does_not_leak_allocator_claim(
         self, tmp_path
@@ -897,10 +1084,16 @@ class TestBoundHooks:
             binding_read_entered.set()
             await asyncio.Future()
 
-        async def gated_release(lease_id, cleanup_worker=None):
+        async def gated_release(
+            lease_id, cleanup_worker=None, *, expected_lease=None
+        ):
             cleanup_entered.set()
             await allow_cleanup.wait()
-            return await real_release(lease_id, cleanup_worker)
+            return await real_release(
+                lease_id,
+                cleanup_worker,
+                expected_lease=expected_lease,
+            )
 
         mgr.binding_manager.get_binding = blocked_get_binding
         mgr.binding_manager.release = gated_release
@@ -936,6 +1129,27 @@ class TestBoundHooks:
 
         mgr.binding_manager.get_binding = failed_get_binding
         mgr.binding_manager.release_error = RuntimeError("lease release failed")
+
+        with pytest.raises(RuntimeError, match="account claim retained"):
+            await reserve("job-1", 0, self._spec(), "a1")
+
+        assert await alloc.reserve(
+            "other", "standard", account_id="a1"
+        ) is None
+
+    async def test_post_reserve_missing_rollback_retains_claim(self, tmp_path):
+        mgr, alloc, (reserve, _attach, _release) = await self._setup(tmp_path)
+
+        async def failed_get_binding(_account_id):
+            raise RuntimeError("binding read failed")
+
+        async def missing_release(
+            _lease_id, cleanup_worker=None, *, expected_lease=None
+        ):
+            return None
+
+        mgr.binding_manager.get_binding = failed_get_binding
+        mgr.binding_manager.release = missing_release
 
         with pytest.raises(RuntimeError, match="account claim retained"):
             await reserve("job-1", 0, self._spec(), "a1")

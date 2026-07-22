@@ -1096,6 +1096,8 @@ class BindingManager:
         self,
         lease_id: str,
         cleanup_worker: CleanupWorkerHook | None = None,
+        *,
+        expected_lease: AccountLease | None = None,
     ) -> AccountLease | None:
         """Release a lease while preserving its account's EIP allocation.
 
@@ -1108,33 +1110,28 @@ class BindingManager:
         """
 
         async with self._lease_lock(lease_id):
-            return await self._release_locked(lease_id, cleanup_worker)
+            return await self._release_locked(
+                lease_id, cleanup_worker, expected_lease=expected_lease
+            )
 
     async def _release_locked(
         self,
         lease_id: str,
         cleanup_worker: CleanupWorkerHook | None,
+        *,
+        expected_lease: AccountLease | None,
     ) -> AccountLease | None:
-        lease = await self._store.get_lease(lease_id)
-        if lease is None or lease.state == LeaseState.RELEASED:
+        lease = await self._store.begin_release(
+            lease_id,
+            cleanup_worker_required=cleanup_worker is not None,
+            expected_lease=expected_lease,
+        )
+        if lease is None:
             return lease
-        if lease.launch_uncertain and not lease.instance_id:
-            raise RuntimeError(
-                f"lease {lease_id!r} has an unresolved instance launch; "
-                "bounded cloud-tag recovery must finish before release"
-            )
+        if lease.state == LeaseState.RELEASED:
+            return lease
 
         try:
-            updates: dict[str, object] = {
-                "state": LeaseState.RELEASING,
-                "last_operation": "release",
-                "error": None,
-            }
-            if cleanup_worker is not None:
-                updates["worker_cleanup_required"] = True
-            lease = await self._store.update_lease(lease_id, **updates)
-            assert lease is not None
-
             phase_errors: list[BaseException] = []
             binding = await self._store.get_binding(lease.account_id)
             identity = await self._provider.get_identity()

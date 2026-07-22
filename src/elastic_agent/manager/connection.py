@@ -266,7 +266,7 @@ class WorkerConnectionManager:
             raw = await conn.ws.receive_text()
             conn.last_message_at = _utcnow()
             current_conn = self._connections.get(conn.worker_id)
-            if current_conn is not None and current_conn is not conn:
+            if current_conn is not conn:
                 logger.info("Stopping stale message loop for worker %s", conn.worker_id)
                 break
 
@@ -431,7 +431,12 @@ class WorkerConnectionManager:
         return results
 
     async def disconnect_worker(self, worker_id: str) -> None:
-        conn = self._connections.pop(worker_id, None)
+        async with self._lock:
+            conn = self._connections.pop(worker_id, None)
+            self._worker_status.pop(worker_id, None)
+            status_event = self._worker_status_events.pop(worker_id, None)
+            if status_event is not None:
+                status_event.set()
         if conn:
             try:
                 await conn.ws.close()

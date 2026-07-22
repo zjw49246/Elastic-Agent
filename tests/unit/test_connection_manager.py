@@ -4,24 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from elastic_agent.core.protocols.messages import (
     AuthMessage,
-    AuthResultMessage,
-    ExecuteMessage,
     EventAckMessage,
     HeartbeatMessage,
-    LogMessage,
     ProcessExitMessage,
     StatusMessage,
-    StopMessage,
     parse_message,
 )
-from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
+from elastic_agent.core.registry import NodeRecord, NodeRegistry
 from elastic_agent.manager.connection import (
     WorkerConnection,
     WorkerConnectionManager,
@@ -316,6 +310,7 @@ class TestSendCommand:
             ).model_dump_json()
         ])
         conn = WorkerConnection("worker-1", ws)
+        manager._connections["worker-1"] = conn
 
         with pytest.raises(RuntimeError, match="coroutine raised StopIteration"):
             await manager._message_loop(conn)
@@ -392,15 +387,61 @@ class TestDisconnect:
         ws = FakeWebSocket()
         conn = WorkerConnection("worker-1", ws)
         manager._connections["worker-1"] = conn
+        manager._worker_status["worker-1"] = {"runtime_ready": True}
+        status_event = asyncio.Event()
+        manager._worker_status_events["worker-1"] = status_event
 
         await manager.disconnect_worker("worker-1")
 
         assert not manager.is_connected("worker-1")
+        assert manager.get_worker_status("worker-1") is None
+        assert "worker-1" not in manager._worker_status_events
+        assert status_event.is_set()
         assert ws.closed
 
     @pytest.mark.asyncio
     async def test_disconnect_nonexistent_worker(self, manager):
         await manager.disconnect_worker("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_queued_status_cannot_resurrect_cache_after_disconnect(
+        self, manager
+    ):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        status = StatusMessage(
+            cpu=1.0,
+            mem=2.0,
+            disk=3.0,
+            runtime_ready=True,
+            claude_cli_ok=True,
+        ).model_dump_json()
+
+        class GatedWebSocket(FakeWebSocket):
+            async def receive_text(self):
+                entered.set()
+                await release.wait()
+                return status
+
+        ws = GatedWebSocket()
+        conn = WorkerConnection("worker-1", ws)
+        manager._connections["worker-1"] = conn
+        delivered = []
+
+        async def on_message(worker_id, message):
+            delivered.append((worker_id, message.type))
+
+        manager.on_message = on_message
+        loop_task = asyncio.create_task(manager._message_loop(conn))
+        await entered.wait()
+
+        await manager.disconnect_worker("worker-1")
+        release.set()
+        await loop_task
+
+        assert manager.get_worker_status("worker-1") is None
+        assert "worker-1" not in manager._worker_status_events
+        assert delivered == []
 
 
 class TestVerifyToken:

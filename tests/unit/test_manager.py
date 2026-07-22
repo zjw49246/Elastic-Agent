@@ -279,6 +279,7 @@ class TestManagerLifecycle:
             assert recovered.eip_detached is True
             assert recovered.instance_terminated is True
             assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
+            assert await restarted.registry.get(instance.instance_id) is None
             assert (await provider.describe_eip(allocation_id)).instance_id is None
             assert len(provider.get_operations("release_eip")) == 0
             assert restarted.binding_recovery_ready is True
@@ -1379,6 +1380,367 @@ class TestEipRecoveryHardening:
 
         assert provider.get_operations("terminate") == []
         await manager.binding_manager.release(lease.lease_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_reconciler_never_raw_terminates_another_active_lease(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-live-claim", job_id="job-live-claim"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": "lease-unknown-tag",
+            },
+        ))
+        await manager.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+
+        result = await manager.reconciler.reconcile()
+
+        current = await manager.binding_manager.get_lease(lease.lease_id)
+        assert current.state == LeaseState.ATTACHING
+        assert result.orphans_adopted == [instance.instance_id]
+        assert result.bound_nodes_lost == [instance.instance_id]
+        assert await manager.registry.get(instance.instance_id) is not None
+        assert provider.get_operations("terminate") == []
+        assert provider.get_operations("disassociate_eip") == []
+
+        await manager.binding_manager.release(lease.lease_id)
+        await manager.registry.remove(instance.instance_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_quarantines_unknown_tag_claimed_by_active_lease(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-startup-claim", job_id="job-startup-claim"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": "lease-unknown-tag",
+            },
+        ))
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+
+        current = await restarted.binding_manager.get_lease(lease.lease_id)
+        assert current.state == LeaseState.ATTACHING
+        assert lease.lease_id in restarted._recovery_unsafe_lease_ids
+        assert restarted.binding_recovery_ready is False
+        assert provider.get_operations("terminate") == []
+        assert provider.get_operations("disassociate_eip") == []
+        await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_quarantines_durable_worker_registry_collision(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-worker-collision", job_id="job-worker-collision"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        worker_id = "worker-collision"
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id, instance.instance_id, worker_id
+        )
+        await previous.registry.add(NodeRecord(
+            node_id=worker_id,
+            instance_id="dryrun:i-other",
+            platform="dryrun",
+            status=NodeStatus.READY,
+        ))
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+
+        current = await restarted.binding_manager.get_lease(lease.lease_id)
+        node = await restarted.registry.get(worker_id)
+        assert current.state == LeaseState.ATTACHING
+        assert lease.lease_id in restarted._recovery_unsafe_lease_ids
+        assert restarted.binding_recovery_ready is False
+        assert node is not None
+        assert node.instance_id == "dryrun:i-other"
+        assert provider.get_operations("terminate") == []
+        assert provider.get_operations("disassociate_eip") == []
+        await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_quarantines_worker_without_durable_instance(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-missing-instance", job_id="job-missing-instance"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+        ))
+        await manager.registry.add(NodeRecord(
+            node_id="worker-missing-instance",
+            instance_id=instance.instance_id,
+            platform="dryrun",
+            status=NodeStatus.READY,
+        ))
+        corrupt = lease.model_copy(update={
+            "worker_id": "worker-missing-instance",
+            "instance_id": None,
+        })
+        real_get_lease = manager.binding_manager.get_lease
+
+        async def corrupt_get_lease(lease_id):
+            if lease_id == lease.lease_id:
+                return corrupt.model_copy(deep=True)
+            return await real_get_lease(lease_id)
+
+        manager.binding_manager.get_lease = corrupt_get_lease
+        manager._recovery_lease_ids.add(lease.lease_id)
+        manager._binding_recovery_scan_pending = False
+
+        await manager._recover_bound_resources_once()
+
+        assert lease.lease_id in manager._recovery_unsafe_lease_ids
+        assert await manager.registry.get("worker-missing-instance") is not None
+        assert provider.get_operations("terminate") == []
+        assert provider.get_operations("disassociate_eip") == []
+
+        manager.binding_manager.get_lease = real_get_lease
+        manager._recovery_lease_ids.discard(lease.lease_id)
+        await manager.binding_manager.release(
+            lease.lease_id, expected_lease=lease
+        )
+        await manager.registry.remove("worker-missing-instance")
+        await provider.terminate_instance(instance.instance_id)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_ignores_exact_released_terminated_history(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-startup-history", job_id="job-startup-history"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await previous.binding_manager.attach_instance(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        released = await previous.binding_manager.release(lease.lease_id)
+        assert released.state == LeaseState.RELEASED
+        terminate_count = len(provider.get_operations("terminate"))
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+
+        assert len(provider.get_operations("terminate")) == terminate_count
+        assert await restarted.registry.get(instance.instance_id) is None
+        assert restarted.binding_recovery_ready is True
+        await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_reconciler_forgets_released_terminated_lease_without_cloud_calls(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        lease = await manager.binding_manager.reserve(
+            "acct-released-history", job_id="job-released-history"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await manager.binding_manager.attach_instance(
+            lease.lease_id, instance.instance_id, instance.instance_id
+        )
+        released = await manager.binding_manager.release(lease.lease_id)
+        assert released.state == LeaseState.RELEASED
+        assert released.instance_id == instance.instance_id
+        assert await manager._is_reconciler_bound_released(
+            lease.lease_id,
+            instance.instance_id,
+            lease.account_id,
+            lease.job_id,
+        ) is True
+        assert await manager._is_reconciler_bound_released(
+            lease.lease_id,
+            "dryrun:i-other",
+            lease.account_id,
+            lease.job_id,
+        ) is False
+        for incomplete in (
+            released.model_copy(update={"state": LeaseState.ERROR}),
+            released.model_copy(update={"eip_detached": False}),
+            released.model_copy(update={"instance_terminated": False}),
+            released.model_copy(update={
+                "worker_cleanup_required": True,
+                "worker_cleanup_done": False,
+            }),
+            released.model_copy(update={"released_at": None}),
+        ):
+            assert manager._lease_proves_released_instance(
+                incomplete,
+                instance_id=instance.instance_id,
+                account_id=lease.account_id,
+                job_id=lease.job_id,
+            ) is False
+        terminate_count = len(provider.get_operations("terminate"))
+        worker_id = instance.instance_id
+        await manager.registry.add(NodeRecord(
+            node_id=worker_id,
+            instance_id=worker_id,
+            platform="dryrun",
+            status=NodeStatus.TERMINATED,
+            metadata={
+                "controller_id": manager.account_binding_store.controller_id,
+                "account_id": lease.account_id,
+                "lease_id": lease.lease_id,
+                "job_id": lease.job_id,
+            },
+        ))
+
+        await manager._on_reconciler_bound_lost(worker_id, lease.lease_id)
+
+        assert await manager.registry.get(worker_id) is None
+        assert len(provider.get_operations("terminate")) == terminate_count
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_released_history_never_suppresses_conflicting_active_claim(
+        self, tmp_config
+    ):
+        provider = DryRunProvider()
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        history = await manager.binding_manager.reserve(
+            "acct-history", job_id="job-history"
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": history.account_id,
+                "ElasticAgentJob": history.job_id,
+                "ElasticAgentLease": history.lease_id,
+            },
+        ))
+        await manager.binding_manager.attach_instance(
+            history.lease_id, instance.instance_id, instance.instance_id
+        )
+        released = await manager.binding_manager.release(history.lease_id)
+        assert released.state == LeaseState.RELEASED
+        terminate_count = len(provider.get_operations("terminate"))
+        disassociate_count = len(
+            provider.get_operations("disassociate_eip")
+        )
+
+        active = await manager.binding_manager.reserve(
+            "acct-active-conflict", job_id="job-active-conflict"
+        )
+        await manager.account_binding_store.begin_attach(
+            active.lease_id, instance.instance_id, instance.instance_id
+        )
+
+        result = await manager.reconciler.reconcile()
+
+        assert result.orphans_adopted == [instance.instance_id]
+        assert result.bound_nodes_lost == [instance.instance_id]
+        assert await manager.registry.get(instance.instance_id) is not None
+        assert (
+            await manager.binding_manager.get_lease(active.lease_id)
+        ).state == LeaseState.ATTACHING
+        assert len(provider.get_operations("terminate")) == terminate_count
+        assert len(
+            provider.get_operations("disassociate_eip")
+        ) == disassociate_count
+
+        await manager.binding_manager.release(active.lease_id)
+        await manager.registry.remove(instance.instance_id)
         await manager.stop()
 
     @pytest.mark.asyncio

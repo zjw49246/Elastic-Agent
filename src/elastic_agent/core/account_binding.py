@@ -322,6 +322,11 @@ class AccountBindingStore:
                 raise ValueError(
                     f"lease {lease.lease_id!r} has invalid state {lease.state!r}"
                 )
+            if lease.worker_id and not lease.instance_id:
+                raise ValueError(
+                    f"lease {lease.lease_id!r} identifies worker "
+                    f"{lease.worker_id!r} without an instance"
+                )
             if lease.state in {LeaseState.ATTACHING, LeaseState.ATTACHED} and (
                 not lease.instance_id
             ):
@@ -669,6 +674,75 @@ class AccountBindingStore:
             self._write_config_sync(candidate)
             return lease.model_copy(deep=True)
 
+    async def begin_release(
+        self,
+        lease_id: str,
+        *,
+        cleanup_worker_required: bool = False,
+        expected_lease: AccountLease | None = None,
+    ) -> AccountLease | None:
+        """Atomically validate lease identity and enter ``RELEASING``.
+
+        Identity-changing attach/recovery writes use this same store lock.  A
+        caller's snapshot therefore cannot be validated and then replaced by a
+        different instance before the release intent is durably committed.
+        """
+
+        async with self._lock:
+            self._ensure_loaded()
+            candidate = self._config.model_copy(deep=True)
+            lease = next(
+                (
+                    current
+                    for current in candidate.leases
+                    if current.lease_id == lease_id
+                ),
+                None,
+            )
+            if lease is None:
+                return None
+            if expected_lease is not None:
+                identity_fields = (
+                    "lease_id",
+                    "account_id",
+                    "job_id",
+                    "slot",
+                    "generation",
+                    "instance_id",
+                    "worker_id",
+                )
+                mismatched = [
+                    field
+                    for field in identity_fields
+                    if getattr(lease, field) != getattr(expected_lease, field)
+                ]
+                if mismatched:
+                    raise LeaseConflictError(
+                        f"lease {lease_id!r} changed identity before release: "
+                        + ", ".join(mismatched)
+                    )
+            if lease.state == LeaseState.RELEASED:
+                return lease.model_copy(deep=True)
+            if lease.worker_id and not lease.instance_id:
+                raise RuntimeError(
+                    f"lease {lease_id!r} identifies worker "
+                    f"{lease.worker_id!r} but has no durable instance id"
+                )
+            if lease.launch_uncertain and not lease.instance_id:
+                raise RuntimeError(
+                    f"lease {lease_id!r} has an unresolved instance launch; "
+                    "bounded cloud-tag recovery must finish before release"
+                )
+
+            lease.state = LeaseState.RELEASING
+            lease.last_operation = "release"
+            lease.error = None
+            if cleanup_worker_required:
+                lease.worker_cleanup_required = True
+            lease.touch()
+            self._write_config_sync(candidate)
+            return lease.model_copy(deep=True)
+
     async def update_lease(
         self, lease_id: str, **fields: Any
     ) -> AccountLease | None:
@@ -681,6 +755,32 @@ class AccountBindingStore:
             )
             if lease is None:
                 return None
+            release_started = lease.state in {
+                LeaseState.RELEASING,
+                LeaseState.RELEASED,
+            } or (
+                lease.state == LeaseState.ERROR
+                and lease.last_operation == "release"
+            )
+            identity_fields = {
+                "lease_id",
+                "account_id",
+                "job_id",
+                "slot",
+                "generation",
+                "instance_id",
+                "worker_id",
+            }
+            changed_identity = [
+                field
+                for field in identity_fields.intersection(fields)
+                if fields[field] != getattr(lease, field)
+            ]
+            if release_started and changed_identity:
+                raise LeaseConflictError(
+                    f"lease {lease_id!r} identity is frozen after release "
+                    "intent: " + ", ".join(sorted(changed_identity))
+                )
             self._patch(lease, fields)
             self._write_config_sync(candidate)
             return lease.model_copy(deep=True)

@@ -73,6 +73,7 @@ uv run pytest -q \
   tests/unit/test_aws_provider.py \
   tests/unit/test_batch_hooks.py \
   tests/unit/test_batch_orchestrator.py \
+  tests/unit/test_reconciler.py \
   tests/unit/test_job_spec.py \
   tests/unit/test_api_batch.py \
   tests/unit/test_manager_fleet_driver.py \
@@ -107,10 +108,14 @@ The focused suite covers:
 - validation of AWS EIP mode (`per_worker=1`, matching account/worker counts,
   and no in-place account rotation);
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
-  the temporary instance/root disk, release the lease, retain the EIP;
-- managed primary-ENI tagging plus tagged EIP/ENI detach authorization, and a
-  reconciler guard that ignores terminated unleased cloud history while still
-  recovering terminated leased orphans;
+  the temporary instance/root disk, require an identity-matched `RELEASED`
+  lease, clear task/Node/WS status state, retain the EIP, and preserve the Node
+  plus account claim on missing/conflicting durable state, crossed claim
+  identity, or a worker lease missing its durable instance ID;
+- managed primary-ENI tagging plus tagged EIP/ENI detach authorization, and
+  reconciler guards that ignore exact fully-released terminated history,
+  recover unknown/incomplete leased orphans fail-closed, and quarantine an
+  instance claimed by a conflicting active lease without cloud mutation;
 - bounded final collection (three attempts/300 seconds by default), IPv6
   disablement before login, current-source worker deployment, WSS enforcement,
   forced fresh runtime reconnect, strict request correlation, protected

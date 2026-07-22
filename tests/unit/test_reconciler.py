@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -272,6 +273,157 @@ async def test_terminated_bound_orphan_triggers_cleanup_immediately(
     assert result.orphans_adopted == ["aws:i-bound"]
     assert result.bound_nodes_lost == ["aws:i-bound"]
     assert await registry.get("aws:i-bound") is not None
+
+
+async def test_released_terminated_bound_orphan_is_not_adopted(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """AWS termination history must not resurrect a durably released lease."""
+    callback = AsyncMock()
+    is_bound_released = AsyncMock(return_value=True)
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-released",
+            state="terminated",
+            tags={
+                "ElasticAgentLease": "lease-released",
+                "ElasticAgentAccount": "account-1",
+                "ElasticAgentJob": "job-1",
+            },
+        )
+    ]
+
+    reconciler = CloudReconciler(
+        provider,
+        registry,
+        on_bound_lost=callback,
+        is_bound_released=is_bound_released,
+    )
+    first = await reconciler.reconcile()
+    second = await reconciler.reconcile()
+
+    assert is_bound_released.await_args_list[0].args == (
+        "lease-released", "aws:i-released", "account-1", "job-1"
+    )
+    assert is_bound_released.await_count == 2
+    callback.assert_not_awaited()
+    assert first.orphans_adopted == second.orphans_adopted == []
+    assert first.bound_nodes_lost == second.bound_nodes_lost == []
+    assert await registry.get("aws:i-released") is None
+
+
+async def test_released_lease_lookup_failure_adopts_terminated_orphan_fail_closed(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """An unreadable durable lease is unknown, never evidence of safe history."""
+    callback = AsyncMock()
+    is_bound_released = AsyncMock(side_effect=OSError("journal unavailable"))
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-unknown",
+            state="terminated",
+            tags={
+                "ElasticAgentLease": "lease-unknown",
+                "ElasticAgentAccount": "account-1",
+                "ElasticAgentJob": "job-1",
+            },
+        )
+    ]
+
+    result = await CloudReconciler(
+        provider,
+        registry,
+        on_bound_lost=callback,
+        is_bound_released=is_bound_released,
+    ).reconcile()
+
+    callback.assert_awaited_once_with("aws:i-unknown", "lease-unknown")
+    assert result.orphans_adopted == ["aws:i-unknown"]
+    assert result.bound_nodes_lost == ["aws:i-unknown"]
+
+
+async def test_released_lease_lookup_cancellation_propagates(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """Manager shutdown must not be converted into a recovery decision."""
+    is_bound_released = AsyncMock(side_effect=asyncio.CancelledError)
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-cancelled",
+            state="terminated",
+            tags={
+                "ElasticAgentLease": "lease-cancelled",
+                "ElasticAgentAccount": "account-1",
+                "ElasticAgentJob": "job-1",
+            },
+        )
+    ]
+
+    with pytest.raises(asyncio.CancelledError):
+        await CloudReconciler(
+            provider,
+            registry,
+            is_bound_released=is_bound_released,
+        ).reconcile()
+
+    assert await registry.get("aws:i-cancelled") is None
+
+
+async def test_released_terminated_orphan_identity_mismatch_is_cleaned(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """Only an exact durable lease/instance/account match may suppress recovery."""
+    callback = AsyncMock()
+    is_bound_released = AsyncMock(return_value=False)
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-mismatch",
+            state="terminated",
+            tags={
+                "ElasticAgentLease": "lease-released",
+                "ElasticAgentAccount": "account-other",
+                "ElasticAgentJob": "job-1",
+            },
+        )
+    ]
+
+    result = await CloudReconciler(
+        provider,
+        registry,
+        on_bound_lost=callback,
+        is_bound_released=is_bound_released,
+    ).reconcile()
+
+    is_bound_released.assert_awaited_once_with(
+        "lease-released", "aws:i-mismatch", "account-other", "job-1"
+    )
+    callback.assert_awaited_once_with("aws:i-mismatch", "lease-released")
+    assert result.orphans_adopted == ["aws:i-mismatch"]
+
+
+async def test_running_bound_orphan_is_never_suppressed_by_released_history_check(
+    registry: NodeRegistry, provider: AsyncMock
+) -> None:
+    """A billable live orphan must be cleaned even if its lease says released."""
+    callback = AsyncMock()
+    is_bound_released = AsyncMock(return_value=True)
+    provider.list_instances.return_value = [
+        _make_instance(
+            "aws:i-live",
+            tags={"ElasticAgentLease": "lease-released"},
+        )
+    ]
+
+    result = await CloudReconciler(
+        provider,
+        registry,
+        on_bound_lost=callback,
+        is_bound_released=is_bound_released,
+    ).reconcile()
+
+    is_bound_released.assert_not_awaited()
+    callback.assert_awaited_once_with("aws:i-live", "lease-released")
+    assert result.orphans_adopted == ["aws:i-live"]
 
 
 async def test_state_conflict_stopped(registry: NodeRegistry, provider: AsyncMock) -> None:

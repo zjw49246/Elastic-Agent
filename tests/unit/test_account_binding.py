@@ -127,6 +127,27 @@ async def test_contradictory_released_lease_fails_closed(tmp_path, mutation):
     assert path.read_text(encoding="utf-8") == source
 
 
+async def test_worker_without_instance_fails_closed_and_preserves_journal(
+    tmp_path,
+):
+    path = tmp_path / "bindings.json"
+    raw = BindingsConfig(
+        bindings=[AccountBinding(account_id="acc-1")],
+        leases=[AccountLease(
+            account_id="acc-1",
+            job_id="job-1",
+            worker_id="worker-1",
+        )],
+    ).model_dump(mode="json")
+    source = json.dumps(raw)
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(BindingStoreCorruptError, match="binding store is corrupt"):
+        await AccountBindingStore(str(path)).load()
+
+    assert path.read_text(encoding="utf-8") == source
+
+
 async def test_update_rejects_invalid_runtime_state_and_phase(tmp_path):
     store = _store(tmp_path)
     await store.upsert_binding(AccountBinding(account_id="acc-1"))
@@ -321,6 +342,28 @@ async def test_get_lease_by_instance_and_list_filters(tmp_path):
     assert (await store.get_lease_by_instance("aws:i-1")).lease_id == lease.lease_id
     assert len(await store.list_leases(account_id="acc-1", active_only=True)) == 1
     assert await store.get_lease_by_instance("aws:i-missing") is None
+
+
+async def test_release_intent_atomically_freezes_lease_identity(tmp_path):
+    store = _store(tmp_path)
+    await store.upsert_binding(AccountBinding(account_id="acc-1"))
+    lease = await store.reserve_lease("acc-1", job_id="job-1")
+
+    releasing = await store.begin_release(
+        lease.lease_id, expected_lease=lease
+    )
+    assert releasing.state == LeaseState.RELEASING
+
+    with pytest.raises(LeaseConflictError, match="identity is frozen"):
+        await store.update_lease(
+            lease.lease_id,
+            instance_id="aws:i-late",
+            worker_id="worker-late",
+        )
+
+    current = await store.get_lease(lease.lease_id)
+    assert current.instance_id is None
+    assert current.worker_id == ""
 
 
 async def test_remove_binding_refuses_active_lease(tmp_path):

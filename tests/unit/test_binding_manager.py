@@ -525,6 +525,24 @@ async def test_release_is_idempotent(tmp_path):
     assert await manager.release("missing", cleanup) is None
 
 
+async def test_release_expected_identity_is_checked_inside_lease_lock(tmp_path):
+    provider, store, manager = _make(tmp_path)
+    lease = await manager.reserve("acc-1", job_id="job-1")
+    instance = await _instance(provider)
+    expected = await manager.attach_instance(
+        lease.lease_id, instance.instance_id, "worker-1"
+    )
+    await store.update_lease(lease.lease_id, worker_id="worker-crossed")
+
+    with pytest.raises(LeaseConflictError, match="changed identity.*worker_id"):
+        await manager.release(lease.lease_id, expected_lease=expected)
+
+    current = await manager.get_lease(lease.lease_id)
+    assert current.state == LeaseState.ATTACHED
+    assert provider.get_operations("disassociate_eip") == []
+    assert provider.get_operations("terminate") == []
+
+
 async def test_release_failure_is_marked_and_retries_remaining_phases(tmp_path):
     provider, _store, manager = _make(tmp_path)
     lease = await manager.reserve("acc-1", job_id="job-1")
