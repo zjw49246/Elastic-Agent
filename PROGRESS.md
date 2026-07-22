@@ -348,3 +348,13 @@
 **以后避免**：不能长期接受“与本任务无关”的红色基线；语义变更必须同时更新集成断言。`BaseSettings` 默认会读取宿主环境，测默认值必须先清相关键，同时另测覆盖能力。文件发现器面对外部路径时，权限错误应隔离到单个候选根，不能让一个不可读的 fallback 阻断所有可读路径。
 
 **验证**：原 8 个失败逐条转绿；配置/凭证/额度/file-sync 组合回归 192 passed；完整套件 **2049 passed / 12 skipped / 0 failed**，`git diff --check` 通过。file-sync 两个历史文件原有 Ruff 15 项，本次前后数量不变；其余变更文件 Ruff 全绿。
+
+## 2026-07-22 可靠终态重连/ACK 竞态收口（commit `c2a9f9b`）
+
+**问题**：生产 Codex+EIP canary 已成功完成任务、S3 收集和资源释放，但终态 handler 在 `PROCESS_EXIT` 内完成 EC2/Node/WS 清理后，连接层仍向已关闭的旧 WebSocket 发送 `EVENT_ACK`，产生一条 closed-send traceback。并发复核继续发现：replacement 若在首个 handler 尚未结束时重放同一 event_id，会重复执行终态 handler；handler 完成附近的取消可遗留永不完成的 in-flight owner；subscriber 失败后若原 WS 保持在线，worker outbox 又只在重连时 replay，事件会永久不 ACK。
+
+**解决**：Manager 只向 identity 仍匹配的当前连接 ACK；旧连接已关闭/替换时保留 processed 结果，等待新连接 replay 后去重 ACK，活动连接的发送错误仍原样抛出。同一 event_id 用 in-flight Future 串行化，唯一 owner 成功后唤醒等待者，失败则由一个等待者重新竞争；claim/create 和同步 finish 均无取消点，handler 失败或取消不会留下悬挂 owner。可靠事件 subscriber 失败且没有并发接手者时，message loop 主动关闭 WS，让 worker durable outbox 通过重连重放。
+
+**以后避免**：at-least-once 不能只检查“处理后再 ACK”；还要覆盖处理期间 connection replacement、ACK 前主动清理 socket、handler failure/cancellation，以及无并发 replay 时如何强制下一次投递。event-id 的 in-flight 状态转移必须在无 await 的事件循环原子段内完成，不能把 owner 清理放在可取消的锁等待之后。
+
+**验证**：先用严格 WebSocket fake 复现生产同款异常，再覆盖 disconnect/replay、并发 replacement、failure takeover、handler cancellation、ACK 活动连接错误和失败后重连；Connection Manager 38 passed，Ruff 与 diff check 通过，独立复审无 blocker。完整套件 **2057 passed / 12 skipped / 0 failed**。触发修复的真实 Job `job-5a9e8c7df50112ffc4e64368f16b5360` 已完成 token-only Codex 自动登录与真实 `codex exec`，S3 五个对象逐项断言通过，出口精确为账号绑定 EIP `13.112.54.251`；EC2 `i-0d423ec97597f8031` 已终止且 root EBS 已删除，EIP 解绑保留，Node/active lease/allocation 均为 0。AWS terminated 历史行在边界后的两个完整 300 秒 reconcile 周期均保持 `cloud=1, registry=0, orphans=0, conflicts=0`，绑定 journal 哈希和 Manager PID/InvocationID 不变。
