@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -19,6 +20,11 @@ from deploy.aws_manager import (
 
 CALLER_ACCOUNT = "123456789012"
 SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
+MANAGER_POLICY = (
+    Path(__file__).resolve().parents[2]
+    / "deploy/aws/elastic-agent-manager-policy.json"
+)
+IAM_CUTOVER = Path(__file__).resolve().parents[2] / "deploy/aws/iam-cutover.md"
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
@@ -94,6 +100,23 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     ):
         assert setting in source
     assert "UnsetEnvironment=AWS_ACCESS_KEY_ID" in source
+
+
+def test_manager_policy_and_cutover_pin_real_key_pair_name():
+    policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
+    launch = next(
+        statement
+        for statement in policy["Statement"]
+        if statement["Sid"] == "LaunchWithPinnedInfrastructure"
+    )
+    expected = (
+        "arn:aws:ec2:ap-northeast-1:297645381734:"
+        "key-pair/interview-key"
+    )
+
+    assert expected in launch["Resource"]
+    assert expected in IAM_CUTOVER.read_text(encoding="utf-8")
+    assert not any("key-pair/key-" in resource for resource in launch["Resource"])
 
 
 def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
