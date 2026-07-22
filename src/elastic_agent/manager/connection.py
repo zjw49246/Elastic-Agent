@@ -98,6 +98,7 @@ class WorkerConnectionManager:
         self._worker_status: dict[str, dict[str, Any]] = {}
         self._worker_status_events: dict[str, asyncio.Event] = {}
         self._processed_event_ids: OrderedDict[str, None] = OrderedDict()
+        self._inflight_event_ids: dict[str, asyncio.Future[bool]] = {}
         self._processed_event_limit = 10_000
 
     @property
@@ -282,7 +283,107 @@ class WorkerConnectionManager:
                 self._worker_status[conn.worker_id] = msg.model_dump(mode="json")
                 self._worker_status_events.setdefault(conn.worker_id, asyncio.Event()).set()
 
-            await self._deliver_worker_message(conn, msg)
+            delivered = await self._deliver_worker_message(conn, msg)
+            event_id = str(getattr(msg, "event_id", "") or "")
+            if event_id and not delivered:
+                # Workers replay durable events only after reconnecting.  A
+                # subscriber failure must therefore end this connection; just
+                # continuing to read would strand the unacknowledged event in
+                # the worker outbox forever on an otherwise healthy socket.
+                logger.warning(
+                    "Closing worker connection %s after reliable event %s failed",
+                    conn.worker_id,
+                    event_id,
+                )
+                try:
+                    await conn.ws.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close worker %s after reliable event failure",
+                        conn.worker_id,
+                    )
+                break
+            if self._connections.get(conn.worker_id) is not conn:
+                logger.info(
+                    "Stopping closed message loop for worker %s",
+                    conn.worker_id,
+                )
+                break
+
+    async def _ack_reliable_event(
+        self, conn: WorkerConnection, event_id: str
+    ) -> bool:
+        """ACK on the same live connection, or let a reconnect replay it.
+
+        A terminal event handler can intentionally remove and close ``conn``
+        while collecting results and destroying its Worker.  Sending on that
+        stale socket would raise after the event was already handled.  Keep the
+        event in the deduplication set and ACK a later replay instead.  The
+        second identity check covers a concurrent close between the first
+        check and ``send`` without hiding failures on an active connection.
+        """
+        if self._connections.get(conn.worker_id) is not conn:
+            logger.debug(
+                "Skipping reliable event ACK on closed worker connection %s",
+                conn.worker_id,
+            )
+            return False
+        try:
+            await conn.send(EventAckMessage(event_id=event_id))
+        except Exception:
+            if self._connections.get(conn.worker_id) is not conn:
+                logger.debug(
+                    "Worker connection %s closed while sending reliable event ACK",
+                    conn.worker_id,
+                )
+                return False
+            raise
+        return True
+
+    async def _claim_reliable_event(
+        self, event_id: str
+    ) -> asyncio.Future[bool] | None:
+        """Become the event handler, or wait for the current handler.
+
+        A replacement connection can replay an event while the old connection
+        is still inside its handler.  The shared future serializes that window:
+        success turns the replay into a duplicate, while failure lets one
+        waiter claim the event and retry it.
+        """
+        while True:
+            # No await occurs between the lookup and insertion.  Asyncio runs
+            # this as one atomic event-loop segment, so a cancellation cannot
+            # leave a half-created owner behind.
+            if event_id in self._processed_event_ids:
+                self._processed_event_ids.move_to_end(event_id)
+                return None
+            pending = self._inflight_event_ids.get(event_id)
+            if pending is None:
+                pending = asyncio.get_running_loop().create_future()
+                self._inflight_event_ids[event_id] = pending
+                return pending
+            if await asyncio.shield(pending):
+                return None
+
+    def _finish_reliable_event(
+        self,
+        event_id: str,
+        owner: asyncio.Future[bool],
+        *,
+        success: bool,
+    ) -> None:
+        """Publish one handler outcome without introducing a cancel point."""
+        if self._inflight_event_ids.get(event_id) is not owner:
+            raise RuntimeError(
+                f"reliable event {event_id!r} lost its in-flight owner"
+            )
+        if success:
+            self._processed_event_ids[event_id] = None
+            self._processed_event_ids.move_to_end(event_id)
+            while len(self._processed_event_ids) > self._processed_event_limit:
+                self._processed_event_ids.popitem(last=False)
+        del self._inflight_event_ids[event_id]
+        owner.set_result(success)
 
     async def _deliver_worker_message(
         self, conn: WorkerConnection, msg: Message
@@ -295,28 +396,40 @@ class WorkerConnectionManager:
         can durably discard them.
         """
         event_id = str(getattr(msg, "event_id", "") or "")
-        if event_id and event_id in self._processed_event_ids:
-            self._processed_event_ids.move_to_end(event_id)
-            await conn.send(EventAckMessage(event_id=event_id))
-            return True
-
-        if self.on_message:
-            try:
-                await self.on_message(conn.worker_id, msg)
-            except Exception:
-                logger.exception(
-                    "on_message handler failed for worker=%s type=%s",
-                    conn.worker_id,
-                    msg.type,
-                )
-                return False
-
+        event_owner: asyncio.Future[bool] | None = None
         if event_id:
-            self._processed_event_ids[event_id] = None
-            self._processed_event_ids.move_to_end(event_id)
-            while len(self._processed_event_ids) > self._processed_event_limit:
-                self._processed_event_ids.popitem(last=False)
-            await conn.send(EventAckMessage(event_id=event_id))
+            event_owner = await self._claim_reliable_event(event_id)
+            if event_owner is None:
+                await self._ack_reliable_event(conn, event_id)
+                return True
+
+        try:
+            if self.on_message:
+                await self.on_message(conn.worker_id, msg)
+        except Exception:
+            logger.exception(
+                "on_message handler failed for worker=%s type=%s",
+                conn.worker_id,
+                msg.type,
+            )
+            if event_owner is not None:
+                self._finish_reliable_event(
+                    event_id, event_owner, success=False
+                )
+            return False
+        except BaseException:
+            if event_owner is not None:
+                self._finish_reliable_event(
+                    event_id, event_owner, success=False
+                )
+            raise
+
+        if event_owner is not None:
+            self._finish_reliable_event(
+                event_id, event_owner, success=True
+            )
+        if event_id:
+            await self._ack_reliable_event(conn, event_id)
         return True
 
     # ---- High-level command API ----

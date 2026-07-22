@@ -99,6 +99,7 @@ uv run pytest -q \
   tests/unit/test_codex_login.py \
   tests/unit/test_generic_harness.py \
   tests/unit/test_protocol_messages.py \
+  tests/unit/test_connection_manager.py \
   tests/unit/test_worker_runtime.py \
   tests/unit/test_bootstrap_steps.py \
   tests/unit/test_web_ui.py
@@ -141,9 +142,12 @@ The focused suite covers:
   reads and downloads, awaited Manager-side upload, explicit S3 failures, and
   force-termination plus Node-record removal (not registry-only draining) after
   ordinary Job completion;
-- ordered durable lifecycle-event replay, STATUS coverage during final sync,
-  cancellation during dispatch, non-blocking exhaustion/login rotation, and
-  live compensation retry after ordinary EC2 creation failures;
+- ordered durable lifecycle-event replay, single-handler in-flight replay with
+  failure/cancellation takeover, reconnect-on-handler-failure, stale-socket ACK
+  suppression with deduplicated reconnect ACK, active-socket send-error
+  propagation, STATUS coverage during final sync, cancellation during dispatch,
+  non-blocking exhaustion/login rotation, and live compensation retry after
+  ordinary EC2 creation failures;
 - `run.secret_env` resolution only at dispatch and rejection of plaintext
   cross-host WebSockets before AWS secrets are read; worker clone never receives
   the Manager's repository token;

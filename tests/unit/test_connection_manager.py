@@ -188,6 +188,7 @@ class TestConnectionManager:
     async def test_reliable_worker_event_is_acked_and_deduplicated(self, manager):
         ws = FakeWebSocket()
         conn = WorkerConnection("worker-1", ws)
+        manager._connections["worker-1"] = conn
         received = []
 
         async def on_message(worker_id, msg):
@@ -204,6 +205,264 @@ class TestConnectionManager:
         assert len(acks) == 2
         assert all(isinstance(ack, EventAckMessage) for ack in acks)
         assert all(ack.event_id == event.event_id for ack in acks)
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_cleanup_disconnect_replays_for_ack(self, manager):
+        """A terminal handler may intentionally close the worker before ACK."""
+        class CloseAwareWebSocket(FakeWebSocket):
+            async def send_text(self, data: str):
+                if self.closed:
+                    raise RuntimeError(
+                        'Cannot call "send" once a close message has been sent.'
+                    )
+                await super().send_text(data)
+
+        first_ws = CloseAwareWebSocket()
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        received = []
+
+        async def on_message(worker_id, msg):
+            received.append((worker_id, msg.task_id))
+            await manager.disconnect_worker(worker_id)
+
+        manager.on_message = on_message
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+
+        assert await manager._deliver_worker_message(first_conn, event) is True
+        assert first_ws.closed is True
+        assert first_ws.sent == []
+
+        # The worker may reconnect before its old outbox disappears.  The
+        # event remains deduplicated, and the active replacement receives the
+        # ACK needed to discard that replay without running cleanup twice.
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+
+        assert await manager._deliver_worker_message(second_conn, event) is True
+        assert received == [("worker-1", "task-1")]
+        ack = parse_message(second_ws.sent[0])
+        assert isinstance(ack, EventAckMessage)
+        assert ack.event_id == event.event_id
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_inflight_replay_waits_and_acks_replacement(
+        self, manager
+    ):
+        first_ws = FakeWebSocket()
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        received = []
+
+        async def on_message(worker_id, msg):
+            received.append((worker_id, msg.task_id))
+            entered.set()
+            await release.wait()
+
+        manager.on_message = on_message
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        first_delivery = asyncio.create_task(
+            manager._deliver_worker_message(first_conn, event)
+        )
+        await entered.wait()
+
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+        await first_ws.close()
+        replay_delivery = asyncio.create_task(
+            manager._deliver_worker_message(second_conn, event)
+        )
+        await asyncio.sleep(0)
+
+        assert received == [("worker-1", "task-1")]
+        assert replay_delivery.done() is False
+
+        release.set()
+        assert await first_delivery is True
+        assert await replay_delivery is True
+        assert received == [("worker-1", "task-1")]
+        assert first_ws.sent == []
+        ack = parse_message(second_ws.sent[0])
+        assert isinstance(ack, EventAckMessage)
+        assert ack.event_id == event.event_id
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_inflight_failure_allows_waiter_retry(self, manager):
+        first_ws = FakeWebSocket()
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        attempts = 0
+
+        async def on_message(_worker_id, _msg):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                entered.set()
+                await release.wait()
+                raise RuntimeError("first handler failed")
+
+        manager.on_message = on_message
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        first_delivery = asyncio.create_task(
+            manager._deliver_worker_message(first_conn, event)
+        )
+        await entered.wait()
+
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+        replay_delivery = asyncio.create_task(
+            manager._deliver_worker_message(second_conn, event)
+        )
+        await asyncio.sleep(0)
+        assert attempts == 1
+
+        release.set()
+        assert await first_delivery is False
+        assert await replay_delivery is True
+        assert attempts == 2
+        assert first_ws.sent == []
+        ack = parse_message(second_ws.sent[0])
+        assert isinstance(ack, EventAckMessage)
+        assert ack.event_id == event.event_id
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_cancelled_handler_releases_inflight(self, manager):
+        first_ws = FakeWebSocket()
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        entered = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocked_handler(_worker_id, _msg):
+            entered.set()
+            await block.wait()
+
+        manager.on_message = blocked_handler
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        first_delivery = asyncio.create_task(
+            manager._deliver_worker_message(first_conn, event)
+        )
+        await entered.wait()
+        first_delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_delivery
+
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+        calls = 0
+
+        async def successful_handler(_worker_id, _msg):
+            nonlocal calls
+            calls += 1
+
+        manager.on_message = successful_handler
+        assert await manager._deliver_worker_message(second_conn, event) is True
+        assert calls == 1
+        assert isinstance(parse_message(second_ws.sent[0]), EventAckMessage)
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_cancel_after_handler_cannot_strand_inflight(
+        self, manager
+    ):
+        first_ws = FakeWebSocket()
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+
+        async def self_cancelling_handler(_worker_id, _msg):
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+
+        manager.on_message = self_cancelling_handler
+        delivery = asyncio.create_task(
+            manager._deliver_worker_message(first_conn, event)
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+
+        assert event.event_id not in manager._inflight_event_ids
+        assert event.event_id in manager._processed_event_ids
+
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+        assert await manager._deliver_worker_message(second_conn, event) is True
+        assert isinstance(parse_message(second_ws.sent[0]), EventAckMessage)
+
+    @pytest.mark.asyncio
+    async def test_message_loop_stops_after_handler_disconnect(self, manager):
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        ws = FakeWebSocket([event.model_dump_json()])
+        conn = WorkerConnection("worker-1", ws)
+        manager._connections["worker-1"] = conn
+
+        async def on_message(worker_id, _msg):
+            await manager.disconnect_worker(worker_id)
+
+        manager.on_message = on_message
+
+        await manager._message_loop(conn)
+
+        assert ws.closed is True
+        assert ws.sent == []
+
+    @pytest.mark.asyncio
+    async def test_reliable_handler_failure_closes_loop_for_reconnect_replay(
+        self, manager
+    ):
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        first_ws = FakeWebSocket([event.model_dump_json()])
+        first_conn = WorkerConnection("worker-1", first_ws)
+        manager._connections["worker-1"] = first_conn
+        attempts = 0
+
+        async def on_message(_worker_id, _msg):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("subscriber failed")
+
+        manager.on_message = on_message
+        await manager._message_loop(first_conn)
+
+        assert first_ws.closed is True
+        assert first_ws.sent == []
+        assert event.event_id not in manager._processed_event_ids
+        assert event.event_id not in manager._inflight_event_ids
+
+        second_ws = FakeWebSocket()
+        second_conn = WorkerConnection("worker-1", second_ws)
+        manager._connections["worker-1"] = second_conn
+        assert await manager._deliver_worker_message(second_conn, event) is True
+        assert attempts == 2
+        ack = parse_message(second_ws.sent[0])
+        assert isinstance(ack, EventAckMessage)
+        assert ack.event_id == event.event_id
+
+    @pytest.mark.asyncio
+    async def test_reliable_event_ack_failure_on_active_connection_propagates(
+        self, manager
+    ):
+        class BrokenWebSocket(FakeWebSocket):
+            async def send_text(self, data: str):
+                raise RuntimeError("active socket send failed")
+
+        ws = BrokenWebSocket()
+        conn = WorkerConnection("worker-1", ws)
+        manager._connections["worker-1"] = conn
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+
+        with pytest.raises(RuntimeError, match="active socket send failed"):
+            await manager._deliver_worker_message(conn, event)
 
 
 class TestSendCommand:
