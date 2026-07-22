@@ -12,6 +12,7 @@ from elastic_agent.harness.generic import (
     GenericJobHarness,
     build_execute,
     compile_bootstrap_steps,
+    compile_job_setup_steps,
     load_harness_class,
     resolve_harness,
 )
@@ -27,10 +28,12 @@ class TestBootstrapSteps:
     def test_harness_step_carries_repo_and_commands(self):
         spec = _spec(setup={"repo": "https://x/y.git", "commands": ["uv sync"]})
         steps = GenericJobHarness(spec).get_bootstrap_steps()
-        assert len(steps) == 1
+        assert len(steps) == 2
         assert steps[0].name == "harness-code"
         assert "git clone" in steps[0].command
-        assert "uv sync" in steps[0].command
+        assert steps[1].name.endswith("legacy-commands")
+        assert steps[1].command == "uv sync"
+        assert steps[1].cwd == "/opt/elastic-agent/harness"
 
     def test_compile_full_sequence_order(self):
         spec = _spec(setup={"repo": "https://x/y.git", "commands": ["uv sync"]})
@@ -74,6 +77,56 @@ class TestBootstrapSteps:
             spec2, manager_url="u", auth_token="t", worker_id="w")]
         assert "docker-install" not in names2
 
+    def test_docker_environment_profile_enables_common_docker_step(self):
+        spec = _spec(environment={"profile": "ubuntu-agent-docker-v1"})
+        names = [step.name for step in compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+        )]
+        assert "docker-install" in names
+
+    def test_structured_setup_steps_run_as_job_user_with_own_policy(self):
+        spec = _spec(setup={
+            "steps": [{
+                "name": "install deps",
+                "command": "uv sync",
+                "env": {"UV_LINK_MODE": "copy"},
+                "cwd": "python",
+                "timeout": 1234,
+                "retries": 2,
+            }],
+        })
+        step = compile_job_setup_steps(spec, run_as="ubuntu")[0]
+        assert step.name.endswith("install-deps")
+        assert "sudo -n -H -u ubuntu" in step.command
+        assert "UV_LINK_MODE" in step.command
+        assert "/opt/elastic-agent/harness/python" in step.command
+        assert step.timeout == 1234
+        assert step.retry_count == 2
+        assert step.env == {}
+        assert step.cwd is None
+
+    def test_resolved_source_manifest_is_verified_before_setup(self):
+        commit = "a" * 40
+        spec = _spec(setup={
+            "repo": "https://github.com/x/y.git",
+            "ref": "release-v1",
+            "resolved_commit": commit,
+            "steps": [{"name": "install", "command": "uv sync"}],
+        })
+        steps = compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+            run_as="ubuntu",
+        )
+        clone = next(step for step in steps if step.name == "harness-code")
+        assert "--branch release-v1" in clone.command
+        assert "chown -R ubuntu:ubuntu" in clone.command
+        source = next(step for step in steps if "source-manifest" in step.name)
+        assert commit in source.command
+        assert steps.index(source) < next(
+            i for i, step in enumerate(steps)
+            if step.name.startswith("job-setup-") and step.name.endswith("install")
+        )
+
     def test_eip_binding_disables_ipv6_before_any_install_or_login(self):
         spec = _spec(account={"binding": "eip", "ids": ["acct-1"]})
         steps = compile_bootstrap_steps(
@@ -98,6 +151,37 @@ class TestBootstrapSteps:
         names = [s.name for s in compile_bootstrap_steps(
             spec, manager_url="u", auth_token="t", worker_id="w")]
         assert "harness-code" not in names
+
+    def test_worker_clone_never_receives_manager_git_token(self, monkeypatch):
+        monkeypatch.setenv("ELASTIC_AGENT_GIT_TOKEN", "ghp_manager_only_secret")
+        spec = _spec(setup={
+            "repo": "https://github.com/example/public.git",
+            "deliver": "worker_clone",
+        })
+
+        steps = compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+        )
+        command = next(
+            step.command for step in steps if step.name == "harness-code"
+        )
+
+        assert "ghp_manager_only_secret" not in command
+        assert "x-access-token" not in command
+        assert "https://github.com/example/public.git" in command
+
+    def test_repo_less_manager_rsync_still_runs_declared_setup(self):
+        spec = _spec(setup={
+            "deliver": "manager_rsync",
+            "target_dir": "/opt/jobs/repo-less",
+            "commands": ["mkdir -p results", "touch results/ready"],
+        })
+        names = [step.name for step in compile_bootstrap_steps(
+            spec, manager_url="u", auth_token="t", worker_id="w",
+        )]
+
+        assert "harness-code" in names
+        assert any(name.startswith("job-setup-") for name in names)
 
     def test_no_pty_omits_pty_steps(self):
         spec = _spec()
@@ -206,7 +290,7 @@ class TestBuildExecute:
         ex = build_execute(spec, WorkerContext(shard_index=2))
         assert ex["command"] == ["bash", "-lc", "bench --out 2"]
         assert ex["cwd"] == "/opt/h/repo"   # relative cwd joined under the repo root
-        assert ex["timeout"] is None  # 0 → no wall-clock limit
+        assert ex["timeout"] == 86_400  # legacy 0 → finite safety default
 
     def test_resume_appends_args(self):
         spec = _spec(

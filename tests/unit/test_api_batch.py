@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import os
 import stat
+import tarfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -97,6 +101,21 @@ class FakeBatch:
     async def submit(self, spec):
         # Route uses submit() (background bring-up); for tests it mirrors launch().
         return await self.launch(spec)
+
+    async def cancel_job(self, job_id, reason="job cancelled"):
+        from elastic_agent.core.batch_orchestrator import WorkerPhase
+
+        job = self._jobs.get(job_id)
+        if job is None:
+            return False
+        job.cancel_requested = True
+        job.cancel_reason = reason
+        job.launch_complete = True
+        job.resources_released = True
+        for run in job.runs.values():
+            run.phase = WorkerPhase.CANCELLED
+            run.error = reason
+        return True
 
     async def shutdown(self):
         return None
@@ -692,6 +711,27 @@ class TestJobsAPI:
         "account": {"mode": "none"},
     }
 
+    @staticmethod
+    def _idempotent_job_id(key: str) -> str:
+        return "job-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+    def _seed_job_journal(self, manager, key: str, state: str = "prepared") -> str:
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import persist_job_spec, update_job_state
+
+        job_id = self._idempotent_job_id(key)
+        persist_job_spec(
+            manager.config.registry.path, job_id, JobSpec.model_validate(self._SPEC),
+        )
+        if state != "prepared":
+            update_job_state(
+                manager.config.registry.path,
+                job_id,
+                state,
+                summary={"workers": 3, "phases": {state: 3}},
+            )
+        return job_id
+
     @pytest.mark.asyncio
     async def test_submit_returns_detail(self, client):
         r = await client.post("/api/jobs", json=self._SPEC)
@@ -700,6 +740,103 @@ class TestJobsAPI:
         assert body["workers"] == 3
         assert len(body["workers_detail"]) == 3
         assert all(w["phase"] == "running" for w in body["workers_detail"])
+
+    @pytest.mark.asyncio
+    async def test_submit_idempotency_key_never_launches_duplicate_fleet(
+        self, client, manager
+    ):
+        headers = {"Idempotency-Key": "request-123"}
+        first = await client.post("/api/jobs", json=self._SPEC, headers=headers)
+        second = await client.post("/api/jobs", json=self._SPEC, headers=headers)
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["job_id"] == second.json()["job_id"]
+        assert second.json()["idempotent_replay"] is True
+        assert manager.batch.started == [first.json()["job_id"]]
+
+    @pytest.mark.asyncio
+    async def test_idempotent_retry_reschedules_durably_prepared_job(
+        self, client, manager,
+    ):
+        key = "prepared-before-crash"
+        job_id = self._seed_job_journal(manager, key)
+
+        response = await client.post(
+            "/api/jobs", json=self._SPEC, headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["idempotent_replay"] is True
+        assert response.json()["done"] is False
+        assert manager.batch.started == [job_id]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["launching", "running"])
+    async def test_idempotent_retry_does_not_duplicate_interrupted_fleet(
+        self, client, manager, state,
+    ):
+        key = f"interrupted-{state}"
+        job_id = self._seed_job_journal(manager, key, state)
+
+        response = await client.post(
+            "/api/jobs", json=self._SPEC, headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["submission_state"] == state
+        assert response.json()["state"] == "interrupted"
+        assert response.json()["done"] is False
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled"])
+    async def test_idempotent_retry_reports_durable_terminal_state(
+        self, client, manager, state,
+    ):
+        key = f"terminal-{state}"
+        job_id = self._seed_job_journal(manager, key, state)
+
+        response = await client.post(
+            "/api/jobs", json=self._SPEC, headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["submission_state"] == state
+        assert response.json()["state"] == state
+        assert response.json()["done"] is True
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_reuse_with_different_spec_is_rejected(
+        self, client
+    ):
+        headers = {"Idempotency-Key": "request-conflict"}
+        assert (
+            await client.post("/api/jobs", json=self._SPEC, headers=headers)
+        ).status_code == 201
+        changed = {**self._SPEC, "name": "different"}
+        response = await client.post("/api/jobs", json=changed, headers=headers)
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_cancel_live_job_is_idempotent(self, client):
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+
+        first = await client.post(f"/api/jobs/{job_id}/cancel")
+        second = await client.post(f"/api/jobs/{job_id}/cancel")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["state"] == "cancelled"
+        assert all(
+            worker["phase"] == "cancelled"
+            for worker in first.json()["workers_detail"]
+        )
 
     @pytest.mark.asyncio
     async def test_submit_fsyncs_spec_before_starting_job(self, client, manager, monkeypatch):
@@ -764,6 +901,49 @@ class TestJobsAPI:
         assert detail["spec"]["name"] == "ai4sci"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("submission_state", "api_state", "done"),
+        [
+            ("prepared", "prepared", False),
+            ("running", "interrupted", False),
+            ("succeeded", "succeeded", True),
+        ],
+    )
+    async def test_recovered_list_and_get_use_submission_journal_state(
+        self, client, manager, submission_state, api_state, done,
+    ):
+        key = f"list-state-{submission_state}"
+        job_id = self._seed_job_journal(manager, key, submission_state)
+
+        item = (await client.get("/api/jobs")).json()["jobs"][0]
+        detail = (await client.get(f"/api/jobs/{job_id}")).json()
+
+        for view in (item, detail):
+            assert view["job_id"] == job_id
+            assert view["submission_state"] == submission_state
+            assert view["state"] == api_state
+            assert view["done"] is done
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [
+            ("get", ""),
+            ("post", "/cancel"),
+            ("post", "/resubmit"),
+            ("get", "/results"),
+            ("get", "/results/download"),
+        ],
+    )
+    async def test_job_routes_reject_non_component_job_ids(
+        self, client, method, suffix,
+    ):
+        response = await getattr(client, method)(f"/api/jobs/bad$id{suffix}")
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "invalid job_id"
+
+    @pytest.mark.asyncio
     async def test_list_includes_workers_detail(self, client):
         # The UI renders each job card straight from the list response, so every
         # item must carry workers_detail (no per-job detail fetch) — and drop the
@@ -782,6 +962,170 @@ class TestJobsAPI:
         # missing run.command
         assert (await client.post("/api/jobs", json={"name": "x"})).status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_plan_is_secret_safe_and_has_no_launch_side_effects(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket")
+        manager.config.provider.aws.worker_instance_profile = "worker-role"
+        spec = {
+            **self._SPEC,
+            "environment": {"profile": "ubuntu-agent-docker-v1"},
+            "setup": {
+                "repo": "https://github.com/org/repo.git",
+                "ref": "release-v1",
+                "resolved_commit": "a" * 40,
+                "steps": [{
+                    "name": "install", "command": "uv sync",
+                    "env": {"PRIVATE_VALUE": "supersecret"},
+                    "timeout": 1000, "retries": 1,
+                }],
+            },
+            "run": {
+                "command": "bench --token $TOKEN",
+                "env": {"TOKEN": "another-secret"},
+                "secret_env": {"DB_PASSWORD": "aws-ssm:///prod/db/password"},
+            },
+            "collect": {"paths": ["results"], "interval_seconds": 120},
+        }
+
+        response = await client.post("/api/jobs/plan", json=spec)
+
+        assert response.status_code == 200
+        plan = response.json()
+        assert plan["valid"] is True
+        assert plan["side_effects"] is False
+        assert plan["environment"]["docker"] is True
+        assert plan["results"]["mode"] == "worker-direct-s3"
+        assert plan["results"]["automatic_final_collect"] is True
+        assert plan["setup_steps"][0]["run_as"] == "job"
+        assert "PRIVATE_VALUE" in plan["setup_steps"][0]["env_keys"]
+        assert "supersecret" not in response.text
+        assert "another-secret" not in response.text
+        assert plan["run"]["secret_env_keys"] == ["DB_PASSWORD"]
+        assert "aws-ssm" not in response.text
+        assert plan["fanout"]["worst_case_worker_hours"] == 144
+        assert plan["fanout"]["instance_type_allowlist"] == [
+            manager.config.provider.aws.default_instance_type
+        ]
+        assert any(
+            "private repositories must use setup.deliver='manager_rsync'"
+            in warning
+            for warning in plan["warnings"]
+        )
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+        specs = Path(manager.config.registry.path).with_name("specs")
+        assert list(specs.glob("*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_submit_preflight_rejects_unavailable_region_before_persisting(
+        self, client, manager,
+    ):
+        spec = {**self._SPEC, "fanout": {"workers": 1, "region": "eu-west-1"}}
+
+        response = await client.post("/api/jobs", json=spec)
+
+        assert response.status_code == 422
+        assert "configured only for 'us-west-2'" in response.json()["detail"]
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+        specs = Path(manager.config.registry.path).with_name("specs")
+        assert list(specs.glob("*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_preflight_rejects_missing_account_capacity(self, client):
+        response = await client.post("/api/jobs/plan", json={
+            "name": "needs-accounts",
+            "run": {"command": "bench"},
+            "fanout": {"workers": 2},
+            "account": {"agent_type": "codex", "group": "prod"},
+        })
+
+        assert response.status_code == 422
+        assert "requires 2" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_job_detail_and_persisted_replay_redact_all_env_values(
+        self, client, manager,
+    ):
+        spec = {
+            **self._SPEC,
+            "setup": {"steps": [{
+                "name": "install", "command": "true",
+                "env": {"SETUP_TOKEN": "setup-plaintext"},
+            }]},
+            "run": {
+                "command": "true",
+                "env": {"VISIBLE_TOKEN": "run-plaintext"},
+                "secret_env": {
+                    "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
+                },
+            },
+        }
+        headers = {"Idempotency-Key": "redaction-replay"}
+        first = await client.post("/api/jobs", json=spec, headers=headers)
+        assert first.status_code == 201
+        body = first.json()["spec"]
+        assert body["run"]["env"] == {"VISIBLE_TOKEN": "[REDACTED]"}
+        assert body["run"]["secret_env"] == {
+            "SECRET_TOKEN": "[SECRET_REFERENCE]",
+        }
+        assert body["setup"]["steps"][0]["env"] == {
+            "SETUP_TOKEN": "[REDACTED]",
+        }
+        assert "plaintext" not in first.text
+        assert "aws-secretsmanager" not in first.text
+
+        # Force the idempotency path to use the persisted journal rather than
+        # the in-memory Job, and verify that response is redacted too.
+        manager.batch._jobs.clear()
+        replay = await client.post("/api/jobs", json=spec, headers=headers)
+        assert replay.status_code == 201
+        assert replay.json()["spec"] == body
+        assert "plaintext" not in replay.text
+        assert "aws-secretsmanager" not in replay.text
+
+        detail = await client.get(f"/api/jobs/{first.json()['job_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["spec"] == body
+
+    @pytest.mark.asyncio
+    async def test_preflight_instance_allowlist_fails_closed_and_can_be_configured(
+        self, client, monkeypatch,
+    ):
+        monkeypatch.delenv("ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES", raising=False)
+        custom = {
+            **self._SPEC,
+            "fanout": {"workers": 1, "instance_type": "m5.4xlarge"},
+        }
+        rejected = await client.post("/api/jobs/plan", json=custom)
+        assert rejected.status_code == 422
+        assert "not allowed" in rejected.json()["detail"]
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES", "t3.large,m5.4xlarge",
+        )
+        allowed = await client.post("/api/jobs/plan", json=custom)
+        assert allowed.status_code == 200
+        assert allowed.json()["fanout"]["instance_type"] == "m5.4xlarge"
+
+    @pytest.mark.asyncio
+    async def test_preflight_rejects_excess_worst_case_worker_hours(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_MAX_JOB_WORKER_HOURS", "100")
+        response = await client.post("/api/jobs", json={
+            **self._SPEC,
+            "fanout": {"workers": 3},
+            "ttl_seconds": 172800,
+        })
+
+        assert response.status_code == 422
+        assert "worker-hours 144" in response.json()["detail"]
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+
 
 class TestHarnessUpload:
     _CODE = (
@@ -792,7 +1136,15 @@ class TestHarnessUpload:
     )
 
     @pytest.mark.asyncio
-    async def test_upload_returns_ref(self, client):
+    async def test_upload_disabled_by_default(self, client):
+        response = await client.post("/api/jobs/harness", json={
+            "filename": "myh.py", "content": self._CODE, "class_name": "MyHarness",
+        })
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_upload_returns_ref(self, client, monkeypatch):
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
         r = await client.post("/api/jobs/harness", json={
             "filename": "myh.py", "content": self._CODE, "class_name": "MyHarness",
         })
@@ -801,14 +1153,16 @@ class TestHarnessUpload:
         assert ref.endswith(":MyHarness")
 
     @pytest.mark.asyncio
-    async def test_bad_filename_rejected(self, client):
+    async def test_bad_filename_rejected(self, client, monkeypatch):
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
         r = await client.post("/api/jobs/harness", json={
             "filename": "../evil.py", "content": self._CODE, "class_name": "MyHarness",
         })
         assert r.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_not_a_harness_rejected(self, client):
+    async def test_not_a_harness_rejected(self, client, monkeypatch):
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
         r = await client.post("/api/jobs/harness", json={
             "filename": "plain.py", "content": "class Nope:\n    pass\n", "class_name": "Nope",
         })
@@ -848,6 +1202,77 @@ class TestJobResults:
         assert len(r.content) > 0
 
     @pytest.mark.asyncio
+    async def test_local_results_ignore_symlinks_directories_and_special_files(
+        self, client, manager, tmp_path,
+    ):
+        jid = self._seed(manager, "job-safe-local")
+        base = Path(manager.config.registry.path).with_name("collected") / jid
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "stolen.json").write_text(json.dumps({"final_score": 999}))
+        (base / "linked-file.json").symlink_to(outside / "stolen.json")
+        (base / "linked-directory").symlink_to(outside, target_is_directory=True)
+        os.mkfifo(base / "named-pipe")
+
+        listed = await client.get(f"/api/jobs/{jid}/results")
+        downloaded = await client.get(f"/api/jobs/{jid}/results/download")
+
+        assert listed.status_code == 200
+        assert listed.json()["file_count"] == 2
+        assert listed.json()["scores"][0]["final_score"] == 39.06
+        assert all("linked" not in item["path"] for item in listed.json()["files"])
+        with tarfile.open(fileobj=io.BytesIO(downloaded.content), mode="r:gz") as archive:
+            names = archive.getnames()
+        assert names == [
+            "job-safe-local/run_metadata.json",
+            "job-safe-local/math.foo/res_b1.json",
+        ] or names == [
+            "job-safe-local/math.foo/res_b1.json",
+            "job-safe-local/run_metadata.json",
+        ]
+        assert all("linked" not in name and "named-pipe" not in name for name in names)
+
+    @pytest.mark.asyncio
+    async def test_collected_job_symlink_cannot_escape_root(
+        self, client, manager, tmp_path,
+    ):
+        collected = Path(manager.config.registry.path).with_name("collected")
+        collected.mkdir()
+        outside = tmp_path / "outside-results"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("must not escape")
+        (collected / "job-link").symlink_to(outside, target_is_directory=True)
+
+        response = await client.get("/api/jobs/job-link/results")
+
+        assert response.status_code == 400
+        assert "escapes collected root" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_download_uses_mode_0600_temp_file_and_cleans_it(
+        self, client, manager, monkeypatch, tmp_path,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        jid = self._seed(manager, "job-temp")
+        real_mkstemp = jobs_route.tempfile.mkstemp
+        created: list[tuple[Path, int]] = []
+
+        def recording_mkstemp(*args, **kwargs):
+            kwargs["dir"] = tmp_path
+            fd, raw_path = real_mkstemp(*args, **kwargs)
+            created.append((Path(raw_path), stat.S_IMODE(os.fstat(fd).st_mode)))
+            return fd, raw_path
+
+        monkeypatch.setattr(jobs_route.tempfile, "mkstemp", recording_mkstemp)
+
+        response = await client.get(f"/api/jobs/{jid}/results/download")
+
+        assert response.status_code == 200
+        assert created and created[0][1] == 0o600
+        assert all(not path.exists() for path, _ in created)
+
+    @pytest.mark.asyncio
     async def test_missing_results_404(self, client):
         assert (await client.get("/api/jobs/nope/results")).status_code == 404
 
@@ -862,6 +1287,284 @@ class TestJobResults:
         assert {j["job_id"] for j in body["jobs"]} == {"job-a", "job-b"}
         assert all(j["file_count"] == 2 for j in body["jobs"])
 
+    @pytest.mark.asyncio
+    async def test_configured_s3_list_failure_is_explicit_503(
+        self, client, monkeypatch,
+    ):
+        class BrokenPaginator:
+            def paginate(self, **kwargs):
+                raise RuntimeError("AccessDenied")
+
+        class BrokenS3:
+            def get_paginator(self, name):
+                return BrokenPaginator()
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client", lambda: BrokenS3(),
+        )
+
+        r = await client.get("/api/jobs/job-s3/results")
+        assert r.status_code == 503
+        assert "AccessDenied" in r.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_s3_unsafe_relative_object_key_is_rejected(
+        self, client, monkeypatch,
+    ):
+        class UnsafePaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-s3/../../manager-secret",
+                    "Size": 1,
+                }]}]
+
+        class UnsafeS3:
+            def get_paginator(self, name):
+                return UnsafePaginator()
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client", lambda: UnsafeS3(),
+        )
+
+        response = await client.get("/api/jobs/job-s3/results")
+
+        assert response.status_code == 503
+        assert "unsafe object key" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_s3_download_streams_objects_without_full_body_read(
+        self, client, monkeypatch,
+    ):
+        class StreamingBody(io.BytesIO):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.full_reads = 0
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    self.full_reads += 1
+                    raise AssertionError("archive attempted an unbounded object read")
+                return super().read(size)
+
+        body = StreamingBody(b"streamed-result")
+
+        class OneObjectPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-stream/output.txt",
+                    "Size": len(b"streamed-result"),
+                }]}]
+
+        class StreamingS3:
+            def get_paginator(self, name):
+                return OneObjectPaginator()
+
+            def get_object(self, **kwargs):
+                return {"Body": body}
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client", lambda: StreamingS3(),
+        )
+
+        response = await client.get("/api/jobs/job-stream/results/download")
+
+        assert response.status_code == 200
+        assert body.full_reads == 0
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
+            assert archive.extractfile("job-stream/output.txt").read() == b"streamed-result"
+
+    @pytest.mark.asyncio
+    async def test_s3_score_reads_are_bounded_and_attempt_limited(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class RecordingBody(io.BytesIO):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.read_sizes: list[int] = []
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                if size is None or size < 0:
+                    raise AssertionError("score parser attempted an unbounded read")
+                return super().read(size)
+
+        class ScorePaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [
+                    {"Key": f"jobs/job-scores/bad-{index}.json", "Size": 1}
+                    for index in range(5)
+                ]}]
+
+        class ScoreS3:
+            def __init__(self):
+                self.get_calls = 0
+                self.bodies: list[RecordingBody] = []
+
+            def get_paginator(self, name):
+                return ScorePaginator()
+
+            def get_object(self, **kwargs):
+                self.get_calls += 1
+                body = RecordingBody(b"x")  # invalid JSON must still count
+                self.bodies.append(body)
+                return {"Body": body, "ContentLength": 1}
+
+        s3 = ScoreS3()
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: s3)
+        monkeypatch.setattr(jobs_route, "RESULT_SCORE_MAX_ATTEMPTS", 2)
+
+        response = await client.get("/api/jobs/job-scores/results")
+
+        assert response.status_code == 200
+        assert response.json()["scores"] == []
+        assert s3.get_calls == 2
+        assert all(
+            size >= 0
+            for body in s3.bodies
+            for size in body.read_sizes
+        )
+
+    @pytest.mark.asyncio
+    async def test_s3_download_fails_closed_when_object_changes_after_list(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class ChangedPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-changing/output.txt",
+                    "Size": 3,
+                    "ETag": '"listed-version"',
+                }]}]
+
+        class ChangedS3:
+            def __init__(self):
+                self.get_kwargs = None
+
+            def get_paginator(self, name):
+                return ChangedPaginator()
+
+            def get_object(self, **kwargs):
+                self.get_kwargs = kwargs
+                return {
+                    "Body": io.BytesIO(b"new-larger-content"),
+                    "ContentLength": len(b"new-larger-content"),
+                    "ETag": '"new-version"',
+                }
+
+        s3 = ChangedS3()
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: s3)
+
+        response = await client.get("/api/jobs/job-changing/results/download")
+
+        assert response.status_code == 503
+        assert "changed" in response.json()["detail"]
+        assert s3.get_kwargs["IfMatch"] == '"listed-version"'
+
+    @pytest.mark.asyncio
+    async def test_s3_download_eof_probe_rejects_larger_body_without_metadata(
+        self, client, monkeypatch,
+    ):
+        class ChangedPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-changing-no-meta/output.txt",
+                    "Size": 3,
+                }]}]
+
+        class MetadataFreeS3:
+            def get_paginator(self, name):
+                return ChangedPaginator()
+
+            def get_object(self, **kwargs):
+                return {"Body": io.BytesIO(b"abcdef")}
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client",
+            lambda: MetadataFreeS3(),
+        )
+
+        response = await client.get(
+            "/api/jobs/job-changing-no-meta/results/download"
+        )
+
+        assert response.status_code == 503
+        assert "became larger" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_s3_download_enforces_object_and_byte_limits_before_get(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class ObjectsPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [
+                    {"Key": "jobs/job-limit/a", "Size": 2},
+                    {"Key": "jobs/job-limit/b", "Size": 2},
+                ]}]
+
+        class ObjectsS3:
+            get_calls = 0
+
+            def get_paginator(self, name):
+                return ObjectsPaginator()
+
+            def get_object(self, **kwargs):
+                self.get_calls += 1
+                raise AssertionError("limits must be checked before object download")
+
+        s3 = ObjectsS3()
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: s3)
+        monkeypatch.setattr(jobs_route, "RESULT_ARCHIVE_MAX_OBJECTS", 1)
+        monkeypatch.setattr(jobs_route, "RESULT_ARCHIVE_MAX_BYTES", 100)
+
+        too_many = await client.get("/api/jobs/job-limit/results/download")
+        assert too_many.status_code == 413
+
+        monkeypatch.setattr(jobs_route, "RESULT_ARCHIVE_MAX_OBJECTS", 10)
+        monkeypatch.setattr(jobs_route, "RESULT_ARCHIVE_MAX_BYTES", 3)
+        too_large = await client.get("/api/jobs/job-limit/results/download")
+        assert too_large.status_code == 413
+        assert s3.get_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_s3_download_object_failure_is_not_silently_skipped(
+        self, client, monkeypatch,
+    ):
+        class OneObjectPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-s3/workers/shard-00000/result.json",
+                    "Size": 2,
+                }]}]
+
+        class BrokenGetS3:
+            def get_paginator(self, name):
+                return OneObjectPaginator()
+
+            def get_object(self, **kwargs):
+                raise RuntimeError("NoSuchKey")
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client", lambda: BrokenGetS3(),
+        )
+
+        r = await client.get("/api/jobs/job-s3/results/download")
+        assert r.status_code == 503
+        assert "NoSuchKey" in r.json()["detail"]
+
 
 class TestBatchConsoleUI:
     @pytest.mark.asyncio
@@ -871,3 +1574,10 @@ class TestBatchConsoleUI:
         assert "Batch Console" in r.text
         assert "Submit Job" in r.text
         assert "Accounts" in r.text
+        assert 'id="jProfile"' in r.text
+        assert 'id="jRepoRef"' in r.text
+        assert 'id="jRunTimeout"' in r.text
+        assert 'id="jSpot"' in r.text
+        assert 'id="jSecretEnv"' in r.text
+        assert "aws-secretsmanager://" in r.text
+        assert "currently not support" not in r.text.lower()

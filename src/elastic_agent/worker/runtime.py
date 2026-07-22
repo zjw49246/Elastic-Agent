@@ -29,8 +29,8 @@ import websockets
 import websockets.exceptions
 
 from elastic_agent.core.protocols.messages import (
-    AccountLoginCancelMessage,
     AccountLoginCancelledMessage,
+    AccountLoginCancelMessage,
     AccountLoginMessage,
     AccountLoginOtpMessage,
     AccountLoginOtpRequiredMessage,
@@ -40,6 +40,7 @@ from elastic_agent.core.protocols.messages import (
     CredentialLoginMessage,
     CredentialLoginResultMessage,
     ErrorMessage,
+    EventAckMessage,
     ExecuteMessage,
     FileChangeMessage,
     FileContentMessage,
@@ -63,6 +64,7 @@ from elastic_agent.core.protocols.messages import (
     parse_message,
 )
 from elastic_agent.core.rate_limit import is_auth_failure, is_rate_limited
+from elastic_agent.core.secure_store import atomic_write_private, secure_state_directory
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,13 @@ class WorkerRuntime:
         self._worker_id = worker_id
         self._heartbeat_interval = heartbeat_interval
         self._log_dir = Path(log_dir)
+        self._event_outbox_path = self._log_dir / "event_outbox.json"
+        self._event_outbox_lock = asyncio.Lock()
+        self._reliable_events = self._load_reliable_events()
+        # A WebSocket send can fail after dequeue.  Keep that exact frame ahead
+        # of later STATUS/heartbeat frames across reconnects instead of putting
+        # it at the tail and reordering lifecycle state.
+        self._retry_send: str | None = None
 
         self._ws: Any = None
         self._authenticated = False
@@ -155,6 +164,11 @@ class WorkerRuntime:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._process_tasks: dict[str, asyncio.Task] = {}
         self._stdin_pipes: dict[str, asyncio.StreamWriter | None] = {}
+        # A process is removed from ``_processes`` before potentially slow final
+        # file sync and durable PROCESS_EXIT persistence.  Keep that transition
+        # visible to STATUS reconciliation so the Manager cannot mistake the
+        # narrow hand-off window for a lost terminal event.
+        self._exiting_task_ids: set[str] = set()
 
         # Mode-B exhaustion watch: task_id -> job_id for runs whose opaque
         # command should be scanned for rate-limit banners; _exhaustion_fired
@@ -216,6 +230,7 @@ class WorkerRuntime:
                     logger.info("Connected and authenticated to Manager at %s", self._manager_url)
 
                     await self._start_quota_checker()
+                    await self._replay_reliable_events()
 
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     sender_task = asyncio.create_task(self._sender_loop())
@@ -301,10 +316,22 @@ class WorkerRuntime:
 
     async def _sender_loop(self) -> None:
         while self._running and self._ws:
-            data = await self._send_queue.get()
+            data = self._retry_send
+            if data is None:
+                data = await self._send_queue.get()
+            sent = False
             try:
                 await self._ws.send(data)
-            except websockets.exceptions.ConnectionClosed:
+                sent = True
+                if self._retry_send == data:
+                    self._retry_send = None
+            except BaseException:
+                # The queue item used to be lost as soon as get() returned.  A
+                # disconnect/cancel at the send boundary must remain first;
+                # reliable terminal events are additionally replayed from the
+                # fsynced outbox and are safe to deliver more than once.
+                if not sent:
+                    self._retry_send = data
                 raise
 
     async def _receiver_loop(self) -> None:
@@ -338,6 +365,7 @@ class WorkerRuntime:
             "ACCOUNT_LOGIN": self._handle_account_login,
             "ACCOUNT_LOGIN_OTP": self._handle_account_login_otp,
             "ACCOUNT_LOGIN_CANCEL": self._handle_account_login_cancel,
+            "EVENT_ACK": self._handle_event_ack,
         }
         handler = handlers.get(msg.type)
         if handler:
@@ -434,7 +462,7 @@ class WorkerRuntime:
                 message=f"Failed to start process: {exc}",
                 recoverable=True,
             ))
-            await self._send_event(ProcessExitMessage(
+            await self._send_process_exit(ProcessExitMessage(
                 task_id=task_id,
                 exit_code=-1,
                 error_type="execute_failed",
@@ -518,6 +546,7 @@ class WorkerRuntime:
             if log_file is not None:
                 log_file.close()
             exit_code = proc.returncode if proc.returncode is not None else -1
+            await self._mark_task_exiting(task_id)
             self._processes.pop(task_id, None)
             self._process_tasks.pop(task_id, None)
             self._stdin_pipes.pop(task_id, None)
@@ -532,7 +561,9 @@ class WorkerRuntime:
                 except Exception:
                     logger.exception("Failed to force-sync files for task %s on exit", task_id)
 
-            await self._send_event(ProcessExitMessage(task_id=task_id, exit_code=exit_code))
+            await self._send_process_exit(
+                ProcessExitMessage(task_id=task_id, exit_code=exit_code)
+            )
 
     # ---- PTY-hosted execution (claude-pty) ----
 
@@ -578,7 +609,7 @@ class WorkerRuntime:
                 message=f"Failed to start PTY session: {exc}",
                 recoverable=True,
             ))
-            await self._send_event(ProcessExitMessage(
+            await self._send_process_exit(ProcessExitMessage(
                 task_id=task_id,
                 exit_code=-1,
                 error_type="execute_failed",
@@ -623,6 +654,7 @@ class WorkerRuntime:
         error_message: str | None = None,
     ) -> None:
         """Called by ElasticPTYBackend when a PTY turn/session finishes."""
+        await self._mark_task_exiting(task_id)
         timer = self._pty_timeouts.pop(task_id, None)
         if timer and not timer.done():
             timer.cancel()
@@ -638,7 +670,7 @@ class WorkerRuntime:
             except Exception:
                 logger.exception("Failed to force-sync files for PTY task %s", task_id)
 
-        await self._send_event(ProcessExitMessage(
+        await self._send_process_exit(ProcessExitMessage(
             task_id=task_id,
             exit_code=exit_code,
             session_id=session_id,
@@ -707,15 +739,37 @@ class WorkerRuntime:
         self._exhaustion_fired.add(task_id)
         job_id = self._exhaustion_watch.get(task_id, "")
         logger.warning(
-            "Task %s tripped exhaustion detector; signaling manager + interrupting", task_id
+            "Task %s tripped exhaustion detector; interrupting before rotation", task_id
         )
+        # Do not let the Manager dispatch a resumed command while the old
+        # command is still consuming the same credential/config directory.
+        # _monitor_process drains this stream and queues PROCESS_EXIT only after
+        # this RUN_EXHAUSTED event, so task-id guards can discard that stale exit.
+        proc = self._processes.get(task_id)
+        await self._stop_process(task_id, "SIGINT")
+        if proc is not None and proc.returncode is None:
+            if not await self._wait_process_exit(proc, 15):
+                logger.warning(
+                    "Task %s ignored SIGINT after exhaustion; sending SIGKILL",
+                    task_id,
+                )
+                await self._stop_process(task_id, "SIGKILL")
+                if not await self._wait_process_exit(proc, 5):
+                    # Rotating now would run two commands concurrently against
+                    # the same credential/config directory.  Let the eventual
+                    # PROCESS_EXIT fail the run instead of dispatching a resume
+                    # while ownership of the old process is still ambiguous.
+                    logger.error(
+                        "Task %s did not exit after exhaustion; refusing rotation",
+                        task_id,
+                    )
+                    return
         await self._send_event(RunExhaustedMessage(
             task_id=task_id,
             job_id=job_id,
             worker_id=self._worker_id or "unknown",
             reason="rate_limit",
         ))
-        await self._stop_process(task_id, "SIGINT")
 
     @staticmethod
     def _try_parse_ndjson(line: str) -> dict | None:
@@ -930,11 +984,13 @@ class WorkerRuntime:
             selected = claude
         runtime_ready = bool(selected["ok"])
 
+        pending_process_exits = await self._pending_process_exit_task_ids()
         await self._send_event(StatusMessage(
             cpu=round(cpu, 1),
             mem=round(mem, 1),
             disk=round(disk, 1),
             active_processes=self.active_processes,
+            pending_process_exits=pending_process_exits,
             runtime_ready=runtime_ready,
             runtime_error=None if runtime_ready else selected["error"],
             agent_type=expected_agent,
@@ -1587,8 +1643,119 @@ class WorkerRuntime:
 
     # ---- Send helper ----
 
+    def _load_reliable_events(self) -> dict[str, str]:
+        """Load terminal events that were not acknowledged before a restart."""
+        try:
+            if not self._event_outbox_path.is_file():
+                return {}
+            payload = json.loads(self._event_outbox_path.read_text(encoding="utf-8"))
+            events = payload.get("events", []) if isinstance(payload, dict) else []
+            ordered: dict[str, str] = {}
+            if isinstance(events, list):
+                # v2 stores an explicit sequence.  Dict key sorting must never
+                # be allowed to reorder RUN_EXHAUSTED and its later PROCESS_EXIT.
+                for item in events:
+                    if not isinstance(item, dict):
+                        continue
+                    event_id = item.get("event_id")
+                    data = item.get("data")
+                    if event_id and isinstance(data, str):
+                        ordered[str(event_id)] = data
+                return ordered
+            if isinstance(events, dict):
+                # v1 compatibility: retain the order present in the JSON object.
+                # Older files may already have been key-sorted, but accepting
+                # them prevents an upgrade from discarding terminal events.
+                for event_id, data in events.items():
+                    if event_id and isinstance(data, str):
+                        ordered[str(event_id)] = data
+                return ordered
+            raise ValueError("event outbox events must be an ordered list or object")
+        except Exception:
+            logger.exception("Failed to load durable worker event outbox")
+            return {}
+
+    def _persist_reliable_events(self) -> None:
+        secure_state_directory(self._log_dir)
+        atomic_write_private(
+            self._event_outbox_path,
+            json.dumps(
+                {
+                    "version": 2,
+                    "events": [
+                        {"event_id": event_id, "data": data}
+                        for event_id, data in self._reliable_events.items()
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    async def _replay_reliable_events(self) -> None:
+        """Send fsynced terminal events before any queued STATUS on reconnect.
+
+        Authentication has completed and the Manager can buffer ACK frames even
+        though the receiver task starts immediately after this method returns.
+        Direct sends preserve the required terminal-event-before-snapshot order;
+        the durable outbox remains authoritative until those ACKs are handled.
+        """
+        async with self._event_outbox_lock:
+            pending = list(self._reliable_events.values())
+        for data in pending:
+            if self._ws is None:
+                return
+            await self._ws.send(data)
+
+    async def _pending_process_exit_task_ids(self) -> list[str]:
+        """Snapshot exiting/unacknowledged task ids for STATUS reconciliation."""
+        async with self._event_outbox_lock:
+            pending = list(self._reliable_events.values())
+            task_ids: set[str] = set(self._exiting_task_ids)
+        for data in pending:
+            try:
+                payload = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if payload.get("type") == "PROCESS_EXIT" and payload.get("task_id"):
+                task_ids.add(str(payload["task_id"]))
+        return sorted(task_ids)
+
+    async def _mark_task_exiting(self, task_id: str) -> None:
+        async with self._event_outbox_lock:
+            self._exiting_task_ids.add(task_id)
+
+    async def _send_process_exit(self, msg: ProcessExitMessage) -> None:
+        """Bridge active-process removal to a durable PROCESS_EXIT atomically.
+
+        ``_send_event`` fsyncs the event while holding ``_event_outbox_lock``.
+        We clear the transient marker only after that durable map contains this
+        exact event, so every STATUS snapshot sees either ``exiting`` or an
+        unacknowledged PROCESS_EXIT (and briefly both), never neither.
+        """
+        await self._mark_task_exiting(msg.task_id)
+        await self._send_event(msg)
+        async with self._event_outbox_lock:
+            if msg.event_id in self._reliable_events:
+                self._exiting_task_ids.discard(msg.task_id)
+
+    async def _handle_event_ack(self, msg: EventAckMessage) -> None:
+        async with self._event_outbox_lock:
+            if self._reliable_events.pop(msg.event_id, None) is None:
+                return
+            self._persist_reliable_events()
+
     async def _send_event(self, msg: Message) -> None:
         try:
-            await self._send_queue.put(msg.model_dump_json())
+            data = msg.model_dump_json()
+            event_id = getattr(msg, "event_id", "")
+            if event_id:
+                async with self._event_outbox_lock:
+                    self._reliable_events[str(event_id)] = data
+                    self._persist_reliable_events()
+            await self._send_queue.put(data)
         except Exception:
-            logger.debug("Failed to queue message of type %s", msg.type)
+            # Critical events must never be silently discarded.  The process
+            # monitor cannot retry an exit later, so surface persistence/queue
+            # failures loudly while preserving the local process log.
+            logger.exception("Failed to queue message of type %s", msg.type)

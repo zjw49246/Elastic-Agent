@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,40 @@ async def test_atomic_write(registry_path: Path) -> None:
     await reg.add(_make_record())
     assert registry_path.exists()
     assert not registry_path.with_suffix(".tmp").exists()
+
+
+async def test_registry_state_permissions_are_private(registry_path: Path) -> None:
+    registry_path.parent.chmod(0o755)
+    reg = NodeRegistry(registry_path)
+    await reg.add(_make_record(auth_token="worker-bearer"))
+
+    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
+
+
+async def test_load_repairs_legacy_registry_permissions(registry_path: Path) -> None:
+    registry_path.write_text('{"nodes": {}}', encoding="utf-8")
+    registry_path.chmod(0o644)
+    registry_path.parent.chmod(0o755)
+
+    await NodeRegistry(registry_path).load()
+
+    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
+
+
+async def test_load_repairs_recovery_job_spec_permissions(registry_path: Path) -> None:
+    registry_path.write_text('{"nodes": {}}', encoding="utf-8")
+    specs = registry_path.with_name("specs")
+    specs.mkdir(mode=0o755)
+    spec = specs / "job-legacy.json"
+    spec.write_text("{}", encoding="utf-8")
+    spec.chmod(0o644)
+
+    await NodeRegistry(registry_path).load()
+
+    assert stat.S_IMODE(specs.stat().st_mode) == 0o700
+    assert stat.S_IMODE(spec.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------

@@ -107,11 +107,17 @@ from elastic_agent.core.job_spec import JobSpec
 
 spec = JobSpec.model_validate({
     "name": "ai4sci-opus48-seed128",
-    "setup": {"repo": "https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git",
-              "commands": ["uv sync"]},
+    "environment": {"profile": "ubuntu-agent-docker-v1"},
+    "setup": {
+        "repo": "https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git",
+        "ref": "main",
+        "steps": [{"name": "install", "command": "uv sync",
+                   "timeout": 1200, "retries": 1}],
+    },
     "run": {"command": 'uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"',
             "env": {"AI4SCI_SANDBOX_CPU": "1", "AI4SCI_SANDBOX_MEM": "4g"},
-            "cwd": "Agent-AI4Sci-Bench"},
+            "cwd": ".", "timeout": 86400, "shell": True},
+    "ttl_seconds": 172800,
     "account": {"mode": "worker_local_login", "per_worker": 1},
     "rotation": {"strategy": "on_exhaust_restart_resume",
                  "resume_args": '--resume "results/opus48_$(hostname -s)_seed128"'},
@@ -122,6 +128,52 @@ job = await manager.batch.launch(spec)   # scale → bootstrap → login → run
 
 Template `{{shard_index}}` / `{{num_shards}}` / `{{hostname}}` are rendered by the
 Manager; shell constructs like `$(hostname -s)` are evaluated on the worker.
+
+`environment.profile` selects a versioned common platform definition maintained
+by the framework. Jobs add only their repository, setup steps, datasets, run
+environment, and command. `ubuntu-agent-v1` is the compatibility default;
+`ubuntu-agent-docker-v1` adds the common Docker capability. Profile ids are
+immutable—publish/select a new `*-vN` id instead of changing an old Job's base
+environment.
+
+Legacy `setup.commands: ["..."]` remains accepted and runs as one shell. New
+`setup.steps` entries have independent `name`, `command`, `env`, `cwd`,
+`timeout`, and `retries`; every Job-owned setup operation runs as the same
+non-root Job/runtime user that later executes `run.command`. Use `setup.ref` for
+a branch/tag and provide the full `setup.resolved_commit` when replay must fail
+unless the checkout is byte-for-byte the expected Git revision.
+
+JobSpec sections reject unknown fields instead of silently ignoring typos.
+Missing, `null`, or legacy-zero `run.timeout` is normalized to 24 hours;
+`ttl_seconds` defaults to 48 hours, must cover the run timeout, and both are
+capped at 30 days. Preview the resolved source, setup policy, command, capacity,
+account availability, and S3 collection mode without creating any state:
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $EA_TEST_KEY" \
+  -H 'Content-Type: application/json' \
+  --data @job.json "$EA_TEST_URL/api/jobs/plan"
+```
+
+Real submit and resubmit repeat this pure preflight before persisting a spec,
+claiming an account, or creating an instance. A Job cannot select a different
+Region from the Manager's configured provider; cross-Region AMI/subnet/security
+group selection is not currently supported.
+
+Keep plaintext values in `run.env`. For managed secrets, put only AWS references
+in `run.secret_env`, for example `{"OPENAI_API_KEY":
+"aws-secretsmanager://prod/agent#OPENAI_API_KEY"}` or an `aws-ssm://...`
+reference. The reference is persisted and shown in plans, while the value is
+resolved immediately before dispatch and is never returned by the Job API.
+Cross-host secret delivery requires `ELASTIC_AGENT_MANAGER_URL=wss://...`;
+plaintext WebSocket delivery is rejected before Secrets Manager/SSM is read.
+
+`setup.repo` must be a remote HTTP(S), SSH/Git, or scp-style Git URL and may not
+contain embedded HTTP credentials, query parameters, or fragments. Use
+`worker_clone` only for a repository the Worker can clone without a Manager
+credential. Private repositories should use `manager_rsync`; the Manager uses
+`ELASTIC_AGENT_GIT_TOKEN` only for its local clone and does not copy `.git` or
+the token to the Worker.
 
 ### Account data and worker-local auto-login
 
@@ -297,20 +349,62 @@ JobSpec in a mode-`0600` recovery journal before registration, account/EIP
 reservation, or cloud creation; a journal failure produces no launch side
 effect. An EIP Job also reserves the whole fanout against provider
 `max_instances` before allocating any EIP. Schema limits are 100 workers, 32
-accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for nonzero run timeouts,
+accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for run timeout/Job TTL,
 and an 86,400-second collection interval; provider `max_instances` defaults to
 30. At terminal state, periodic collection stops and final collection is awaited
 for up to three attempts/300 seconds before teardown. Collection failure marks
 the Job failed but does not retain the billable EC2 indefinitely.
 
-**Upload-code escape hatch**: for jobs needing custom logic, set
-`harness_ref: "module:Class"` (or upload a `.py` via `POST /api/jobs/harness`) to
-drive the job with a real `Harness` subclass instead.
+Collected output is isolated per stable fan-out slot at
+`<prefix>/<job_id>/workers/shard-00000/...` (with a collision-resistant Worker
+ID fallback during restart recovery), so same-named files from different
+Workers cannot overwrite each other. Every slot includes
+`_elastic_agent/collection.json` with its Job, Worker, shard, paths, collection
+time, and transfer mode. `collect.interval_seconds > 0` uploads snapshots while
+the command runs; success and failure both perform an awaited final collection.
+
+S3 upload is automatic only when `ELASTIC_AGENT_RESULTS_S3_BUCKET` is set. On
+AWS Workers with `worker_instance_profile`, each Worker pushes directly with its
+instance role. Otherwise results first rsync to the Manager and its configured
+AWS credentials upload them. `ELASTIC_AGENT_RESULTS_S3_PREFIX` defaults to
+`jobs`. With no bucket, results remain under the Manager's `collected/` tree;
+with a bucket configured, upload/list/download failures are explicit and a
+failed final upload marks the Job failed instead of silently reporting durable
+results.
+
+Only files below the explicitly declared `collect.paths` are collected. An
+empty list is an intentional no-op; the Batch Console defaults this field to
+`results`, while API/SDK callers must set it themselves. Worker stdout/stderr
+remain execution logs and are **not** automatically result objects—redirect or
+write them into a collected directory if they must be retained in S3. Final
+collection also runs for failed and cancelled Jobs, so already-written partial
+results are preserved before the ephemeral EC2 is terminated.
+
+Use an `Idempotency-Key` header when retrying `POST /api/jobs`: the same key and
+spec resolve to the same deterministic Job, while reusing it for different
+content returns `409`. `POST /api/jobs/{job_id}/cancel` sends TERM/KILL as
+needed, waits for the reliable process-exit event, performs final collection,
+and then force-terminates ordinary Job Workers (EIP Jobs detach/terminate via
+their lease). On restart, durable `prepared/launching/running/terminal` state is
+used to resume preparation or collect and clean up interrupted Workers.
+
+For cost control, `ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES` is a comma-separated
+Job allowlist (default: only the provider's configured instance type), and
+`ELASTIC_AGENT_MAX_JOB_WORKER_HOURS` caps `fanout.workers * ttl_seconds / 3600`
+(default 1440). These checks happen before Job persistence or cloud creation.
+
+**Upload-code escape hatch**: because a Python Harness executes arbitrary code
+inside the Manager, upload and `harness_ref` use are disabled by default. A
+trusted deployment may explicitly set `ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD=1`,
+then upload a `.py` through `POST /api/jobs/harness` and use the returned
+`harness_ref`. Prefer declarative JobSpec for untrusted submitters.
 
 **Frontend**: the Batch Console at `/batch` manages Claude and Codex identities,
 accepts write-only OpenAI passwords/mailbox query tokens (at least one for Codex), filters
 Job account choices by `agent_type`, and displays active Codex OTP challenges
-with a six-digit submission form. REST includes `/api/accounts`,
+with a six-digit submission form. API keys are accepted only in the
+`Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
+`sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, and `/api/jobs/harness`.
 
 Live batch runs require provision/login hooks wired at deployment:

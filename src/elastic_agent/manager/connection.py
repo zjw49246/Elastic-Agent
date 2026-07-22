@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Awaitable
-from contextlib import asynccontextmanager
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,22 +25,21 @@ from elastic_agent.core.auth import verify_token_constant_time
 from elastic_agent.core.protocols.messages import (
     AuthMessage,
     AuthResultMessage,
+    EventAckMessage,
     ExecuteMessage,
+    ForceSyncMessage,
     HealthCheckMessage,
     Message,
     ReadFileMessage,
-    ForceSyncMessage,
     RegisterSyncMappingMessage,
     SendInputMessage,
-    StopMessage,
     StatusMessage,
+    StopMessage,
     UnregisterSyncMappingMessage,
     UploadFileMessage,
-    WatchFilesMessage,
-    UnwatchMessage,
     parse_message,
 )
-from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
+from elastic_agent.core.registry import NodeRegistry, NodeStatus
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +97,8 @@ class WorkerConnectionManager:
         self.on_disconnect: Callable[[str], Awaitable[None]] | None = None
         self._worker_status: dict[str, dict[str, Any]] = {}
         self._worker_status_events: dict[str, asyncio.Event] = {}
+        self._processed_event_ids: OrderedDict[str, None] = OrderedDict()
+        self._processed_event_limit = 10_000
 
     @property
     def connected_workers(self) -> list[str]:
@@ -281,15 +282,42 @@ class WorkerConnectionManager:
                 self._worker_status[conn.worker_id] = msg.model_dump(mode="json")
                 self._worker_status_events.setdefault(conn.worker_id, asyncio.Event()).set()
 
-            if self.on_message:
-                try:
-                    await self.on_message(conn.worker_id, msg)
-                except Exception:
-                    logger.exception(
-                        "on_message handler failed for worker=%s type=%s",
-                        conn.worker_id,
-                        msg.type,
-                    )
+            await self._deliver_worker_message(conn, msg)
+
+    async def _deliver_worker_message(
+        self, conn: WorkerConnection, msg: Message
+    ) -> bool:
+        """Deliver one worker event and ACK reliable events after processing.
+
+        PROCESS_EXIT and RUN_EXHAUSTED are replayed by workers until ACKed.  The
+        bounded event-id set prevents a reconnect replay from running terminal
+        lifecycle handlers twice while still ACKing duplicates so the worker
+        can durably discard them.
+        """
+        event_id = str(getattr(msg, "event_id", "") or "")
+        if event_id and event_id in self._processed_event_ids:
+            self._processed_event_ids.move_to_end(event_id)
+            await conn.send(EventAckMessage(event_id=event_id))
+            return True
+
+        if self.on_message:
+            try:
+                await self.on_message(conn.worker_id, msg)
+            except Exception:
+                logger.exception(
+                    "on_message handler failed for worker=%s type=%s",
+                    conn.worker_id,
+                    msg.type,
+                )
+                return False
+
+        if event_id:
+            self._processed_event_ids[event_id] = None
+            self._processed_event_ids.move_to_end(event_id)
+            while len(self._processed_event_ids) > self._processed_event_limit:
+                self._processed_event_ids.popitem(last=False)
+            await conn.send(EventAckMessage(event_id=event_id))
+        return True
 
     # ---- High-level command API ----
 

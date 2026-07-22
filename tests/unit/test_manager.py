@@ -136,6 +136,66 @@ def manager(tmp_config, provider):
 
 class TestManagerLifecycle:
     @pytest.mark.asyncio
+    async def test_startup_terminates_unbound_job_worker_from_previous_manager(
+        self, tmp_config, provider
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        await previous._persist_batch_job_spec(
+            "job-interrupted",
+            JobSpec.model_validate({
+                "name": "interrupted",
+                "run": {"command": "true"},
+                "account": {"mode": "none"},
+            }),
+        )
+        await previous._update_batch_job_state(
+            "job-interrupted", "running",
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentJob": "job-interrupted",
+            },
+        ))
+        await previous.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.READY,
+            public_ip=instance.public_ip,
+            private_ip=instance.private_ip,
+            metadata={"job_id": "job-interrupted"},
+        ))
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            assert provider._instances == {}
+            recovered = await restarted.registry.get(instance.instance_id)
+            assert recovered.status == NodeStatus.TERMINATED
+            assert restarted.binding_recovery_ready is True
+            journal = json.loads(
+                (
+                    Path(tmp_config.registry.path).with_name("specs")
+                    / "job-interrupted.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert journal["submission_state"] == "failed"
+            assert journal["terminal_summary"]["done"] is True
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
     async def test_start_stop(self, manager):
         await manager.start()
         assert manager._started is True
@@ -393,6 +453,70 @@ class TestManagerLifecycle:
 
 class TestScaleOut:
     @pytest.mark.asyncio
+    async def test_partial_scale_out_failure_terminates_every_created_instance(
+        self, manager, provider
+    ):
+        await manager.start()
+        real_create = provider.create_instance
+        attempts = 0
+
+        async def fail_second(config):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise RuntimeError("second create failed")
+            return await real_create(config)
+
+        provider.create_instance = fail_second
+        with pytest.raises(RuntimeError, match="second create failed"):
+            await manager.scale_out(count=3)
+
+        assert provider._instances == {}
+        nodes = await manager.registry.list_all()
+        assert len(nodes) == 1
+        assert nodes[0].status == NodeStatus.TERMINATED
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_current_unbound_compensation_failure_enters_live_recovery(
+        self, manager, provider
+    ):
+        await manager.start()
+        manager.registry.add = AsyncMock(
+            side_effect=RuntimeError("registry write failed")
+        )
+        real_terminate = provider.terminate_instance
+        terminate_attempts = 0
+
+        async def fail_first_termination(instance_id):
+            nonlocal terminate_attempts
+            terminate_attempts += 1
+            if terminate_attempts == 1:
+                raise RuntimeError("transient terminate failure")
+            await real_terminate(instance_id)
+
+        provider.terminate_instance = fail_first_termination
+        with pytest.raises(RuntimeError, match="registry write failed"):
+            await manager.scale_out(
+                count=1,
+                tags={"ElasticAgentJob": "job-live-recovery"},
+            )
+
+        assert len(provider._instances) == 1
+        instance = next(iter(provider._instances.values()))
+        assert instance.instance_id in manager._recovery_unbound_instances
+        assert manager.binding_recovery_ready is False
+        assert manager._binding_recovery_task is not None
+
+        # Drive the scheduled live-recovery pass without sleeping for the
+        # production retry interval.
+        await manager._recover_bound_resources_once()
+        assert provider._instances == {}
+        assert instance.instance_id not in manager._recovery_unbound_instances
+        assert terminate_attempts == 2
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_scale_out_single(self, manager):
         await manager.start()
         records = await manager.scale_out(count=1)
@@ -604,6 +728,29 @@ class TestScaleIn:
         await manager.start()
         terminated = await manager.scale_in(["nonexistent"], force=True)
         assert terminated == []
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_force_scale_in_attempts_every_node_after_one_failure(
+        self, manager, provider
+    ):
+        await manager.start()
+        records = await manager.scale_out(count=2)
+        attempted = []
+
+        async def terminate(instance_id):
+            attempted.append(instance_id)
+            if len(attempted) == 1:
+                raise RuntimeError("transient terminate failure")
+            native = instance_id.split(":", 1)[-1]
+            provider._instances.pop(native, None)
+
+        provider.terminate_instance = terminate
+        with pytest.raises(RuntimeError, match="failed to scale in 1 worker"):
+            await manager.scale_in([record.node_id for record in records], force=True)
+
+        assert attempted == [record.instance_id for record in records]
+        assert (await manager.registry.get(records[1].node_id)).status == NodeStatus.TERMINATED
         await manager.stop()
 
     @pytest.mark.asyncio

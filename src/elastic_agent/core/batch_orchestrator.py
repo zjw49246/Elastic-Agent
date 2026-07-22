@@ -28,8 +28,10 @@ import asyncio
 import enum
 import functools
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
@@ -39,6 +41,7 @@ from elastic_agent.harness.generic import build_execute, resolve_harness
 logger = logging.getLogger(__name__)
 
 PersistSpecHook = Callable[[str, JobSpec], Awaitable[None]]
+JobStateHook = Callable[[str, str, dict[str, Any] | None], Awaitable[None]]
 
 
 class JobSpecPersistenceError(RuntimeError):
@@ -49,10 +52,19 @@ class WorkerPhase(str, enum.Enum):
     PENDING = "pending"
     BOOTSTRAPPING = "bootstrapping"
     LOGGING_IN = "logging_in"
+    DISPATCHING = "dispatching"
     RUNNING = "running"
     ROTATING = "rotating"
     DONE = "done"
+    CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+TERMINAL_WORKER_PHASES = {
+    WorkerPhase.DONE,
+    WorkerPhase.CANCELLED,
+    WorkerPhase.FAILED,
+}
 
 
 @dataclass
@@ -126,6 +138,15 @@ class WorkerRun:
     cleaned_up: bool = False
     cleanup_error: str | None = None
     cleanup_attempts: int = 0
+    dispatched_at: float = 0.0
+    # Recreated for every dispatch/rotation.  Reliable PROCESS_EXIT sets this
+    # before final collection so cancel/shutdown can wait for process flush.
+    exit_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    bringup_task: asyncio.Task | None = field(default=None, repr=False)
+    # RUN_EXHAUSTED is ACKed after synchronously claiming ROTATING, then the
+    # potentially long account login continues outside the worker's sole WS
+    # receive loop.  Keep that owned task cancellable by Job cancel/shutdown.
+    rotation_task: asyncio.Task | None = field(default=None, repr=False)
     _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
@@ -153,6 +174,24 @@ class BatchJob:
     pending_cleanup: dict[str, WorkerAssignment] = field(default_factory=dict)
     cleanup_errors: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    launch_complete: bool = False
+    cancel_requested: bool = False
+    cancel_reason: str | None = None
+    cancel_as_failure: bool = False
+    resources_released: bool = False
+    release_workers_on_complete: bool = True
+    accounts_released: bool = False
+    persisted_state: str = "prepared"
+    terminal_state_persisted: bool = False
+    launch_task: asyncio.Task | None = field(default=None, repr=False)
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    _finish_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _cancel_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def config_dir(self) -> str:
@@ -162,23 +201,57 @@ class BatchJob:
         by_phase: dict[str, int] = {}
         for r in self.runs.values():
             by_phase[r.phase.value] = by_phase.get(r.phase.value, 0) + 1
-        terminal = all(
-            r.phase in (WorkerPhase.DONE, WorkerPhase.FAILED)
-            for r in self.runs.values()
-        )
+        terminal = all(r.phase in TERMINAL_WORKER_PHASES for r in self.runs.values())
         cleanup_pending = sum(
             1
             for r in self.runs.values()
             if self.spec.account.binding == "eip" and not r.cleaned_up
         ) + len(self.pending_cleanup)
+        ordinary_teardown_pending = bool(
+            self.launch_complete
+            and terminal
+            and self.runs
+            and self.release_workers_on_complete
+            and not self.resources_released
+        )
+        if ordinary_teardown_pending:
+            cleanup_pending += len(self.runs)
+        done = (
+            self.launch_complete
+            and terminal
+            and cleanup_pending == 0
+            and not ordinary_teardown_pending
+        )
+        if done and self.cancel_requested and not self.cancel_as_failure:
+            state = "cancelled"
+        elif done and (
+            self.error or any(r.phase == WorkerPhase.FAILED for r in self.runs.values())
+        ):
+            state = "failed"
+        elif done:
+            state = "succeeded"
+        elif self.cancel_requested:
+            state = "cancelling"
+        elif not self.runs:
+            state = "queued" if self.started_at is None else "creating"
+        elif any(r.phase == WorkerPhase.RUNNING for r in self.runs.values()):
+            state = "running"
+        else:
+            state = "preparing"
         return {
             "job_id": self.job_id,
             "name": self.spec.name,
             "workers": len(self.runs),
             "phases": by_phase,
-            "done": terminal and cleanup_pending == 0,
+            "done": done,
+            "state": state,
             "cleanup_pending": cleanup_pending,
             "error": self.error,
+            "cancel_requested": self.cancel_requested,
+            "cancel_reason": self.cancel_reason,
+            "created_at": self.created_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
 
 
@@ -246,6 +319,18 @@ class FleetDriver(Protocol):
     ) -> None:
         """Dispatch an EXECUTE to the worker. ``watch_exhaustion`` tells the
         worker to scan output for rate-limit banners (Mode-B rotation)."""
+        ...
+
+    async def resolve_secret_env(
+        self, secret_env: dict[str, str],
+    ) -> dict[str, str]:
+        """Resolve opaque references without mutating/persisting the JobSpec."""
+        ...
+
+    async def stop_command(
+        self, worker_id: str, task_id: str, signal: str = "SIGTERM"
+    ) -> None:
+        """Stop one active command before collection and worker teardown."""
         ...
 
     async def collect(self, worker_id: str, spec: JobSpec, job_id: str) -> None:
@@ -320,11 +405,17 @@ class BatchOrchestrator:
         self,
         driver: FleetDriver,
         *,
-        scale_in_on_complete: bool = False,
+        scale_in_on_complete: bool = True,
         final_collect_attempts: int = 3,
         final_collect_timeout: float = 300.0,
         cleanup_retry_seconds: float = 5.0,
+        worker_concurrency: int = 8,
         persist_spec_hook: PersistSpecHook | None = None,
+        job_state_hook: JobStateHook | None = None,
+        cancel_grace_seconds: float = 20.0,
+        cancel_kill_grace_seconds: float = 5.0,
+        status_reconcile_grace_seconds: float = 60.0,
+        disconnect_grace_seconds: float = 60.0,
     ) -> None:
         self._driver = driver
         self._scale_in_on_complete = scale_in_on_complete
@@ -332,10 +423,20 @@ class BatchOrchestrator:
         self._final_collect_timeout = max(0.01, final_collect_timeout)
         self._cleanup_retry_seconds = max(0.01, cleanup_retry_seconds)
         self._persist_spec_hook = persist_spec_hook
+        self._job_state_hook = job_state_hook
+        self._cancel_grace_seconds = max(0.01, cancel_grace_seconds)
+        self._cancel_kill_grace_seconds = max(0.01, cancel_kill_grace_seconds)
+        self._status_reconcile_grace_seconds = max(
+            0.0, status_reconcile_grace_seconds
+        )
+        self._disconnect_grace_seconds = max(0.0, disconnect_grace_seconds)
+        self._worker_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
         self._collect_tasks: dict[str, asyncio.Task] = {}  # worker_id -> periodic collect
         self._cleanup_tasks: dict[str, asyncio.Task] = {}  # worker_id -> durable teardown retry
+        self._ttl_tasks: dict[str, asyncio.Task] = {}
+        self._disconnect_tasks: dict[str, asyncio.Task] = {}
         self._launch_tasks: set[asyncio.Task] = set()  # background bring-ups (submit)
         self._lifecycle_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
@@ -351,19 +452,147 @@ class BatchOrchestrator:
     def job_id_for_worker(self, worker_id: str) -> str | None:
         return self._worker_index.get(worker_id)
 
-    async def handle_exhausted(self, worker_id: str) -> bool:
+    async def _record_job_state(
+        self,
+        job: BatchJob,
+        state: str,
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        """Serialize durable lifecycle markers for idempotent crash recovery."""
+        async with job._state_lock:
+            if job.terminal_state_persisted:
+                return
+            if self._job_state_hook is not None:
+                await self._job_state_hook(job.job_id, state, summary)
+            job.persisted_state = state
+            if state in {"succeeded", "failed", "cancelled"}:
+                job.terminal_state_persisted = True
+
+    async def handle_exhausted(
+        self, worker_id: str, *, task_id: str | None = None,
+    ) -> bool:
         """Route a worker's RUN_EXHAUSTED by resolving its job (connection knows
         the worker_id; the run command carried the job_id)."""
         job_id = self._worker_index.get(worker_id)
         if job_id is None:
             return False
-        return await self.on_worker_exhausted(job_id, worker_id)
+        return await self.on_worker_exhausted(
+            job_id, worker_id, task_id=task_id,
+        )
+
+    def defer_exhausted(
+        self, worker_id: str, *, task_id: str | None = None,
+    ) -> bool:
+        """Claim one exhaustion event, then finish rotation in the background.
+
+        ``RUN_EXHAUSTED`` arrives on the worker's only WebSocket receive loop.
+        Dynamic rotation may need ``ACCOUNT_LOGIN_RESULT`` from that same socket,
+        so awaiting the whole rotation in the event callback deadlocks the read
+        pump.  Claiming ``ROTATING`` synchronously makes a following old
+        ``PROCESS_EXIT`` harmless; returning lets the connection layer ACK the
+        durable event and resume reads while this owned task performs login.
+        """
+
+        job_id = self._worker_index.get(worker_id)
+        if job_id is None:
+            return False
+        claim = self._claim_worker_exhaustion(
+            job_id, worker_id, task_id=task_id,
+        )
+        if claim is None:
+            return False
+        job, run, decline_error = claim
+        task = asyncio.create_task(
+            self._run_worker_exhaustion(job, run, decline_error)
+        )
+        # Publish ownership before yielding so cancel/shutdown cannot miss the
+        # just-created task in the ACK -> task-start scheduling window.
+        run.rotation_task = task
+        self._lifecycle_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._lifecycle_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:  # pragma: no cover - defensive visibility
+                logger.error(
+                    "deferred exhaustion task failed for %s",
+                    worker_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(finished)
+        return True
+
+    async def handle_disconnect(self, worker_id: str) -> None:
+        """Fail a batch run only when a disconnected worker stays gone."""
+        if worker_id not in self._worker_index or self._shutting_down:
+            return
+        existing = self._disconnect_tasks.get(worker_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def expire() -> None:
+            try:
+                if self._disconnect_grace_seconds:
+                    await asyncio.sleep(self._disconnect_grace_seconds)
+                await self.cancel_worker(
+                    worker_id,
+                    "worker disconnected and did not reconnect within "
+                    f"{self._disconnect_grace_seconds:g}s",
+                )
+            except asyncio.CancelledError:
+                return
+            finally:
+                if self._disconnect_tasks.get(worker_id) is asyncio.current_task():
+                    self._disconnect_tasks.pop(worker_id, None)
+
+        self._disconnect_tasks[worker_id] = asyncio.create_task(expire())
+
+    async def handle_reconnect(self, worker_id: str) -> None:
+        task = self._disconnect_tasks.pop(worker_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def handle_exit(self, worker_id: str, exit_code: int, task_id: str | None = None) -> None:
         """Route a worker's PROCESS_EXIT by resolving its job."""
         job_id = self._worker_index.get(worker_id)
         if job_id is not None:
             await self.on_worker_exit(job_id, worker_id, exit_code, task_id=task_id)
+
+    async def reconcile_worker_status(
+        self, worker_id: str, active_processes: list[str]
+    ) -> bool:
+        """Fail closed when a reconnected worker no longer owns its run task.
+
+        New runtimes replay a durable PROCESS_EXIT before STATUS.  This fallback
+        also closes the upgrade window for old runtimes that could lose the
+        one-shot exit while their WebSocket was down.
+        """
+        job_id = self._worker_index.get(worker_id)
+        job = self._jobs.get(job_id) if job_id else None
+        run = job.runs.get(worker_id) if job is not None else None
+        if (
+            run is None
+            or run.phase != WorkerPhase.RUNNING
+            or not run.task_id
+            or run.task_id in set(active_processes)
+            # EXECUTE delivery has no separate process-start ACK.  Ignore an
+            # older/in-flight STATUS snapshot immediately after dispatch; old
+            # runtimes that truly lost an exit are reconciled after this grace.
+            or (
+                run.dispatched_at > 0
+                and time.monotonic() - run.dispatched_at
+                < self._status_reconcile_grace_seconds
+            )
+        ):
+            return False
+        self._fail(run, "worker reports run task is no longer active")
+        await self._finalize_terminal_run(job, run)
+        await self._maybe_finish(job)
+        return True
 
     def prepare(self, spec: JobSpec) -> BatchJob:
         """Validate and assign a job id without registering or starting it.
@@ -379,6 +608,9 @@ class BatchOrchestrator:
             job_id=f"job-{uuid.uuid4().hex}",
             spec=spec,
             harness=harness,
+            release_workers_on_complete=(
+                self._scale_in_on_complete and not self._is_eip_bound(spec)
+            ),
         )
 
     def _schedule_prepared(self, job: BatchJob) -> asyncio.Task:
@@ -388,9 +620,30 @@ class BatchOrchestrator:
             raise ValueError(f"job {job.job_id!r} is already registered")
         self._jobs[job.job_id] = job
         task = asyncio.create_task(self._bring_up_all(job))
+        job.launch_task = task
         self._launch_tasks.add(task)
         task.add_done_callback(self._launch_tasks.discard)
+        ttl = int(getattr(job.spec, "ttl_seconds", 0) or 0)
+        if ttl > 0:
+            ttl_task = asyncio.create_task(self._ttl_watchdog(job.job_id, ttl))
+            self._ttl_tasks[job.job_id] = ttl_task
         return task
+
+    async def _ttl_watchdog(self, job_id: str, ttl_seconds: int) -> None:
+        try:
+            await asyncio.sleep(ttl_seconds)
+            job = self._jobs.get(job_id)
+            if job is not None and not job.summary()["done"]:
+                await self.cancel_job(
+                    job_id,
+                    reason=f"job TTL exceeded ({ttl_seconds}s)",
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            current = asyncio.current_task()
+            if self._ttl_tasks.get(job_id) is current:
+                self._ttl_tasks.pop(job_id, None)
 
     async def _persist_then_schedule(self, job: BatchJob) -> asyncio.Task:
         """Journal ``job`` before registering it or starting bring-up."""
@@ -451,6 +704,43 @@ class BatchOrchestrator:
                 task.cancel()
             if periodic:
                 await asyncio.gather(*periodic, return_exceptions=True)
+
+            ttl_tasks = list(self._ttl_tasks.values())
+            self._ttl_tasks.clear()
+            for task in ttl_tasks:
+                task.cancel()
+            if ttl_tasks:
+                await asyncio.gather(*ttl_tasks, return_exceptions=True)
+
+            disconnects = list(self._disconnect_tasks.values())
+            self._disconnect_tasks.clear()
+            for task in disconnects:
+                task.cancel()
+            if disconnects:
+                await asyncio.gather(*disconnects, return_exceptions=True)
+
+            # Mark/cancel every launch before waiting for it.  In particular an
+            # ACCOUNT_LOGIN await would otherwise keep shutdown blocked for its
+            # full 2700-second OTP timeout.  The cancellation path waits for the
+            # worker's correlated login-cleanup ACK, then stops live commands
+            # and performs final collection for ordinary and EIP jobs alike.
+            jobs = list(self._jobs.values())
+            if jobs:
+                per_signal_grace = max(0.01, timeout / 2)
+                await asyncio.gather(*(
+                    self._cancel_job_impl(
+                        job,
+                        reason="manager shutting down",
+                        as_failure=True,
+                        term_grace=min(
+                            self._cancel_grace_seconds, per_signal_grace
+                        ),
+                        kill_grace=min(
+                            self._cancel_kill_grace_seconds, per_signal_grace
+                        ),
+                    )
+                    for job in jobs
+                ), return_exceptions=True)
 
             launches = list(self._launch_tasks)
             if launches:
@@ -555,9 +845,41 @@ class BatchOrchestrator:
                 # parameter only bounds non-destructive final collection above.
                 await asyncio.gather(*settlement, return_exceptions=True)
 
+            # A transient ordinary scale-in failure must not be forgotten just
+            # because retry loops were intentionally woken for shutdown.
+            for job in self._jobs.values():
+                if (
+                    self._is_eip_bound(job.spec)
+                    or not job.release_workers_on_complete
+                    or job.resources_released
+                ):
+                    continue
+                for attempt in range(1, 4):
+                    try:
+                        await self._driver.scale_in(list(job.runs))
+                    except Exception:
+                        logger.exception(
+                            "shutdown ordinary cleanup attempt %s/3 failed for %s",
+                            attempt,
+                            job.job_id,
+                        )
+                    else:
+                        job.resources_released = True
+                        for worker_id in job.runs:
+                            self._worker_index.pop(worker_id, None)
+                        break
+
+            for job in self._jobs.values():
+                await self._maybe_finish(job)
+
     async def _bring_up_all(self, job: BatchJob) -> None:
         spec = job.spec
+        job.started_at = datetime.now(timezone.utc)
         try:
+            # This durable gate is crossed before account reservation or any
+            # cloud call.  A journal left at ``prepared`` can therefore be
+            # safely scheduled by an idempotent retry after a crash.
+            await self._record_job_state(job, "launching")
             if self._is_eip_bound(spec):
                 await self._bring_up_bound_all(job)
             else:
@@ -567,9 +889,15 @@ class BatchOrchestrator:
             # error would otherwise vanish. Log and fall through to settle state.
             job.error = str(exc)
             logger.exception("bring-up failed for job %s", job.job_id)
-        # A job that fails entirely during provision/login never reaches a run
-        # exit, so settle terminal state (and release its accounts) here too.
-        await self._maybe_finish(job)
+        finally:
+            job.launch_complete = True
+            # A job that fails entirely during provision/login never reaches a
+            # run exit, so settle terminal state and resources here too.  A
+            # concurrent cancel owns a stricter STOP -> PROCESS_EXIT -> collect
+            # sequence; do not let cancellation of a DISPATCHING bring-up make
+            # this launch-finally collect/terminate before that sequence runs.
+            if not job.cancel_requested:
+                await self._maybe_finish(job)
 
     async def _bring_up_unbound_all(self, job: BatchJob) -> None:
         """Original fleet path, kept unchanged for ``account.binding=none``."""
@@ -578,15 +906,64 @@ class BatchOrchestrator:
         worker_ids = await self._driver.scale_out(
             n, name_prefix=spec.fanout.name_prefix or spec.name,
             instance_type=spec.fanout.instance_type, region=spec.fanout.region,
-            disk_gb=spec.fanout.disk_gb, spot=spec.fanout.spot)
+            disk_gb=spec.fanout.disk_gb, spot=spec.fanout.spot,
+            tags={"ElasticAgentJob": job.job_id})
+        # Register every returned cloud id before any optional metadata lookup.
+        # A hostname/registry exception must never leave an EC2 outside the
+        # Job's ownership graph and therefore outside terminal scale-in.
         contexts = spec.worker_contexts()
-        for wid, ctx in zip(worker_ids, contexts):
-            ctx.hostname = await self._driver.hostname_of(wid)
-            job.runs[wid] = WorkerRun(worker_id=wid, ctx=ctx)
+        for index, wid in enumerate(worker_ids):
+            ctx = (
+                contexts[index]
+                if index < len(contexts)
+                else WorkerContext(
+                    shard_index=index,
+                    num_shards=n,
+                    job_name=spec.name,
+                )
+            )
+            job.runs[wid] = WorkerRun(
+                worker_id=wid,
+                ctx=ctx,
+                phase=(
+                    WorkerPhase.CANCELLED
+                    if job.cancel_requested
+                    else WorkerPhase.PENDING
+                ),
+                error=job.cancel_reason if job.cancel_requested else None,
+            )
             self._worker_index[wid] = job.job_id
 
+        if len(worker_ids) != n or len(set(worker_ids)) != len(worker_ids):
+            job.error = (
+                f"scale_out returned {len(worker_ids)} worker id(s), expected {n} "
+                "unique ids"
+            )
+            for run in job.runs.values():
+                self._fail(run, job.error)
+            # An empty result owns no resources and can finish immediately.
+            if not worker_ids:
+                job.resources_released = True
+            return
+
+        hostname_results = await asyncio.gather(
+            *(self._driver.hostname_of(wid) for wid in worker_ids),
+            return_exceptions=True,
+        )
+        for wid, hostname in zip(worker_ids, hostname_results):
+            if isinstance(hostname, BaseException):
+                logger.warning(
+                    "hostname lookup failed for %s; worker shell hostname remains available: %s",
+                    wid,
+                    hostname,
+                )
+            else:
+                job.runs[wid].ctx.hostname = hostname
+
+        if job.cancel_requested:
+            return
         await asyncio.gather(
-            *(self._bring_up(job, wid) for wid in job.runs),
+            *(self._bring_up_limited(job, wid) for wid in job.runs),
             return_exceptions=True,
         )
 
@@ -656,7 +1033,7 @@ class BatchOrchestrator:
                 ).__name__
                 job.error = job.error or f"EIP reservation rollback failed: {detail}"
 
-        if self._shutting_down:
+        if self._shutting_down or job.cancel_requested:
             reservation_error = RuntimeError("manager shutting down")
         else:
             # Start every reservation before awaiting any one of them.  The
@@ -688,6 +1065,10 @@ class BatchOrchestrator:
                 for result in results:
                     if isinstance(result, WorkerAssignment):
                         assignments.append(result)
+                        # Treat every successful durable lease as cleanup-owned
+                        # immediately.  A concurrent API cancel can therefore
+                        # never fall through the no-runs window and leak it.
+                        job.pending_cleanup[result.lease_id] = result
                     elif isinstance(result, asyncio.CancelledError):
                         remember_cancel(result)
                     elif isinstance(result, BaseException):
@@ -702,6 +1083,11 @@ class BatchOrchestrator:
                     reservation_error = RuntimeError(
                         "invalid assignment result count"
                     )
+
+        if job.cancel_requested and reservation_error is None:
+            reservation_error = RuntimeError(
+                job.cancel_reason or "job cancelled"
+            )
 
         if cancellation is not None:
             job.error = "EIP reservation cancelled"
@@ -746,20 +1132,25 @@ class BatchOrchestrator:
         # Cancellation may arrive while the capacity hold itself is being
         # released.  It still changes a successful reservation transaction into
         # rollback, and cleanup must settle before cancellation is re-raised.
+        if job.cancel_requested and not rolled_back:
+            job.error = job.error or job.cancel_reason or "job cancelled"
+            await rollback_assignments()
         if cancellation is not None and not rolled_back:
             job.error = "EIP reservation cancelled"
             await rollback_assignments()
 
         if cancellation is not None:
             raise cancellation
-        if job.error is not None:
+        if job.cancel_requested or job.error is not None:
+            if not rolled_back:
+                await rollback_assignments()
             return
 
         # Each call creates exactly one temporary instance and associates its
         # reserved EIP before hostname lookup/bootstrap can touch the box.
         await asyncio.gather(
             *(
-                self._create_and_bring_up_bound(job, ctx, assignment)
+                self._create_and_bring_up_bound_limited(job, ctx, assignment)
                 for ctx, assignment in zip(contexts, assignments)
             ),
             return_exceptions=True,
@@ -813,6 +1204,7 @@ class BatchOrchestrator:
                     else:
                         job.pending_cleanup.pop(assignment.lease_id, None)
                         job.cleanup_errors.pop(assignment.lease_id, None)
+                        await self._maybe_finish(job)
                         return
             except asyncio.CancelledError:
                 return
@@ -828,6 +1220,9 @@ class BatchOrchestrator:
         worker_id: str | None = None
         run: WorkerRun | None = None
         try:
+            if job.cancel_requested or self._shutting_down:
+                await self._release_unattached(job, assignment)
+                return
             prefix = spec.fanout.name_prefix or spec.name
             worker_ids = await self._driver.scale_out(
                 1, name_prefix=f"{prefix}-{assignment.slot}",
@@ -840,9 +1235,15 @@ class BatchOrchestrator:
                     f"bound scale_out returned {len(worker_ids)} workers for one lease"
                 )
             worker_id = worker_ids[0]
-            if self._shutting_down:
-                raise RuntimeError("manager shutting down")
+            if self._shutting_down or job.cancel_requested:
+                raise RuntimeError(
+                    job.cancel_reason or "manager shutting down"
+                )
             assignment = await self._driver.attach_bound(worker_id, assignment)
+            if self._shutting_down or job.cancel_requested:
+                raise RuntimeError(
+                    job.cancel_reason or "manager shutting down"
+                )
             ctx.hostname = await self._driver.hostname_of(worker_id)
 
             slots = self._slot_dirs(job)
@@ -860,6 +1261,8 @@ class BatchOrchestrator:
                 assignment=assignment,
             )
             job.runs[worker_id] = run
+            job.pending_cleanup.pop(assignment.lease_id, None)
+            job.cleanup_errors.pop(assignment.lease_id, None)
             self._worker_index[worker_id] = job.job_id
             await self._bring_up(job, worker_id)
         except BaseException as exc:
@@ -889,9 +1292,15 @@ class BatchOrchestrator:
                     error=detail,
                 )
                 job.runs[worker_id] = run
+                job.pending_cleanup.pop(assignment.lease_id, None)
+                job.cleanup_errors.pop(assignment.lease_id, None)
                 self._worker_index[worker_id] = job.job_id
             elif run is not None:
-                self._fail(run, detail)
+                if job.cancel_requested and not job.cancel_as_failure:
+                    run.phase = WorkerPhase.CANCELLED
+                    run.error = job.cancel_reason or "job cancelled"
+                else:
+                    self._fail(run, detail)
 
             if run is None:
                 # scale_out itself failed, so there is no worker to collect or
@@ -905,19 +1314,39 @@ class BatchOrchestrator:
             if cancelled:
                 raise
 
-        if run is not None and run.phase == WorkerPhase.FAILED:
+        if run is not None and run.phase in TERMINAL_WORKER_PHASES:
             await self._finalize_terminal_run(job, run)
+
+    async def _create_and_bring_up_bound_limited(
+        self, job: BatchJob, ctx: WorkerContext, assignment: WorkerAssignment
+    ) -> None:
+        async with self._worker_semaphore:
+            await self._create_and_bring_up_bound(job, ctx, assignment)
+
+    async def _bring_up_limited(self, job: BatchJob, worker_id: str) -> None:
+        async with self._worker_semaphore:
+            await self._bring_up(job, worker_id)
 
     async def _bring_up(self, job: BatchJob, worker_id: str) -> None:
         run = job.runs[worker_id]
         spec = job.spec
+        current_task = asyncio.current_task()
+        run.bringup_task = current_task
         try:
+            if job.cancel_requested:
+                run.phase = WorkerPhase.CANCELLED
+                run.error = job.cancel_reason or "job cancelled"
+                return
             run.phase = WorkerPhase.BOOTSTRAPPING
             if not await self._driver.provision(worker_id, job.harness, spec):
                 return self._fail(run, "bootstrap failed")
             if self._shutting_down:
                 return self._fail(run, "manager shutting down")
-            if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED):
+            if job.cancel_requested:
+                run.phase = WorkerPhase.CANCELLED
+                run.error = job.cancel_reason or "job cancelled"
+                return
+            if run.phase in TERMINAL_WORKER_PHASES:
                 return
 
             if spec.account.mode != "none":
@@ -950,13 +1379,30 @@ class BatchOrchestrator:
             if self._shutting_down:
                 return self._fail(run, "manager shutting down")
 
-            if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED):
+            if job.cancel_requested:
+                run.phase = WorkerPhase.CANCELLED
+                run.error = job.cancel_reason or "job cancelled"
+                return
+            if run.phase in TERMINAL_WORKER_PHASES:
                 return
 
             await self._dispatch(job, run, resume=False)
+        except asyncio.CancelledError:
+            if job.cancel_requested and not job.cancel_as_failure:
+                run.phase = WorkerPhase.CANCELLED
+                run.error = job.cancel_reason or "job cancelled"
+            else:
+                self._fail(
+                    run,
+                    job.cancel_reason or "manager shutting down",
+                )
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("bring-up failed for %s", worker_id)
             self._fail(run, str(exc))
+        finally:
+            if run.bringup_task is current_task:
+                run.bringup_task = None
 
     def _slot_dirs(self, job: BatchJob) -> list[str]:
         """config_dirs to log accounts into — from the harness credential slots,
@@ -977,15 +1423,41 @@ class BatchOrchestrator:
         run.ctx.account_id = run.account_id
         run.ctx.account_email = run.account_email
         ex = build_execute(spec, run.ctx, resume=resume)
+        resolved_secrets = await self._driver.resolve_secret_env(
+            spec.run.secret_env,
+        )
+        ex["env"].update(resolved_secrets)
+        if job.cancel_requested:
+            run.phase = (
+                WorkerPhase.FAILED
+                if job.cancel_as_failure
+                else WorkerPhase.CANCELLED
+            )
+            run.error = job.cancel_reason or "job cancelled"
+            return
         run.task_id = f"{job.job_id}:{run.worker_id}:{uuid.uuid4().hex[:6]}"
-        run.phase = WorkerPhase.RUNNING
+        run.exit_event = asyncio.Event()
+        run.dispatched_at = time.monotonic()
+        run.phase = WorkerPhase.DISPATCHING
         await self._driver.run_command(
             run.worker_id, run.task_id,
             command=ex["command"], cwd=ex["cwd"], env=ex["env"], timeout=ex["timeout"],
             job_id=job.job_id,
             watch_exhaustion=spec.rotation.strategy != "none",
         )
-        self._start_periodic_collect(job, run.worker_id)
+        # PROCESS_EXIT can race the return of WebSocket send_command.  Never
+        # resurrect a terminal run after that event already finalized it.
+        if run.phase == WorkerPhase.DISPATCHING:
+            run.phase = WorkerPhase.RUNNING
+        if job.persisted_state in {"prepared", "launching"}:
+            try:
+                await self._record_job_state(job, "running")
+            except Exception:  # the command is already live; do not orphan it
+                logger.exception(
+                    "failed to persist running state for job %s", job.job_id
+                )
+        if run.phase == WorkerPhase.RUNNING:
+            self._start_periodic_collect(job, run.worker_id)
 
     def _start_periodic_collect(self, job: BatchJob, worker_id: str) -> None:
         """While the run goes, pull results back every ``collect.interval_seconds``
@@ -1004,7 +1476,7 @@ class BatchOrchestrator:
                 while True:
                     await asyncio.sleep(interval)
                     run = job.runs.get(worker_id)
-                    if run is None or run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED):
+                    if run is None or run.phase in TERMINAL_WORKER_PHASES:
                         return
                     try:
                         await self._driver.collect(worker_id, spec, job.job_id)
@@ -1026,54 +1498,139 @@ class BatchOrchestrator:
     # -- lifecycle events (called by the Manager's message handlers) --------
 
     @_tracked_lifecycle
-    async def on_worker_exhausted(self, job_id: str, worker_id: str) -> bool:
+    async def on_worker_exhausted(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> bool:
         """Mode-B rotation (strategy a): swap account + restart with --resume.
 
         Returns True if a rotation was started, False if the policy declined
         (wrong strategy, max rotations reached, or re-login failed → FAILED).
         """
-        if self._shutting_down:
+        claim = self._claim_worker_exhaustion(
+            job_id, worker_id, task_id=task_id,
+        )
+        if claim is None:
             return False
+        return await self._run_worker_exhaustion(*claim)
+
+    def _claim_worker_exhaustion(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        task_id: str | None,
+    ) -> tuple[BatchJob, WorkerRun, str | None] | None:
+        """Atomically claim an exact running dispatch before ACKing its event."""
+
+        if self._shutting_down:
+            return None
         job = self._jobs.get(job_id)
         if job is None or worker_id not in job.runs:
-            return False
+            return None
         run = job.runs[worker_id]
+
+        # Reliable RUN_EXHAUSTED is intentionally replayable.  Only the exact
+        # currently-running dispatch may claim rotation; duplicates see
+        # ROTATING or a new task id and become harmless ACKed no-ops.
+        if (
+            run.phase != WorkerPhase.RUNNING
+            or (task_id is not None and task_id != run.task_id)
+            or job.cancel_requested
+        ):
+            return None
+
+        decline_error: str | None = None
         spec = job.spec
-
         if spec.rotation.strategy != "on_exhaust_restart_resume":
-            self._fail(run, "account exhausted (no rotation policy)")
-            await self._finalize_terminal_run(job, run)
-            await self._maybe_finish(job)
-            return False
-        if run.rotations >= spec.rotation.max_rotations:
-            self._fail(run, f"account exhausted (max {spec.rotation.max_rotations} rotations reached)")
-            await self._finalize_terminal_run(job, run)
-            await self._maybe_finish(job)
-            return False
+            decline_error = "account exhausted (no rotation policy)"
+        elif run.rotations >= spec.rotation.max_rotations:
+            decline_error = (
+                "account exhausted "
+                f"(max {spec.rotation.max_rotations} rotations reached)"
+            )
 
+        # This transition has no await and therefore happens before the reliable
+        # event is ACKed.  The old process exit can now be consumed safely while
+        # a fresh account login waits on later frames from the same socket.
         run.phase = WorkerPhase.ROTATING
-        run.rotations += 1
+        if decline_error is None:
+            run.rotations += 1
+        return job, run, decline_error
 
-        if run.active_slot + 1 < len(run.config_dirs):
-            # A pre-logged account is ready in the local pool — switch to it with
-            # no re-login (the fast path that per_worker > 1 buys).
-            run.active_slot += 1
-        else:
-            # Local pool spent: log a fresh account into a new config_dir.
-            new_dir = self._extra_dir(job, run)
-            outcome = await self._driver.login(worker_id, spec, new_dir)
-            if not outcome.success:
-                self._fail(run, outcome.error or "rotation login failed")
+    async def _run_worker_exhaustion(
+        self,
+        job: BatchJob,
+        run: WorkerRun,
+        decline_error: str | None,
+    ) -> bool:
+        """Complete a claimed rotation without blocking worker event reads."""
+
+        current_task = asyncio.current_task()
+        run.rotation_task = current_task
+        spec = job.spec
+        try:
+            if decline_error is not None:
+                self._fail(run, decline_error)
                 await self._finalize_terminal_run(job, run)
                 await self._maybe_finish(job)
                 return False
-            run.config_dirs.append(new_dir)
-            run.account_ids.append(outcome.account_id)
-            run.account_emails.append(outcome.account_email)
-            run.active_slot = len(run.config_dirs) - 1
 
-        await self._dispatch(job, run, resume=True)
-        return True
+            if run.active_slot + 1 < len(run.config_dirs):
+                # A pre-logged account is ready in the local pool — switch to it
+                # without a round trip through ACCOUNT_LOGIN.
+                run.active_slot += 1
+            else:
+                # Local pool spent: login must run off the WebSocket read pump so
+                # LoginCoordinator can receive its correlated result/OTP frames.
+                new_dir = self._extra_dir(job, run)
+                outcome = await self._driver.login(
+                    run.worker_id, spec, new_dir
+                )
+                if not outcome.success:
+                    self._fail(run, outcome.error or "rotation login failed")
+                    await self._finalize_terminal_run(job, run)
+                    await self._maybe_finish(job)
+                    return False
+                run.config_dirs.append(new_dir)
+                run.account_ids.append(outcome.account_id)
+                run.account_emails.append(outcome.account_email)
+                run.active_slot = len(run.config_dirs) - 1
+
+            try:
+                await self._dispatch(job, run, resume=True)
+            except Exception as exc:  # noqa: BLE001
+                self._fail(run, f"rotation dispatch failed: {exc}")
+                await self._finalize_terminal_run(job, run)
+                await self._maybe_finish(job)
+                return False
+            return run.phase == WorkerPhase.RUNNING
+        except asyncio.CancelledError:
+            # Job cancellation owns the phase transition/final collection after
+            # LoginCoordinator has completed correlated browser/CLI rollback.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "rotation failed unexpectedly for worker %s", run.worker_id
+            )
+            if job.cancel_requested:
+                run.phase = (
+                    WorkerPhase.FAILED
+                    if job.cancel_as_failure
+                    else WorkerPhase.CANCELLED
+                )
+                run.error = job.cancel_reason or "job cancelled"
+            else:
+                self._fail(run, f"rotation failed: {exc}")
+            await self._finalize_terminal_run(job, run)
+            await self._maybe_finish(job)
+            return False
+        finally:
+            if run.rotation_task is current_task:
+                run.rotation_task = None
 
     @staticmethod
     def _extra_dir(job: BatchJob, run: WorkerRun) -> str:
@@ -1094,8 +1651,6 @@ class BatchOrchestrator:
         self, job_id: str, worker_id: str, exit_code: int, task_id: str | None = None,
     ) -> None:
         """Terminal process exit for a worker's run command."""
-        if self._shutting_down:
-            return
         job = self._jobs.get(job_id)
         if job is None or worker_id not in job.runs:
             return
@@ -1107,9 +1662,23 @@ class BatchOrchestrator:
         # ROTATING phase-guard alone can't (the restart may already be RUNNING).
         if task_id is not None and run.task_id and task_id != run.task_id:
             return
-        if run.phase in (WorkerPhase.DONE, WorkerPhase.FAILED, WorkerPhase.ROTATING):
+        run.exit_event.set()
+        if run.phase in TERMINAL_WORKER_PHASES:
+            # The first handler may have completed process accounting but hit a
+            # transient scale-in error.  A reliable replay must re-enter finish
+            # logic instead of ACKing away the only cleanup retry trigger.
+            await self._maybe_finish(job)
             return
-        if exit_code == job.spec.completion.on_process_exit:
+        if run.phase == WorkerPhase.ROTATING:
+            return
+        if job.cancel_requested:
+            run.phase = (
+                WorkerPhase.FAILED
+                if job.cancel_as_failure
+                else WorkerPhase.CANCELLED
+            )
+            run.error = job.cancel_reason or "job cancelled"
+        elif exit_code == job.spec.completion.on_process_exit:
             run.phase = WorkerPhase.DONE
             run.error = None
         else:
@@ -1134,11 +1703,134 @@ class BatchOrchestrator:
         if job is None or worker_id not in job.runs:
             return False
         run = job.runs[worker_id]
-        if run.phase not in (WorkerPhase.DONE, WorkerPhase.FAILED):
+        if run.phase not in TERMINAL_WORKER_PHASES:
             self._fail(run, reason)
         await self._finalize_terminal_run(job, run)
         await self._maybe_finish(job)
         return not self._is_eip_bound(job.spec) or run.cleaned_up
+
+    @_tracked_lifecycle
+    async def cancel_job(self, job_id: str, reason: str = "job cancelled") -> bool:
+        """Stop every active shard, collect partial output, then tear it down."""
+        if self._shutting_down:
+            return False
+        job = self._jobs.get(job_id)
+        if job is None:
+            return False
+        return await self._cancel_job_impl(job, reason=reason)
+
+    async def _stop_run_for_cancel(
+        self,
+        run: WorkerRun,
+        *,
+        term_grace: float,
+        kill_grace: float,
+    ) -> None:
+        """Wait for the matching reliable exit before result collection."""
+        # Cancelling a bring-up can mark DISPATCHING terminal while the EXECUTE
+        # frame is already in the WebSocket but ``send_text`` has not returned.
+        # A terminal phase is therefore not proof that the remote process exited;
+        # only the matching reliable PROCESS_EXIT closes that uncertainty.
+        if not run.task_id or run.exit_event.is_set():
+            return
+        try:
+            await self._driver.stop_command(
+                run.worker_id, run.task_id, "SIGTERM"
+            )
+        except Exception:
+            logger.exception("failed to SIGTERM task %s", run.task_id)
+        try:
+            await asyncio.wait_for(run.exit_event.wait(), timeout=term_grace)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await self._driver.stop_command(
+                run.worker_id, run.task_id, "SIGKILL"
+            )
+        except Exception:
+            logger.exception("failed to SIGKILL task %s", run.task_id)
+        try:
+            await asyncio.wait_for(run.exit_event.wait(), timeout=kill_grace)
+        except asyncio.TimeoutError:
+            logger.error(
+                "task %s did not confirm exit before cancellation collection",
+                run.task_id,
+            )
+
+    async def _cancel_job_impl(
+        self,
+        job: BatchJob,
+        *,
+        reason: str,
+        as_failure: bool = False,
+        term_grace: float | None = None,
+        kill_grace: float | None = None,
+    ) -> bool:
+        async with job._cancel_lock:
+            # Never rewrite an already-completed historical outcome merely
+            # because an administrator retries the cancel endpoint.
+            if job.summary()["done"]:
+                return True
+
+            job.cancel_requested = True
+            job.cancel_reason = reason
+            job.cancel_as_failure = as_failure
+            job.error = job.error or reason
+
+            # Provision/login is part of the launch task.  Cancelling the exact
+            # per-worker task invokes LoginCoordinator's correlated cleanup and
+            # waits for ACCOUNT_LOGIN_CANCELLED instead of leaving Chrome/CLI
+            # running for the remainder of its 2700-second login timeout.
+            owned_run_tasks = {
+                task
+                for run in job.runs.values()
+                for task in (run.bringup_task, run.rotation_task)
+                if task is not None and not task.done()
+            }
+            for task in owned_run_tasks:
+                task.cancel()
+            if owned_run_tasks:
+                await asyncio.gather(*owned_run_tasks, return_exceptions=True)
+
+            launch_task = job.launch_task
+            if (
+                launch_task is not None
+                and launch_task is not asyncio.current_task()
+                and not launch_task.done()
+            ):
+                # EIP reservation has no WorkerRun yet; the flag above makes its
+                # transaction roll back after all in-flight cloud calls settle.
+                await asyncio.gather(launch_task, return_exceptions=True)
+
+            await asyncio.gather(*(
+                self._stop_run_for_cancel(
+                    run,
+                    term_grace=(
+                        self._cancel_grace_seconds
+                        if term_grace is None else max(0.01, term_grace)
+                    ),
+                    kill_grace=(
+                        self._cancel_kill_grace_seconds
+                        if kill_grace is None else max(0.01, kill_grace)
+                    ),
+                )
+                for run in list(job.runs.values())
+            ))
+
+            for run in job.runs.values():
+                if run.phase not in TERMINAL_WORKER_PHASES:
+                    run.phase = (
+                        WorkerPhase.FAILED if as_failure else WorkerPhase.CANCELLED
+                    )
+                    run.error = reason
+            await asyncio.gather(*(
+                self._finalize_terminal_run(job, run)
+                for run in job.runs.values()
+                if run.phase in TERMINAL_WORKER_PHASES
+            ))
+            await self._maybe_finish(job)
+            return True
 
     async def _finalize_terminal_run(self, job: BatchJob, run: WorkerRun) -> None:
         """Collect once, then compensate EIP-bound infrastructure once.
@@ -1147,7 +1839,7 @@ class BatchOrchestrator:
         harmless.  Cleanup is deliberately after collection while the EIP still
         routes to the worker.
         """
-        if run.phase not in (WorkerPhase.DONE, WorkerPhase.FAILED):
+        if run.phase not in TERMINAL_WORKER_PHASES:
             return
         async with run._finalize_lock:
             # Periodic SSH/rsync must cross this barrier before the lease can
@@ -1241,6 +1933,7 @@ class BatchOrchestrator:
                         return
                     except asyncio.TimeoutError:
                         pass
+                    cleaned = False
                     async with run._finalize_lock:
                         if run.cleaned_up:
                             return
@@ -1260,7 +1953,10 @@ class BatchOrchestrator:
                             run.cleaned_up = True
                             run.cleanup_error = None
                             self._worker_index.pop(run.worker_id, None)
-                            return
+                            cleaned = True
+                    if cleaned:
+                        await self._maybe_finish(job)
+                        return
             except asyncio.CancelledError:
                 return
             finally:
@@ -1268,31 +1964,147 @@ class BatchOrchestrator:
 
         self._cleanup_tasks[run.worker_id] = asyncio.create_task(retry())
 
-    async def _maybe_finish(self, job: BatchJob) -> None:
-        terminal = (WorkerPhase.DONE, WorkerPhase.FAILED)
-        # A bootstrap/login failure must release its EIP immediately even while
-        # other shards keep running for hours.
-        for run in job.runs.values():
-            if run.phase in terminal:
-                await self._finalize_terminal_run(job, run)
-
-        if not all(r.phase in terminal for r in job.runs.values()):
+    def _schedule_unbound_cleanup(self, job: BatchJob) -> None:
+        """Retry idempotent ordinary-worker termination until it succeeds."""
+        key = f"job:{job.job_id}"
+        existing = self._cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
             return
-        # Release each worker's accounts back to the allocator once the job is
-        # terminal (DONE/FAILED) so a later job can reuse them. Previously
-        # accounts were only freed on scale-in (_scale_in_on_complete defaults
-        # to False), which starved single-account setups after the first job
-        # finished. release_worker is idempotent (pops by worker_id), so calling
-        # this across the several terminal paths is safe.
-        allocator = getattr(self, "_allocator", None)
-        if allocator is not None:
-            for worker_id in job.runs:
+
+        async def retry() -> None:
+            try:
+                while not job.resources_released:
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=self._cleanup_retry_seconds,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    try:
+                        await self._driver.scale_in(list(job.runs))
+                    except Exception:
+                        logger.exception(
+                            "retrying ordinary cleanup failed for job %s",
+                            job.job_id,
+                        )
+                    else:
+                        job.resources_released = True
+                        for worker_id in job.runs:
+                            self._worker_index.pop(worker_id, None)
+                        await self._maybe_finish(job)
+                        return
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._cleanup_tasks.pop(key, None)
+
+        self._cleanup_tasks[key] = asyncio.create_task(retry())
+
+    def _schedule_finish_retry(self, job: BatchJob) -> None:
+        key = f"finish:{job.job_id}"
+        existing = self._cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            try:
+                while not (
+                    job.summary()["done"] and job.terminal_state_persisted
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=self._cleanup_retry_seconds,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    await self._maybe_finish(job)
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._cleanup_tasks.pop(key, None)
+
+        self._cleanup_tasks[key] = asyncio.create_task(retry())
+
+    async def _maybe_finish(self, job: BatchJob) -> None:
+        async with job._finish_lock:
+            terminal = TERMINAL_WORKER_PHASES
+            # A bootstrap/login failure must release its EIP immediately even
+            # while other shards keep running for hours.
+            for run in job.runs.values():
+                if run.phase in terminal:
+                    await self._finalize_terminal_run(job, run)
+
+            if not job.launch_complete or not all(
+                r.phase in terminal for r in job.runs.values()
+            ):
+                return
+
+            if not job.accounts_released:
+                allocator = getattr(self, "_allocator", None)
+                if allocator is not None:
+                    failures: list[str] = []
+                    for worker_id in job.runs:
+                        try:
+                            await allocator.release_worker(worker_id)
+                        except Exception as exc:  # pragma: no cover - defensive
+                            failures.append(f"{worker_id}: {exc}")
+                            logger.exception(
+                                "account release failed for %s", worker_id
+                            )
+                    if failures:
+                        job.error = job.error or (
+                            "account release failed: " + "; ".join(failures[:3])
+                        )
+                        self._schedule_finish_retry(job)
+                        return
+                job.accounts_released = True
+
+            if self._is_eip_bound(job.spec):
+                if job.pending_cleanup or any(
+                    not run.cleaned_up for run in job.runs.values()
+                ):
+                    return
+            elif job.release_workers_on_complete and not job.resources_released:
                 try:
-                    await allocator.release_worker(worker_id)
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception("account release failed for %s", worker_id)
-        if self._scale_in_on_complete and not self._is_eip_bound(job.spec):
-            await self._driver.scale_in(list(job.runs.keys()))
+                    await self._driver.scale_in(list(job.runs))
+                except Exception as exc:  # noqa: BLE001
+                    job.error = job.error or (
+                        "worker teardown failed: "
+                        f"{str(exc) or type(exc).__name__}"
+                    )
+                    logger.exception(
+                        "ordinary worker teardown failed for job %s", job.job_id
+                    )
+                    self._schedule_unbound_cleanup(job)
+                    return
+                job.resources_released = True
+                for worker_id in job.runs:
+                    self._worker_index.pop(worker_id, None)
+
+            if job.completed_at is None:
+                job.completed_at = datetime.now(timezone.utc)
+            ttl_task = self._ttl_tasks.pop(job.job_id, None)
+            if ttl_task is not None and ttl_task is not asyncio.current_task():
+                ttl_task.cancel()
+
+            terminal_state = job.summary()["state"]
+            if terminal_state in {"succeeded", "failed", "cancelled"}:
+                try:
+                    await self._record_job_state(
+                        job, terminal_state, job.summary()
+                    )
+                except Exception:
+                    # Cleanup is complete and reliable worker events must still
+                    # be ACKed.  The launching/running journal remains an honest
+                    # crash-interrupted state instead of causing resource leaks.
+                    logger.exception(
+                        "failed to persist terminal state for job %s", job.job_id
+                    )
+                    self._schedule_finish_retry(job)
 
     # -- helpers -----------------------------------------------------------
 

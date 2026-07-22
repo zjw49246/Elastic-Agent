@@ -135,9 +135,9 @@ class TestAuthBearerHeader:
 
 class TestAuthQueryParam:
     @pytest.mark.asyncio
-    async def test_valid_query_param(self, client):
+    async def test_query_parameter_credentials_are_rejected(self, client):
         resp = await client.get(f"/api/nodes?api_key={API_KEY}")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_invalid_query_param(self, client):

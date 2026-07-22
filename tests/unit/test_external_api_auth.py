@@ -114,9 +114,9 @@ class TestValidKey:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_query_param_valid(self, client):
+    async def test_query_param_credentials_are_rejected(self, client):
         resp = await client.get(f"/api/nodes?api_key={VALID_KEY}")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_bearer_case_insensitive(self, client):

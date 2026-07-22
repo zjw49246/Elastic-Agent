@@ -18,7 +18,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,8 @@ class EventBus:
         event_type: str,
         worker_id: str,
         data: dict[str, Any],
+        *,
+        raise_on_error: bool = False,
     ) -> int:
         """Dispatch an event to all matching subscribers.
 
@@ -111,6 +113,7 @@ class EventBus:
             return 0
 
         count = 0
+        failures: list[Exception] = []
         for sub_id in target_ids:
             sub = self._subscriptions.get(sub_id)
             if sub is None:
@@ -118,13 +121,18 @@ class EventBus:
             try:
                 await sub.callback(event_type, worker_id, data)
                 count += 1
-            except Exception:
+            except Exception as exc:
+                failures.append(exc)
                 logger.exception(
                     "EventBus: callback %s failed for event_type=%s worker=%s",
                     sub_id[:8],
                     event_type,
                     worker_id,
                 )
+        if failures and raise_on_error:
+            raise RuntimeError(
+                f"{len(failures)} subscriber(s) failed for {event_type}"
+            ) from failures[0]
         return count
 
     def subscriber_count(self, event_type: str | None = None) -> int:

@@ -350,6 +350,7 @@ def _make_backend(tmp_path):
     backend._runtime = MagicMock()
     backend._runtime._send_event = AsyncMock()
     backend._runtime._on_pty_exit = AsyncMock()
+    backend._runtime._mark_task_exiting = AsyncMock()
     backend._log_dir = tmp_path / "logs"
     backend._task_session_ids = {}
     backend._turn_errors = {}

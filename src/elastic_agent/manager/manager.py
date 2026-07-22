@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -103,12 +104,14 @@ class ElasticAgentManager:
         self._recovery_decommission_ids: set[str] = set()
         self._recovery_allocation_attempts: dict[str, int] = {}
         self._recovery_instances: dict[str, Any] = {}
+        self._recovery_unbound_instances: dict[str, Any] = {}
         self._binding_recovery_task: asyncio.Task | None = None
         self._bound_disconnect_tasks: dict[str, asyncio.Task] = {}
         self._bound_disconnect_cancel_events: dict[str, asyncio.Event] = {}
         self._shutdown_event = asyncio.Event()
         self._binding_lock_fd: int | None = None
         self._instance_capacity_lock = asyncio.Lock()
+        self._job_state_lock = asyncio.Lock()
         self._inflight_instance_creates = 0
         self._instance_capacity_holds: dict[str, int] = {}
         self._account_allocator: Any = None
@@ -181,13 +184,6 @@ class ElasticAgentManager:
             self.reconciler.set_controller_id(
                 self.account_binding_store.controller_id
             )
-            await self._initialize_binding_recovery()
-
-            online_workers = set(self.connection_manager.connected_workers)
-            await self.task_registry.recover(online_workers)
-
-            await self.reconciler.start_periodic()
-
             import os as _os
             bucket = _os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET")
             if bucket:
@@ -202,6 +198,18 @@ class ElasticAgentManager:
                     self._s3_uploader.run_periodic(interval)
                 )
                 logger.info("S3 result upload enabled → s3://%s", bucket)
+
+            # Startup recovery may collect a previous controller's final
+            # output.  Initialize the authoritative S3 sink first so relay-mode
+            # recovery can await the upload instead of recording a false
+            # permanent collection failure merely because startup ordering left
+            # ``_s3_uploader`` unset.
+            await self._initialize_binding_recovery()
+
+            online_workers = set(self.connection_manager.connected_workers)
+            await self.task_registry.recover(online_workers)
+
+            await self.reconciler.start_periodic()
 
             self._started = True
             logger.info("ElasticAgentManager started")
@@ -503,6 +511,19 @@ class ElasticAgentManager:
                     ):
                         continue
                     lease_id = instance.tags.get("ElasticAgentLease", "")
+                    if (
+                        not lease_id
+                        and instance.tags.get("ElasticAgentJob")
+                        and instance.state != InstanceState.TERMINATED
+                    ):
+                        # Ordinary Jobs now carry the same controller/job
+                        # ownership tags as EIP Jobs.  Since BatchJob state is
+                        # process-local, a startup instance cannot have a live
+                        # owner and must be collected/terminated fail-closed.
+                        self._recovery_unbound_instances[
+                            instance.instance_id
+                        ] = instance
+                        continue
                     if lease_id and (
                         self._startup_binding_recovery
                         or lease_id in self._recovery_lease_ids
@@ -746,6 +767,72 @@ class ElasticAgentManager:
             except Exception:  # noqa: BLE001
                 logger.exception("Startup cleanup failed for orphan %s", instance_id)
 
+        async def recover_unbound(instance_id: str, instance) -> None:
+            collection_error: str | None = None
+            try:
+                await self._collect_recovered_unbound(instance)
+            except Exception as exc:  # noqa: BLE001
+                collection_error = str(exc) or type(exc).__name__
+                # Partial output may already be in S3 through periodic collect.
+                # Collection loss is visible in logs but must never retain a
+                # billable instance indefinitely.
+                logger.exception(
+                    "Startup result collection failed for unbound Job worker %s",
+                    instance_id,
+                )
+            try:
+                await self.provider.terminate_instance(instance_id)
+                await self.registry.update(
+                    instance_id, status=NodeStatus.TERMINATED
+                )
+                await self.connection_manager.disconnect_worker(instance_id)
+                self._recovery_unbound_instances.pop(instance_id, None)
+                job_id = str(instance.tags.get("ElasticAgentJob") or "")
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id):
+                    try:
+                        await self._update_batch_job_state(
+                            job_id,
+                            "failed",
+                            {
+                                "job_id": job_id,
+                                "state": "failed",
+                                "done": True,
+                                "workers": 1,
+                                "phases": {"failed": 1},
+                                "cleanup_pending": 0,
+                                "error": (
+                                    "Manager restarted during execution; "
+                                    + (
+                                        "final recovery collection failed: "
+                                        f"{collection_error}"
+                                        if collection_error
+                                        else "the orphan worker was collected "
+                                        "and terminated"
+                                    )
+                                ),
+                            },
+                        )
+                    except FileNotFoundError:
+                        # A legacy/manual tagged instance may have no JobSpec.
+                        pass
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Could not persist recovered terminal state for %s",
+                            job_id,
+                        )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Startup termination failed for unbound Job worker %s",
+                    instance_id,
+                )
+
+        await asyncio.gather(*(
+            recover_unbound(instance_id, instance)
+            for instance_id, instance in list(
+                self._recovery_unbound_instances.items()
+            )
+        ))
+
         # A decommission is durable administrative intent.  Complete it after
         # lease cleanup, including the crash window where AWS released the EIP
         # but the local binding record was not removed yet.
@@ -763,6 +850,7 @@ class ElasticAgentManager:
             not self._binding_recovery_scan_pending
             and not self._recovery_lease_ids
             and not self._recovery_instances
+            and not self._recovery_unbound_instances
             and not self._recovery_decommission_ids
             and not self._recovery_allocation_attempts
         )
@@ -776,6 +864,57 @@ class ElasticAgentManager:
         )
         self._binding_recovery_ready = False
         self._ensure_binding_recovery_task()
+
+    async def _collect_recovered_unbound(self, instance) -> None:
+        """Bounded best-effort collect for a prior Manager's ordinary Job."""
+        import json
+
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = str(instance.tags.get("ElasticAgentJob") or "")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id) is None:
+            logger.error(
+                "Refusing unsafe recovered Job id %r on instance %s",
+                job_id,
+                instance.instance_id,
+            )
+            return
+        spec_path = self.account_binding_store.path.with_name("specs") / (
+            f"{job_id}.json"
+        )
+        if not spec_path.is_file():
+            return
+        payload = json.loads(spec_path.read_text(encoding="utf-8"))
+        spec = JobSpec.model_validate(payload["spec"])
+        worker_id = instance.instance_id
+        node = await self.registry.get(worker_id)
+        if node is None:
+            await self.registry.add(NodeRecord(
+                node_id=worker_id,
+                instance_id=instance.instance_id,
+                platform=instance.platform,
+                status=NodeStatus.DRAINING,
+                public_ip=instance.public_ip,
+                private_ip=instance.private_ip,
+                metadata={
+                    "job_id": job_id,
+                    "controller_id": instance.tags.get(
+                        "ElasticAgentController", ""
+                    ),
+                },
+            ))
+        else:
+            await self.registry.update(
+                worker_id,
+                status=NodeStatus.DRAINING,
+                public_ip=instance.public_ip,
+                private_ip=instance.private_ip,
+            )
+        await asyncio.wait_for(
+            ManagerFleetDriver(self).collect(worker_id, spec, job_id),
+            timeout=30.0,
+        )
 
     async def _collect_recovered_lease(self, lease) -> None:
         """Best-effort persisted-spec collection before restart teardown.
@@ -895,12 +1034,29 @@ class ElasticAgentManager:
 
         from elastic_agent.core.job_spec_store import persist_job_spec
 
-        await asyncio.to_thread(
-            persist_job_spec,
-            self.config.registry.path,
-            job_id,
-            spec,
-        )
+        async with self._job_state_lock:
+            await asyncio.to_thread(
+                persist_job_spec,
+                self.config.registry.path,
+                job_id,
+                spec,
+            )
+
+    async def _update_batch_job_state(
+        self, job_id: str, state: str, summary: dict | None = None,
+    ) -> None:
+        """Publish a lifecycle marker into the already-durable Job journal."""
+
+        from elastic_agent.core.job_spec_store import update_job_state
+
+        async with self._job_state_lock:
+            await asyncio.to_thread(
+                update_job_state,
+                self.config.registry.path,
+                job_id,
+                state,
+                summary=summary,
+            )
 
     @property
     def account_allocator(self):
@@ -937,7 +1093,7 @@ class ElasticAgentManager:
         return self._account_login_coordinator
 
     def configure_batch(self, *, provision_hook=None, login_hook=None,
-                        scale_in_on_complete: bool = False, include_pty: bool = False) -> None:
+                        scale_in_on_complete: bool = True, include_pty: bool = False) -> None:
         """Rewire the batch orchestrator.
 
         With no hooks, uses the default live wiring (``wire_batch``). Pass
@@ -979,6 +1135,7 @@ class ElasticAgentManager:
             driver,
             scale_in_on_complete=scale_in_on_complete,
             persist_spec_hook=self._persist_batch_job_spec,
+            job_state_hook=self._update_batch_job_state,
         )
         self._batch._allocator = allocator
 
@@ -1268,6 +1425,22 @@ class ElasticAgentManager:
                     self._binding_recovery_scan_pending = False
                     self._binding_recovery_ready = False
                     self._ensure_binding_recovery_task()
+                elif (
+                    not lease_id
+                    and instance is not None
+                    and not compensation_succeeded
+                ):
+                    # The current ordinary instance is not part of ``records``
+                    # yet when registry/event publication fails.  If its direct
+                    # compensation also fails, track the exact returned instance
+                    # and wake live recovery now; relying on a future Manager
+                    # restart would leave a controller-tagged EC2 billable with
+                    # no BatchJob/registry owner.
+                    self._recovery_unbound_instances[
+                        instance.instance_id
+                    ] = instance
+                    self._binding_recovery_ready = False
+                    self._ensure_binding_recovery_task()
                 elif lease_id and instance is not None and compensation_succeeded:
                     # The exact returned instance was successfully destroyed;
                     # release no longer needs an eventual-consistency scan.
@@ -1286,6 +1459,37 @@ class ElasticAgentManager:
                     self._binding_recovery_scan_pending = True
                     self._binding_recovery_ready = False
                     self._ensure_binding_recovery_task()
+
+                # ``scale_out(count=N)`` is one ownership transaction.  If a
+                # later create fails, every earlier success from this call must
+                # be compensated before the error escapes; otherwise the
+                # orchestrator never receives their ids and cannot tear down
+                # those billable instances.
+                for created in reversed(records):
+                    try:
+                        await self.provider.terminate_instance(
+                            created.instance_id
+                        )
+                        await self.registry.update(
+                            created.node_id, status=NodeStatus.TERMINATED
+                        )
+                        await self.connection_manager.disconnect_worker(
+                            created.node_id
+                        )
+                    except BaseException:  # noqa: BLE001
+                        logger.exception(
+                            "Failed to compensate earlier worker %s after "
+                            "partial scale-out",
+                            created.instance_id,
+                        )
+                        # The instance is controller/job tagged and therefore
+                        # discoverable without trusting this in-memory record.
+                        # Trigger the same retry scanner used at startup now;
+                        # waiting for a future process restart would leave a
+                        # billable ordinary Job worker running indefinitely.
+                        self._binding_recovery_scan_pending = True
+                        self._binding_recovery_ready = False
+                        self._ensure_binding_recovery_task()
                 if isinstance(exc, Exception):
                     logger.exception("Failed to create worker instance")
                 raise
@@ -1294,25 +1498,38 @@ class ElasticAgentManager:
 
     async def scale_in(self, node_ids: list[str], force: bool = False) -> list[str]:
         terminated: list[str] = []
+        failures: list[tuple[str, BaseException]] = []
         for nid in node_ids:
-            node = await self.registry.get(nid)
-            if node is None:
-                continue
-            if not force:
-                await self.registry.update(nid, status=NodeStatus.DRAINING)
-            else:
-                lease_id = await self._lease_id_for_node(node)
-                if lease_id:
-                    await self._cleanup_bound_lease(
-                        node.node_id,
-                        lease_id,
-                        reason="worker force-scaled in by administrator",
-                    )
+            try:
+                node = await self.registry.get(nid)
+                if node is None:
+                    continue
+                if not force:
+                    await self.registry.update(nid, status=NodeStatus.DRAINING)
                 else:
-                    await self.provider.terminate_instance(node.instance_id)
-                    await self.registry.update(nid, status=NodeStatus.TERMINATED)
-                    await self.connection_manager.disconnect_worker(nid)
-                terminated.append(nid)
+                    lease_id = await self._lease_id_for_node(node)
+                    if lease_id:
+                        await self._cleanup_bound_lease(
+                            node.node_id,
+                            lease_id,
+                            reason="worker force-scaled in by administrator",
+                        )
+                    else:
+                        await self.provider.terminate_instance(node.instance_id)
+                        await self.registry.update(nid, status=NodeStatus.TERMINATED)
+                        await self.connection_manager.disconnect_worker(nid)
+                    terminated.append(nid)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append((nid, exc))
+                logger.exception("Failed to scale in worker %s", nid)
+        if failures:
+            detail = "; ".join(
+                f"{node_id}: {error or type(error).__name__}"
+                for node_id, error in failures[:3]
+            )
+            raise RuntimeError(
+                f"failed to scale in {len(failures)} worker(s): {detail}"
+            ) from failures[0][1]
         return terminated
 
     async def _cleanup_bound_node(self, node: NodeRecord, *, reason: str) -> None:
@@ -1607,7 +1824,15 @@ class ElasticAgentManager:
 
     async def _on_worker_message(self, worker_id: str, msg: Message) -> None:
         data = msg.model_dump()
-        await self.event_bus.emit(msg.type, worker_id, data)
+        await self.event_bus.emit(
+            msg.type,
+            worker_id,
+            data,
+            # The connection layer ACKs reliable terminal events only after
+            # this call succeeds.  Propagate subscriber failures so the worker
+            # retains and replays the fsynced event on reconnect.
+            raise_on_error=bool(getattr(msg, "event_id", "")),
+        )
 
         if msg.type == "LOG":
             self.log_event_parser.process_log_event(worker_id, data)

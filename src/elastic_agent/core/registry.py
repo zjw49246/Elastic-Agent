@@ -12,6 +12,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_private_json_directory,
+    tighten_state_file,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,8 +71,13 @@ class NodeRegistry:
             self._load_sync()
 
     def _load_sync(self) -> None:
+        secure_state_directory(self._path.parent)
+        # Recovery reads these specs directly after registry startup, so repair
+        # old journals before that read rather than waiting for the next submit.
+        tighten_private_json_directory(self._path.with_name("specs"))
         if self._path.exists():
             try:
+                tighten_state_file(self._path)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 nodes: dict[str, NodeRecord] = {}
                 for nid, data in raw.get("nodes", {}).items():
@@ -80,13 +92,12 @@ class NodeRegistry:
         self._loaded = True
 
     def _flush_sync(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "nodes": {nid: json.loads(rec.model_dump_json()) for nid, rec in self._nodes.items()},
         }
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        tmp.replace(self._path)
+        atomic_write_private(
+            self._path, json.dumps(payload, indent=2, default=str)
+        )
 
     async def add(self, record: NodeRecord) -> None:
         async with self._lock:

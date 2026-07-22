@@ -17,6 +17,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,8 +76,10 @@ class TaskRegistry:
             self._load_sync()
 
     def _load_sync(self) -> None:
+        secure_state_directory(self._path.parent)
         if self._path.exists():
             try:
+                tighten_state_file(self._path)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 tasks: dict[str, TaskRecord] = {}
                 for tid, data in raw.get("tasks", {}).items():
@@ -86,13 +94,12 @@ class TaskRegistry:
         self._loaded = True
 
     def _flush_sync(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "tasks": {tid: json.loads(rec.model_dump_json()) for tid, rec in self._tasks.items()},
         }
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        tmp.replace(self._path)
+        atomic_write_private(
+            self._path, json.dumps(payload, indent=2, default=str)
+        )
 
     async def register(self, task_id: str, worker_id: str, metadata: dict[str, Any] | None = None) -> TaskRecord:
         async with self._lock:

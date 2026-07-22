@@ -164,15 +164,43 @@ class AWSProvider(CloudProvider):
             MinCount=1,
             MaxCount=1,
             TagSpecifications=tag_specs,
+            # Worker bootstrap never needs IMDSv1.  Requiring a session token
+            # prevents SSRF-style credential retrieval from the job process.
+            MetadataOptions={
+                "HttpEndpoint": "enabled",
+                "HttpTokens": "required",
+                "HttpPutResponseHopLimit": 1,
+            },
         )
 
         sg_ids = config.security_group_ids or self._config.security_group_ids
         subnet_id = config.subnet_id or self._config.subnet_id
+        is_eip_bound_worker = bool(config.tags.get("ElasticAgentLease"))
 
-        if subnet_id:
-            kwargs["SubnetId"] = subnet_id
-        if sg_ids:
-            kwargs["SecurityGroupIds"] = sg_ids
+        if is_eip_bound_worker:
+            # The account's durable EIP is attached before SSH bootstrap.  Do
+            # not also allocate a transient public IPv4 address to the fresh
+            # instance.  NetworkInterfaces is required to override a subnet's
+            # auto-assign-public-IP setting; its subnet/groups fields replace
+            # the mutually-exclusive top-level RunInstances fields.
+            interface: dict = {
+                "DeviceIndex": 0,
+                "AssociatePublicIpAddress": False,
+                "DeleteOnTermination": True,
+            }
+            if subnet_id:
+                interface["SubnetId"] = subnet_id
+            if sg_ids:
+                interface["Groups"] = sg_ids
+            kwargs["NetworkInterfaces"] = [interface]
+        else:
+            # Unbound workers are still bootstrapped over SSH using their
+            # launch address, so retain the deployment subnet's current public
+            # IP policy for compatibility.
+            if subnet_id:
+                kwargs["SubnetId"] = subnet_id
+            if sg_ids:
+                kwargs["SecurityGroupIds"] = sg_ids
 
         # Attach the worker IAM instance profile (if configured) so the worker
         # can reach S3 directly — dataset pull + result push without a Manager
@@ -199,6 +227,7 @@ class AWSProvider(CloudProvider):
                     "VolumeSize": config.root_disk_size_gb,
                     "VolumeType": "gp3",
                     "DeleteOnTermination": True,
+                    "Encrypted": True,
                 },
             }
         ]

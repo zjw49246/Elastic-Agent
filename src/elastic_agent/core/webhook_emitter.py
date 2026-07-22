@@ -24,6 +24,12 @@ from typing import Any
 
 import httpx
 
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -138,8 +144,10 @@ class WebhookEmitter:
         self._load_dead_letters()
 
     def _load_dead_letters(self) -> None:
+        secure_state_directory(self._dead_letter_path.parent)
         if self._dead_letter_path.exists():
             try:
+                tighten_state_file(self._dead_letter_path)
                 raw = json.loads(self._dead_letter_path.read_text(encoding="utf-8"))
                 self._dead_letters = [DeadLetter.from_dict(d) for d in raw]
                 logger.info("Loaded %d dead letters from %s", len(self._dead_letters), self._dead_letter_path)
@@ -148,11 +156,11 @@ class WebhookEmitter:
                 self._dead_letters = []
 
     def _flush_dead_letters(self) -> None:
-        self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
         payload = [dl.to_dict() for dl in self._dead_letters]
-        tmp = self._dead_letter_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        tmp.replace(self._dead_letter_path)
+        atomic_write_private(
+            self._dead_letter_path,
+            json.dumps(payload, indent=2, default=str),
+        )
 
     def register(self, target_id: str, url: str, secret: str, event_types: list[str] | None = None) -> None:
         self._targets[target_id] = WebhookTarget(

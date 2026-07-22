@@ -1,8 +1,8 @@
 """External API authentication — API Key Bearer Token.
 
-T-015: REST requests must carry an API Key via:
-  - Header: Authorization: Bearer <key>
-  - Query parameter: ?api_key=<key>
+T-015: REST requests must carry an API Key via the
+``Authorization: Bearer <key>`` header. Query-string credentials are rejected
+because URLs leak into browser history, referrers, proxies, and access logs.
 
 API keys are defined via the ELASTIC_AGENT_EXTERNAL_API_KEYS environment variable
 (comma-separated) and validated using constant-time comparison.
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Query, Request, status
+from fastapi import Depends, HTTPException, Request, status
 
 from elastic_agent.core.auth import verify_token_constant_time
 
@@ -48,18 +48,17 @@ def _extract_bearer(request: Request) -> str | None:
 
 async def require_api_key(
     request: Request,
-    api_key: str | None = Query(None, alias="api_key"),
 ) -> str:
     """FastAPI dependency that enforces API Key auth.
 
     Returns the matched key on success; raises 401 on failure.
     """
-    token = _extract_bearer(request) or api_key
+    token = _extract_bearer(request)
 
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing API key — provide Authorization: Bearer <key> or ?api_key=<key>",
+            detail="Missing API key — provide Authorization: Bearer <key>",
         )
 
     keys = get_api_keys()

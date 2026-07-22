@@ -136,6 +136,22 @@ class TestEmit:
         passing.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_strict_emit_propagates_failure_after_notifying_others(self):
+        bus = EventBus()
+        failing = AsyncMock(side_effect=ValueError("boom"))
+        passing = AsyncMock()
+        bus.subscribe("PROCESS_EXIT", failing)
+        bus.subscribe("PROCESS_EXIT", passing)
+
+        with pytest.raises(RuntimeError, match="subscriber.*failed"):
+            await bus.emit(
+                "PROCESS_EXIT", "w1", {"task_id": "t1"},
+                raise_on_error=True,
+            )
+
+        passing.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_emit_after_unsubscribe(self):
         bus = EventBus()
         handler = AsyncMock()

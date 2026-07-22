@@ -1124,15 +1124,18 @@ class TestProvisionHook:
             async def ensure_clone(self, repo, branch): return "/local/clone"
             async def deliver(self, local, host, target): return True
 
-        captured = {}
+        captured = {"calls": []}
 
         class FakeSSHExecutor:
             def __init__(self, host, *, user=None, key_path=None, use_sudo=None):
                 captured["user"] = user
                 captured["use_sudo"] = use_sudo
 
-            async def execute(self, cmd, timeout=None):
+            async def execute(self, cmd, timeout=None, env=None, cwd=None):
                 captured["cmd"] = cmd
+                captured["calls"].append({
+                    "cmd": cmd, "timeout": timeout, "env": env, "cwd": cwd,
+                })
                 return 0, "", ""
 
         monkeypatch.setattr(code_sync_mod, "ManagerCodeSync", FakeSync)
@@ -1152,7 +1155,66 @@ class TestProvisionHook:
         assert await hook("w1", None, spec) is True
         assert captured["user"] == "ubuntu"
         assert captured["use_sudo"] is False
-        assert "/home/ubuntu/bench" in captured["cmd"]
+        assert captured["calls"][0]["cwd"] == "/home/ubuntu/bench"
+
+    async def test_manager_rsync_structured_setup_honors_step_policy(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        import elastic_agent.core.code_sync as code_sync_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        mgr.config.worker.ssh_user = "ubuntu"
+        mgr.collected_root = str(tmp_path / "collected")
+
+        class FakeSync:
+            def __init__(self, *args, **kwargs): ...
+            async def ensure_clone(self, repo, branch): return "/local/clone"
+            async def deliver(self, local, host, target): return True
+
+        calls = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                assert kwargs["use_sudo"] is False
+
+            async def execute(self, command, timeout=None, env=None, cwd=None):
+                calls.append((command, timeout, env, cwd))
+                # Exercise retry_count=1 without delaying the test.
+                return (1, "", "retry") if len(calls) == 1 else (0, "", "")
+
+        monkeypatch.setattr(code_sync_mod, "ManagerCodeSync", FakeSync)
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            setup={
+                "repo": "https://example.com/r.git",
+                "deliver": "manager_rsync",
+                "target_dir": "/home/ubuntu/bench",
+                "steps": [{
+                    "name": "install", "command": "uv sync",
+                    "env": {"UV_LINK_MODE": "copy"}, "cwd": "python",
+                    "timeout": 777, "retries": 1,
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("w1", None, spec) is True
+        assert len(calls) == 2
+        assert calls[-1] == (
+            "uv sync", 777, {"UV_LINK_MODE": "copy"},
+            "/home/ubuntu/bench/python",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1167,23 +1229,24 @@ class TestWireBatchRouting:
 
         calls = {"exh": [], "exit": []}
 
-        async def fake_exh(worker_id):
-            calls["exh"].append(worker_id)
+        def fake_exh(worker_id, *, task_id=None):
+            calls["exh"].append((worker_id, task_id))
             return True
 
         async def fake_exit(worker_id, exit_code, task_id=None):
             calls["exit"].append((worker_id, exit_code, task_id))
 
-        orch.handle_exhausted = fake_exh
+        orch.defer_exhausted = fake_exh
         orch.handle_exit = fake_exit
         # mark w1 as a batch-owned worker so PROCESS_EXIT routes
         orch._worker_index["w1"] = "job-1"
 
         await mgr.event_bus.emit("RUN_EXHAUSTED", "w1",
-                                 {"worker_id": "w1", "job_id": "job-1", "reason": "rate_limit"})
+                                 {"worker_id": "w1", "job_id": "job-1",
+                                  "task_id": "job-1:w1:old", "reason": "rate_limit"})
         await mgr.event_bus.emit("PROCESS_EXIT", "w1",
                                  {"task_id": "job-1:w1:abc", "exit_code": 0})
-        assert calls["exh"] == ["w1"]
+        assert calls["exh"] == [("w1", "job-1:w1:old")]
         assert calls["exit"] == [("w1", 0, "job-1:w1:abc")]
 
     async def test_non_batch_exit_ignored(self, tmp_path):

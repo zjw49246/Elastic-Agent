@@ -12,6 +12,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elastic_agent.core.config import CredentialConfig
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +173,11 @@ class CredentialPool:
 
     def _load_sync(self) -> None:
         # Load account definitions
+        secure_state_directory(self._accounts_path.parent)
+        secure_state_directory(self._status_path.parent)
         if self._accounts_path.exists():
             try:
+                tighten_state_file(self._accounts_path)
                 raw = json.loads(self._accounts_path.read_text(encoding="utf-8"))
                 self._accounts_config = AccountsConfig.model_validate(raw)
                 logger.info(
@@ -190,6 +198,7 @@ class CredentialPool:
         # Load pool status (or initialise from account definitions)
         if self._status_path.exists():
             try:
+                tighten_state_file(self._status_path)
                 raw = json.loads(self._status_path.read_text(encoding="utf-8"))
                 self._pool_status = PoolStatus.model_validate(raw)
                 logger.info(
@@ -233,11 +242,10 @@ class CredentialPool:
 
     def _flush_sync(self) -> None:
         self._pool_status.last_updated = _utcnow()
-        self._status_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.loads(self._pool_status.model_dump_json())
-        tmp = self._status_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        tmp.replace(self._status_path)
+        atomic_write_private(
+            self._status_path, json.dumps(payload, indent=2, default=str)
+        )
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:

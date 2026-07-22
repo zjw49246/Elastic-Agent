@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 
 from elastic_agent.core.credential_pool import AccountDefinition, AccountsConfig
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 
 class AccountStoreCorruptError(RuntimeError):
@@ -35,12 +39,13 @@ class AccountStore:
             self._load_sync()
 
     def _load_sync(self) -> None:
+        secure_state_directory(self._path.parent)
         if self._path.exists():
             try:
                 # The file contains passwords and mailbox authorization tokens.
                 # Tighten legacy permissions before reading; refusing to run is
                 # safer than continuing with a world-readable credential source.
-                os.chmod(self._path, 0o600)
+                tighten_state_file(self._path)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 self._config = AccountsConfig.model_validate(raw)
             except Exception as exc:
@@ -59,34 +64,12 @@ class AccountStore:
             self._load_sync()
 
     def _flush_sync(self, config: AccountsConfig) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         # Revalidate the whole candidate before touching the only copy of
         # account identities/tokens, then publish in memory only after the
         # atomic durable replace succeeds.
         config = AccountsConfig.model_validate(config.model_dump())
         payload = json.loads(config.model_dump_json())
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(json.dumps(payload, indent=2))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, self._path)
-            if hasattr(os, "O_DIRECTORY"):
-                directory_fd = os.open(
-                    self._path.parent, os.O_RDONLY | os.O_DIRECTORY
-                )
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        atomic_write_private(self._path, json.dumps(payload, indent=2))
         self._config = config
 
     # -- CRUD --------------------------------------------------------------

@@ -27,6 +27,9 @@ class FakeDriver:
         self.login_calls: list[tuple[str, str]] = []
         self.dispatched: list[dict] = []
         self.scaled_in: list[str] = []
+        self.scale_in_calls = 0
+        self.scale_in_failures = 0
+        self.stopped: list[tuple[str, str, str]] = []
         self.collected: list = []
         self._account_seq = 0
         self._bound_worker_seq = 0
@@ -41,6 +44,9 @@ class FakeDriver:
         self.collect_failures = 0
         self.capacity_error: str | None = None
         self.capacity_holds: set[str] = set()
+        self.resolved_secret_env: dict[str, str] = {}
+        self.secret_resolve_calls: list[dict[str, str]] = []
+        self.secret_resolve_error: str | None = None
 
     async def acquire_capacity(self, count):
         self.events.append(("capacity_acquire", count))
@@ -63,6 +69,7 @@ class FakeDriver:
         self.events.append(("scale", count))
         if tags is not None:
             self.scale_tags.append(tags)
+        if tags and tags.get("ElasticAgentLease"):
             start = self._bound_worker_seq
             self._bound_worker_seq += count
             return [f"bw{i}" for i in range(start, start + count)]
@@ -130,6 +137,12 @@ class FakeDriver:
             "job_id": job_id, "watch_exhaustion": watch_exhaustion,
         })
 
+    async def resolve_secret_env(self, secret_env):
+        self.secret_resolve_calls.append(dict(secret_env))
+        if self.secret_resolve_error:
+            raise RuntimeError(self.secret_resolve_error)
+        return dict(self.resolved_secret_env)
+
     async def collect(self, worker_id, spec, job_id):
         self.events.append(("collect", worker_id))
         if self.collect_failures:
@@ -137,7 +150,14 @@ class FakeDriver:
             raise RuntimeError("collect transient")
         self.collected.append((worker_id, job_id))
 
+    async def stop_command(self, worker_id, task_id, signal="SIGTERM"):
+        self.stopped.append((worker_id, task_id, signal))
+
     async def scale_in(self, worker_ids):
+        self.scale_in_calls += 1
+        if self.scale_in_failures:
+            self.scale_in_failures -= 1
+            raise RuntimeError("scale-in transient")
         self.scaled_in.extend(worker_ids)
 
 
@@ -148,6 +168,13 @@ def _spec(**kw):
 
 
 class TestSubmit:
+    async def test_new_job_is_not_done_before_workers_exist(self):
+        orch = BatchOrchestrator(FakeDriver())
+        job = orch.prepare(_spec(fanout={"workers": 1}))
+
+        assert job.summary()["done"] is False
+        assert job.summary()["state"] == "queued"
+
     async def test_prepare_uses_full_uuid_hex_job_id(self):
         orch = BatchOrchestrator(FakeDriver())
 
@@ -251,6 +278,13 @@ class TestLaunch:
         await BatchOrchestrator(d2).launch(_spec(name="ai4sci", fanout={"workers": 1}))
         assert d2.scale_name_prefix == "ai4sci"   # falls back to job name
 
+    async def test_unbound_workers_are_tagged_with_job_ownership(self):
+        d = FakeDriver()
+        job = await BatchOrchestrator(d).launch(
+            _spec(fanout={"workers": 1})
+        )
+        assert d.scale_tags == [{"ElasticAgentJob": job.job_id}]
+
     async def test_fanout_disk_and_spot_flow_to_scale_out(self):
         d = FakeDriver()
         await BatchOrchestrator(d).launch(
@@ -284,6 +318,45 @@ class TestLaunch:
         await orch.launch(_spec(fanout={"workers": 2}, account={"mode": "none"}))
         assert d.login_calls == []
         assert len(d.dispatched) == 2
+
+    async def test_secret_env_is_resolved_only_at_dispatch_and_merged(self):
+        d = FakeDriver()
+        d.resolved_secret_env = {"TOKEN": "resolved-plaintext"}
+        spec = _spec(
+            account={"mode": "none"},
+            fanout={"workers": 1},
+            run={
+                "command": "bench",
+                "env": {"VISIBLE": "value"},
+                "secret_env": {"TOKEN": "aws-ssm:///prod/token"},
+            },
+        )
+
+        await BatchOrchestrator(d).launch(spec)
+
+        assert d.secret_resolve_calls == [{"TOKEN": "aws-ssm:///prod/token"}]
+        assert d.dispatched[0]["env"] == {
+            "VISIBLE": "value", "TOKEN": "resolved-plaintext",
+        }
+        # Plaintext never mutates the durable JobSpec.
+        assert spec.run.secret_env == {"TOKEN": "aws-ssm:///prod/token"}
+        assert "resolved-plaintext" not in spec.model_dump_json()
+
+    async def test_secret_resolution_failure_fails_worker_before_dispatch(self):
+        d = FakeDriver()
+        d.secret_resolve_error = "AccessDenied"
+        job = await BatchOrchestrator(d).launch(_spec(
+            account={"mode": "none"},
+            fanout={"workers": 1},
+            run={
+                "command": "bench",
+                "secret_env": {"TOKEN": "aws-secretsmanager://prod/token"},
+            },
+        ))
+
+        assert d.dispatched == []
+        assert next(iter(job.runs.values())).phase == WorkerPhase.FAILED
+        assert "AccessDenied" in next(iter(job.runs.values())).error
 
     async def test_watch_exhaustion_flag_reflects_rotation_policy(self):
         d = FakeDriver()
@@ -505,6 +578,35 @@ class TestEipBoundLaunch:
         }
         assert not any(event[0] == "scale" for event in d.events)
 
+    async def test_admin_cancel_during_reservation_rolls_back_before_scale(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_reserve = d.reserve_bound
+
+        async def gated_reserve(job_id, slot, spec, account_id=""):
+            entered.set()
+            await release.wait()
+            return await original_reserve(
+                job_id, slot, spec, account_id=account_id,
+            )
+
+        d.reserve_bound = gated_reserve
+        job = await orch.submit(self._bound_spec(workers=1, ids=["acct-1"]))
+        await entered.wait()
+        cancelling = asyncio.create_task(
+            orch.cancel_job(job.job_id, reason="admin cancelled")
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await cancelling is True
+        assert d.bound_released == [("lease-0", None)]
+        assert not any(event[0] == "scale" for event in d.events)
+        assert job.pending_cleanup == {}
+        assert job.summary()["state"] == "cancelled"
+
     async def test_capacity_release_error_retries_and_rolls_back(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
@@ -670,6 +772,52 @@ class TestEipBoundLaunch:
 
 
 class TestRotation:
+    async def test_deferred_exhaustion_does_not_block_dynamic_login_result(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1},
+            rotation={
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "--resume out",
+                "max_rotations": 3,
+            },
+        ))
+        run = next(iter(job.runs.values()))
+        old_task_id = run.task_id
+        login_started = asyncio.Event()
+        login_result = asyncio.Event()
+        original_login = d.login
+
+        async def gated_login(*args, **kwargs):
+            login_started.set()
+            await login_result.wait()
+            return await original_login(*args, **kwargs)
+
+        d.login = gated_login
+
+        # The event callback can ACK immediately: claim is synchronous and the
+        # correlated login result is awaited by a separate lifecycle task.
+        assert orch.defer_exhausted(
+            run.worker_id, task_id=old_task_id,
+        ) is True
+        rotation_task = run.rotation_task
+        assert rotation_task is not None
+        assert run.phase == WorkerPhase.ROTATING
+        await asyncio.wait_for(login_started.wait(), timeout=1)
+        assert rotation_task.done() is False
+
+        # PROCESS_EXIT queued behind RUN_EXHAUSTED cannot fail the claimed run.
+        await orch.on_worker_exit(
+            job.job_id, run.worker_id, 130, task_id=old_task_id,
+        )
+        assert run.phase == WorkerPhase.ROTATING
+
+        login_result.set()
+        assert await asyncio.wait_for(rotation_task, timeout=1) is True
+        assert run.phase == WorkerPhase.RUNNING
+        assert run.task_id != old_task_id
+
     async def test_exhaustion_rotates_and_resumes(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
@@ -755,6 +903,32 @@ class TestRotation:
         # genuine completion of the fresh run
         await orch.on_worker_exit(job.job_id, wid, 0, task_id=new_task_id)
         assert job.runs[wid].phase == WorkerPhase.DONE
+
+    async def test_stale_or_replayed_exhaustion_cannot_rotate_new_task(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1},
+            rotation={
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "-r",
+                "max_rotations": 3,
+            },
+        ))
+        wid = next(iter(job.runs))
+        old_task = job.runs[wid].task_id
+
+        assert await orch.on_worker_exhausted(
+            job.job_id, wid, task_id=old_task,
+        ) is True
+        new_task = job.runs[wid].task_id
+        dispatches = len(d.dispatched)
+
+        assert await orch.on_worker_exhausted(
+            job.job_id, wid, task_id=old_task,
+        ) is False
+        assert job.runs[wid].task_id == new_task
+        assert len(d.dispatched) == dispatches
 
     async def test_final_collect_on_failed_run(self):
         # A non-zero exit (e.g. quota-out) still pulls back whatever completed —
@@ -945,6 +1119,18 @@ class TestMultiAccountPerWorker:
 
 
 class TestCompletion:
+    async def test_status_reconciliation_finalizes_missing_running_task(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, status_reconcile_grace_seconds=0)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        wid = next(iter(job.runs))
+
+        assert await orch.reconcile_worker_status(wid, []) is True
+
+        assert job.runs[wid].phase == WorkerPhase.FAILED
+        assert "no longer active" in job.runs[wid].error
+        assert d.scaled_in == [wid]
+
     async def test_exit_zero_marks_done(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
@@ -968,6 +1154,185 @@ class TestCompletion:
         for wid in list(job.runs):
             await orch.on_worker_exit(job.job_id, wid, 0)
         assert set(d.scaled_in) == set(job.runs.keys())
+
+    async def test_default_lifecycle_terminates_ephemeral_workers(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+        for wid in list(job.runs):
+            await orch.on_worker_exit(job.job_id, wid, 0)
+        assert set(d.scaled_in) == set(job.runs.keys())
+
+    async def test_terminal_replay_retries_failed_scale_in(self):
+        d = FakeDriver()
+        d.scale_in_failures = 1
+        orch = BatchOrchestrator(d, cleanup_retry_seconds=60)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.on_worker_exit(
+            job.job_id, run.worker_id, 0, task_id=run.task_id,
+        )
+        assert run.phase == WorkerPhase.DONE
+        assert job.resources_released is False
+
+        await orch.on_worker_exit(
+            job.job_id, run.worker_id, 0, task_id=run.task_id,
+        )
+        assert job.resources_released is True
+        assert d.scale_in_calls == 2
+
+    async def test_concurrent_shard_exits_scale_in_once(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+        await asyncio.gather(*(
+            orch.on_worker_exit(
+                job.job_id, run.worker_id, 0, task_id=run.task_id,
+            )
+            for run in job.runs.values()
+        ))
+        assert d.scale_in_calls == 1
+
+    async def test_cancel_job_stops_collects_and_scales_in_all_workers(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(
+            d, cancel_grace_seconds=0.01, cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+
+        assert await orch.cancel_job(job.job_id, reason="admin requested") is True
+
+        assert {worker for worker, _task, _signal in d.stopped} == set(job.runs)
+        assert {worker for worker, _job in d.collected} == set(job.runs)
+        assert set(d.scaled_in) == set(job.runs)
+        assert all(run.phase == WorkerPhase.CANCELLED for run in job.runs.values())
+        assert job.summary()["state"] == "cancelled"
+
+    async def test_cancel_stops_uncertain_dispatch_even_after_phase_is_terminal(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(
+            d, cancel_grace_seconds=0.01, cancel_kill_grace_seconds=0.01,
+        )
+        dispatch_entered = asyncio.Event()
+        hold_dispatch = asyncio.Event()
+        original_run = d.run_command
+        original_stop = d.stop_command
+
+        async def accepted_but_blocked_dispatch(*args, **kwargs):
+            # Model send_text having handed EXECUTE to the socket before its
+            # await is cancelled by the admin request.
+            await original_run(*args, **kwargs)
+            dispatch_entered.set()
+            await hold_dispatch.wait()
+
+        async def record_stop(*args, **kwargs):
+            signal = kwargs.get("signal", args[2] if len(args) > 2 else "SIGTERM")
+            d.events.append(("stop", args[0], signal))
+            await original_stop(*args, **kwargs)
+
+        d.run_command = accepted_but_blocked_dispatch
+        d.stop_command = record_stop
+        job = await orch.submit(_spec(fanout={"workers": 1}))
+        await asyncio.wait_for(dispatch_entered.wait(), timeout=1)
+        run = next(iter(job.runs.values()))
+
+        assert await orch.cancel_job(job.job_id, "admin") is True
+
+        assert run.phase == WorkerPhase.CANCELLED
+        assert [signal for _wid, _task, signal in d.stopped] == [
+            "SIGTERM", "SIGKILL",
+        ]
+        stop_indexes = [
+            index for index, event in enumerate(d.events) if event[0] == "stop"
+        ]
+        collect_index = next(
+            index for index, event in enumerate(d.events)
+            if event == ("collect", run.worker_id)
+        )
+        assert stop_indexes and max(stop_indexes) < collect_index
+
+    async def test_cancel_waits_for_matching_exit_before_collect(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(
+            d, cancel_grace_seconds=1, cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+        original_stop = d.stop_command
+
+        async def stop_then_confirm(worker_id, task_id, signal="SIGTERM"):
+            await original_stop(worker_id, task_id, signal)
+            if signal == "SIGTERM":
+                asyncio.create_task(orch.on_worker_exit(
+                    job.job_id, worker_id, 143, task_id=task_id,
+                ))
+
+        d.stop_command = stop_then_confirm
+        assert await orch.cancel_job(job.job_id, "admin") is True
+        assert d.collected == [(run.worker_id, job.job_id)]
+        assert all(signal != "SIGKILL" for _wid, _task, signal in d.stopped)
+
+    async def test_cancel_completed_job_does_not_rewrite_outcome(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+        await orch.on_worker_exit(
+            job.job_id, run.worker_id, 0, task_id=run.task_id,
+        )
+        assert job.summary()["state"] == "succeeded"
+
+        assert await orch.cancel_job(job.job_id, "late cancel") is True
+        assert job.summary()["state"] == "succeeded"
+        assert job.cancel_requested is False
+
+    async def test_job_state_hook_reaches_terminal_after_cleanup(self):
+        d = FakeDriver()
+        states = []
+
+        async def record(job_id, state, summary):
+            states.append((state, summary))
+
+        orch = BatchOrchestrator(d, job_state_hook=record)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+        await orch.on_worker_exit(
+            job.job_id, run.worker_id, 0, task_id=run.task_id,
+        )
+
+        assert [state for state, _summary in states] == [
+            "launching", "running", "succeeded",
+        ]
+        assert states[-1][1]["done"] is True
+
+    async def test_permanent_disconnect_fails_and_tears_down_worker(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, disconnect_grace_seconds=0.01)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.handle_disconnect(run.worker_id)
+        for _ in range(100):
+            if job.summary()["done"]:
+                break
+            await asyncio.sleep(0.01)
+
+        assert run.phase == WorkerPhase.FAILED
+        assert job.resources_released is True
+
+    async def test_reconnect_cancels_disconnect_teardown(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, disconnect_grace_seconds=0.1)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.handle_disconnect(run.worker_id)
+        await orch.handle_reconnect(run.worker_id)
+        await asyncio.sleep(0.12)
+
+        assert run.phase == WorkerPhase.RUNNING
+        assert d.scale_in_calls == 0
 
     async def test_summary_shape(self):
         d = FakeDriver()
@@ -1075,3 +1440,20 @@ class TestShutdown:
         release_count = driver.bound_release_attempts
         await orch.shutdown(timeout=1)
         assert driver.bound_release_attempts == release_count
+
+    async def test_running_ordinary_workers_are_collected_and_terminated(self):
+        driver = FakeDriver()
+        orch = BatchOrchestrator(
+            driver,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.shutdown(timeout=0.1)
+
+        assert run.phase == WorkerPhase.FAILED
+        assert driver.collected == [(run.worker_id, job.job_id)]
+        assert driver.scaled_in == [run.worker_id]
+        assert job.resources_released is True

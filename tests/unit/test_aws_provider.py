@@ -102,6 +102,14 @@ async def test_create_instance_sizes_the_amis_real_root_device():
     bdm = client.run_instances.call_args.kwargs["BlockDeviceMappings"]
     assert bdm[0]["DeviceName"] == "/dev/sda1"
     assert bdm[0]["Ebs"]["VolumeSize"] == 40
+    assert bdm[0]["Ebs"]["Encrypted"] is True
+    assert bdm[0]["Ebs"]["DeleteOnTermination"] is True
+    metadata = client.run_instances.call_args.kwargs["MetadataOptions"]
+    assert metadata == {
+        "HttpEndpoint": "enabled",
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -119,6 +127,59 @@ async def test_create_instance_falls_back_when_ami_lookup_fails():
 
     bdm = client.run_instances.call_args.kwargs["BlockDeviceMappings"]
     assert bdm[0]["DeviceName"] == "/dev/sda1"  # safe Ubuntu default
+
+
+@pytest.mark.asyncio
+async def test_eip_bound_worker_does_not_get_transient_public_ip():
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    client.run_instances.return_value = {
+        "Instances": [{"InstanceId": "i-bound", "State": {"Name": "pending"}}]
+    }
+    prov = _provider_with_client(client)
+
+    await prov.create_instance(InstanceConfig(
+        instance_type="t3.large",
+        image_id="ami-x",
+        key_pair_name="k",
+        subnet_id="subnet-private",
+        security_group_ids=["sg-worker"],
+        tags={"ElasticAgentLease": "lease-1"},
+    ))
+
+    kwargs = client.run_instances.call_args.kwargs
+    assert "SubnetId" not in kwargs
+    assert "SecurityGroupIds" not in kwargs
+    assert kwargs["NetworkInterfaces"] == [{
+        "DeviceIndex": 0,
+        "AssociatePublicIpAddress": False,
+        "DeleteOnTermination": True,
+        "SubnetId": "subnet-private",
+        "Groups": ["sg-worker"],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_unbound_worker_preserves_existing_subnet_public_ip_policy():
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    client.run_instances.return_value = {
+        "Instances": [{"InstanceId": "i-normal", "State": {"Name": "pending"}}]
+    }
+    prov = _provider_with_client(client)
+
+    await prov.create_instance(InstanceConfig(
+        instance_type="t3.large",
+        image_id="ami-x",
+        key_pair_name="k",
+        subnet_id="subnet-worker",
+        security_group_ids=["sg-worker"],
+    ))
+
+    kwargs = client.run_instances.call_args.kwargs
+    assert kwargs["SubnetId"] == "subnet-worker"
+    assert kwargs["SecurityGroupIds"] == ["sg-worker"]
+    assert "NetworkInterfaces" not in kwargs
 
 
 @pytest.mark.asyncio

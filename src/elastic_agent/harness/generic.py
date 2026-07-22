@@ -15,7 +15,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
-import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,7 +32,7 @@ from elastic_agent.core.bootstrap_steps import (
     runtime_deploy_step,
     system_init_step,
 )
-from elastic_agent.core.job_spec import JobSpec, WorkerContext
+from elastic_agent.core.job_spec import JobSpec, SetupStep, WorkerContext
 from elastic_agent.harness.base import (
     BootstrapStep,
     FileSyncConfig,
@@ -71,14 +71,13 @@ class GenericJobHarness(Harness):
         the job-specific provisioning.
         """
         setup = self.spec.setup
-        return [
-            harness_code_step(
-                repo_url=setup.repo,
-                branch=setup.branch,
-                target_dir=setup.target_dir,
-                extra_commands=list(setup.commands),
-            )
-        ]
+        steps = [harness_code_step(
+            repo_url=setup.repo,
+            branch=setup.checkout_ref,
+            target_dir=setup.target_dir,
+        )]
+        steps.extend(compile_job_setup_steps(self.spec, run_as="ubuntu", wrap_user=False))
+        return steps
 
     # -- accounts ----------------------------------------------------------
 
@@ -123,6 +122,83 @@ class GenericJobHarness(Harness):
 # ---------------------------------------------------------------------------
 
 
+def _resolved_setup_cwd(target_dir: str, cwd: str) -> str:
+    value = (cwd or ".").strip()
+    if value in ("", "."):
+        return target_dir
+    if value.startswith("/"):
+        return value
+    return f"{target_dir.rstrip('/')}/{value}"
+
+
+def _job_user_command(step: SetupStep, *, cwd: str, run_as: str) -> str:
+    """Wrap a setup operation so a root bootstrap still runs it as the Job user."""
+    inner: list[str] = []
+    for key, value in step.env.items():
+        inner.append(f"export {key}={shlex.quote(value)}")
+    inner.append(f"cd {shlex.quote(cwd)}")
+    inner.append(step.command)
+    shell = " && ".join(inner)
+    if run_as == "root":
+        return f"bash -lc {shlex.quote(shell)}"
+    return (
+        f"sudo -n -H -u {shlex.quote(run_as)} "
+        f"bash -lc {shlex.quote(shell)}"
+    )
+
+
+def compile_job_setup_steps(
+    spec: JobSpec,
+    *,
+    run_as: str,
+    wrap_user: bool = True,
+    include_source_manifest: bool = True,
+) -> list[BootstrapStep]:
+    """Compile legacy + structured setup operations into isolated steps.
+
+    ``wrap_user=True`` is used by the root bootstrap pipeline and explicitly
+    drops privileges to the provider's Job user. Manager-rsync already creates
+    a non-sudo SSH executor for that user and requests raw env/cwd metadata via
+    ``wrap_user=False``.
+    """
+    out: list[BootstrapStep] = []
+    if include_source_manifest and spec.setup.resolved_commit:
+        expected = shlex.quote(spec.setup.resolved_commit)
+        source_check = SetupStep(
+            name="source-manifest",
+            command=(
+                f'test "$(git rev-parse HEAD)" = {expected} || '
+                f'(echo "source commit mismatch; expected {expected}" >&2; exit 1)'
+            ),
+            timeout=60,
+        )
+        source_steps = [source_check]
+    else:
+        source_steps = []
+
+    for index, step in enumerate([*source_steps, *spec.setup.normalized_steps()]):
+        cwd = _resolved_setup_cwd(spec.setup.target_dir, step.cwd)
+        safe_name = "-".join(step.name.strip().lower().split()) or str(index)
+        if wrap_user:
+            command = _job_user_command(step, cwd=cwd, run_as=run_as)
+            env: dict[str, str] = {}
+            step_cwd = None
+        else:
+            command = step.command
+            env = dict(step.env)
+            step_cwd = cwd
+        out.append(BootstrapStep(
+            name=f"job-setup-{index + 1}-{safe_name}",
+            command=command,
+            timeout=step.timeout,
+            retry_count=step.retries,
+            env=env,
+            cwd=step_cwd,
+            description=f"Job-owned setup step '{step.name}' as user {run_as}",
+        ))
+    return out
+
+
 def compile_bootstrap_steps(
     spec: JobSpec,
     *,
@@ -155,6 +231,8 @@ def compile_bootstrap_steps(
     # is a Manager-wide provisioning option, so silently narrowing it here keeps
     # a Codex Job usable without installing or invoking Claude-only machinery.
     include_claude_pty = include_pty and spec.account.agent_type == "claude"
+    profile = spec.environment.manifest()
+    common_packages = system_packages or list(profile["system_packages"])
 
     steps: list[BootstrapStep] = []
     if spec.account.binding == "eip":
@@ -162,12 +240,12 @@ def compile_bootstrap_steps(
         # any job code gets a chance to prefer a subnet-assigned IPv6 address.
         steps.append(ipv4_only_egress_step())
     steps.extend([
-        system_init_step(packages=system_packages),
+        system_init_step(packages=common_packages),
         agent_install_step(agent_type=spec.account.agent_type),
     ])
     # Docker before any runtime deploy: the runtime user's docker-group
     # membership must exist when systemd starts the unit (see docker_install_step).
-    if spec.setup.needs_docker:
+    if spec.setup.needs_docker or profile["docker"]:
         steps.append(docker_install_step(run_as=run_as))
     if not runtime_from_src:
         steps.append(runtime_deploy_step(
@@ -180,17 +258,24 @@ def compile_bootstrap_steps(
     if include_claude_pty:
         steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
-    # Job-specific provisioning. For manager_rsync delivery the Manager clones +
-    # rsyncs the code and runs setup commands (see make_provision_hook), so no
-    # worker-side clone step here. For worker_clone, clone on the worker (token
-    # from ELASTIC_AGENT_GIT_TOKEN for private repos — never in the JobSpec).
+    # Job-specific provisioning. For manager_rsync *with a repository* the
+    # Manager clones + rsyncs the code and runs setup commands (see
+    # make_provision_hook), so no worker-side steps are emitted here. A
+    # repo-less Job still needs its target directory and declared setup steps.
     setup = spec.setup
-    if setup.deliver != "manager_rsync":
-        steps.append(harness_code_step(
-            repo_url=setup.repo, branch=setup.branch, target_dir=setup.target_dir,
-            extra_commands=list(setup.commands),
-            git_token=os.environ.get("ELASTIC_AGENT_GIT_TOKEN") or None,
-        ))
+    if setup.deliver != "manager_rsync" or not setup.repo:
+        clone_step = harness_code_step(
+            repo_url=setup.repo, branch=setup.checkout_ref,
+            target_dir=setup.target_dir,
+        )
+        # The bootstrap pipeline is privileged for apt/systemd work. Make the
+        # checkout writable by the runtime/Job user before any Job-owned step.
+        clone_step.command = (
+            f"{clone_step.command} && chown -R {shlex.quote(run_as)}:"
+            f"{shlex.quote(run_as)} {shlex.quote(setup.target_dir)}"
+        )
+        steps.append(clone_step)
+        steps.extend(compile_job_setup_steps(spec, run_as=run_as))
 
     if include_claude_pty and not runtime_from_src:
         steps.append(pty_refresh_step())
@@ -218,7 +303,7 @@ def build_execute(spec: JobSpec, ctx: WorkerContext, *, resume: bool = False) ->
         "command": command,
         "cwd": spec.resolved_cwd(),
         "env": spec.render_env(ctx),
-        "timeout": spec.run.timeout or None,
+        "timeout": spec.run.timeout,
     }
 
 

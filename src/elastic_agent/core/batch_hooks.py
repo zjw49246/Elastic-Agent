@@ -39,7 +39,10 @@ from elastic_agent.core.credential_pool import AccountDefinition
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 from elastic_agent.harness.base import Harness
-from elastic_agent.harness.generic import compile_bootstrap_steps
+from elastic_agent.harness.generic import (
+    compile_bootstrap_steps,
+    compile_job_setup_steps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -686,11 +689,37 @@ def make_provision_hook(
         # manager_rsync: clone on the Manager (token stays here) → rsync to the
         # worker (no token) → run setup commands on the worker.
         if need_manager_rsync:
-            local = await _sync.ensure_clone(spec.setup.repo, spec.setup.branch)
+            local = await _sync.ensure_clone(
+                spec.setup.repo, spec.setup.checkout_ref,
+            )
+            if spec.setup.resolved_commit:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", local, "rev-parse", "HEAD",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                actual = stdout.decode(errors="replace").strip().lower()
+                if proc.returncode != 0 or actual != spec.setup.resolved_commit:
+                    logger.error(
+                        "manager_rsync source commit mismatch for %s: "
+                        "expected=%s actual=%s error=%s",
+                        worker_id, spec.setup.resolved_commit, actual,
+                        stderr.decode(errors="replace")[-200:],
+                    )
+                    return False
             if not await _sync.deliver(local, host, spec.setup.target_dir):
                 logger.error("manager_rsync deliver failed for %s", worker_id)
                 return False
-            if spec.setup.commands:
+            setup_steps = compile_job_setup_steps(
+                spec,
+                run_as=ssh_user,
+                wrap_user=False,
+                # manager_rsync strips .git; the immutable commit was verified
+                # against the Manager checkout immediately above.
+                include_source_manifest=False,
+            )
+            if setup_steps:
                 # Run setup AS THE JOB USER (no sudo). The benchmark/run command
                 # executes as ssh_user via the runtime; setup must share its HOME
                 # so per-user installs land where run can find them. If setup were
@@ -698,12 +727,28 @@ def make_provision_hook(
                 # like `curl uv/install.sh | sh` + `uv sync` would install into
                 # /root/.local + a root-owned .venv, invisible to the ssh_user run
                 # → `$HOME/.local/bin/uv: No such file or directory` at run time.
-                ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
-                setup_cmd = f"cd {spec.setup.target_dir} && " + " && ".join(spec.setup.commands)
-                rc, _out, _err = await ex.execute(setup_cmd, timeout=1200)
-                if rc != 0:
-                    logger.error("manager_rsync setup commands failed on %s (rc=%s)", worker_id, rc)
-                    return False
+                ex = SSHExecutor(
+                    host, user=ssh_user, key_path=ssh_key, use_sudo=False,
+                )
+                for setup_step in setup_steps:
+                    succeeded = False
+                    for _attempt in range(setup_step.retry_count + 1):
+                        rc, _out, _err = await ex.execute(
+                            setup_step.command,
+                            timeout=setup_step.timeout,
+                            env=setup_step.env or None,
+                            cwd=setup_step.cwd,
+                        )
+                        if rc == 0:
+                            succeeded = True
+                            break
+                    if not succeeded:
+                        logger.error(
+                            "manager_rsync setup step %s failed on %s "
+                            "(rc=%s): %s",
+                            setup_step.name, worker_id, rc, _err[-200:],
+                        )
+                        return False
 
         # Framework src → worker + systemd unit (runtime runs from src, survives
         # SSH disconnects). No token needed — it's a local directory.
@@ -1050,7 +1095,7 @@ def wire_batch(
     manager,
     *,
     include_pty: bool = False,
-    scale_in_on_complete: bool = False,
+    scale_in_on_complete: bool = True,
     login_timeout: float = 2700.0,
 ) -> BatchOrchestrator:
     """Build a fully-wired BatchOrchestrator and route worker events into it."""
@@ -1078,10 +1123,18 @@ def wire_batch(
         driver,
         scale_in_on_complete=scale_in_on_complete,
         persist_spec_hook=getattr(manager, "_persist_batch_job_spec", None),
+        job_state_hook=getattr(manager, "_update_batch_job_state", None),
     )
 
     async def _on_exhausted(event_type, worker_id, data):
-        await orch.handle_exhausted(data.get("worker_id") or worker_id)
+        # Claim ROTATING synchronously, then return so the connection layer can
+        # ACK this durable event and resume the worker's sole WS receive loop.
+        # A dynamic rotation's ACCOUNT_LOGIN_RESULT arrives on that same loop;
+        # awaiting the login here would deadlock it until the 2700s timeout.
+        orch.defer_exhausted(
+            worker_id,
+            task_id=data.get("task_id"),
+        )
 
     async def _on_exit(event_type, worker_id, data):
         # Only route batch-owned workers; ignore other PROCESS_EXITs.
@@ -1090,8 +1143,25 @@ def wire_batch(
                 worker_id, int(data.get("exit_code", -1)), task_id=data.get("task_id"),
             )
 
+    async def _on_status(event_type, worker_id, data):
+        if orch.job_id_for_worker(worker_id) is not None:
+            active_or_pending = list(data.get("active_processes") or [])
+            active_or_pending.extend(data.get("pending_process_exits") or [])
+            await orch.reconcile_worker_status(
+                worker_id, active_or_pending
+            )
+
+    async def _on_disconnect(event_type, worker_id, data):
+        await orch.handle_disconnect(worker_id)
+
+    async def _on_connect(event_type, worker_id, data):
+        await orch.handle_reconnect(worker_id)
+
     manager.event_bus.subscribe("RUN_EXHAUSTED", _on_exhausted)
     manager.event_bus.subscribe("PROCESS_EXIT", _on_exit)
+    manager.event_bus.subscribe("STATUS", _on_status)
+    manager.event_bus.subscribe("WORKER_DISCONNECTED", _on_disconnect)
+    manager.event_bus.subscribe("WORKER_CONNECTED", _on_connect)
 
     orch._allocator = allocator  # keep a handle for scale-in release / tests
     return orch

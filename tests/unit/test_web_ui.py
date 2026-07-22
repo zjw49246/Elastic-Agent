@@ -63,6 +63,22 @@ class TestDashboardEndpoint:
         assert "container.replaceChildren()" in html
         assert "title.textContent = `Codex OTP" in html
         assert "worker 用实例角色直拉，不经 Manager" in html
+        assert '<textarea id="jCollect" placeholder="results">results</textarea>' in html
+
+    @pytest.mark.asyncio
+    async def test_batch_console_does_not_persist_or_put_api_key_in_download_url(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "localStorage" not in html
+        assert "results/download?api_key=" not in html
+        assert "sessionStorage" in html
+        assert "function esc(value)" in html
+        assert "Idempotency-Key" in html
+        assert "downloadResults" in html
+        assert "/cancel" in html
 
     @pytest.mark.asyncio
     async def test_fleet_dashboard(self, ui_client):

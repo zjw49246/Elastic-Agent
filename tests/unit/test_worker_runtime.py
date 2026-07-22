@@ -33,6 +33,7 @@ class TestWorkerRuntimeInit:
         assert runtime.active_processes == []
         assert runtime._worker_id == "test-worker-1"
         assert runtime._auth_token == "test-token-123"
+        assert runtime._exiting_task_ids == set()
 
     def test_custom_log_dir(self, tmp_path):
         custom = tmp_path / "custom-logs"
@@ -42,6 +43,230 @@ class TestWorkerRuntimeInit:
             log_dir=str(custom),
         )
         assert rt._log_dir == custom
+
+    @pytest.mark.asyncio
+    async def test_reliable_exit_event_survives_restart_until_ack(self, tmp_path):
+        from elastic_agent.core.protocols.messages import EventAckMessage, ProcessExitMessage
+
+        log_dir = tmp_path / "durable-logs"
+        first = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        await first._send_event(event)
+
+        assert event.event_id in first._reliable_events
+        assert first._event_outbox_path.stat().st_mode & 0o777 == 0o600
+
+        restarted = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+        assert event.event_id in restarted._reliable_events
+
+        await restarted._handle_event_ack(EventAckMessage(event_id=event.event_id))
+        assert event.event_id not in restarted._reliable_events
+
+        after_ack = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+        assert after_ack._reliable_events == {}
+
+    @pytest.mark.asyncio
+    async def test_reliable_restart_replay_preserves_event_sequence(self, tmp_path):
+        from elastic_agent.core.protocols.messages import (
+            ProcessExitMessage,
+            RunExhaustedMessage,
+        )
+
+        log_dir = tmp_path / "ordered-outbox"
+        first = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+        # Deliberately choose ids whose lexical order is opposite their event
+        # order.  The v1 object + sort_keys format replayed these backwards.
+        exhausted = RunExhaustedMessage(
+            task_id="task-1",
+            job_id="job-1",
+            worker_id="worker-1",
+            event_id="z-first",
+        )
+        exited = ProcessExitMessage(
+            task_id="task-1", exit_code=130, event_id="a-second",
+        )
+        await first._send_event(exhausted)
+        await first._send_event(exited)
+
+        persisted = json.loads(first._event_outbox_path.read_text())
+        assert persisted["version"] == 2
+        assert [item["event_id"] for item in persisted["events"]] == [
+            "z-first", "a-second",
+        ]
+
+        restarted = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+
+        class WebSocket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(json.loads(data)["type"])
+
+        restarted._ws = WebSocket()
+        await restarted._replay_reliable_events()
+        assert restarted._ws.sent == ["RUN_EXHAUSTED", "PROCESS_EXIT"]
+
+    def test_reliable_outbox_loads_legacy_object_format(self, tmp_path):
+        from elastic_agent.core.protocols.messages import ProcessExitMessage
+
+        log_dir = tmp_path / "legacy-outbox"
+        log_dir.mkdir()
+        first = ProcessExitMessage(
+            task_id="task-1", exit_code=1, event_id="legacy-z",
+        )
+        second = ProcessExitMessage(
+            task_id="task-2", exit_code=2, event_id="legacy-a",
+        )
+        (log_dir / "event_outbox.json").write_text(json.dumps({
+            "version": 1,
+            "events": {
+                first.event_id: first.model_dump_json(),
+                second.event_id: second.model_dump_json(),
+            },
+        }))
+
+        restarted = WorkerRuntime(
+            manager_url="ws://localhost/ws",
+            auth_token="token",
+            worker_id="worker-1",
+            log_dir=str(log_dir),
+        )
+        assert list(restarted._reliable_events) == ["legacy-z", "legacy-a"]
+
+    @pytest.mark.asyncio
+    async def test_reliable_replay_is_sent_before_queued_status(self, runtime):
+        from elastic_agent.core.protocols.messages import (
+            ProcessExitMessage,
+            StatusMessage,
+        )
+
+        class WebSocket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(json.loads(data)["type"])
+
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+        await runtime._send_event(event)
+        await runtime._send_queue.put(StatusMessage(
+            worker_id="worker-1", active_processes=[], cpu=0, mem=0, disk=0,
+        ).model_dump_json())
+        runtime._ws = WebSocket()
+
+        await runtime._replay_reliable_events()
+
+        assert runtime._ws.sent == ["PROCESS_EXIT"]
+
+    @pytest.mark.asyncio
+    async def test_pending_process_exit_is_advertised_until_ack(self, runtime):
+        from elastic_agent.core.protocols.messages import (
+            EventAckMessage,
+            ProcessExitMessage,
+            RunExhaustedMessage,
+        )
+
+        exited = ProcessExitMessage(task_id="task-finished", exit_code=0)
+        await runtime._send_event(exited)
+        await runtime._send_event(RunExhaustedMessage(
+            task_id="task-other",
+            job_id="job-1",
+            worker_id="worker-1",
+        ))
+
+        assert await runtime._pending_process_exit_task_ids() == ["task-finished"]
+        await runtime._handle_event_ack(EventAckMessage(event_id=exited.event_id))
+        assert await runtime._pending_process_exit_task_ids() == []
+
+    @pytest.mark.asyncio
+    async def test_exiting_task_is_advertised_during_final_sync(self, runtime, tmp_path):
+        class Process:
+            returncode = 0
+            stdout = None
+            stderr = None
+
+        class BlockingSync:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def force_sync(self, _task_id):
+                self.entered.set()
+                await self.release.wait()
+                return 0
+
+        task_id = "task-final-sync"
+        process = Process()
+        sync = BlockingSync()
+        runtime._file_sync_manager = sync
+        runtime._processes[task_id] = process
+
+        monitor = asyncio.create_task(runtime._monitor_process(
+            task_id, process, tmp_path / "process.ndjson", timeout=None,
+        ))
+        await asyncio.wait_for(sync.entered.wait(), timeout=1)
+
+        assert task_id not in runtime.active_processes
+        assert await runtime._pending_process_exit_task_ids() == [task_id]
+
+        sync.release.set()
+        await asyncio.wait_for(monitor, timeout=1)
+        # After persistence the durable PROCESS_EXIT, rather than the transient
+        # marker, keeps the task advertised until the Manager ACKs it.
+        assert task_id not in runtime._exiting_task_ids
+        assert await runtime._pending_process_exit_task_ids() == [task_id]
+
+    @pytest.mark.asyncio
+    async def test_failed_send_retries_ahead_of_later_frames(self, runtime):
+        class FailingWebSocket:
+            async def send(self, _data):
+                raise ConnectionError("disconnected")
+
+        await runtime._send_queue.put("first")
+        await runtime._send_queue.put("second")
+        runtime._running = True
+        runtime._ws = FailingWebSocket()
+        with pytest.raises(ConnectionError):
+            await runtime._sender_loop()
+        assert runtime._retry_send == "first"
+
+        sent = []
+
+        class WorkingWebSocket:
+            async def send(self, data):
+                sent.append(data)
+                if len(sent) == 2:
+                    runtime._running = False
+
+        runtime._ws = WorkingWebSocket()
+        await runtime._sender_loop()
+        assert sent == ["first", "second"]
 
 
 class TestNDJSONParsing:
@@ -348,6 +573,59 @@ class TestExhaustionWatch:
         await runtime._signal_exhaustion("t")  # second call is a no-op
 
         assert len([m for m in sent if m["type"] == "RUN_EXHAUSTED"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_signal_exhaustion_stops_old_process_before_event(self, runtime):
+        order = []
+
+        async def stop(task_id, signal_name):
+            order.append(("stop", task_id, signal_name))
+
+        async def send(message):
+            order.append(("send", message.type))
+
+        runtime._stop_process = stop
+        runtime._send_event = send
+        runtime._exhaustion_watch["t"] = "job-1"
+
+        await runtime._signal_exhaustion("t")
+
+        assert order == [
+            ("stop", "t", "SIGINT"),
+            ("send", "RUN_EXHAUSTED"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_signal_exhaustion_confirms_exit_before_event(self, runtime):
+        order = []
+        process = MagicMock()
+        process.returncode = None
+        runtime._processes["t"] = process
+
+        async def stop(task_id, signal_name):
+            order.append(("stop", task_id, signal_name))
+
+        async def wait_for_exit(observed, timeout):
+            assert observed is process
+            order.append(("wait", timeout))
+            process.returncode = 130
+            return True
+
+        async def send(message):
+            order.append(("send", message.type))
+
+        runtime._stop_process = stop
+        runtime._wait_process_exit = wait_for_exit
+        runtime._send_event = send
+        runtime._exhaustion_watch["t"] = "job-1"
+
+        await runtime._signal_exhaustion("t")
+
+        assert order == [
+            ("stop", "t", "SIGINT"),
+            ("wait", 15),
+            ("send", "RUN_EXHAUSTED"),
+        ]
 
 
 class TestStopProcess:

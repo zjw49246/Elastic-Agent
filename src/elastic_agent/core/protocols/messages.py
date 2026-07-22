@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
@@ -54,6 +55,17 @@ class StopMessage(Message):
     type: Literal["STOP"] = "STOP"
     task_id: str
     signal: str = "SIGTERM"
+
+
+class EventAckMessage(Message):
+    """Manager -> Worker acknowledgement for a durable terminal event.
+
+    Workers retain critical events until this acknowledgement arrives.  The
+    event id also lets the Manager make reconnect replays idempotent.
+    """
+
+    type: Literal["EVENT_ACK"] = "EVENT_ACK"
+    event_id: str
 
 
 class ReadFileMessage(Message):
@@ -196,6 +208,7 @@ class ProcessExitMessage(Message):
     session_id: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class FileContentMessage(Message):
@@ -218,6 +231,10 @@ class StatusMessage(Message):
     mem: float
     disk: float
     active_processes: list[str] = Field(default_factory=list)
+    # A process can disappear from ``active_processes`` just before its durable
+    # PROCESS_EXIT is delivered/ACKed.  Advertising those pending task ids keeps
+    # reconnect reconciliation from falsely failing a run in that narrow gap.
+    pending_process_exits: list[str] = Field(default_factory=list)
     runtime_ready: bool = True
     runtime_error: str | None = None
     agent_type: Literal["claude", "codex"] = "claude"
@@ -335,6 +352,7 @@ class RunExhaustedMessage(Message):
     job_id: str
     worker_id: str
     reason: str = "rate_limit"
+    event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class AuthMessage(Message):
@@ -364,6 +382,7 @@ ManagerToWorkerMessage = Annotated[
     Union[
         ExecuteMessage,
         StopMessage,
+        EventAckMessage,
         ReadFileMessage,
         WatchFilesMessage,
         UnwatchMessage,
@@ -410,6 +429,7 @@ AnyMessage = Annotated[
     Union[
         ExecuteMessage,
         StopMessage,
+        EventAckMessage,
         ReadFileMessage,
         WatchFilesMessage,
         UnwatchMessage,

@@ -13,8 +13,10 @@ from elastic_agent.core.protocols.messages import (
     AuthMessage,
     AuthResultMessage,
     ExecuteMessage,
+    EventAckMessage,
     HeartbeatMessage,
     LogMessage,
+    ProcessExitMessage,
     StatusMessage,
     StopMessage,
     parse_message,
@@ -187,6 +189,27 @@ class TestConnectionManager:
         manager._connections["worker-1"] = conn
 
         assert manager.get_connection("worker-1") is conn
+
+    @pytest.mark.asyncio
+    async def test_reliable_worker_event_is_acked_and_deduplicated(self, manager):
+        ws = FakeWebSocket()
+        conn = WorkerConnection("worker-1", ws)
+        received = []
+
+        async def on_message(worker_id, msg):
+            received.append((worker_id, msg.task_id))
+
+        manager.on_message = on_message
+        event = ProcessExitMessage(task_id="task-1", exit_code=0)
+
+        assert await manager._deliver_worker_message(conn, event) is True
+        assert await manager._deliver_worker_message(conn, event) is True
+
+        assert received == [("worker-1", "task-1")]
+        acks = [parse_message(raw) for raw in ws.sent]
+        assert len(acks) == 2
+        assert all(isinstance(ack, EventAckMessage) for ack in acks)
+        assert all(ack.event_id == event.event_id for ack in acks)
 
 
 class TestSendCommand:

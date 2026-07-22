@@ -173,18 +173,22 @@ _DASHBOARD_HTML = """\
 <div class="toast" id="toast"></div>
 
 <script>
-const _urlKey = new URLSearchParams(window.location.search).get('api_key');
-if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
-let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
-if (!API_KEY) {  // ask once, then remember in this browser
+// Never accept bearer credentials in URLs (browser history/referrer/server logs)
+// and keep them only for this tab/session rather than durable localStorage.
+const _params = new URLSearchParams(window.location.search);
+if (_params.has('api_key')) {
+  _params.delete('api_key');
+  history.replaceState(null, '', window.location.pathname + (_params.size ? '?' + _params : ''));
+}
+let API_KEY = sessionStorage.getItem('ea_api_key') || '';
+if (!API_KEY) {
   const k = (window.prompt('请输入 API Key：') || '').trim();
-  if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
+  if (k) { sessionStorage.setItem('ea_api_key', k); API_KEY = k; }
 }
 const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
                         : {'Content-Type': 'application/json'};
 
-// Batch Console link (key persists via localStorage; keep query too).
-{const nb = document.getElementById('navBatch'); if (nb) nb.href = '/' + window.location.search;}
+{const nb = document.getElementById('navBatch'); if (nb) nb.href = '/';}
 
 let refreshTimer = null;
 
@@ -281,6 +285,13 @@ function timeAgo(isoStr) {
   return Math.floor(diff/86400) + 'd ago';
 }
 
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[ch]);
+}
+function jsArg(value) { return esc(JSON.stringify(String(value ?? ''))); }
+
 function renderNode(n) {
   const isActive = ['running', 'ready', 'bootstrapping', 'draining'].includes(n.status.toLowerCase());
   return `
@@ -288,22 +299,22 @@ function renderNode(n) {
       <div class="node-header">
         <div>
           <span class="ws-indicator ${n.ws_connected ? 'ws-connected' : 'ws-disconnected'}"></span>
-          <span class="node-id">${n.node_id.substring(0, 12)}...</span>
+          <span class="node-id">${esc(n.node_id.substring(0, 12))}...</span>
         </div>
-        <span class="status-badge ${statusClass(n.status)}">${n.status}</span>
+        <span class="status-badge ${statusClass(n.status)}">${esc(n.status)}</span>
       </div>
-      <div class="instance-id">${n.instance_id}</div>
+      <div class="instance-id">${esc(n.instance_id)}</div>
       <dl class="node-details">
-        <dt>Platform</dt><dd>${n.platform || '--'}</dd>
-        <dt>Public IP</dt><dd>${n.public_ip || '--'}</dd>
-        <dt>Private IP</dt><dd>${n.private_ip || '--'}</dd>
+        <dt>Platform</dt><dd>${esc(n.platform || '--')}</dd>
+        <dt>Public IP</dt><dd>${esc(n.public_ip || '--')}</dd>
+        <dt>Private IP</dt><dd>${esc(n.private_ip || '--')}</dd>
         <dt>Created</dt><dd>${timeAgo(n.created_at)}</dd>
         <dt>Last HB</dt><dd>${timeAgo(n.last_heartbeat)}</dd>
       </dl>
       <div class="node-actions">
-        ${isActive ? `<button class="btn" onclick="drainNode('${n.node_id}')">Drain</button>` : ''}
-        ${isActive ? `<button class="btn btn-danger" onclick="scaleInNode('${n.node_id}')">Terminate</button>` : ''}
-        <button class="btn btn-danger" onclick="removeNode('${n.node_id}')">Remove</button>
+        ${isActive ? `<button class="btn" onclick="drainNode(${jsArg(n.node_id)})">Drain</button>` : ''}
+        ${isActive ? `<button class="btn btn-danger" onclick="scaleInNode(${jsArg(n.node_id)})">Terminate</button>` : ''}
+        <button class="btn btn-danger" onclick="removeNode(${jsArg(n.node_id)})">Remove</button>
       </div>
     </div>`;
 }
@@ -443,9 +454,12 @@ _BATCH_HTML = """\
   <!-- Job submission -->
   <div class="card">
     <h2>Submit Job</h2>
-    <div class="grid2">
+    <div class="grid3">
       <div><label>Job name</label><input id="jName" placeholder="ai4sci-opus48-seed128"></div>
       <div><label>Workers (fan-out)</label><input id="jWorkers" type="number" value="1" min="1"></div>
+      <div><label>Environment profile（固定通用环境）</label>
+        <select id="jProfile"><option value="ubuntu-agent-v1">ubuntu-agent-v1</option>
+          <option value="ubuntu-agent-docker-v1">ubuntu-agent-docker-v1</option></select></div>
     </div>
     <div class="grid3">
       <div><label>机器命名前缀（EC2 Name=前缀-i；空=用 Job name）</label>
@@ -465,12 +479,8 @@ _BATCH_HTML = """\
             <option>c5.xlarge</option><option>c5.2xlarge</option><option>c5.4xlarge</option><option>c5.9xlarge</option>
           </optgroup>
         </select></div>
-      <div><label>Region（空=Manager 默认；换区需 Manager 侧有对应 AMI/子网）</label>
-        <select id="jRegion">
-          <option value="">（默认）</option>
-          <option>ap-northeast-1</option><option>ap-southeast-1</option><option>ap-south-1</option>
-          <option>us-east-1</option><option>us-west-2</option><option>eu-west-1</option><option>eu-central-1</option>
-        </select></div>
+      <div><label>Region（空=当前 Manager 区域；目前不支持跨区）</label>
+        <input id="jRegion" placeholder="留空；仅可填当前 Manager 配置的区域"></div>
     </div>
     <div class="grid2">
       <div><label>根盘 disk_gb（0=Manager 默认；吃盘任务如 ai4sci 建议 ≥60）</label>
@@ -478,6 +488,12 @@ _BATCH_HTML = """\
     </div>
     <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
     <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
+    <div class="grid3">
+      <div><label>Repo branch/tag ref</label><input id="jRepoRef" value="main"></div>
+      <div><label>Resolved commit（推荐，完整 40 位 SHA）</label><input id="jResolvedCommit" placeholder="精确复现时填写"></div>
+      <div><label>代码目录 target_dir（绝对路径）</label>
+        <input id="jTargetDir" value="/opt/elastic-agent/harness"></div>
+    </div>
     <label>代码分发方式</label>
     <select id="jDeliver">
       <option value="manager_rsync">manager_rsync（私有 repo 推荐：token 只在 Manager，clone 后 rsync 到 worker，token 不上机）</option>
@@ -486,6 +502,10 @@ _BATCH_HTML = """\
     <label>Setup — commands（每行一条,在代码目录里跑；默认已装 uv 并 pin Python 3.13）</label>
     <textarea id="jSetup" placeholder="uv sync">curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3.13</textarea>
+    <details><summary class="muted">Structured setup steps（JSON，可单独设置 env/cwd/timeout/retries）</summary>
+      <textarea id="jSetupSteps" style="min-height:90px" placeholder='[{"name":"install","command":"uv sync","env":{"UV_LINK_MODE":"copy"},"cwd":".","timeout":1200,"retries":1}]'></textarea>
+      <div class="hint">每一步固定以 Job 用户运行；不允许指定 root 或其他用户名。旧的逐行 commands 仍兼容。</div>
+    </details>
     <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
     <div class="grid2">
       <div><label>需要 Docker（run 用 Docker,如 ai4sci <code>--sandbox os</code>）</label>
@@ -495,17 +515,28 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     </div>
     <label>Run command（shell;从代码目录运行;支持 {{shard_index}} 和 $(hostname -s)）</label>
     <textarea id="jRun" placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
-    <div class="grid2">
+    <div class="grid3">
       <div><label>Working dir（空/. = 代码目录;相对路径=其子目录）</label><input id="jCwd" value="."></div>
       <div><label>Shard by</label>
         <select id="jShard"><option value="hostname">hostname</option>
           <option value="shard_index">shard_index</option><option value="none">none</option></select></div>
+      <div><label>Shell mode</label><select id="jShell"><option value="true">bash -lc</option>
+        <option value="false">direct argv</option></select></div>
+    </div>
+    <div class="grid2">
+      <div><label>Run timeout 秒（默认 24h，最长 30 天）</label>
+        <input id="jRunTimeout" type="number" value="86400" min="60" max="2592000"></div>
+      <div><label>Job TTL 秒（含启动/登录/收集；默认 48h）</label>
+        <input id="jTtl" type="number" value="172800" min="300" max="2592000"></div>
     </div>
     <label>Env (KEY=VALUE per line)</label>
     <textarea id="jEnv" placeholder="AI4SCI_SANDBOX_CPU=1&#10;AI4SCI_SANDBOX_MEM=4g"></textarea>
+    <label>Secret env references（KEY=aws-secretsmanager://... 或 KEY=aws-ssm://...）</label>
+    <textarea id="jSecretEnv" placeholder="OPENAI_API_KEY=aws-secretsmanager://prod/openai#api_key&#10;DB_PASSWORD=aws-ssm:///prod/db/password"></textarea>
+    <div class="hint">只提交 AWS 引用；明文仅在命令下发前解析，不写回 JobSpec，也不在 API 中回显。</div>
     <div class="grid2">
       <div><label>结果收集目录 collect.paths（每行一个,相对代码目录,如 results）</label>
-        <textarea id="jCollect" placeholder="results"></textarea></div>
+        <textarea id="jCollect" placeholder="results">results</textarea></div>
       <div><label>增量收集间隔秒（0=只在完成时收集；&gt;0=边跑边收→持续上 S3，长跑推荐 120）</label>
         <input id="jCollectInterval" type="number" value="0" min="0"></div>
     </div>
@@ -520,7 +551,9 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     </div>
     <div class="grid2">
       <div><label>config_dir（空 = Agent 默认目录）</label>
-        <input id="jConfigDir" placeholder="~/.claude / ~/.codex"></div>
+        <input id="jConfigDir" placeholder="留空，或填写 worker 上的绝对路径"></div>
+      <div><label>Accounts per worker</label>
+        <input id="jPerWorker" type="number" value="1" min="1" max="32"></div>
     </div>
     <div class="grid2">
       <div><label>账号固定 EIP</label>
@@ -543,6 +576,10 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       <div><label>Resume args (appended on rotation restart)</label>
         <input id="jResume" placeholder='--resume "results/opus48_$(hostname -s)_seed128"'></div>
     </div>
+    <div class="grid2">
+      <div><label>Max rotations</label><input id="jMaxRotations" type="number" value="20" min="0" max="100"></div>
+      <div><label>Spot instance</label><select id="jSpot"><option value="false">否</option><option value="true">是</option></select></div>
+    </div>
 
     <details>
       <summary class="muted">Advanced: upload Harness code (escape hatch)</summary>
@@ -557,7 +594,11 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
         <input id="jHarnessRef" placeholder=""></div>
     </details>
 
-    <button class="btn" id="jSubmitBtn" onclick="submitJob()">Launch Job</button>
+    <div>
+      <button class="btn btn-ghost" id="jPlanBtn" onclick="previewJob()">Validate / Preview</button>
+      <button class="btn" id="jSubmitBtn" onclick="submitJob()">Launch Job</button>
+    </div>
+    <pre id="jPlanOutput" style="display:none;white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:10px;font-size:.72rem"></pre>
   </div>
 
   <!-- Jobs monitor -->
@@ -587,20 +628,22 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
 <div class="toast" id="toast"></div>
 
 <script>
-const _urlKey = new URLSearchParams(window.location.search).get('api_key');
-if (_urlKey) localStorage.setItem('ea_api_key', _urlKey);
-let API_KEY = _urlKey || localStorage.getItem('ea_api_key') || '';
-if (!API_KEY) {  // ask once, then remember in this browser
+const _params = new URLSearchParams(window.location.search);
+if (_params.has('api_key')) {
+  _params.delete('api_key');
+  history.replaceState(null, '', window.location.pathname + (_params.size ? '?' + _params : ''));
+}
+let API_KEY = sessionStorage.getItem('ea_api_key') || '';
+if (!API_KEY) {
   const k = (window.prompt('请输入 API Key：') || '').trim();
-  if (k) { localStorage.setItem('ea_api_key', k); API_KEY = k; }
+  if (k) { sessionStorage.setItem('ea_api_key', k); API_KEY = k; }
 }
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
                         : {'Content-Type':'application/json'};
-// Fleet Dashboard link (key persists via localStorage; keep query too).
-{const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet' + window.location.search;}
-function forgetKey() { localStorage.removeItem('ea_api_key'); location.href = '/'; }
-async function api(method, path, body) {
-  const opts = {method, headers:{...headers}};
+{const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet';}
+function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
+async function api(method, path, body, extraHeaders={}) {
+  const opts = {method, headers:{...headers, ...extraHeaders}};
   if (body) opts.body = JSON.stringify(body);
   const resp = await fetch('/api' + path, opts);
   if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
@@ -614,6 +657,12 @@ function toast(msg, type='success') {
 function lines(id) {
   return document.getElementById(id).value.split('\\n').map(s => s.trim()).filter(Boolean);
 }
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[ch]);
+}
+function jsArg(value) { return esc(JSON.stringify(String(value ?? ''))); }
 
 // ---- Accounts ----
 async function refreshAccounts() {
@@ -625,16 +674,16 @@ async function refreshAccounts() {
     document.getElementById('acctRows').innerHTML = accounts.map(a => {
       const b = alloc[a.id] || [];
       const bind = b.length
-        ? b.map(x => `${(x.worker_id||'').replace('aws:','')} <span class="muted">(${x.job_name||x.job_id}·${x.phase}${x.active?'·当前':''})</span>`).join('<br>')
+        ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} <span class="muted">(${esc(x.job_name||x.job_id)}·${esc(x.phase)}${x.active?'·当前':''})</span>`).join('<br>')
         : '<span class="muted">空闲</span>';
       const secrets = `${a.has_password ? 'password' : ''}`
         + `${a.has_password && a.has_email_token ? ' + ' : ''}`
         + `${a.has_email_token ? 'mail token' : ''}` || '—';
-      return `<tr><td>${a.id}</td><td>${a.agent_type}</td><td>${a.email}</td>
-        <td>${secrets}</td><td>${a.group}</td><td>${a.enabled}</td>
+      return `<tr><td>${esc(a.id)}</td><td>${esc(a.agent_type)}</td><td>${esc(a.email)}</td>
+        <td>${esc(secrets)}</td><td>${esc(a.group)}</td><td>${esc(a.enabled)}</td>
         <td style="font-size:.72rem">${bind}</td>
         <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
-            onclick="removeAccount('${a.id}')">✕</button></td></tr>`;
+            onclick="removeAccount(${jsArg(a.id)})">✕</button></td></tr>`;
     }).join('') || '<tr><td colspan="8" class="muted">No accounts.</td></tr>';
 
     const picker = document.getElementById('jAcctIds');
@@ -723,7 +772,7 @@ async function terminateWorker(wid) {
   catch(e) { toast(e.message, 'error'); }
 }
 async function removeAccount(id) {
-  try { await api('DELETE', '/accounts/' + id); toast('Removed'); refreshAccounts(); }
+  try { await api('DELETE', '/accounts/' + encodeURIComponent(id)); toast('Removed'); refreshAccounts(); }
   catch(e) { toast(e.message, 'error'); }
 }
 
@@ -740,16 +789,21 @@ async function uploadHarness() {
 }
 
 // ---- Job submit ----
-function buildEnv() {
+function buildKeyValueLines(id) {
   const env = {};
-  for (const l of lines('jEnv')) { const i = l.indexOf('='); if (i > 0) env[l.slice(0,i)] = l.slice(i+1); }
+  for (const l of lines(id)) { const i = l.indexOf('='); if (i > 0) env[l.slice(0,i)] = l.slice(i+1); }
   return env;
 }
+function buildEnv() { return buildKeyValueLines('jEnv'); }
+function buildSecretEnv() { return buildKeyValueLines('jSecretEnv'); }
 function updateEipBindingUI() {
   const enabled = document.getElementById('jAcctBinding').value === 'eip';
   const picker = document.getElementById('jAcctIds');
   const rotation = document.getElementById('jRot');
+  const perWorker = document.getElementById('jPerWorker');
   picker.disabled = !enabled;
+  if (enabled) perWorker.value = '1';
+  perWorker.disabled = enabled;
   const restartOption = Array.from(rotation.options)
     .find(o => o.value === 'on_exhaust_restart_resume');
   if (restartOption) restartOption.disabled = enabled;
@@ -770,9 +824,18 @@ function updateAgentUI() {
     if (option.disabled) option.selected = false;
   });
   document.getElementById('jConfigDir').placeholder =
-    agentType === 'codex' ? '~/.codex (CODEX_HOME)' : '~/.claude (CLAUDE_CONFIG_DIR)';
+    agentType === 'codex'
+      ? '/home/ubuntu/.codex（示例；必须是绝对路径）'
+      : '/home/ubuntu/.claude（示例；必须是绝对路径）';
 }
-async function submitJob() {
+function parseSetupSteps() {
+  const raw = document.getElementById('jSetupSteps').value.trim();
+  if (!raw) return [];
+  const value = JSON.parse(raw);
+  if (!Array.isArray(value)) throw new Error('Structured setup steps 必须是 JSON array');
+  return value;
+}
+function buildJobSpec() {
   const ref = document.getElementById('jHarnessRef').value.trim();
   const workers = parseInt(document.getElementById('jWorkers').value) || 1;
   const accountBinding = document.getElementById('jAcctBinding').value;
@@ -780,47 +843,124 @@ async function submitJob() {
     ? Array.from(document.getElementById('jAcctIds').selectedOptions).map(o => o.value)
     : [];
   if (accountBinding === 'eip' && accountIds.length && accountIds.length !== workers) {
-    return toast(`EIP 绑定模式下，选中账号数必须等于 Workers（当前 ${accountIds.length}/${workers}）`, 'error');
+    throw new Error(`EIP 绑定模式下，选中账号数必须等于 Workers（当前 ${accountIds.length}/${workers}）`);
+  }
+  const repo = document.getElementById('jRepo').value.trim() || null;
+  const setup = {
+    repo: repo,
+    target_dir: document.getElementById('jTargetDir').value.trim(),
+    commands: lines('jSetup'), steps: parseSetupSteps(),
+    deliver: document.getElementById('jDeliver').value,
+    needs_docker: document.getElementById('jNeedsDocker').value === 'true',
+    s3_datasets: lines('jS3').map(function(l){var p=l.trim().split(/ +/); return {uri:p[0], dest:p[1]||''};})
+                  .filter(function(d){return d.uri && d.dest;})
+  };
+  if (repo) {
+    setup.ref = document.getElementById('jRepoRef').value.trim();
+    setup.resolved_commit = document.getElementById('jResolvedCommit').value.trim();
   }
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
-    setup: {repo: document.getElementById('jRepo').value.trim() || null, commands: lines('jSetup'),
-            deliver: document.getElementById('jDeliver').value,
-            needs_docker: document.getElementById('jNeedsDocker').value === 'true',
-            s3_datasets: lines('jS3').map(function(l){var p=l.trim().split(/ +/); return {uri:p[0], dest:p[1]||''};})
-                          .filter(function(d){return d.uri && d.dest;})},
+    environment: {profile: document.getElementById('jProfile').value},
+    setup: setup,
     run: {command: document.getElementById('jRun').value.trim(),
-          cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv()},
+          cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv(),
+          secret_env: buildSecretEnv(),
+          timeout: parseInt(document.getElementById('jRunTimeout').value) || 86400,
+          shell: document.getElementById('jShell').value === 'true'},
+    ttl_seconds: parseInt(document.getElementById('jTtl').value) || 172800,
     account: {mode: document.getElementById('jAcctMode').value,
               agent_type: document.getElementById('jAgentType').value,
               group: document.getElementById('jAcctGroup').value.trim() || 'standard',
+              per_worker: parseInt(document.getElementById('jPerWorker').value) || 1,
               config_dir: document.getElementById('jConfigDir').value.trim(),
               binding: accountBinding,
               ids: accountIds},
     rotation: {strategy: document.getElementById('jRot').value,
-               resume_args: document.getElementById('jResume').value.trim()},
+               resume_args: document.getElementById('jResume').value.trim(),
+               max_rotations: parseInt(document.getElementById('jMaxRotations').value) || 0},
     fanout: {workers: workers,
              shard_by: document.getElementById('jShard').value,
              name_prefix: document.getElementById('jNamePrefix').value.trim(),
              instance_type: document.getElementById('jInstanceType').value.trim(),
              region: document.getElementById('jRegion').value.trim(),
              disk_gb: parseInt(document.getElementById('jDiskGb').value) || 0,
-             spot: false},
+             spot: document.getElementById('jSpot').value === 'true'},
     collect: {paths: lines('jCollect'),
               interval_seconds: parseInt(document.getElementById('jCollectInterval').value) || 0},
   };
   if (ref) spec.harness_ref = ref;
+  return spec;
+}
+function showJobPlan(plan) {
+  const output = document.getElementById('jPlanOutput');
+  output.style.display = 'block';
+  output.textContent = JSON.stringify(plan, null, 2);
+}
+async function previewJob() {
+  const button = document.getElementById('jPlanBtn');
+  const label = button.textContent;
+  button.disabled = true; button.textContent = 'Validating…';
+  try {
+    const plan = await api('POST', '/jobs/plan', buildJobSpec());
+    showJobPlan(plan); toast('Job plan valid'); return plan;
+  } catch(e) { toast(e.message, 'error'); throw e; }
+  finally { button.disabled = false; button.textContent = label; }
+}
+async function submitJob() {
   const btn = document.getElementById('jSubmitBtn');
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
-  try { const j = await api('POST', '/jobs', spec);
+  try {
+    const spec = buildJobSpec();
+    // Pure preflight first: no spec journal, account claim or EC2 is created
+    // until this succeeds. The backend repeats the same check at submit time.
+    const plan = await api('POST', '/jobs/plan', spec);
+    showJobPlan(plan);
+    const serialized = JSON.stringify(spec);
+    if (!window._pendingJobSubmission || window._pendingJobSubmission.spec !== serialized) {
+      window._pendingJobSubmission = {
+        spec: serialized,
+        key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random())
+      };
+    }
+    const j = await api('POST', '/jobs', spec, {
+      'Idempotency-Key': window._pendingJobSubmission.key
+    });
+    window._pendingJobSubmission = null;
     toast('Launched ' + j.job_id); refreshJobs(); }
   catch(e) { toast(e.message, 'error'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
 
 // ---- Jobs monitor ----
-function badge(p) { return `<span class="badge b-${p}">${p}</span>`; }
+function badge(p) {
+  const label = String(p || 'unknown');
+  const cls = label.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return `<span class="badge b-${cls}">${esc(label)}</span>`;
+}
+async function downloadResults(jobId) {
+  try {
+    const resp = await fetch(
+      '/api/jobs/' + encodeURIComponent(jobId) + '/results/download',
+      {headers: {...headers}}
+    );
+    if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = jobId + '-results.tar.gz';
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch(e) { toast('下载失败：' + e.message, 'error'); }
+}
+async function cancelJob(jobId) {
+  if (!window.confirm('取消 Job ' + jobId + '？将收集已有结果并销毁全部 Worker。')) return;
+  try {
+    await api('POST', '/jobs/' + encodeURIComponent(jobId) + '/cancel');
+    toast('Job 已取消并进入清理：' + jobId); refreshJobs();
+  } catch(e) { toast(e.message, 'error'); }
+}
 // Run async `fn` over items with at most `limit` in flight; never throws.
 async function mapLimit(items, limit, fn) {
   const it = items[Symbol.iterator]();
@@ -837,31 +977,33 @@ async function mapLimit(items, limit, fn) {
 // One job card. `r` = its results payload (or null while not yet loaded).
 function jobRowHtml(j, r) {
   const wd = j.workers_detail || [];
-  const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
   const scoreStr = (r && r.scores && r.scores.length)
-    ? r.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
+    ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
   const dlBtn = (r && r.file_count)
-    ? `<a class="btn btn-ghost" style="padding:4px 10px;margin:0" href="${dl}">⬇ 下载结果 (${r.file_count})</a>`
+    ? `<button class="btn btn-ghost" style="padding:4px 10px;margin:0" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
     : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
+  const cancelBtn = !j.done
+    ? `<button class="btn btn-danger" style="padding:4px 10px;margin:0 0 0 6px" onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
+    : '';
   return `
-  <div id="jobrow-${j.job_id}" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
+  <div id="jobrow-${esc(j.job_id)}" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
     <div style="display:flex;justify-content:space-between;align-items:center">
-      <div><b>${j.name||''}</b> <span class="muted">${j.job_id}</span> ·
-        ${Object.entries(j.phases||{}).map(([p,n]) => badge(p)+' '+n).join(' ')}</div>
-      ${dlBtn}
+      <div><b>${esc(j.name||'')}</b> <span class="muted">${esc(j.job_id)}</span> ·
+        ${Object.entries(j.phases||{}).map(([p,n]) => badge(p)+' '+(Number(n)||0)).join(' ')}</div>
+      <div>${dlBtn}${cancelBtn}</div>
     </div>
     ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
-    ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${r.s3_uri}</div>` : ''}
+    ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
     <details><summary class="muted">${wd.length} workers</summary>
     <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
       <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>日志</th></tr></thead><tbody>
-    ${wd.map(w => `<tr><td>${w.shard_index}</td>
-      <td>${(w.worker_id||'').substring(0,14)}</td><td>${badge(w.phase)}</td>
-      <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+(a.email||a.account_id)+'</b>' : (a.email||a.account_id)).join('<br>') : (w.account_email||'--')}</td>
-      <td>${w.rotations}</td>
-      <td class="muted">${w.error||''}</td>
-      <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs('${w.worker_id}')">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker('${w.worker_id}')">终止</button>` : ''}</td></tr>`).join('')}
+    ${wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
+      <td>${esc((w.worker_id||'').substring(0,14))}</td><td>${badge(w.phase)}</td>
+      <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+esc(a.email||a.account_id)+'</b>' : esc(a.email||a.account_id)).join('<br>') : esc(w.account_email||'--')}</td>
+      <td>${Number(w.rotations)||0}</td>
+      <td class="muted">${esc(w.error||'')}</td>
+      <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs(${jsArg(w.worker_id)})">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker(${jsArg(w.worker_id)})">终止</button>` : ''}</td></tr>`).join('')}
     </tbody></table></details>
   </div>`;
 }
@@ -916,16 +1058,15 @@ async function refreshResults() {
     const jobs = d.jobs || [];
     if (!jobs.length) { document.getElementById('resultsList').innerHTML = '<p class="muted">No results yet.</p>'; return; }
     document.getElementById('resultsList').innerHTML = jobs.map(j => {
-      const dl = '/api/jobs/' + j.job_id + '/results/download?api_key=' + encodeURIComponent(API_KEY);
       const scoreStr = (j.scores && j.scores.length)
-        ? j.scores.map(s => `${s.task_id} ${s.prompt_level}: <b>${(s.final_score||0).toFixed(1)}</b>`).join(' · ')
+        ? j.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
         : '';
       return `<div style="display:flex;justify-content:space-between;align-items:center;
           border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
-        <div><b>${j.job_id}</b> <span class="muted">(${j.file_count} 文件)</span>
+        <div><b>${esc(j.job_id)}</b> <span class="muted">(${Number(j.file_count)||0} 文件)</span>
           ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
-          ${j.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+j.s3_uri+'</div>' : ''}</div>
-        <a class="btn" style="margin:0" href="${dl}">⬇ 下载全部</a>
+          ${j.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(j.s3_uri)+'</div>' : ''}</div>
+        <button class="btn" style="margin:0" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载全部</button>
       </div>`;
     }).join('');
   } catch(e) { /* silent */ }

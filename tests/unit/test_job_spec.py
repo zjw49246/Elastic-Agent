@@ -6,9 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from elastic_agent.core.job_spec import (
+    DEFAULT_JOB_TTL_SECONDS,
+    DEFAULT_RUN_TIMEOUT_SECONDS,
     AccountSpec,
+    EnvironmentSpec,
     JobSpec,
     RunSpec,
+    S3Dataset,
+    SetupSpec,
     WorkerContext,
     render_template,
 )
@@ -72,6 +77,152 @@ class TestWorkerContexts:
     def test_run_timeout_has_a_bounded_maximum(self):
         with pytest.raises(ValidationError):
             RunSpec(command="echo hi", timeout=2_592_001)
+
+    def test_legacy_unlimited_timeout_is_normalized_to_safe_default(self):
+        assert RunSpec(command="echo hi", timeout=0).timeout == DEFAULT_RUN_TIMEOUT_SECONDS
+        assert RunSpec(command="echo hi", timeout=None).timeout == DEFAULT_RUN_TIMEOUT_SECONDS
+
+    def test_job_ttl_must_cover_run_and_is_bounded(self):
+        with pytest.raises(ValidationError, match="greater than or equal"):
+            JobSpec(
+                name="j",
+                run={"command": "x", "timeout": 7200},
+                ttl_seconds=3600,
+            )
+        with pytest.raises(ValidationError):
+            JobSpec(
+                name="j",
+                run={"command": "x"},
+                ttl_seconds=2_592_001,
+            )
+
+
+class TestEnvironmentAndSetup:
+    def test_versioned_environment_profile_is_fixed(self):
+        env = EnvironmentSpec(profile="ubuntu-agent-docker-v1")
+        assert env.manifest()["docker"] is True
+        with pytest.raises(ValidationError, match="unknown environment profile"):
+            EnvironmentSpec(profile="latest")
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"name": "j", "run": {"command": "x"}, "timeuot": 1},
+            {"name": "j", "run": {"command": "x", "timeuot": 1}},
+            {"name": "j", "run": {"command": "x"}, "setup": {"commnads": []}},
+        ],
+    )
+    def test_unknown_fields_are_rejected_at_every_level(self, payload):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            JobSpec.model_validate(payload)
+
+    def test_legacy_commands_and_structured_steps_normalize_in_order(self):
+        setup = SetupSpec.model_validate({
+            "commands": ["export A=1", "echo $A"],
+            "steps": [{
+                "name": "install",
+                "command": "uv sync",
+                "env": {"UV_LINK_MODE": "copy"},
+                "cwd": "python",
+                "timeout": 1200,
+                "retries": 2,
+            }],
+        })
+        steps = setup.normalized_steps()
+        assert [step.name for step in steps] == ["legacy-commands", "install"]
+        assert steps[0].command == "export A=1 && echo $A"
+        assert steps[1].env == {"UV_LINK_MODE": "copy"}
+        assert steps[1].retries == 2
+        assert steps[1].run_as == "job"
+
+    def test_setup_step_rejects_root_escape_and_bad_env(self):
+        with pytest.raises(ValidationError):
+            SetupSpec(steps=[{"name": "x", "command": "x", "run_as": "root"}])
+        with pytest.raises(ValidationError, match="invalid variable"):
+            SetupSpec(steps=[{
+                "name": "x", "command": "x", "env": {"BAD-NAME": "x"},
+            }])
+        with pytest.raises(ValidationError, match="cannot escape"):
+            SetupSpec(steps=[{"name": "x", "command": "x", "cwd": "../etc"}])
+
+    def test_source_ref_and_resolved_commit_are_explicit(self):
+        commit = "a" * 40
+        setup = SetupSpec(
+            repo="https://github.com/org/repo.git",
+            ref="release/v1",
+            resolved_commit=commit,
+        )
+        assert setup.checkout_ref == "release/v1"
+        assert setup.resolved_commit == commit
+        with pytest.raises(ValidationError, match="full 40-64 hex"):
+            SetupSpec(repo="https://github.com/org/repo.git", resolved_commit="abc")
+        with pytest.raises(ValidationError, match="require setup.repo"):
+            SetupSpec(ref="release/v1")
+
+    @pytest.mark.parametrize("repo", [
+        "https://token@github.com/org/repo.git",
+        "https://user:secret@github.com/org/repo.git",
+        "https://github.com/org/repo.git?token=secret",
+        "file:///srv/private/repo",
+        "/srv/private/repo",
+    ])
+    def test_repo_rejects_embedded_credentials_and_local_paths(self, repo):
+        with pytest.raises(ValidationError, match="setup.repo"):
+            SetupSpec(repo=repo)
+
+    def test_repo_accepts_scp_style_ssh_remote(self):
+        setup = SetupSpec(repo="git@github.com:org/repo.git")
+        assert setup.repo == "git@github.com:org/repo.git"
+
+
+class TestRunSafetyAndSecretEnv:
+    def test_secret_env_accepts_references_and_rejects_plaintext(self):
+        run = RunSpec(command="bench", secret_env={
+            "TOKEN": "aws-secretsmanager://prod/service#token",
+            "PASSWORD": "aws-ssm:///prod/password",
+        })
+        assert set(run.secret_env) == {"TOKEN", "PASSWORD"}
+
+        with pytest.raises(ValidationError, match="must use"):
+            RunSpec(command="bench", secret_env={"TOKEN": "plaintext"})
+
+    def test_plain_and_secret_env_keys_cannot_overlap(self):
+        with pytest.raises(ValidationError, match="cannot define the same"):
+            RunSpec(
+                command="bench",
+                env={"TOKEN": "not-secret"},
+                secret_env={"TOKEN": "aws-ssm:///prod/token"},
+            )
+
+    @pytest.mark.parametrize("field", ["env", "secret_env"])
+    def test_run_env_names_are_validated(self, field):
+        value = "x" if field == "env" else "aws-ssm:///x"
+        with pytest.raises(ValidationError, match="invalid variable"):
+            RunSpec(command="bench", **{field: {"BAD-NAME": value}})
+
+    def test_command_cwd_and_env_reject_unsafe_values_but_allow_absolute_cwd(self):
+        assert RunSpec(command="bench", cwd="/srv/jobs/input").cwd == "/srv/jobs/input"
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            RunSpec(command="  ")
+        with pytest.raises(ValidationError, match="control"):
+            RunSpec(command="echo\x00bad")
+        with pytest.raises(ValidationError, match="cannot contain"):
+            RunSpec(command="bench", cwd="../escape")
+        with pytest.raises(ValidationError, match="NUL"):
+            RunSpec(command="bench", env={"TOKEN": "bad\x00value"})
+
+    def test_s3_dataset_validates_uri_and_absolute_non_root_dest(self):
+        dataset = S3Dataset(uri="s3://example-data/prefix/", dest="/srv/data")
+        assert dataset.uri == "s3://example-data/prefix/"
+        for payload in (
+            {"uri": "https://example/data", "dest": "/srv/data"},
+            {"uri": "s3://Bad_Bucket/data", "dest": "/srv/data"},
+            {"uri": "s3://example-data/data", "dest": "relative"},
+            {"uri": "s3://example-data/data", "dest": "/"},
+            {"uri": "s3://example-data/data", "dest": "/srv/../etc"},
+        ):
+            with pytest.raises(ValidationError):
+                S3Dataset.model_validate(payload)
 
 
 class TestRenderCommand:
@@ -292,7 +443,10 @@ class TestResolvedCwd:
 
 
 class TestCollectPaths:
-    @pytest.mark.parametrize("path", ["", ".", "../secret", "out/../../secret", "/etc"])
+    @pytest.mark.parametrize(
+        "path",
+        ["", ".", "../secret", "out/../../secret", "/etc", "bad\\path", "bad\x00path"],
+    )
     def test_rejects_paths_outside_job_collection_root(self, path):
         with pytest.raises(ValidationError, match="collect.paths"):
             JobSpec(
@@ -322,6 +476,9 @@ class TestJobSpecDefaults:
         assert spec.account.ids == []
         assert spec.rotation.strategy == "none"
         assert spec.run.shell is True
+        assert spec.run.timeout == DEFAULT_RUN_TIMEOUT_SECONDS
+        assert spec.ttl_seconds == DEFAULT_JOB_TTL_SECONDS
+        assert spec.environment.profile == "ubuntu-agent-v1"
         assert spec.harness_ref is None
 
     def test_codex_agent_type_is_supported(self):

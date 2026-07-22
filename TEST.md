@@ -26,6 +26,8 @@ uv run pytest -q \
   tests/unit/test_batch_orchestrator.py \
   tests/unit/test_job_spec.py \
   tests/unit/test_api_batch.py \
+  tests/unit/test_manager_fleet_driver.py \
+  tests/unit/test_result_uploader.py \
   tests/unit/test_manager.py \
   tests/unit/test_account_store.py \
   tests/unit/test_account_login_api.py \
@@ -46,6 +48,13 @@ The focused suite covers:
   scale-out, and explicit/group-based account choice;
 - durable mode-0600 JobSpec persistence before direct/API launch side effects,
   crash recovery collection, and whole-fanout capacity rejection before any EIP;
+- strict unknown-field rejection, immutable environment-profile selection,
+  finite run/Job TTL defaults and bounds, exact Git manifest validation, and
+  backward-compatible legacy plus structured per-step setup executed as the Job
+  user with isolated env/cwd/timeout/retry policy;
+- side-effect-free `/api/jobs/plan` previews with secret values omitted, plus
+  pre-persistence checks for Manager region/capacity, account availability, S3
+  dataset instance-role requirements, and resolved S3 collection mode;
 - validation of AWS EIP mode (`per_worker=1`, matching account/worker counts,
   and no in-place account rotation);
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
@@ -55,6 +64,16 @@ The focused suite covers:
   forced fresh runtime reconnect, strict request correlation, protected
   credential-home env, exact authenticated-email checks, and successful
   credential warm-up;
+- per-shard Worker result namespaces and collection manifests, direct/fallback
+  S3 prefix parity, content-hash change detection, bounded/consistent result
+  reads and downloads, awaited Manager-side upload, explicit S3 failures, and
+  force-termination (not registry-only draining) after ordinary Job completion;
+- ordered durable lifecycle-event replay, STATUS coverage during final sync,
+  cancellation during dispatch, non-blocking exhaustion/login rotation, and
+  live compensation retry after ordinary EC2 creation failures;
+- `run.secret_env` resolution only at dispatch and rejection of plaintext
+  cross-host WebSockets before AWS secrets are read; worker clone never receives
+  the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token

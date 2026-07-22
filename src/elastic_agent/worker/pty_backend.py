@@ -345,6 +345,10 @@ if PTY_AVAILABLE:
                     error_message=error,
                     error_type=error_type,
                 ))
+            # Publish the terminal hand-off before removing the PTY task from
+            # ``active_tasks``.  STATUS can otherwise observe neither an active
+            # task nor a pending PROCESS_EXIT while runtime final sync runs.
+            await self._runtime._mark_task_exiting(task_id)
             self._saw_result.discard(task_id)
             self._saw_claude_output.discard(task_id)
             self._task_session_ids.pop(task_id, None)

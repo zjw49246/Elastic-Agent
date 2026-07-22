@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 
 import pytest
 
@@ -182,6 +183,28 @@ async def test_persistence(registry_path):
     assert got.worker_id == "w1"
     assert got.session_id == "sess-abc"
     assert got.metadata == {"key": "value"}
+
+
+@pytest.mark.asyncio
+async def test_task_registry_state_permissions_are_private(registry_path):
+    registry_path.parent.chmod(0o755)
+    registry = TaskRegistry(registry_path)
+    await registry.register("t1", "w1")
+
+    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_load_repairs_legacy_task_registry_permissions(registry_path):
+    registry_path.write_text('{"tasks": {}}', encoding="utf-8")
+    registry_path.chmod(0o644)
+    registry_path.parent.chmod(0o755)
+
+    await TaskRegistry(registry_path).load()
+
+    assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
 
 
 @pytest.mark.asyncio

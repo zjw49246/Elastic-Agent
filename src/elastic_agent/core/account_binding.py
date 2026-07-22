@@ -16,13 +16,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +194,10 @@ class AccountBindingStore:
                 self._load_sync()
 
     def _load_sync(self) -> None:
+        secure_state_directory(self._path.parent)
         if self._path.exists():
             try:
+                tighten_state_file(self._path)
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 legacy = raw.get("version", 1) < 2 or any(
                     "instance_id" in item for item in raw.get("bindings", [])
@@ -211,7 +218,7 @@ class AccountBindingStore:
                 # Older versions created this journal using the process umask,
                 # which commonly left account emails and cloud identifiers
                 # world-readable.  Repair a valid legacy file on first load.
-                self._path.chmod(0o600)
+                tighten_state_file(self._path)
             except Exception as exc:
                 # This file is the source of truth for billable EIPs and active
                 # instance leases.  Treating corruption as an empty store could
@@ -237,32 +244,8 @@ class AccountBindingStore:
     def _write_config_sync(self, config: BindingsConfig) -> None:
         """Durably write ``config`` before publishing it as in-memory state."""
         self._validate_invariants(config)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.loads(config.model_dump_json())
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as stream:
-                # ``open(..., mode=...)`` would not tighten a stale temp file,
-                # so enforce the mode on the actual descriptor before writing.
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(json.dumps(payload, indent=2))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, self._path)
-            # Persist the directory entry too.  Some test/platform filesystems
-            # do not expose O_DIRECTORY; the file fsync above still applies.
-            if hasattr(os, "O_DIRECTORY"):
-                directory_fd = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        atomic_write_private(self._path, json.dumps(payload, indent=2))
         self._config = config
 
     @staticmethod

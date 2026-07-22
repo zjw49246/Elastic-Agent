@@ -18,6 +18,7 @@ from elastic_agent.core.protocols.messages import (
     CredentialLoginResultMessage,
     CredentialRotateMessage,
     ErrorMessage,
+    EventAckMessage,
     ExecuteMessage,
     FileChangeMessage,
     FileContentMessage,
@@ -72,6 +73,12 @@ class TestManagerToWorkerMessages:
     def test_stop_default_signal(self):
         msg = StopMessage(task_id="t-1")
         assert msg.signal == "SIGTERM"
+
+    def test_reliable_event_ack_roundtrip(self):
+        msg = EventAckMessage(event_id="event-123")
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, EventAckMessage)
+        assert restored.event_id == "event-123"
 
     def test_read_file_roundtrip(self):
         msg = ReadFileMessage(request_id="req-1", path="/tmp/out.txt", encoding="utf-8")
@@ -252,6 +259,8 @@ class TestWorkerToManagerMessages:
         restored = parse_message(msg.model_dump_json())
         assert isinstance(restored, ProcessExitMessage)
         assert restored.exit_code == 0
+        assert restored.event_id == msg.event_id
+        assert len(restored.event_id) == 32
 
     def test_process_exit_nonzero(self):
         msg = ProcessExitMessage(task_id="t-2", exit_code=137)
@@ -304,18 +313,21 @@ class TestWorkerToManagerMessages:
             mem=72.8,
             disk=60.0,
             active_processes=["claude-pid-1234", "claude-pid-5678"],
+            pending_process_exits=["claude-pid-finished"],
         )
         restored = parse_message(msg.model_dump_json())
         assert isinstance(restored, StatusMessage)
         assert restored.cpu == 45.2
         assert restored.mem == 72.8
         assert len(restored.active_processes) == 2
+        assert restored.pending_process_exits == ["claude-pid-finished"]
         assert restored.runtime_ready is True
         assert restored.claude_cli_ok is True
 
     def test_status_defaults(self):
         msg = StatusMessage(cpu=0.0, mem=0.0, disk=0.0)
         assert msg.active_processes == []
+        assert msg.pending_process_exits == []
 
     def test_codex_status_roundtrip(self):
         msg = StatusMessage(
