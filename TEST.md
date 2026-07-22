@@ -67,7 +67,8 @@ The focused suite covers:
 - per-shard Worker result namespaces and collection manifests, direct/fallback
   S3 prefix parity, content-hash change detection, bounded/consistent result
   reads and downloads, awaited Manager-side upload, explicit S3 failures, and
-  force-termination (not registry-only draining) after ordinary Job completion;
+  force-termination plus Node-record removal (not registry-only draining) after
+  ordinary Job completion;
 - ordered durable lifecycle-event replay, STATUS coverage during final sync,
   cancellation during dispatch, non-blocking exhaustion/login rotation, and
   live compensation retry after ordinary EC2 creation failures;

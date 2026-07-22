@@ -385,7 +385,9 @@ spec resolve to the same deterministic Job, while reusing it for different
 content returns `409`. `POST /api/jobs/{job_id}/cancel` sends TERM/KILL as
 needed, waits for the reliable process-exit event, performs final collection,
 and then force-terminates ordinary Job Workers (EIP Jobs detach/terminate via
-their lease). On restart, durable `prepared/launching/running/terminal` state is
+their lease). Disposable ordinary Workers are also removed from the live Node
+registry after cloud termination, preventing unbounded dashboard/state growth.
+On restart, durable `prepared/launching/running/terminal` state is
 used to resume preparation or collect and clean up interrupted Workers.
 
 For cost control, `ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES` is a comma-separated

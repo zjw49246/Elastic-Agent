@@ -473,7 +473,16 @@ class ManagerFleetDriver:
     async def scale_in(self, worker_ids: list[str]) -> None:
         # Batch completion owns these ephemeral workers.  A graceful drain only
         # changes registry state and leaves the EC2 instance billable.
-        await self._mgr.scale_in(node_ids=list(worker_ids), force=True)
+        terminated = await self._mgr.scale_in(
+            node_ids=list(worker_ids), force=True,
+        )
+        # Job workers are disposable implementation details, not fleet history.
+        # Keeping a TERMINATED NodeRecord for every shard makes the dashboard and
+        # registry grow without bound across large fan-out workloads.  Cloud
+        # termination has succeeded at this point; remove the disconnected
+        # record through Manager's normal task/registry cleanup path.
+        for worker_id in terminated:
+            await self._mgr.remove_node(worker_id)
 
 
 async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:

@@ -53,6 +53,7 @@ class FakeManager:
         self._batch = FakeBatch()
         self._s3_uploader = None
         self.scale_in_calls = []
+        self.removed_nodes = []
         self.config = SimpleNamespace(
             server=SimpleNamespace(host="127.0.0.1", port=8080),
             worker=SimpleNamespace(ssh_user="ubuntu"),
@@ -68,6 +69,11 @@ class FakeManager:
 
     async def scale_in(self, *, node_ids, force):
         self.scale_in_calls.append((node_ids, force))
+        return list(node_ids)
+
+    async def remove_node(self, node_id):
+        self.removed_nodes.append(node_id)
+        return True
 
 
 class FakeProcess:
@@ -260,6 +266,7 @@ async def test_scale_in_force_terminates_and_stop_command_forwards_signal(tmp_pa
     await driver.stop_command("worker-a", "task-1", signal="SIGINT")
 
     assert manager.scale_in_calls == [(["worker-a", "worker-b"], True)]
+    assert manager.removed_nodes == ["worker-a", "worker-b"]
     assert manager.connection_manager.stopped == [
         ("worker-a", "task-1", "SIGINT")
     ]
