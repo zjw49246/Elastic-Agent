@@ -279,3 +279,11 @@
 **测试命令教训**：worker 的 subprocess stdin 保持 PIPE 以支持 `SEND_INPUT`。首条无人值守 `codex exec` 虽已有 prompt，仍显示 `Reading additional input from stdin...` 并等 EOF；这不是登录失败。该轮通过编排器安全取消并完成 final collect/EC2 清理，重跑时显式加 `</dev/null` 即完成。以后所有可能读取 stdin 到 EOF 的 Mode-B CLI 都要明确重定向，不能把“进程存活但无输出”误判成 OAuth 卡住。
 
 **验证**：`tests/unit/test_codex_login.py` 26 项全绿，Ruff、`compileall` 与 diff check 通过；真实 Job 的登录、命令、结果 API、EIP 出口、失败补偿和成功清理均已验证。
+
+## 2026-07-22 Manager 生产域名与 WSS 回连（deployed main `476c3f0`）
+
+**变更**：`elastic-agent.claude-code-manager.com` 已由 Cloudflare 代理到东京 `elastic-agent-manager`。公网 HTTPS 页面和 `/api/health` 均返回 200，`wss://elastic-agent.claude-code-manager.com/ws/runtime` 握手成功。Manager 的 mode-0600 EnvironmentFile 改为该 WSS URL，机器 launcher 改为 `setdefault`（不再覆盖部署环境），并移除临时 `ELASTIC_AGENT_ALLOW_INSECURE_ACCOUNT_LOGIN`；零活动 Job 时重启，原 3 个 worker 全部重连且健康。修改前 launcher/EnvironmentFile 均留有同机备份。
+
+**边界**：当前 TLS 在 Cloudflare 边缘终止；源站仍只有 Python 服务监听 `0.0.0.0:8080`，本机没有 nginx/caddy/certbot 或 80/443 listener。若要求 Cloudflare→源站也加密，需要在 Cloudflare 侧配合 Origin Certificate/Tunnel 与 Full (strict)，不能仅凭公网 `https://`/`wss://` 握手推断端到端 TLS。
+
+**同时完成**：东京区 EC2-VPC EIP quota 从 13 提升到 20 的申请已 `APPROVED`；新增地址仍按账号 binding 按需分配，不提前创建无账号归属且持续计费的 EIP。
