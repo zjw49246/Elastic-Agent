@@ -27,6 +27,7 @@ from elastic_agent.core.config import (
     RegistryConfig,
     ServerConfig,
     TaskRegistryConfig,
+    WebhookConfig,
     WorkerConfig,
 )
 from elastic_agent.core.providers.aws import AWSProvider
@@ -42,7 +43,30 @@ GOLDEN_IMAGE_TAGS = {
 
 _AWS_ID_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
+_IAM_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_+=,.@-]{1,64}$")
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+_FORBIDDEN_AWS_CREDENTIAL_ENV = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_ENDPOINT_URL_EC2",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_ENDPOINT_URL_SECRETSMANAGER",
+    "AWS_ENDPOINT_URL_SSM",
+)
 
 
 class LauncherConfigurationError(ValueError):
@@ -61,6 +85,7 @@ class AWSManagerSettings:
     key_pair_name: str
     ssh_key_path: Path
     worker_instance_profile: str
+    expected_role_name: str
     max_instances: int
     state_dir: Path
     manager_url: str
@@ -151,11 +176,35 @@ def _validate_api_key_presence(environ: Mapping[str, str]) -> None:
         raise LauncherConfigurationError("required environment variable ELASTIC_AGENT_EXTERNAL_API_KEYS is missing")
 
 
+def _validate_instance_profile_only(environ: Mapping[str, str]) -> None:
+    forbidden = [
+        name for name in _FORBIDDEN_AWS_CREDENTIAL_ENV
+        if environ.get(name, "").strip()
+    ]
+    if forbidden:
+        raise LauncherConfigurationError(
+            "alternate AWS credential/endpoint environment is forbidden: "
+            + ", ".join(forbidden)
+        )
+    for name in (
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "BOTO_CONFIG",
+    ):
+        if environ.get(name, "").strip() != "/dev/null":
+            raise LauncherConfigurationError(f"{name} must be /dev/null")
+    if _boolean(environ, "AWS_EC2_METADATA_DISABLED"):
+        raise LauncherConfigurationError("AWS_EC2_METADATA_DISABLED must be false")
+    if not _boolean(environ, "AWS_EC2_METADATA_V1_DISABLED"):
+        raise LauncherConfigurationError("AWS_EC2_METADATA_V1_DISABLED must be true")
+
+
 def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSettings:
     """Parse production configuration without mutating ``os.environ``."""
 
     source = os.environ if environ is None else environ
     _validate_api_key_presence(source)
+    _validate_instance_profile_only(source)
 
     region = _required(source, "ELASTIC_AGENT_AWS_REGION")
     if not _REGION_RE.fullmatch(region):
@@ -179,6 +228,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
     manager_url = _required(source, "ELASTIC_AGENT_MANAGER_URL")
     _validate_manager_url(manager_url)
 
+    expected_role_name = _required(source, "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME")
+    if not _IAM_ROLE_NAME_RE.fullmatch(expected_role_name):
+        raise LauncherConfigurationError("ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME is invalid")
+
     log_level = _required(source, "ELASTIC_AGENT_LOG_LEVEL").upper()
     if log_level not in _LOG_LEVELS:
         raise LauncherConfigurationError("ELASTIC_AGENT_LOG_LEVEL must be one of CRITICAL, ERROR, WARNING, INFO, DEBUG")
@@ -192,6 +245,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         key_pair_name=_required(source, "ELASTIC_AGENT_AWS_KEY_PAIR_NAME"),
         ssh_key_path=_absolute_path(source, "ELASTIC_AGENT_AWS_SSH_KEY_PATH"),
         worker_instance_profile=_required(source, "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE"),
+        expected_role_name=expected_role_name,
         max_instances=_positive_int(source, "ELASTIC_AGENT_AWS_MAX_INSTANCES", maximum=100),
         state_dir=_absolute_path(source, "ELASTIC_AGENT_STATE_DIR"),
         manager_url=manager_url,
@@ -230,6 +284,9 @@ def build_config(settings: AWSManagerSettings) -> ElasticAgentConfig:
         logging=LoggingConfig(
             operations_log=str(settings.state_dir / "operations.log"),
             log_level=settings.log_level,
+        ),
+        webhook=WebhookConfig(
+            dead_letter_path=str(settings.state_dir / "webhook_dead_letters.json"),
         ),
     )
 
@@ -354,9 +411,19 @@ def validate_worker_ami(
         raise LauncherConfigurationError(f"worker AMI {settings.ami_id}: DescribeImages returned no unique image")
     if images[0].get("ImageId") != settings.ami_id:
         raise LauncherConfigurationError(f"worker AMI {settings.ami_id}: DescribeImages returned a different image")
-    caller_account_id = str(sts_client.get_caller_identity().get("Account") or "")
+    identity = sts_client.get_caller_identity()
+    caller_account_id = str(identity.get("Account") or "")
     if not caller_account_id:
         raise LauncherConfigurationError("AWS caller identity has no account ID")
+    caller_arn = str(identity.get("Arn") or "")
+    expected_prefix = (
+        f"arn:aws:sts::{caller_account_id}:assumed-role/"
+        f"{settings.expected_role_name}/"
+    )
+    if not caller_arn.startswith(expected_prefix):
+        raise LauncherConfigurationError(
+            "AWS caller identity is not the expected Manager instance role"
+        )
     return validate_image_description(
         images[0],
         caller_account_id=caller_account_id,

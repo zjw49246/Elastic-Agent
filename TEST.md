@@ -22,7 +22,9 @@ uv run pytest -q tests/unit/test_aws_manager_launcher.py
 ```
 
 These tests cover required environment-only configuration, secret-free
-settings/errors, WSS enforcement, local state/key permissions, and AMI
+settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
+Manager-role identity, local state/key permissions, systemd readiness/teardown
+bounds, and AMI
 availability/architecture/HVM/ENA/IMDSv2/encryption/provenance checks including
 the explicit Canonical break-glass path.
 

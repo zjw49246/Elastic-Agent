@@ -18,6 +18,7 @@ from deploy.aws_manager import (
 )
 
 CALLER_ACCOUNT = "123456789012"
+SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
@@ -31,6 +32,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_AWS_KEY_PAIR_NAME": "elastic-agent-key",
         "ELASTIC_AGENT_AWS_SSH_KEY_PATH": str(tmp_path / "worker.pem"),
         "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE": "elastic-agent-worker",
+        "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME": "elastic-agent-manager",
         "ELASTIC_AGENT_AWS_MAX_INSTANCES": "30",
         "ELASTIC_AGENT_STATE_DIR": str(tmp_path / "state"),
         "ELASTIC_AGENT_MANAGER_URL": "wss://manager.example/ws/runtime",
@@ -42,6 +44,11 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_RESULTS_S3_BUCKET": "elastic-agent-results-example",
         "ELASTIC_AGENT_RESULTS_S3_PREFIX": "jobs",
         "ELASTIC_AGENT_RESULTS_S3_INTERVAL": "60",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_CONFIG_FILE": "/dev/null",
+        "BOTO_CONFIG": "/dev/null",
+        "AWS_EC2_METADATA_DISABLED": "false",
+        "AWS_EC2_METADATA_V1_DISABLED": "true",
     }
 
 
@@ -71,6 +78,24 @@ def _golden_image() -> dict:
     }
 
 
+def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
+    source = SERVICE_UNIT.read_text(encoding="utf-8")
+
+    assert "AssertPathIsDirectory=/home/ubuntu/.elastic-agent-demo" in source
+    assert "ReadWritePaths=/home/ubuntu/.elastic-agent-demo" in source
+    assert "ExecStartPost=" in source and "/api/health" in source
+    assert "TimeoutStopSec=1200" in source
+    for setting in (
+        "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
+        "AWS_CONFIG_FILE=/dev/null",
+        "BOTO_CONFIG=/dev/null",
+        "AWS_EC2_METADATA_DISABLED=false",
+        "AWS_EC2_METADATA_V1_DISABLED=true",
+    ):
+        assert setting in source
+    assert "UnsetEnvironment=AWS_ACCESS_KEY_ID" in source
+
+
 def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     settings = load_settings(_environment(tmp_path))
     config = build_config(settings)
@@ -85,10 +110,14 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert config.provider.aws.key_pair_name == "elastic-agent-key"
     assert config.provider.aws.worker_instance_profile == "elastic-agent-worker"
     assert config.provider.aws.max_instances == 30
+    assert settings.expected_role_name == "elastic-agent-manager"
     assert config.worker.ssh_user == "ubuntu"
     assert config.registry.path == str(tmp_path / "state" / "registry.json")
     assert config.task_registry.path == str(tmp_path / "state" / "task_registry.json")
     assert config.logging.operations_log == str(tmp_path / "state" / "operations.log")
+    assert config.webhook.dead_letter_path == str(
+        tmp_path / "state" / "webhook_dead_letters.json"
+    )
     assert settings.results_s3_bucket == "elastic-agent-results-example"
     assert settings.results_s3_prefix == "jobs"
     assert settings.results_s3_interval == 60
@@ -104,6 +133,7 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
         "ELASTIC_AGENT_AWS_KEY_PAIR_NAME",
         "ELASTIC_AGENT_AWS_SSH_KEY_PATH",
         "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE",
+        "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME",
         "ELASTIC_AGENT_STATE_DIR",
         "ELASTIC_AGENT_MANAGER_URL",
         "ELASTIC_AGENT_RESULTS_S3_BUCKET",
@@ -143,6 +173,47 @@ def test_settings_repr_does_not_contain_external_api_key(tmp_path):
     settings = load_settings(environ)
 
     assert "must-never-be-rendered" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_ENDPOINT_URL_STS",
+    ],
+)
+def test_load_settings_rejects_alternate_aws_credential_sources(
+    tmp_path, name,
+):
+    environ = _environment(tmp_path)
+    environ[name] = "must-not-be-used"
+
+    with pytest.raises(LauncherConfigurationError, match=name):
+        load_settings(environ)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials"),
+        ("AWS_CONFIG_FILE", "~/.aws/config"),
+        ("BOTO_CONFIG", "~/.boto"),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+        ("AWS_EC2_METADATA_V1_DISABLED", "false"),
+    ],
+)
+def test_load_settings_requires_imdsv2_only_credential_chain(
+    tmp_path, name, value,
+):
+    environ = _environment(tmp_path)
+    environ[name] = value
+
+    with pytest.raises(LauncherConfigurationError, match=name):
+        load_settings(environ)
 
 
 def test_prepare_local_paths_secures_state_and_checks_key(tmp_path):
@@ -264,7 +335,13 @@ class _EC2Client:
 
 class _STSClient:
     def get_caller_identity(self):
-        return {"Account": CALLER_ACCOUNT}
+        return {
+            "Account": CALLER_ACCOUNT,
+            "Arn": (
+                f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/"
+                "elastic-agent-manager/i-0123456789abcdef0"
+            ),
+        }
 
 
 def test_validate_worker_ami_queries_only_configured_image(tmp_path):
@@ -279,6 +356,28 @@ def test_validate_worker_ami_queries_only_configured_image(tmp_path):
 
     assert client.image_ids == [settings.ami_id]
     assert result.image_id == settings.ami_id
+
+
+class _WrongRoleSTSClient:
+    def get_caller_identity(self):
+        return {
+            "Account": CALLER_ACCOUNT,
+            "Arn": (
+                f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/"
+                "shared-administrator/i-0123456789abcdef0"
+            ),
+        }
+
+
+def test_validate_worker_ami_requires_expected_manager_role(tmp_path):
+    settings = load_settings(_environment(tmp_path))
+
+    with pytest.raises(LauncherConfigurationError, match="expected Manager"):
+        validate_worker_ami(
+            settings,
+            ec2_client=_EC2Client([_golden_image()]),
+            sts_client=_WrongRoleSTSClient(),
+        )
 
 
 def test_validate_worker_ami_fails_closed_when_image_is_not_unique(tmp_path):

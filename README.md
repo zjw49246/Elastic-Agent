@@ -175,6 +175,10 @@ credential. Private repositories should use `manager_rsync`; the Manager uses
 `ELASTIC_AGENT_GIT_TOKEN` only for its local clone and does not copy `.git` or
 the token to the Worker.
 
+The hardened AWS Manager keeps its home read-only. HTTPS repositories need no
+extra host state; SSH/scp-style repository URLs require the deployment to
+pre-seed the server key in the Manager user's `known_hosts` before starting.
+
 ### Account data and worker-local auto-login
 
 Declarative Mode-B Jobs support worker-local login for both Claude and Codex.
@@ -431,6 +435,7 @@ ELASTIC_AGENT_AWS_SUBNET_ID
 ELASTIC_AGENT_AWS_KEY_PAIR_NAME
 ELASTIC_AGENT_AWS_SSH_KEY_PATH
 ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE
+ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME
 ELASTIC_AGENT_AWS_MAX_INSTANCES
 ELASTIC_AGENT_STATE_DIR
 ELASTIC_AGENT_MANAGER_URL
@@ -454,6 +459,15 @@ startup logs. Optional Git access comes only from `ELASTIC_AGENT_GIT_TOKEN`—th
 launcher never falls back to a local `gh` login. Start one process with
 the supplied systemd unit (or use `uv run python deploy/aws_manager.py` for an
 interactive preflight).
+
+The supplied unit disables IMDSv1, points the AWS shared/config/Boto files at
+`/dev/null`, removes environment/web-identity/container credential inputs, and
+the launcher requires STS to report `ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME`.
+This makes a healthy process proof that it is using the dedicated EC2 instance
+role rather than same-account static/admin credentials. The configured state
+directory must be created as the service user with mode `0700` before starting;
+the unit asserts that path exists and exposes readiness only after its local
+health check succeeds.
 
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,

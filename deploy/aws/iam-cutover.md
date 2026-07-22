@@ -102,33 +102,13 @@ ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes \
 curl --fail --silent --show-error \
   https://elastic-agent.claude-code-manager.com/api/health >/dev/null
 
-# The versioned launcher/unit and both protected environments must already be
-# deployed. Source both files inside a privileged remote shell and compare only;
-# this emits none of the API/Git secret values carried by the secret file.
-ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes \
-  ubuntu@172.31.46.129 \
-  sudo bash -s -- "$FINAL_AMI_ID" "$FINAL_WORKER_SECURITY_GROUP_ID" <<'REMOTE'
-set -Eeuo pipefail
-set -a
-source /etc/elastic-agent-manager.env
-source /etc/elastic-agent-manager.aws.env
-set +a
-test "$ELASTIC_AGENT_AWS_REGION" = ap-northeast-1
-test "$ELASTIC_AGENT_AWS_AMI_ID" = "$1"
-test "$ELASTIC_AGENT_AWS_INSTANCE_TYPE" = t3.large
-test "$ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS" = "$2"
-test "$ELASTIC_AGENT_AWS_SUBNET_ID" = subnet-0c1db80817d054277
-test "$ELASTIC_AGENT_AWS_KEY_PAIR_NAME" = interview-key
-test "$ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE" = elastic-agent-worker
-test "$ELASTIC_AGENT_RESULTS_S3_BUCKET" = elastic-agent-results-297645381734
-test "$ELASTIC_AGENT_RESULTS_S3_PREFIX" = jobs
-systemctl show elastic-agent-manager.service -p ExecStart --value \
-  | grep -Fq /home/ubuntu/elastic-agent/deploy/aws_manager.py
-REMOTE
 ```
 
 Do not proceed if a Job, account lease, EIP attachment, Worker bootstrap, or
 collection is active even if the EC2 query happens to be empty.
+The final launcher requires the dedicated role, so stage its immutable release
+now but activate it only after step 4 has replaced and verified the instance
+profile.
 
 ## 2. Validate and simulate before any IAM write
 
@@ -313,6 +293,74 @@ curl --fail --silent --show-error \
   https://elastic-agent.claude-code-manager.com/api/health >/dev/null
 ```
 
+Now install the immutable release and versioned unit. The state directory must
+pre-exist because systemd constructs `ReadWritePaths` before the launcher can
+create it. Back up the old release, unit, and both environment files; install
+the `/etc` files with explicit ownership/modes. `systemctl restart` does not
+return until the unit's local health `ExecStartPost` succeeds. A healthy process
+also proves that the launcher's exact STS role check passed with alternate AWS
+credential providers disabled.
+
+```bash
+export RELEASE=/home/ubuntu/elastic-agent.release-<git-short-sha>
+export BACKUP_SUFFIX=pre-<git-short-sha>
+
+ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
+  sudo bash -s -- "$RELEASE" "$BACKUP_SUFFIX" \
+  "$FINAL_AMI_ID" "$FINAL_WORKER_SECURITY_GROUP_ID" <<'REMOTE'
+set -Eeuo pipefail
+release=$1
+suffix=$2
+final_ami=$3
+final_sg=$4
+state_dir=/home/ubuntu/.elastic-agent-demo
+test -x "$release/.venv/bin/python"
+test -f "$release/deploy/aws_manager.py"
+test -f "$release/deploy/aws/elastic-agent-manager.service"
+test -f "$release/deploy/aws/elastic-agent-manager.aws.env"
+
+old_release=$(readlink -f /home/ubuntu/elastic-agent)
+ln -sfn "$old_release" "/home/ubuntu/elastic-agent.rollback-$suffix"
+cp -a /etc/systemd/system/elastic-agent-manager.service \
+  "/etc/systemd/system/elastic-agent-manager.service.$suffix"
+cp -a /etc/elastic-agent-manager.env "/etc/elastic-agent-manager.env.$suffix"
+if test -e /etc/elastic-agent-manager.aws.env; then
+  cp -a /etc/elastic-agent-manager.aws.env \
+    "/etc/elastic-agent-manager.aws.env.$suffix"
+else
+  : >"/etc/elastic-agent-manager.aws.env.$suffix.absent"
+fi
+
+install -d -o ubuntu -g ubuntu -m 0700 "$state_dir"
+install -o root -g root -m 0600 \
+  "$release/deploy/aws/elastic-agent-manager.aws.env" \
+  /etc/elastic-agent-manager.aws.env
+install -o root -g root -m 0644 \
+  "$release/deploy/aws/elastic-agent-manager.service" \
+  /etc/systemd/system/elastic-agent-manager.service
+ln -sfn "$release" /home/ubuntu/elastic-agent.next
+mv -Tf /home/ubuntu/elastic-agent.next /home/ubuntu/elastic-agent
+
+set -a
+source /etc/elastic-agent-manager.env
+source /etc/elastic-agent-manager.aws.env
+set +a
+test "$ELASTIC_AGENT_STATE_DIR" = "$state_dir"
+test "$ELASTIC_AGENT_AWS_AMI_ID" = "$final_ami"
+test "$ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS" = "$final_sg"
+test "$ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME" = elastic-agent-manager
+test "$(stat -c '%U:%G:%a' /etc/elastic-agent-manager.env)" = root:root:600
+test "$(stat -c '%U:%G:%a' /etc/elastic-agent-manager.aws.env)" = root:root:600
+systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/elastic-agent-manager.service
+systemctl restart elastic-agent-manager.service
+curl -fsS http://127.0.0.1:8080/api/health >/dev/null
+REMOTE
+
+curl --fail --silent --show-error \
+  https://elastic-agent.claude-code-manager.com/api/health >/dev/null
+```
+
 Run one ordinary one-Worker canary while `AmazonS3FullAccess` is still attached
 to the Worker role. It must launch with the final AMI/SG/profile, upload a file
 under `jobs/<job>/workers/shard-00000/results/`, terminate the EC2/root EBS, and
@@ -349,7 +397,29 @@ Rollback Manager and Worker independently from the administrator/control host.
 Do not edit or detach policies on the shared `Manager` role.
 
 ```bash
-# Manager rollback: use the current association ID returned by cutover.
+# Restore launcher/unit/env while the dedicated role is still available.
+ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
+  sudo bash -s -- "$BACKUP_SUFFIX" <<'REMOTE'
+set -Eeuo pipefail
+suffix=$1
+cp -a "/etc/systemd/system/elastic-agent-manager.service.$suffix" \
+  /etc/systemd/system/elastic-agent-manager.service
+cp -a "/etc/elastic-agent-manager.env.$suffix" /etc/elastic-agent-manager.env
+if test -e "/etc/elastic-agent-manager.aws.env.$suffix.absent"; then
+  rm -f /etc/elastic-agent-manager.aws.env
+else
+  cp -a "/etc/elastic-agent-manager.aws.env.$suffix" \
+    /etc/elastic-agent-manager.aws.env
+fi
+rollback_release=$(readlink -f "/home/ubuntu/elastic-agent.rollback-$suffix")
+ln -sfn "$rollback_release" /home/ubuntu/elastic-agent.next
+mv -Tf /home/ubuntu/elastic-agent.next /home/ubuntu/elastic-agent
+systemctl daemon-reload
+systemctl restart elastic-agent-manager.service
+curl -fsS http://127.0.0.1:8080/api/health >/dev/null
+REMOTE
+
+# Then restore the original Manager profile with the current association ID.
 ROLLBACK_JSON=$(aws ec2 replace-iam-instance-profile-association \
   --region "$AWS_REGION" \
   --association-id "$NEW_ASSOCIATION_ID" \
@@ -357,7 +427,8 @@ ROLLBACK_JSON=$(aws ec2 replace-iam-instance-profile-association \
 ROLLBACK_ASSOCIATION_ID=$(jq -r \
   '.IamInstanceProfileAssociation.AssociationId' <<<"$ROLLBACK_JSON")
 ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
-  'sudo systemctl restart elastic-agent-manager.service'
+  'sudo systemctl restart elastic-agent-manager.service && \
+   curl -fsS http://127.0.0.1:8080/api/health >/dev/null'
 
 # Worker rollback: restore only the previous managed policy.
 aws iam attach-role-policy \
