@@ -14,7 +14,7 @@ import pytest
 
 from elastic_agent.core.config import CredentialConfig
 from elastic_agent.core.credential_binding import CredentialBinding
-from elastic_agent.core.credential_pool import AccountDefinition, CredentialPool
+from elastic_agent.core.credential_pool import CredentialPool
 from elastic_agent.core.credential_rotator import CredentialRotator
 from elastic_agent.core.event_bus import EventBus
 from elastic_agent.core.quota_monitor import QuotaMonitor
@@ -101,13 +101,20 @@ class TestCredentialRotationE2E:
         await binding.bind(acct.id, "worker-1")
 
         exhausted_events: list[dict] = []
-        event_bus.subscribe("CREDENTIAL_EXHAUSTED", lambda et, wid, d: exhausted_events.append(d))
+
+        async def on_exhausted(event_type, worker_id, data):
+            exhausted_events.append(data)
+
+        event_bus.subscribe("CREDENTIAL_EXHAUSTED", on_exhausted)
 
         result = await rotator.rotate("worker-1", "only-one", "quota_exceeded")
 
         assert not result.success
         assert "no replacement" in result.error.lower() or "No replacement" in result.error
-        assert len(exhausted_events) == 1
+        assert exhausted_events == []
+        status = pool.get_status("only-one")
+        assert status is not None
+        assert status.assigned_to == "worker-1"
 
     @pytest.mark.asyncio
     async def test_rotation_waits_for_task(self, tmp_path):
@@ -234,7 +241,7 @@ class TestQuotaMonitorIntegration:
             await monitor.stop()
 
     @pytest.mark.asyncio
-    async def test_quota_warning_does_not_trigger_rotation(self, tmp_path):
+    async def test_quota_warning_triggers_graceful_rotation(self, tmp_path):
         accounts = [{"id": "warn-1", "email": "w@test.com", "group": "standard"}]
         _write_accounts(tmp_path, accounts)
 
@@ -257,7 +264,11 @@ class TestQuotaMonitorIntegration:
         monitor.on_rotation_needed = on_rotation
 
         warning_events: list[dict] = []
-        event_bus.subscribe("QUOTA_WARNING", lambda et, wid, d: warning_events.append(d))
+
+        async def on_warning(event_type, worker_id, data):
+            warning_events.append(data)
+
+        event_bus.subscribe("QUOTA_WARNING", on_warning)
 
         await monitor.start()
         try:
@@ -268,7 +279,7 @@ class TestQuotaMonitorIntegration:
             })
             await asyncio.sleep(0.2)
 
-            assert len(rotation_requests) == 0
+            assert rotation_requests == ["quota_exceeded"]
             assert len(warning_events) == 1
             assert warning_events[0]["reason"] == "quota_warning"
         finally:

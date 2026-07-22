@@ -372,6 +372,7 @@ def _file_md5(path: str) -> str:
 def _is_delivery_manuscript_name(name: str) -> bool:
     lower = name.lower()
     return lower in {
+        "audiobook_manuscript.md",
         "manuscript.md",
         "manuscript_compliant.md",
         "manuscript_final.md",
@@ -593,16 +594,19 @@ class FileSyncManager:
         for root in normalized_roots:
             root_path = Path(root)
             searched.append(str(root_path))
-            if not root_path.exists():
+            try:
+                is_dir = root_path.is_dir()
+            except OSError:
                 continue
-            if root_path.is_dir() and root_path.name == "delivery":
+            if not is_dir:
+                continue
+            if root_path.name == "delivery":
                 delivery_dirs.append(root_path)
                 continue
-            if root_path.is_dir():
-                for current_root, dirs, _files in os.walk(str(root_path)):
-                    for dirname in dirs:
-                        if dirname == "delivery":
-                            delivery_dirs.append(Path(current_root) / dirname)
+            for current_root, dirs, _files in os.walk(str(root_path)):
+                for dirname in dirs:
+                    if dirname == "delivery":
+                        delivery_dirs.append(Path(current_root) / dirname)
 
         def _delivery_score(path: Path) -> tuple[int, float]:
             try:

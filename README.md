@@ -15,7 +15,9 @@ Elastic-Agent is a Python library that provides:
 - **Multi-cloud resource management** — Unified CloudProvider interface for Alibaba Cloud ECS and AWS EC2
 - **Worker Runtime** — WebSocket-based communication between Manager and Workers
 - **Task scheduling** — Capacity-aware task distribution with pluggable Harness interface
-- **File sync** — Automatic file synchronization from Workers to OSS/S3
+- **File sync** — Automatic Worker-to-OSS/S3 synchronization; unreadable
+  candidate roots are skipped, and only standard delivery manuscript names
+  receive the high-priority `delivery_manuscript` role
 - **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
 - **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task

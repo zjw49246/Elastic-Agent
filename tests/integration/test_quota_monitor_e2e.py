@@ -7,8 +7,6 @@ Verifies the full pipeline with real EventBus and MockWorker.
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 
 import pytest
 
@@ -162,7 +160,7 @@ class TestQuotaMonitorE2E:
             await asyncio.sleep(0.2)
 
             assert len(rotation_requests) == 1
-            assert rotation_requests[0] == "quota_exceeded"
+            assert rotation_requests[0] == "rate_limited"
         finally:
             await monitor.stop()
 

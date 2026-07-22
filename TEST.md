@@ -14,6 +14,21 @@ Run the complete suite before merging:
 uv run pytest -q
 ```
 
+The configuration, credential-rotation, and legacy file-sync contracts can be
+checked together without the rest of the suite:
+
+```bash
+uv run pytest -q \
+  tests/unit/test_config.py \
+  tests/unit/test_credential_pool.py \
+  tests/unit/test_credential_rotator.py \
+  tests/unit/test_quota_monitor.py \
+  tests/integration/test_credential_rotation_e2e.py \
+  tests/integration/test_quota_monitor_e2e.py \
+  tests/unit/test_file_sync.py \
+  tests/integration/test_file_sync_e2e.py
+```
+
 Validate the production AWS launcher's fail-closed environment and AMI policy
 without making cloud calls:
 

@@ -100,7 +100,7 @@ class TestHelperFunctions:
     def test_guess_role_delivery_files(self):
         assert _guess_role("delivery/audiobook_manuscript.md", {}) == "delivery_manuscript"
         assert _guess_role("delivery/manuscript.md", {}) == "delivery_manuscript"
-        assert _guess_role("delivery/custom_output.md", {}) == "delivery_manuscript"
+        assert _guess_role("delivery/custom_output.md", {}) == "manuscript"
         assert _guess_role("delivery/intro_final.md", {}) == "delivery_intro"
         assert _guess_role("delivery/custom.zip", {}) == "delivery_export"
 
@@ -352,15 +352,15 @@ class TestFileSyncManager:
         finally:
             await sync_manager.stop()
 
-    async def test_scan_task_artifacts_prefers_delivery_with_custom_manuscript(self, sync_manager, watch_dir):
+    async def test_scan_task_artifacts_prefers_delivery_with_standard_manuscript(self, sync_manager, watch_dir):
         old_delivery = watch_dir / "old" / "delivery"
         old_delivery.mkdir(parents=True)
         (old_delivery / "notes.txt").write_text("not a manuscript")
 
         new_delivery = watch_dir / "workspace" / "delivery"
         new_delivery.mkdir(parents=True)
-        custom_manuscript = new_delivery / "custom_output.md"
-        custom_manuscript.write_text("final manuscript")
+        manuscript = new_delivery / "audiobook_manuscript.md"
+        manuscript.write_text("final manuscript")
 
         mapping = SyncMappingEntry(
             task_id="task-1",
@@ -373,14 +373,42 @@ class TestFileSyncManager:
 
         assert scan.delivery_found is True
         assert scan.delivery_path == str(new_delivery)
-        assert scan.manuscript_path == str(custom_manuscript)
+        assert scan.manuscript_path == str(manuscript)
 
-    async def test_force_sync_marks_custom_delivery_md_as_manuscript(self, sync_manager, watch_dir, sync_dir):
+    async def test_scan_task_artifacts_skips_unreadable_candidate_root(
+        self, sync_manager, watch_dir, monkeypatch
+    ):
+        delivery_dir = watch_dir / "delivery"
+        delivery_dir.mkdir()
+        manuscript = delivery_dir / "audiobook_manuscript.md"
+        manuscript.write_text("final manuscript")
+        forbidden_root = Path("/root/books/test-book")
+        original_is_dir = Path.is_dir
+
+        def guarded_is_dir(path: Path) -> bool:
+            if path == forbidden_root:
+                raise PermissionError(path)
+            return original_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+        mapping = SyncMappingEntry(
+            task_id="task-1",
+            book_slug="test-book",
+            oss_prefix="tasks/task-1",
+            watch_paths=[str(watch_dir)],
+        )
+
+        scan = sync_manager.scan_task_artifacts("task-1", mapping=mapping)
+
+        assert scan.delivery_path == str(delivery_dir)
+        assert scan.manuscript_path == str(manuscript)
+
+    async def test_force_sync_marks_standard_delivery_md_as_manuscript(self, sync_manager, watch_dir, sync_dir):
         await sync_manager.start()
         try:
             delivery_dir = watch_dir / "delivery"
             delivery_dir.mkdir()
-            (delivery_dir / "custom_output.md").write_text("final manuscript")
+            (delivery_dir / "audiobook_manuscript.md").write_text("final manuscript")
 
             mapping = SyncMappingEntry(
                 task_id="task-1",
@@ -394,7 +422,9 @@ class TestFileSyncManager:
 
             manifest_path = sync_dir / "tasks" / "task-1" / "_sync_manifest.json"
             manifest = json.loads(manifest_path.read_text())
-            delivery_file = next(f for f in manifest["files"] if f["path"].endswith("custom_output.md"))
+            delivery_file = next(
+                f for f in manifest["files"] if f["path"].endswith("audiobook_manuscript.md")
+            )
             assert delivery_file["role"] == "delivery_manuscript"
         finally:
             await sync_manager.stop()

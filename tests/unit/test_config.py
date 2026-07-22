@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -28,7 +27,9 @@ from elastic_agent.core.config import (
 
 
 class TestDefaults:
-    def test_server_defaults(self):
+    def test_server_defaults(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("HOST", raising=False)
+        monkeypatch.delenv("PORT", raising=False)
         cfg = ServerConfig()
         assert cfg.host == "0.0.0.0"
         assert cfg.port == 8000
@@ -175,7 +176,13 @@ class TestFromYaml:
         assert cfg.worker.ssh_user == "root"
         assert cfg.bootstrap.max_retries == 2
 
-    def test_empty_yaml_uses_all_defaults(self, tmp_path: Path):
+    def test_empty_yaml_uses_all_defaults(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv("HOST", raising=False)
+        monkeypatch.delenv("PORT", raising=False)
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("")
 
@@ -242,6 +249,15 @@ class TestPydanticValidation:
 
 
 class TestConfigOverridePatterns:
+    def test_server_environment_override(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HOST", "127.0.0.1")
+        monkeypatch.setenv("PORT", "8123")
+
+        cfg = ServerConfig()
+
+        assert cfg.host == "127.0.0.1"
+        assert cfg.port == 8123
+
     def test_yaml_with_all_sections(self, tmp_path: Path):
         config_data = {
             "server": {"host": "0.0.0.0", "port": 8000},
