@@ -274,4 +274,8 @@
 
 **以后避免**：write-only 不只要检查 REST/异常和业务日志；第三方 HTTP 客户端可能在 INFO 记录含 query secret 的完整 URL。任何带秘密的 URL 请求都要在第一次真机调用前审计依赖 logger，并用哨兵秘密跑日志回归。
 
-**验证**：`tests/unit/test_codex_login.py` 26 项全绿，Ruff、`compileall` 与 diff check 通过。东京区 EIP 配额申请已批准到 13，新的独立账号 EIP 已成功分配；完整的修复后 EC2 创建、自动登录、Codex 执行与销毁结果待同日后续实盘记录补齐。
+**修复后实盘**：东京区 EIP 配额申请已批准到 13，给 token-only Codex 账号分配了独立 EIP `13.112.54.251`。Job `job-7a2c3b96bf274d3584b1b342fba7c4e1` 从空白 `t3.large` 创建开始，完成 EIP attach、固定版 Codex/Chrome/runtime bootstrap、自动 email-code 登录、OAuth 邮箱身份校验和两次真实 `codex exec`（登录预热 + Job 命令）。结果 API 收到 `codex-output.txt`/`observed-eip.txt`/`status.txt`，分别验证 `CODEX_EIP_JOB_OK`、实际 IPv4 出口等于绑定 EIP、状态 `ok`。终态 `done=1`、final collect 与 cleanup 均成功；实例终止、EIP 解绑但保留，账号 binding 回到 `ready` 且无活动 allocation，Manager 原 3 个 worker 保持在线。真实 journal 二次检查均为 0 条 mailbox token URL。
+
+**测试命令教训**：worker 的 subprocess stdin 保持 PIPE 以支持 `SEND_INPUT`。首条无人值守 `codex exec` 虽已有 prompt，仍显示 `Reading additional input from stdin...` 并等 EOF；这不是登录失败。该轮通过编排器安全取消并完成 final collect/EC2 清理，重跑时显式加 `</dev/null` 即完成。以后所有可能读取 stdin 到 EOF 的 Mode-B CLI 都要明确重定向，不能把“进程存活但无输出”误判成 OAuth 卡住。
+
+**验证**：`tests/unit/test_codex_login.py` 26 项全绿，Ruff、`compileall` 与 diff check 通过；真实 Job 的登录、命令、结果 API、EIP 出口、失败补偿和成功清理均已验证。

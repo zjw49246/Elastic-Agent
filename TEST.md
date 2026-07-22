@@ -128,7 +128,9 @@ IPv4 addresses incur hourly charges even while detached.
    tags for the Job/account/lease.
 4. Confirm the worker's observed public IP equals the binding returned by the
    API, then allow the worker-local login and command to finish. For Codex,
-   confirm the fresh instance creates and verifies its own `CODEX_HOME/auth.json`.
+   confirm the fresh instance creates and verifies its own `CODEX_HOME/auth.json`;
+   redirect a direct, unattended `codex exec` smoke command with `</dev/null`
+   because the worker keeps its interactive stdin pipe open.
 5. Confirm final results are collected before cleanup, the EIP becomes
    detached, and the EC2 plus its root EBS are terminated.
 6. Query the binding again: the same EIP allocation must still exist and be

@@ -94,6 +94,11 @@ Two task shapes are supported:
   the command, watches its output for exhaustion, and rotates by restarting with
   the harness's own `--resume`.
 
+The worker keeps a stdin pipe open so interactive callers can send
+`SEND_INPUT`. For an unattended CLI that waits for stdin EOF even when a prompt
+argument is present, redirect stdin explicitly in `run.command`; for example,
+use `codex exec ... </dev/null`.
+
 Mode-B jobs are described declaratively as a **JobSpec** — no Python subclass
 needed — and fanned out across the fleet:
 
