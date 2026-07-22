@@ -287,3 +287,13 @@
 **边界**：当前 TLS 在 Cloudflare 边缘终止；源站仍只有 Python 服务监听 `0.0.0.0:8080`，本机没有 nginx/caddy/certbot 或 80/443 listener。若要求 Cloudflare→源站也加密，需要在 Cloudflare 侧配合 Origin Certificate/Tunnel 与 Full (strict)，不能仅凭公网 `https://`/`wss://` 握手推断端到端 TLS。
 
 **同时完成**：东京区 EC2-VPC EIP quota 从 13 提升到 20 的申请已 `APPROVED`；新增地址仍按账号 binding 按需分配，不提前创建无账号归属且持续计费的 EIP。
+
+## 2026-07-22 分布式 Job 生命周期、环境与结果耐久性加固（commit `65fb0b7`）
+
+**问题**：从“命令能跑”扩展为可长期分布式执行时，故障注入暴露出一组组合竞态：终态事件断线会丢或乱序；取消撞上 EXECUTE 派发会先收集/销毁再停进程；RUN_EXHAUSTED 的 handler 在唯一 WS read loop 内等动态登录会自锁；云创建后 registry/terminate 双失败会留下收费实例；多 shard 同名结果会覆盖，S3 LIST→GET 变化可造成 OOM/静默截断，metadata 判重也会漏掉同 size/mtime 改写。Job 环境、超时、秘密和实例成本此前也缺少统一的提交前约束。
+
+**解决**：Worker 用 0600 fsync ordered outbox + event_id/ACK 可靠回传 PROCESS_EXIT/RUN_EXHAUSTED，并把 final-sync 中的 task 纳入 STATUS；Manager 精确按 task_id 幂等处理，换号同步 claim 后转后台登录。取消固定执行 TERM→可靠 exit→KILL fallback→final collect→销毁；普通和 EIP 实例所有创建/注册/收集/终止失败都有在线补偿和重启扫描。JobSpec 新增不可变环境 profile、结构化非 root setup、严格 schema、有限 run timeout/TTL、JIT AWS secret refs 与 WSS 守卫；plan/submit 在副作用前校验 region、账号、S3 role、实例 allowlist 和 worker-hours。结果按 shard 隔离，显式 `collect.paths`，worker 直推递归刷新、relay 用 rsync checksum、Manager uploader 用 SHA-256；API 对路径、对象数/大小、score GET 和 tar 流式下载做边界与一致性校验。worker_clone 不再隐式下发 Manager Git token，任意 Python Harness 默认关闭。
+
+**以后避免**：异步“已发送”不等于远端“已完成”，资源释放必须由可靠、相关联的终态证明驱动；不能在承载响应的同一接收循环里等待该响应。云资源一旦 API 返回 ID，就要先进入所有权图再做可失败的登记。结果耐久性不能只信 size/mtime 或一次 LIST；最终收集必须在停止生产者后按内容刷新并 fail closed。任何秘密在解析前先检查传输边界，任何 Job 参数在产生持久化/账号/云副作用前先做纯 preflight。
+
+**验证**：完整 unit 为 1852 passed；仅 3 个本任务前已有的 file_sync 角色/本机 `/root` 权限用例失败。新增/相关聚焦 188 项与 claude-pty 69 项全绿；`compileall`、diff check、变更模块 Ruff 和两段前端 JavaScript 语法检查通过。实机 EC2→命令→S3→销毁闭环在部署后单独记录。
