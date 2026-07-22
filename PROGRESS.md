@@ -297,3 +297,5 @@
 **以后避免**：异步“已发送”不等于远端“已完成”，资源释放必须由可靠、相关联的终态证明驱动；不能在承载响应的同一接收循环里等待该响应。云资源一旦 API 返回 ID，就要先进入所有权图再做可失败的登记。结果耐久性不能只信 size/mtime 或一次 LIST；最终收集必须在停止生产者后按内容刷新并 fail closed。任何秘密在解析前先检查传输边界，任何 Job 参数在产生持久化/账号/云副作用前先做纯 preflight。
 
 **验证**：完整 unit 为 1852 passed；仅 3 个本任务前已有的 file_sync 角色/本机 `/root` 权限用例失败。新增/相关聚焦 188 项与 claude-pty 69 项全绿；`compileall`、diff check、变更模块 Ruff 和两段前端 JavaScript 语法检查通过。实机 EC2→命令→S3→销毁闭环在部署后单独记录。
+
+**实机补充（commit `2799d6d`）**：首轮 smoke 虽已终止 EC2，但 `/api/nodes` 仍保留 TERMINATED NodeRecord；大量短 Job 会让 registry/UI 无界增长。Job 专用 `ManagerFleetDriver.scale_in` 现于云终止成功后调用 Manager 的标准 `remove_node`，同步清理 task/connection/registry；若本地清理失败会让 orchestrator 重试，而不会把仍可能收费的实例句柄提前丢掉。相关 131 项全绿。
