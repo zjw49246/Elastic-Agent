@@ -195,7 +195,9 @@ Batch Console displays the live OTP challenge. The corresponding API is:
 
 Submitted verification codes are not persisted. Codex mailbox polling currently
 supports 171mail and the MailCatcher-backed 163.com, mail.com, onet.pl, and
-gazeta.pl flows; generic IMAP is not implemented.
+gazeta.pl flows; generic IMAP is not implemented. Before mailbox polling, the
+worker suppresses `httpx`/`httpcore` request logging so a query token cannot be
+written as part of a full request URL in the worker journal.
 
 Codex support here is for declarative Mode-B `worker_local_login` Jobs.
 `manager_distribute` is rejected for Codex because `auth.json` must be minted

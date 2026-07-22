@@ -17,6 +17,7 @@ import asyncio
 import base64
 import datetime
 import json
+import logging
 import os
 import re
 import shutil
@@ -106,6 +107,21 @@ class CodexLoginError(RuntimeError):
     """A safe, user-facing Codex login failure."""
 
 
+def _suppress_sensitive_http_client_logs() -> None:
+    """Keep mailbox query parameters out of worker journals.
+
+    httpx emits complete request URLs at INFO, including the write-only mailbox
+    token passed as a query parameter.  Worker runtime logs are INFO by default,
+    so permanently raise the client loggers to WARNING before the first mailbox
+    request.  Error handling below records only safe exception class names.
+    """
+
+    for logger_name in ("httpx", "httpcore"):
+        client_logger = logging.getLogger(logger_name)
+        if client_logger.getEffectiveLevel() < logging.WARNING:
+            client_logger.setLevel(logging.WARNING)
+
+
 def detect_mail_provider(email: str) -> str:
     """Choose CCM's mailbox backend from the address domain."""
 
@@ -150,6 +166,7 @@ async def poll_verification_code(
     request_timeout = 120.0 if uses_mailcatcher else 15.0
     deadline = time.time() + timeout_s
     seen: set[tuple[str, str, str]] = set()
+    _suppress_sensitive_http_client_logs()
 
     async with httpx.AsyncClient(timeout=request_timeout) as client:
         while time.time() < deadline:

@@ -4,11 +4,13 @@ import asyncio
 import base64
 import importlib
 import json
+import logging
 import stat
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 login_module = importlib.import_module("elastic_agent.worker.login.codex_login")
@@ -16,6 +18,38 @@ login_module = importlib.import_module("elastic_agent.worker.login.codex_login")
 
 def test_163_email_uses_mailcatcher_backend():
     assert login_module.detect_mail_provider("user@163.com") == "mailcatcher"
+
+
+@pytest.mark.asyncio
+async def test_mailbox_query_token_is_never_logged_by_httpx(monkeypatch, caplog):
+    secret = "mail-query-token-that-must-not-reach-logs"
+    real_client = httpx.AsyncClient
+
+    def handler(request):
+        assert secret in str(request.url)
+        return httpx.Response(200, json={
+            "code": 200,
+            "data": {"date": "2099-01-01T00:00:00Z", "code": "123456"},
+        })
+
+    def client(**kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(login_module.httpx, "AsyncClient", client)
+    caplog.set_level(logging.INFO, logger="httpx")
+    caplog.set_level(logging.INFO, logger="httpcore")
+
+    code = await login_module.poll_verification_code(
+        secret,
+        after_ts=0,
+        timeout_s=1,
+        email="user@163.com",
+    )
+
+    assert code == "123456"
+    assert secret not in caplog.text
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() >= logging.WARNING
 
 
 def _jwt(email: str) -> str:

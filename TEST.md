@@ -154,6 +154,9 @@ not start before identity verification and the `codex exec` smoke test passes,
 REST/logs never expose the password, mailbox token, OTP, or authorization URL,
 and a failed/cancelled/timed-out login restores the previous
 `CODEX_HOME/auth.json` rather than completing after the Job has failed.
+In particular, run mailbox polling with `httpx` INFO logging enabled and assert
+that neither `httpx` nor inherited `httpcore` request logs contain the mailbox
+query token or its complete request URL.
 
 The Codex `email_token` is only a supported mailbox-query token; it is not an
 OpenAI API/OAuth token or a password. If OpenAI does not expose an email-code
