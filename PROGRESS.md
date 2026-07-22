@@ -265,3 +265,13 @@
 **以后避免**：同步上游登录实现时必须逐层核对账号 schema、REST、协议、runtime 守卫和真实浏览器状态机，不能只复制取码函数。页面跳转成功必须以目标 OTP 控件出现为准，不能用“密码框消失”推断；所有写入后不回显字段还要覆盖框架级 422 路径。
 
 **验证**：token/password、REST、Manager→worker、method picker、OTP、回滚、脱敏与旧密码路径相关 253 项全绿；全量 1784 passed / 12 skipped，8 个失败与既有基线相同（凭证轮换 3、端口默认值 2、文件同步 3），无新增失败；Ruff、`compileall`、diff check 和 Batch Console JavaScript 语法检查通过。完整 AWS EIP/EC2/真实账号结果见后续实盘记录。
+
+## 2026-07-22 Codex mailbox URL 日志脱敏（commit `fd9a737`）
+
+**问题**：token-only Codex 的首轮 AWS EIP 真机登录到达邮箱取码阶段时，发现 `httpx` 默认 INFO 日志会记录完整请求 URL，MailCatcher query token 因而可能落入临时 worker 的 systemd journal。发现后立即取消 Job，按编排链解绑 EIP、终止 EC2 并删除 root EBS；账号绑定的 EIP 保留且恢复 `ready`，未继续执行任务。
+
+**解决**：在任何邮箱请求之前，永久把进程内 `httpx` 与 `httpcore` logger 提升到 WARNING。这里不在请求后恢复级别，避免并发邮箱轮询在恢复窗口再次泄漏。新增回归测试，在 INFO 级别执行带哨兵 token 的请求，断言日志无 token，且两个 logger 的有效级别均已受限；同步更新秘密边界和真机测试文档。
+
+**以后避免**：write-only 不只要检查 REST/异常和业务日志；第三方 HTTP 客户端可能在 INFO 记录含 query secret 的完整 URL。任何带秘密的 URL 请求都要在第一次真机调用前审计依赖 logger，并用哨兵秘密跑日志回归。
+
+**验证**：`tests/unit/test_codex_login.py` 26 项全绿，Ruff、`compileall` 与 diff check 通过。东京区 EIP 配额申请已批准到 13，新的独立账号 EIP 已成功分配；完整的修复后 EC2 创建、自动登录、Codex 执行与销毁结果待同日后续实盘记录补齐。
