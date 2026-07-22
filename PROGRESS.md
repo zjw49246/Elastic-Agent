@@ -338,3 +338,13 @@
 **以后避免**：云 API 的 terminated row 是历史事实，不是新的待清理资源；忽略它必须依赖本地正向、完整、精确的完成证明。资源 release 的“前置读取”和“写入销毁意图”不能分成两个锁窗口，且 Node、durable lease、allocator claim 三张所有权表必须分别核对稳定身份后再释放。缺失返回值或缺失 instance id 不是幂等成功，而是应保留控制面句柄的故障。
 
 **验证**：新增与受影响核心测试 253 项、EIP/Job 聚焦矩阵 726 项全绿；完整套件 2039 passed / 12 skipped，8 个失败与既有基线相同（credential rotation 3、server 默认端口 2、file sync 3），无新增失败；变更文件 Ruff 与 `git diff --check` 通过，安全和生命周期并发复核均无 blocker。
+
+## 2026-07-22 清零全量测试历史失败（commit `eee21b7`）
+
+**问题**：连续多个任务把同一组 8 个失败记录为“既有基线”，久而久之会让真正的新回归混在红色全量测试中。逐项复核后，3 个 credential/quota 断言仍停留在旧轮换语义；2 个 config 默认值用例被宿主通用 `PORT=8002` 合法覆盖；file sync 一方面有两条测试要求已废弃的“delivery 下任意 Markdown 都是最终稿”，另一方面真的会在扫描 `/root/books/...` 时因 PermissionError 中止。
+
+**解决**：凭证测试同步现行契约——无替代账号时保留任务且不发 exhausted、达到阈值请求 graceful rotation、明确 rate limit 保留 `rate_limited` 原因；事件回调改成 async，去掉伪 TypeError。默认配置测试显式隔离 `HOST`/`PORT`，另加环境覆盖用例保留兼容。file sync 继续只把标准文件名提升为 `delivery_manuscript`，补回接口文档规定的 `audiobook_manuscript.md`，不可读候选根按单根跳过，并新增确定性权限回归。
+
+**以后避免**：不能长期接受“与本任务无关”的红色基线；语义变更必须同时更新集成断言。`BaseSettings` 默认会读取宿主环境，测默认值必须先清相关键，同时另测覆盖能力。文件发现器面对外部路径时，权限错误应隔离到单个候选根，不能让一个不可读的 fallback 阻断所有可读路径。
+
+**验证**：原 8 个失败逐条转绿；配置/凭证/额度/file-sync 组合回归 192 passed；完整套件 **2049 passed / 12 skipped / 0 failed**，`git diff --check` 通过。file-sync 两个历史文件原有 Ruff 15 项，本次前后数量不变；其余变更文件 Ruff 全绿。
