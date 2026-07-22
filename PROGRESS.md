@@ -299,3 +299,11 @@
 **验证**：完整 unit 为 1852 passed；仅 3 个本任务前已有的 file_sync 角色/本机 `/root` 权限用例失败。新增/相关聚焦 188 项与 claude-pty 69 项全绿；`compileall`、diff check、变更模块 Ruff 和两段前端 JavaScript 语法检查通过。实机 EC2→命令→S3→销毁闭环在部署后单独记录。
 
 **实机补充（commit `2799d6d`）**：首轮 smoke 虽已终止 EC2，但 `/api/nodes` 仍保留 TERMINATED NodeRecord；大量短 Job 会让 registry/UI 无界增长。Job 专用 `ManagerFleetDriver.scale_in` 现于云终止成功后调用 Manager 的标准 `remove_node`，同步清理 task/connection/registry；若本地清理失败会让 orchestrator 重试，而不会把仍可能收费的实例句柄提前丢掉。相关 131 项全绿。
+
+## 2026-07-22 生产发布与 EC2→S3→销毁双闭环（deployed runtime `c3c25d8`）
+
+东京 Manager 以原子 release symlink 发布到 `/home/ubuntu/elastic-agent.release-c3c25d8`，旧 release 保留可回滚，持久状态目录未移动。新 launcher 移除硬编码 API-key fallback，只依赖 root:root 0600 EnvironmentFile；域名 health 200，WSS/S3/provider 配置保留。发布前后均确认无活动 Job/Worker。
+
+两轮 `account.mode=none`、单 `t3.large` 真 Job 分别为 `job-bc85c36570121c8abe1ff41634a97c39` 与 `job-8029babb8c9162fa7dd001d77ba5cb31`：从零创建 EC2、bootstrap 当前源码、执行 repo-less shell、Worker 实例角色直推 `jobs/<job>/workers/shard-00000/results/`，manifest+4 个数据文件均可经 S3 优先 results/list/download API 读取；Job `succeeded/done=true/cleanup_pending=0`，EC2 终止且 root EBS DeleteOnTermination。重复首轮 Idempotency-Key 返回同 job 且 AWS 始终只有一台实例。第二轮验证 `c3c25d8` 后 `/api/nodes` 自动回到 0，无 TERMINATED registry 残留；首轮旧记录在确认云实例 terminated 后通过标准 API 删除。
+
+冷启动主要耗时仍是 Ubuntu 现场安装 Node/npm（展开 500+ deb）；下一步最高收益是用当前 bootstrap 产出版本化 golden AMI，并保留现有 profile/commit 校验作为漂移与回滚边界。生产侧另有三项需单独变更窗口：Manager/Worker 拆 SG 并封 origin 8080、Worker S3 FullAccess 收敛到结果桶/prefix、为结果桶确定 retention 后启用 lifecycle/versioning。
