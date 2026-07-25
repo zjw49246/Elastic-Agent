@@ -434,3 +434,5 @@
 **以后避免**：异步人工操作 UI 不能只展示资源 ID，必须把“登录请求→可信 Worker→账号→Job/shard”完整标注，并让提交目标从卡片自身的关联键读取，不能靠当前选择或列表顺序猜测。轮询保持 input value 还不够，隐藏祖先再显示会让真实浏览器丢焦点；必须验证 DOM identity、value、focus、selection、scroll 和窄屏 overlay。自动取码 token 与 OpenAI 登录凭据也必须在文案中明确区分。
 
 **验证**：先补红测试覆盖两 Worker/两账号并发、交叉事件拒绝、单卡提交不影响另一卡、双提交 claim、transport 失败恢复、非秘密 REST 元数据和 Job 内 UI 契约。最终完整套件 **2096 passed / 12 skipped / 0 failed**；变更模块 Ruff、Batch JavaScript 语法、diff check 全部通过。Chrome 149 真实浏览器验证双 Job 精确落位、XSS text-only、未知 Job fallback、Job replacement 后值/焦点/选区不变，以及 390px 视口 10 个 Worker 时目标输入完整可见且不被提醒层遮挡；两轮独立后端/UI 审查最终无 blocker。
+
+**生产发布（runtime `f6d510b`）**：发布前确认活跃 Job、Node、账号占用、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0。精确 Git archive 已安装到最终路径 `/home/ubuntu/elastic-agent.release-f6d510b`，东京 Manager 原子切换成功，旧 `/home/ubuntu/elastic-agent.release-05a1181` 由 rollback symlink 保留。域名 health、线上按需 OTP 源码标记、运行时进程路径和当前 systemd Invocation 均复核通过，ERROR pattern 为 0；发布后资源仍全为 0，4 个账号 EIP 均为 `ready`。本次只改登录控制面与 UI，没有为制造人工 OTP 而创建收费 EC2 canary。
