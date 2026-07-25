@@ -362,3 +362,13 @@
 **修复后实盘（production runtime `bf2d6dd`）**：不可变 release 已原子切换到东京 Manager，旧 release 以 rollback symlink 保留，专用实例角色、域名 health 和持久状态不变。Job `job-5502197ba3e23370fefb5ee3aebfd18f` 在 EC2 `i-0fa17f9b9683399b3` 上再次完成无人工 OTP 的 token-only Codex 登录、CLI 预热和真实 `codex exec`；S3 五对象的 release/marker/公网 IP/manifest 断言全部通过。Job `succeeded/done=true/cleanup_pending=0`，final collect 与 cleanup 均成功；实例终止、root EBS `vol-0f0368c545e28f77d` 删除，EIP 解绑保留，Node/active lease/allocation/challenge/live managed instance 全为 0。新 systemd Invocation 中旧 `Cannot call send once a close message has been sent`、`Error in message loop` 均为 0，证明目标竞态已消失；journal 对账号秘密和 query-secret pattern 的扫描也均为 0。
 
 **传输层权衡**：第二轮 AWS `TerminateInstances` 到 terminal readback 之间，底层 Python 3.14 + websockets legacy keepalive 记录过一次 ping-timeout `ConnectionClosedError exception in shielded future`；它来自被终止 EC2 的连接没有 close frame，与只会 `set_result(bool)` 的 event-id Future 无关，也未影响任何终态。没有为消除这条 P3 日志而在 durable `RELEASING` 前提前断 WS：该做法不是 fencing，会破坏 detach/terminate 失败时保留 live control-plane connection 的故障语义并引入额外重连竞态。若后续要清零，应在 BindingManager 原子提交 release intent 后增加专用 pre-terminate fence，而不是禁用 ping、降日志级别或提前 ACK。
+
+## 2026-07-25 Job Worker 执行历史与资源状态分离（commit `cb645cf`）
+
+**问题**：Batch Console 把持久保留的 `WorkerRun` 历史直接显示成 `1 workers`，即使 EC2 已完成结果收集并销毁，仍会让管理员误以为存在存活 Worker；历史行还保留无效的实时日志/终止按钮。
+
+**解决**：Job API 为每条执行记录显式返回 `worker_released` 与 `worker_release_expected`，EIP 以 durable cleanup 完成、普通 Job 以整组 scale-in 完成为释放证明。UI 改成“Worker 执行记录”，将执行状态与资源状态分列；已销毁或其他终态行不再显示实时操作，活动 Worker 的人工终止统一走强制 scale-in，避免只删除 Node 句柄。同步修正 backoff 测试只采样真实重连延迟，不再把认证 timeout 的内部 sleep 误判为退避。
+
+**以后避免**：进程终态、结果收集完成和云资源销毁是三个不同事实，前端不能从 `done/failed` 或历史记录数量推断实例存活；`false` 的释放证明也只表示“尚无完整完成证明”，不等于实例必然存在。涉及云销毁的按钮必须调用保留所有权与失败重试语义的资源回收入口。
+
+**验证**：API/UI 聚焦测试 84 项全绿；完整套件 `2058 passed / 12 skipped / 0 failed`，Ruff、`compileall`、Batch Console JavaScript 语法和 `git diff --check` 均通过。
