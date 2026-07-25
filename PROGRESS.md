@@ -422,3 +422,5 @@
 **以后避免**：减少 DOM 重建不等于交互状态稳定；任何轮询替换都要逐项核对 disclosure、focus、viewport 和局部 scroll。资源生命周期与命令生命周期必须分别控制只读诊断和破坏性操作。原生 disclosure 也要遵守 HTML 内容模型，并验证 focus ring 不被圆角裁剪。
 
 **验证**：先补红测试锁定默认折叠、外层状态恢复和日志资源边界；最终完整套件 **2092 passed / 12 skipped / 0 failed**，变更模块 Ruff（忽略文件既有 E501）、`compileall`、Batch JavaScript 语法和 `git diff --check` 通过。真实 Chrome 在桌面/手机视口验证默认收起、展开、强制数据签名变化后的 open/focus/viewport/table scroll 保持，以及 Worker 404 后只请求一次；两轮独立复审无 blocker/high。
+
+**生产发布（runtime `05a1181`）**：切换前后均确认活跃 Job、Node、allocation、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0，3 个账号 EIP 保持 `ready`。生产机直接 HTTPS clone 私有仓库因无 GitHub 凭证在创建 release 前安全失败，旧 Manager 未受影响；随后改由本机对精确提交生成校验过的 Git archive，经私网 SSH 传到最终路径后执行 frozen AWS-extra 安装，没有向生产机下发 Git token。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-05a1181`，旧 `e56a312` 和 unit/env 备份保留；域名 health、线上折叠/状态保持源码标记、运行时模块路径和 systemd Invocation 全部通过，当前 Invocation 的 ERROR/Traceback/Exception 为 0。此次仅改 UI，未创建收费 EC2 canary。
