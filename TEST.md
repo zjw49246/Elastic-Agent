@@ -165,16 +165,22 @@ The focused suite covers:
   reaches a terminal phase.
 - Batch/Fleet default-light theming, keyed DOM reconciliation, non-overlapping
   visibility-aware polling, default-collapsed Job cards whose user-selected
-  disclosure state survives refresh, prominent OTP action state, and a persistent
-  Job output viewer that remains available for terminal execution history.
+  disclosure state survives refresh, and a persistent Job output viewer that
+  remains available for terminal execution history. OTP UI tests cover
+  per-Worker cards in the exact Job, account email/ID + full Worker + shard
+  labels, challenge-only visibility, keyed DOM transplant with input/focus
+  preservation, single collapsible mobile reminder, and no browser-persisted
+  code.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token
   one-of validation, explicit secret clearing, token-only email/one-time/login-code
   switching, bounded anti-bot diagnostics, 900-second worker timeout propagation, and
   write-only `has_password`/`has_email_token` REST behavior;
 - correlated OTP-required events, six-digit validation, stale/mismatched
   challenge rejection, 32-hex injection protection, one-shot forwarding, retry
-  races, Manager timeout/cancel propagation, cleanup acknowledgement, immediate
-  disconnect failure, uncertain-cleanup account quarantine, and no retained OTP;
+  races, multi-Worker account/request isolation, cross-Worker spoof rejection,
+  concurrent-submit claiming, transport recovery, Manager timeout/cancel
+  propagation, cleanup acknowledgement, immediate disconnect failure,
+  uncertain-cleanup account quarantine, and no retained OTP;
 - Codex `CODEX_HOME` injection, pinned CLI/current-source bootstrap, exact
   JWT-email validation, mandatory `codex exec` smoke test, secret redaction, and
   transactional auth rollback on failure/cancellation, including non-root
@@ -270,6 +276,18 @@ and a failed/cancelled/timed-out login restores the previous
 In particular, run mailbox polling with `httpx` INFO logging enabled and assert
 that neither `httpx` nor inherited `httpcore` request logs contain the mailbox
 query token or its complete request URL.
+
+For the multi-Worker manual path, launch at least two password-only Codex
+Workers and wait until both publish challenges. Confirm each GET item and UI
+card has the exact `login_request_id`, `worker_id`, `account_id`,
+`account_email`, `job_id`, `job_name`, and `shard_index`; only affected Job
+cards should expand. Enter different six-digit values without submitting,
+force a Job refresh, and verify both values, focus, and cursor selection remain.
+Submit one card and confirm only that request disappears/receives
+`ACCOUNT_LOGIN_OTP`; the other card must remain actionable. On a narrow mobile
+viewport, “查看并填写” must collapse the floating reminder and leave the focused
+input visible. With no active challenge, the reminder, badges, and inline OTP
+regions must all be hidden.
 
 The Codex `email_token` is only a supported mailbox-query token; it is not an
 OpenAI API/OAuth token or a password. If OpenAI does not expose an email-code

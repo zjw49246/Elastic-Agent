@@ -259,17 +259,30 @@ spoofing an obsolete Chrome major version that can increase risk-page mismatch.
 A visible managed anti-bot challenge gets up to 120 seconds to clear, then fails
 with explicit bound-EIP guidance instead of consuming the full browser budget.
 
-If no mailbox token is configured, or automatic mailbox polling fails, the
-Batch Console displays the live OTP challenge. The corresponding API is:
+The mailbox token is a query credential for the configured mailbox service,
+not an OpenAI API/OAuth token or password. Token-only login still causes OpenAI
+to send an email OTP; the worker normally retrieves and fills it automatically.
+If no usable mailbox token is configured, polling fails, or OpenAI rejects the
+automatically retrieved code, only the affected Worker publishes a live manual
+OTP challenge. The Batch Console places a separate card inside that Worker's
+Job and labels the account email/ID, full Worker ID, Job, and shard. Concurrent
+Workers keep independent cards and submissions. A floating reminder appears
+only while at least one challenge is active and collapses after navigating to a
+card so it does not cover the mobile input.
+
+The corresponding API is:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/accounts/login-attempts` | List active, correlated OTP challenges |
+| `GET` | `/api/accounts/login-attempts` | List active challenges with exact Worker/account/Job/shard metadata |
 | `POST` | `/api/accounts/login-attempts/{login_request_id}/otp` | Forward `{"challenge_id":"...","code":"123456"}` to the owning worker |
 
-Submitted verification codes are not persisted. Codex mailbox polling currently
+Submitted verification codes are not persisted, and concurrent submissions for
+one challenge are forwarded only once. Codex mailbox polling currently
 supports 171mail and the MailCatcher-backed 163.com, mail.com, onet.pl, and
-gazeta.pl flows; generic IMAP is not implemented. Before mailbox polling, the
+gazeta.pl flows. Other domains, including 139.com, use the default 171mail
+route and therefore require a compatible 171mail query token; generic IMAP is
+not implemented. Before mailbox polling, the
 worker suppresses `httpx`/`httpcore` request logging so a query token cannot be
 written as part of a full request URL in the worker journal.
 
@@ -458,11 +471,16 @@ then upload a `.py` through `POST /api/jobs/harness` and use the returned
 **Frontend**: the Batch Console at `/batch` uses a light theme by default, with
 an optional session-scoped dark theme. It manages Claude and Codex identities,
 accepts write-only OpenAI passwords/mailbox query tokens (at least one for
-Codex), filters Job account choices by `agent_type`, and promotes active Codex
-OTP challenges to a six-digit action panel. Stable keyed rendering and
+Codex; both may be configured), filters Job account choices by `agent_type`,
+and shows active Codex OTP challenges as Worker-specific cards inside the
+corresponding Job. Each card is keyed by login request and challenge, while a
+single floating reminder links to all affected Workers and remains hidden when
+no manual OTP is needed. Stable keyed rendering and
 non-overlapping, visibility-aware polling preserve focus, expanded sections,
 scroll position, and log viewing instead of rebuilding the whole page every
-five seconds. Job cards start collapsed with their identity, state, phase,
+five seconds. OTP inputs, focus, and cursor selection also survive a Job-card
+replacement without persisting the code in browser storage. Job cards start
+collapsed with their identity, state, phase,
 submission time, and Worker count visible; opening a card reveals its actions,
 errors, cleanup state, results, and Worker execution table, and polling keeps
 the user's open/closed choice. Completed execution rows remain available as

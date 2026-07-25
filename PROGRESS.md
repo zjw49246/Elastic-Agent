@@ -424,3 +424,13 @@
 **验证**：先补红测试锁定默认折叠、外层状态恢复和日志资源边界；最终完整套件 **2092 passed / 12 skipped / 0 failed**，变更模块 Ruff（忽略文件既有 E501）、`compileall`、Batch JavaScript 语法和 `git diff --check` 通过。真实 Chrome 在桌面/手机视口验证默认收起、展开、强制数据签名变化后的 open/focus/viewport/table scroll 保持，以及 Worker 404 后只请求一次；两轮独立复审无 blocker/high。
 
 **生产发布（runtime `05a1181`）**：切换前后均确认活跃 Job、Node、allocation、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0，3 个账号 EIP 保持 `ready`。生产机直接 HTTPS clone 私有仓库因无 GitHub 凭证在创建 release 前安全失败，旧 Manager 未受影响；随后改由本机对精确提交生成校验过的 Git archive，经私网 SSH 传到最终路径后执行 frozen AWS-extra 安装，没有向生产机下发 Git token。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-05a1181`，旧 `e56a312` 和 unit/env 备份保留；域名 health、线上折叠/状态保持源码标记、运行时模块路径和 systemd Invocation 全部通过，当前 Invocation 的 ERROR/Traceback/Exception 为 0。此次仅改 UI，未创建收费 EC2 canary。
+
+## 2026-07-25 多 Worker OTP 精确卡片（commit `bae9a7e`）
+
+**问题**：最新 Codex Job 的邮箱自动取码未完成后等待人工 OTP 超时；账号域名没有专属后端映射而走默认 171mail，查询 token 若不兼容就会回退人工输入。旧页面只在顶部显示 `account_id + worker_id`，没有账号邮箱、所属 Job 或 shard；多个 Worker 同时缺码时难以判断每个验证码该交给谁。Job 轮询替换又可能让直接嵌入的输入丢失或失焦。
+
+**解决**：`LoginCoordinator` 在开始登录时保存 Manager 可信的账号邮箱和 Job/name/shard 快照，challenge 继续以 authenticated Worker envelope、`login_request_id` 和 expected account 三重校验；交叉 Worker/账号事件拒绝，同一 challenge 在首次 transport await 前 claim，阻止双击重复发送。Batch Console 只为实际上报人工 challenge 的 Worker 显示卡片，每张卡在对应 Job 内明确账号邮箱/ID、完整 Worker、Job 和 shard，多 Worker 独立提交；浮动提醒负责发现与跳转，移动端跳转后缩成小条，新 challenge 到来再展开。OTP DOM 以 request+challenge 复合键复用，Job replace 时移植原节点，并在显隐完成后恢复输入、焦点和光标选区；验证码不写浏览器持久状态。账号表单同时澄清查询 token 只是读取 OpenAI 邮箱 OTP 的凭据，密码与 token 至少一个且可同时配置。
+
+**以后避免**：异步人工操作 UI 不能只展示资源 ID，必须把“登录请求→可信 Worker→账号→Job/shard”完整标注，并让提交目标从卡片自身的关联键读取，不能靠当前选择或列表顺序猜测。轮询保持 input value 还不够，隐藏祖先再显示会让真实浏览器丢焦点；必须验证 DOM identity、value、focus、selection、scroll 和窄屏 overlay。自动取码 token 与 OpenAI 登录凭据也必须在文案中明确区分。
+
+**验证**：先补红测试覆盖两 Worker/两账号并发、交叉事件拒绝、单卡提交不影响另一卡、双提交 claim、transport 失败恢复、非秘密 REST 元数据和 Job 内 UI 契约。最终完整套件 **2096 passed / 12 skipped / 0 failed**；变更模块 Ruff、Batch JavaScript 语法、diff check 全部通过。Chrome 149 真实浏览器验证双 Job 精确落位、XSS text-only、未知 Job fallback、Job replacement 后值/焦点/选区不变，以及 390px 视口 10 个 Worker 时目标输入完整可见且不被提醒层遮挡；两轮独立后端/UI 审查最终无 blocker。
