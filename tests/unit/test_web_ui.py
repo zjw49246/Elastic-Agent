@@ -115,11 +115,13 @@ class TestDashboardEndpoint:
         assert "worker.worker_released === true" in jobs_monitor
         assert "worker.cleaned_up === true" in jobs_monitor
         assert "Worker 已销毁" in jobs_monitor
-        assert "if (!worker.worker_id || workerReleased(worker) || workerExecutionTerminal(worker))" in actions
+        assert "if (!worker.worker_id || workerReleased(worker))" in actions
+        assert "const terminate = workerExecutionTerminal(worker) ? ''" in actions
         assert "showJobLogs" in actions
         assert "showWorkerLogs" in actions
         assert "workerActionsHtml(w,j.job_id)" in jobs_monitor
         assert "terminateWorker(${jsArg(worker.worker_id)})" in actions
+        assert "Worker 仍存活时可看 ea-runtime systemd journal" in jobs_monitor
         assert (
             "api('POST', '/scale-in', {node_ids: [wid], force: true})"
         ) in terminate
@@ -148,6 +150,29 @@ class TestDashboardEndpoint:
         assert "!document.hidden && !_logPaused" in html
 
     @pytest.mark.asyncio
+    async def test_batch_console_jobs_start_collapsed_and_keep_user_choice(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert '<summary class="job-summary" data-job-focus="job-summary">' in html
+        assert 'class="job-detail"' in html
+        assert "点击查看详情" in html
+        assert "收起详情" in html
+        assert "const wasOpen = node.open" in html
+        assert "replacement.open = wasOpen" in html
+        assert "const focusedControl = jobFocusedControl(node)" in html
+        assert "restoreJobFocus(replacement, focusedControl)" in html
+        assert "replacementScrolls[index].scrollLeft = scrollLeft" in html
+        assert "window.scrollTo(viewportX, viewportY)" in html
+        assert "state === 'failed' || state === 'running'" not in html
+        assert '<span class="job-summary-main">' in html
+        assert '<div class="job-summary-main">' not in html
+        assert "overflow-wrap:anywhere" in html
+        assert ".job-summary:focus-visible" in html
+
+    @pytest.mark.asyncio
     async def test_batch_console_has_light_theme_help_and_job_log_viewer(
         self, ui_client
     ):
@@ -163,6 +188,10 @@ class TestDashboardEndpoint:
         assert "跟随最新" in html
         assert "j.error" in html
         assert "cleanup_pending" in html
+        assert "const workerGone = _logMode === 'worker'" in html
+        assert "[404, 409].includes(Number(error.status))" in html
+        assert "if (workerGone) {" in html
+        assert "_logTimer = null" in html
 
     @pytest.mark.asyncio
     async def test_fleet_removes_empty_state_before_first_worker(self, ui_client):

@@ -160,10 +160,13 @@ The focused suite covers:
   failures, plus REST API write-only token behavior and active claim/lease guards.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
-  and suppress live log/terminate actions after teardown.
+  suppress live actions after teardown, keep read-only system logs until release,
+  stop polling those logs after a 404/409, and suppress terminate once execution
+  reaches a terminal phase.
 - Batch/Fleet default-light theming, keyed DOM reconciliation, non-overlapping
-  visibility-aware polling, prominent OTP action state, and a persistent Job
-  output viewer that remains available for terminal execution history.
+  visibility-aware polling, default-collapsed Job cards whose user-selected
+  disclosure state survives refresh, prominent OTP action state, and a persistent
+  Job output viewer that remains available for terminal execution history.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token
   one-of validation, explicit secret clearing, token-only email/one-time/login-code
   switching, bounded anti-bot diagnostics, 900-second worker timeout propagation, and

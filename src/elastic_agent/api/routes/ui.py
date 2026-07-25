@@ -505,13 +505,28 @@ _BATCH_HTML = """\
     border-radius:9px; padding:10px; font-size:.78rem; text-align:center; }
   .workflow-step b { display:block; color:var(--accent); margin-bottom:3px; }
   .action-card { border-color:var(--orange); background:color-mix(in srgb,var(--surface) 92%,#fff7ed); }
-  .job-row { border:1px solid var(--border); border-radius:10px; padding:12px;
-    margin-bottom:10px; background:var(--surface); }
+  .job-row { border:1px solid var(--border); border-radius:10px; padding:0;
+    margin:0 0 10px; background:var(--surface); overflow:hidden; }
   .job-row.job-failed { border-left:4px solid var(--red); }
   .job-row.job-running, .job-row.job-preparing { border-left:4px solid var(--accent); }
+  .job-summary { display:flex; justify-content:space-between; align-items:center; gap:12px;
+    padding:12px; list-style:none; }
+  .job-summary::-webkit-details-marker { display:none; }
+  .job-summary:hover { background:var(--surface-soft); }
+  .job-summary:focus-visible { outline-offset:-3px; }
+  .job-summary-main { display:block; min-width:0; overflow-wrap:anywhere; }
+  .job-summary-title,.job-summary-meta { display:block; }
+  .job-summary-toggle { color:var(--accent); font-size:.78rem; white-space:nowrap; }
+  .job-summary-open { display:none; }
+  .job-row[open] > .job-summary { border-bottom:1px solid var(--border);
+    background:var(--surface-soft); }
+  .job-row[open] > .job-summary .job-summary-closed { display:none; }
+  .job-row[open] > .job-summary .job-summary-open { display:inline; }
+  .job-detail { padding:12px; }
   .job-head { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
   .job-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
   .job-actions .btn { margin:0; padding:5px 10px; }
+  .worker-records-title { margin-top:10px; margin-bottom:4px; }
   .job-alert { background:color-mix(in srgb,var(--red) 8%,var(--surface));
     border:1px solid color-mix(in srgb,var(--red) 35%,var(--border));
     color:var(--red); border-radius:7px; padding:7px 9px; margin-top:8px; font-size:.8rem;
@@ -533,7 +548,7 @@ _BATCH_HTML = """\
     .grid2,.grid3 { grid-template-columns:1fr; }
     .workflow { grid-template-columns:repeat(2,1fr); }
     .container { padding:12px; }
-    header,.job-head { align-items:flex-start; flex-direction:column; }
+    header,.job-head,.job-summary { align-items:flex-start; flex-direction:column; }
     .job-actions { justify-content:flex-start; }
     .log-dialog { width:96%; height:90vh; }
   }
@@ -764,7 +779,10 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       <button class="btn btn-ghost" id="historyToggle" style="display:none;margin:0"
         onclick="toggleJobHistory()">显示旧历史</button>
     </div>
-    <p class="hint" style="margin-bottom:10px">失败时先点「任务输出」看 stderr；登录、SSH、systemd 问题可在 Worker 存活时看「系统日志」。</p>
+    <p class="hint" style="margin-bottom:10px">
+      Job 默认收起，点击摘要查看详情。失败时先看「任务输出」中的 stderr；
+      登录、SSH、systemd 问题可在 Worker 存活时看「系统日志」。
+    </p>
     <div id="jobsList"><p class="muted">No jobs yet.</p></div>
   </div>
 
@@ -1240,16 +1258,21 @@ function jobStateLabel(state) {
   })[String(state || '').toLowerCase()] || String(state || '未知');
 }
 function workerActionsHtml(worker, jobId) {
-  const taskLog = `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
+  const focusId = esc(worker.worker_id || `shard-${Number(worker.shard_index)||0}`);
+  const taskLog = `<button class="btn btn-ghost" data-job-focus="worker-output-${focusId}"
+    style="padding:2px 8px;font-size:.72rem"
     onclick="showJobLogs(${jsArg(jobId)},${jsArg(worker.worker_id || '')})">任务输出</button>`;
-  if (!worker.worker_id || workerReleased(worker) || workerExecutionTerminal(worker)) {
+  if (!worker.worker_id || workerReleased(worker)) {
     return taskLog;
   }
-  return `${taskLog}
-    <button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
-      onclick="showWorkerLogs(${jsArg(worker.worker_id)})">系统日志</button>
-    <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem"
+  const systemLog = `<button class="btn btn-ghost" data-job-focus="worker-system-${focusId}"
+    style="padding:2px 8px;font-size:.72rem"
+    onclick="showWorkerLogs(${jsArg(worker.worker_id)})">系统日志</button>`;
+  const terminate = workerExecutionTerminal(worker) ? '' : `
+    <button class="btn btn-danger" data-job-focus="worker-terminate-${focusId}"
+      style="padding:2px 8px;font-size:.72rem"
       onclick="terminateWorker(${jsArg(worker.worker_id)})">终止</button>`;
+  return `${taskLog}${systemLog}${terminate}`;
 }
 async function downloadResults(jobId) {
   try {
@@ -1337,10 +1360,12 @@ function jobRowHtml(j, r) {
     ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
   const dlBtn = (r && r.file_count)
-    ? `<button class="btn btn-ghost" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
+    ? `<button class="btn btn-ghost" data-job-focus="job-results"
+        onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
     : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
   const cancelBtn = !j.done && j.in_memory !== false
-    ? `<button class="btn btn-danger" onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
+    ? `<button class="btn btn-danger" data-job-focus="job-cancel"
+        onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
     : '';
   const errors = [...new Set([
     j.error, j.note, j.cancel_reason,
@@ -1352,40 +1377,54 @@ function jobRowHtml(j, r) {
   const phases = Object.entries(j.phases || {})
     .map(([phase,count]) => badge(phase)+' '+(Number(count)||0)).join(' ');
   const created = formatWhen(j.created_at);
-  const defaultOpen = state === 'failed' || state === 'running';
   return `
-  <div id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}" data-job-id="${esc(j.job_id)}">
-    <div class="job-head">
-      <div>
-        <div><b>${esc(j.name||'')}</b> ${badge(state)}
-          <span class="muted">${esc(j.job_id)}</span></div>
-        <div class="muted" style="margin-top:5px">${phases || jobStateLabel(state)}
-          ${created ? ` · 提交 ${esc(created)}` : ''}</div>
+  <details id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}" data-job-id="${esc(j.job_id)}">
+    <summary class="job-summary" data-job-focus="job-summary">
+      <span class="job-summary-main">
+        <span class="job-summary-title"><b>${esc(j.name||'')}</b> ${badge(state)}
+          <span class="muted">${esc(j.job_id)}</span></span>
+        <span class="job-summary-meta muted" style="margin-top:5px">${phases || jobStateLabel(state)}
+          ${created ? ` · 提交 ${esc(created)}` : ''}
+          · ${recordedWorkers} 条 Worker 执行记录</span>
+      </span>
+      <span class="job-summary-toggle" aria-hidden="true">
+        <span class="job-summary-closed">点击查看详情 ▾</span>
+        <span class="job-summary-open">收起详情 ▴</span>
+      </span>
+    </summary>
+    <div class="job-detail">
+      <div class="job-head">
+        <span class="muted">操作与运行详情</span>
+        <div class="job-actions">
+          <button class="btn btn-ghost" data-job-focus="job-output"
+            onclick="showJobLogs(${jsArg(j.job_id)},'')">📄 任务输出</button>
+          ${dlBtn}${cancelBtn}
+        </div>
       </div>
-      <div class="job-actions">
-        <button class="btn btn-ghost" onclick="showJobLogs(${jsArg(j.job_id)},'')">📄 任务输出</button>
-        ${dlBtn}${cancelBtn}
+      ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
+      ${cleanupPending ? `<div class="job-alert cleanup-alert">正在清理 ${cleanupPending} 个 Worker / 租约，请勿重复提交同一账号。</div>` : ''}
+      ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
+      ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
+      <div class="worker-records-title muted">${recordedWorkers} 条 Worker 执行记录</div>
+      <div class="hint">
+        任务输出是命令 stdout/stderr，Worker 销毁后仍可查看；
+        Worker 仍存活时可看 ea-runtime systemd journal（系统日志）。
       </div>
+      <div class="table-scroll"><table><thead><tr><th>shard</th><th>worker</th><th>执行状态</th>
+        <th>资源状态</th><th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>操作</th></tr></thead><tbody>
+      ${wd.length ? wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
+        <td>${esc((w.worker_id||'').substring(0,14))}</td><td>${badge(w.phase)}</td>
+        <td>${workerResourceHtml(w)}</td>
+        <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+esc(a.email||a.account_id)+'</b>' : esc(a.email||a.account_id)).join('<br>') : esc(w.account_email||'--')}</td>
+        <td>${Number(w.rotations)||0}</td>
+        <td class="muted">${esc(w.error||'')}</td>
+        <td>${workerActionsHtml(w,j.job_id)}</td></tr>`).join('')
+        : `<tr><td colspan="8" class="muted">${j.in_memory === false
+            ? '这是 Manager 重启前的历史记录，没有可操作的在线 Worker。'
+            : 'Worker 尚未创建或状态尚未上报。'}</td></tr>`}
+      </tbody></table></div>
     </div>
-    ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
-    ${cleanupPending ? `<div class="job-alert cleanup-alert">正在清理 ${cleanupPending} 个 Worker / 租约，请勿重复提交同一账号。</div>` : ''}
-    ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
-    ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
-    <details ${defaultOpen ? 'open' : ''}><summary class="muted">${recordedWorkers} 条 Worker 执行记录</summary>
-    <div class="table-scroll"><table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>执行状态</th>
-      <th>资源状态</th><th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>操作</th></tr></thead><tbody>
-    ${wd.length ? wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
-      <td>${esc((w.worker_id||'').substring(0,14))}</td><td>${badge(w.phase)}</td>
-      <td>${workerResourceHtml(w)}</td>
-      <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+esc(a.email||a.account_id)+'</b>' : esc(a.email||a.account_id)).join('<br>') : esc(w.account_email||'--')}</td>
-      <td>${Number(w.rotations)||0}</td>
-      <td class="muted">${esc(w.error||'')}</td>
-      <td>${workerActionsHtml(w,j.job_id)}</td></tr>`).join('')
-      : `<tr><td colspan="8" class="muted">${j.in_memory === false
-          ? '这是 Manager 重启前的历史记录，没有可操作的在线 Worker。'
-          : 'Worker 尚未创建或状态尚未上报。'}</td></tr>`}
-    </tbody></table></div></details>
-  </div>`;
+  </details>`;
 }
 function jobRenderSignature(job, result) {
   return JSON.stringify([job, result || null]);
@@ -1397,6 +1436,16 @@ function makeJobNode(job) {
   const node = template.content.firstElementChild;
   node._renderSignature = jobRenderSignature(job, result);
   return node;
+}
+function jobFocusedControl(node) {
+  const active = document.activeElement;
+  return active && node.contains(active) ? (active.dataset.jobFocus || '') : '';
+}
+function restoreJobFocus(node, focusKey) {
+  if (!focusKey) return;
+  const control = Array.from(node.querySelectorAll('[data-job-focus]'))
+    .find(element => element.dataset.jobFocus === focusKey);
+  if (control) control.focus({preventScroll:true});
 }
 function reconcileJobCards(jobs) {
   const list = document.getElementById('jobsList');
@@ -1417,6 +1466,9 @@ function reconcileJobCards(jobs) {
   Array.from(list.querySelectorAll('.job-row')).forEach(node => {
     if (!wanted.has(node.dataset.jobId)) node.remove();
   });
+  const viewportX = window.scrollX;
+  const viewportY = window.scrollY;
+  let replacedAny = false;
   jobs.forEach((job, index) => {
     const id = String(job.job_id);
     const result = resultFor(id);
@@ -1425,16 +1477,27 @@ function reconcileJobCards(jobs) {
     if (!node) {
       node = makeJobNode(job);
     } else if (node._renderSignature !== signature) {
-      const wasOpen = Boolean(node.querySelector('details')?.open);
+      const wasOpen = node.open;
+      const focusedControl = jobFocusedControl(node);
+      const scrollLefts = Array.from(node.querySelectorAll('.table-scroll'))
+        .map(element => element.scrollLeft);
       const replacement = makeJobNode(job);
-      const replacementDetails = replacement.querySelector('details');
-      if (replacementDetails) replacementDetails.open = wasOpen;
+      replacement.open = wasOpen;
       node.replaceWith(replacement);
+      const replacementScrolls = replacement.querySelectorAll('.table-scroll');
+      scrollLefts.forEach((scrollLeft, index) => {
+        if (replacementScrolls[index]) {
+          replacementScrolls[index].scrollLeft = scrollLeft;
+        }
+      });
+      restoreJobFocus(replacement, focusedControl);
+      replacedAny = true;
       node = replacement;
     }
     const current = list.children[index] || null;
     if (node !== current) list.insertBefore(node, current);
   });
+  if (replacedAny) window.scrollTo(viewportX, viewportY);
 }
 async function refreshJobResults(jobs, force=false) {
   const now = Date.now();
@@ -1584,11 +1647,20 @@ async function refreshOpenLogs(force=false) {
     if (_logFollowing && (wasNearBottom || force)) pre.scrollTop = pre.scrollHeight;
   } catch(error) {
     if (contextVersion !== _logContextVersion) return;
+    const workerGone = _logMode === 'worker'
+      && [404, 409].includes(Number(error.status));
+    if (workerGone) {
+      _logPaused = true;
+      updateLogControls();
+    }
     document.getElementById('logMeta').textContent =
       '刷新失败：' + (error.message || error)
       + (_logMode === 'worker'
         ? '；Worker 可能已销毁，请返回 Job 卡片查看任务输出。' : '');
-    scheduleLogRefresh();
+    if (workerGone) {
+      clearTimeout(_logTimer);
+      _logTimer = null;
+    } else scheduleLogRefresh();
   } finally {
     _logLoading = false;
     if (contextVersion !== _logContextVersion && (_logJobId || _logWid)) {

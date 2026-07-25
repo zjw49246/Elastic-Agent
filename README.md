@@ -462,13 +462,16 @@ Codex), filters Job account choices by `agent_type`, and promotes active Codex
 OTP challenges to a six-digit action panel. Stable keyed rendering and
 non-overlapping, visibility-aware polling preserve focus, expanded sections,
 scroll position, and log viewing instead of rebuilding the whole page every
-five seconds. Job cards show the provision → bootstrap → login → run → collect
-→ destroy workflow, terminal errors, cleanup state, results, and a top-level
-command-output viewer. Completed execution rows remain available as history,
-while live system-journal and terminate actions appear only for an existing
-Worker resource. API keys are accepted only in the `Authorization: Bearer` or
-`X-API-Key` header; the UI keeps a key in `sessionStorage` and strips legacy
-query-string credentials. REST includes `/api/accounts`,
+five seconds. Job cards start collapsed with their identity, state, phase,
+submission time, and Worker count visible; opening a card reveals its actions,
+errors, cleanup state, results, and Worker execution table, and polling keeps
+the user's open/closed choice. Completed execution rows remain available as
+history. Command output remains queryable after teardown; the read-only live
+system-journal action remains available until the Worker resource is released,
+then stops polling on a not-found/conflict response; destructive terminate
+actions disappear at execution terminal state. API keys are accepted only in
+the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
+`sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and
 `/api/jobs/harness`.
 
