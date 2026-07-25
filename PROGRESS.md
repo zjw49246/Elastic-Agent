@@ -374,3 +374,13 @@
 **验证**：API/UI 聚焦测试 84 项全绿；完整套件 `2058 passed / 12 skipped / 0 failed`，Ruff、`compileall`、Batch Console JavaScript 语法和 `git diff --check` 均通过。
 
 **生产发布（runtime `a8d8da2`）**：代码已推送 `origin/main`，东京 Manager 原子切换到 `/home/ubuntu/elastic-agent.release-a8d8da2` 并重启。首轮把 editable 环境装在 `.staging` 后再改目录名，导致 `.pth` 仍指向旧路径，启动检查以 `ModuleNotFoundError` fail closed；旧进程已正常停机且当时 Worker/Node/账号占用均为 0。随后在最终 release 路径用 `uv sync --reinstall-package elastic-agent` 修正引用并启动成功。域名 health、目标 Job、页面新文案、systemd Invocation 与 AWS 状态复核通过：Worker/Node/存活 managed EC2 均为 0，目标 EIP 保留且未关联实例。以后构建不可变 release 时必须先确定最终目录再安装 editable 项目，或安装 wheel，不能在安装后移动虚拟环境的源码根。
+
+## 2026-07-25 生产 Worker 常用实例规格白名单（commit `6548a0e`）
+
+**问题**：生产 API 和 Manager IAM 都把 Worker 实例类型钉死为 `t3.large`，提交 `r5.2xlarge` 会在 Job preflight 返回 422；只扩应用白名单又会让后续 `RunInstances` 被 IAM 拒绝。
+
+**解决**：应用 EnvironmentFile 与 Manager IAM `ec2:InstanceType` 条件同步扩为东京固定可用区提供的 39 种常用 x86_64 规格：T3，以及 M/C/R 的 5、6i、7i 世代，尺寸限定 `large` 至 `4xlarge`（T3 至 `2xlarge`）。Graviton、GPU、metal 和更大高成本规格继续拒绝。回归测试解析版本化 env 与 IAM policy 并要求两集合完全相等，运维文档同步给出 `r5.2xlarge` simulator 示例。
+
+**以后避免**：实例类型存在应用 preflight 与 AWS IAM 两道 fail-closed 白名单，任何扩容必须同一变更、同一验证窗口更新；Region/AZ offering、AMI 架构、inline policy 大小、Access Analyzer 和 allow/deny simulation 都要在生产变更前核对。
+
+**验证**：东京 `ap-northeast-1a` offering 与 AMI x86_64 兼容性逐项确认；policy compact 大小 7649 bytes，Access Analyzer 0 finding；`r5.2xlarge`、M/C/R 7i 模拟允许，`g5.xlarge` 保持拒绝。相关测试 129 项、完整套件 `2059 passed / 12 skipped / 0 failed`，Ruff、JSON 和 diff check 均通过。
