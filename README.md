@@ -422,7 +422,10 @@ then upload a `.py` through `POST /api/jobs/harness` and use the returned
 **Frontend**: the Batch Console at `/batch` manages Claude and Codex identities,
 accepts write-only OpenAI passwords/mailbox query tokens (at least one for Codex), filters
 Job account choices by `agent_type`, and displays active Codex OTP challenges
-with a six-digit submission form. API keys are accepted only in the
+with a six-digit submission form. Completed Job cards label retained
+`WorkerRun` rows as execution history and separately show whether the backing
+Worker resource has been destroyed; released rows have no live log/terminate
+actions. API keys are accepted only in the
 `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
 `sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, and `/api/jobs/harness`.

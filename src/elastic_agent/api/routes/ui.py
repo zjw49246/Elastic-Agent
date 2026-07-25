@@ -768,7 +768,10 @@ async function submitLoginOtp(requestId, challengeId) {
 }
 async function terminateWorker(wid) {
   if (!window.confirm('终止 worker ' + wid + ' ？该 EC2 实例会被销毁（失败/空转的 worker 用它清理，省钱）。')) return;
-  try { await api('DELETE', '/nodes/' + encodeURIComponent(wid)); toast('已终止 ' + wid); refreshJobs(); }
+  try {
+    await api('POST', '/scale-in', {node_ids: [wid], force: true});
+    toast('已提交终止 ' + wid); refreshJobs();
+  }
   catch(e) { toast(e.message, 'error'); }
 }
 async function removeAccount(id) {
@@ -939,6 +942,41 @@ function badge(p) {
   const cls = label.toLowerCase().replace(/[^a-z0-9_-]/g, '');
   return `<span class="badge b-${cls}">${esc(label)}</span>`;
 }
+function workerReleased(worker) {
+  // `cleaned_up` keeps this UI compatible with a Manager rolling upgrade;
+  // `worker_released` also covers ordinary (non-EIP) Job teardown.
+  return worker.worker_released === true || worker.cleaned_up === true;
+}
+function workerExecutionTerminal(worker) {
+  return ['done', 'failed', 'cancelled'].includes(String(worker.phase || ''));
+}
+function workerResourceHtml(worker) {
+  if (workerReleased(worker)) {
+    return '<span class="badge b-done">Worker 已销毁</span>';
+  }
+  if (!workerExecutionTerminal(worker)) {
+    return '<span class="muted">活动或准备中</span>';
+  }
+  if (worker.worker_release_expected === false) {
+    return '<span class="muted">按策略保留</span>';
+  }
+  if (worker.cleanup_error) {
+    return '<span class="badge b-failed">清理失败，正在重试</span>';
+  }
+  if (typeof worker.worker_released !== 'boolean') {
+    return '<span class="badge b-pending">资源状态未知</span>';
+  }
+  return '<span class="badge b-pending">等待清理</span>';
+}
+function workerActionsHtml(worker) {
+  if (!worker.worker_id || workerReleased(worker) || workerExecutionTerminal(worker)) {
+    return '<span class="muted">—</span>';
+  }
+  return `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
+      onclick="showLogs(${jsArg(worker.worker_id)})">📄 日志</button>
+    <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem"
+      onclick="terminateWorker(${jsArg(worker.worker_id)})">终止</button>`;
+}
 async function downloadResults(jobId) {
   try {
     const resp = await fetch(
@@ -977,6 +1015,8 @@ async function mapLimit(items, limit, fn) {
 // One job card. `r` = its results payload (or null while not yet loaded).
 function jobRowHtml(j, r) {
   const wd = j.workers_detail || [];
+  const recordedWorkers = Number.isFinite(Number(j.workers))
+    ? Number(j.workers) : wd.length;
   const scoreStr = (r && r.scores && r.scores.length)
     ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
@@ -995,15 +1035,16 @@ function jobRowHtml(j, r) {
     </div>
     ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
     ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
-    <details><summary class="muted">${wd.length} workers</summary>
-    <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>phase</th>
-      <th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>日志</th></tr></thead><tbody>
+    <details><summary class="muted">${recordedWorkers} 条 Worker 执行记录</summary>
+    <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>执行状态</th>
+      <th>资源状态</th><th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>操作</th></tr></thead><tbody>
     ${wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
       <td>${esc((w.worker_id||'').substring(0,14))}</td><td>${badge(w.phase)}</td>
+      <td>${workerResourceHtml(w)}</td>
       <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+esc(a.email||a.account_id)+'</b>' : esc(a.email||a.account_id)).join('<br>') : esc(w.account_email||'--')}</td>
       <td>${Number(w.rotations)||0}</td>
       <td class="muted">${esc(w.error||'')}</td>
-      <td>${w.worker_id ? `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="showLogs(${jsArg(w.worker_id)})">📄 日志</button> <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem" onclick="terminateWorker(${jsArg(w.worker_id)})">终止</button>` : ''}</td></tr>`).join('')}
+      <td>${workerActionsHtml(w)}</td></tr>`).join('')}
     </tbody></table></details>
   </div>`;
 }

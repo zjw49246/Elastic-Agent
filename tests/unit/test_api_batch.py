@@ -733,13 +733,43 @@ class TestJobsAPI:
         return job_id
 
     @pytest.mark.asyncio
-    async def test_submit_returns_detail(self, client):
+    async def test_submit_returns_detail(self, client, manager):
         r = await client.post("/api/jobs", json=self._SPEC)
         assert r.status_code == 201
         body = r.json()
         assert body["workers"] == 3
         assert len(body["workers_detail"]) == 3
         assert all(w["phase"] == "running" for w in body["workers_detail"])
+        assert all(w["worker_released"] is False for w in body["workers_detail"])
+        assert all(
+            w["worker_release_expected"] is True for w in body["workers_detail"]
+        )
+
+        job = manager.batch.get_job(body["job_id"])
+        job.resources_released = True
+        released = (await client.get(f"/api/jobs/{body['job_id']}")).json()
+        assert all(w["worker_released"] is True for w in released["workers_detail"])
+
+        job.resources_released = False
+        job.release_workers_on_complete = False
+        retained = (await client.get(f"/api/jobs/{body['job_id']}")).json()
+        assert all(
+            w["worker_release_expected"] is False
+            for w in retained["workers_detail"]
+        )
+        assert all(w["worker_released"] is False for w in retained["workers_detail"])
+
+        job.spec.account.binding = "eip"
+        next(iter(job.runs.values())).cleaned_up = True
+        eip = (await client.get(f"/api/jobs/{body['job_id']}")).json()
+        assert all(
+            w["worker_release_expected"] is True for w in eip["workers_detail"]
+        )
+        assert [w["worker_released"] for w in eip["workers_detail"]] == [
+            True,
+            False,
+            False,
+        ]
 
     @pytest.mark.asyncio
     async def test_submit_idempotency_key_never_launches_duplicate_fleet(
@@ -951,6 +981,11 @@ class TestJobsAPI:
         await client.post("/api/jobs", json=self._SPEC)
         item = (await client.get("/api/jobs")).json()["jobs"][0]
         assert len(item["workers_detail"]) == 3
+        assert all(
+            worker["worker_released"] is False
+            and worker["worker_release_expected"] is True
+            for worker in item["workers_detail"]
+        )
         assert "spec" not in item
 
     @pytest.mark.asyncio

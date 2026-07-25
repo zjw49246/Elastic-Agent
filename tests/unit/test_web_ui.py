@@ -81,6 +81,40 @@ class TestDashboardEndpoint:
         assert "/cancel" in html
 
     @pytest.mark.asyncio
+    async def test_batch_console_distinguishes_worker_history_from_live_resources(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        jobs_monitor = html[
+            html.index("// ---- Jobs monitor ----"):
+            html.index("async function refreshJobs()")
+        ]
+        actions = jobs_monitor[
+            jobs_monitor.index("function workerActionsHtml(worker)"):
+            jobs_monitor.index("async function downloadResults")
+        ]
+        terminate = html[
+            html.index("async function terminateWorker(wid)"):
+            html.index("async function removeAccount(id)")
+        ]
+
+        assert "Worker 执行记录" in jobs_monitor
+        assert "worker.worker_released === true" in jobs_monitor
+        assert "worker.cleaned_up === true" in jobs_monitor
+        assert "Worker 已销毁" in jobs_monitor
+        assert (
+            "if (!worker.worker_id || workerReleased(worker) "
+            "|| workerExecutionTerminal(worker))"
+        ) in actions
+        assert "workerActionsHtml(w)" in jobs_monitor
+        assert "terminateWorker(${jsArg(worker.worker_id)})" in actions
+        assert (
+            "api('POST', '/scale-in', {node_ids: [wid], force: true})"
+        ) in terminate
+        assert "api('DELETE'" not in terminate
+
+    @pytest.mark.asyncio
     async def test_fleet_dashboard(self, ui_client):
         client, _ = ui_client
         for path in ("/fleet", "/dashboard"):

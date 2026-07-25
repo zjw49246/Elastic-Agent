@@ -218,6 +218,8 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
 
 
 def _job_detail(job) -> dict:
+    is_eip_bound = job.spec.account.binding == "eip"
+    worker_release_expected = is_eip_bound or job.release_workers_on_complete
     return {
         **job.summary(),
         "spec": _redacted_spec(job.spec),
@@ -250,6 +252,14 @@ def _job_detail(job) -> dict:
                 "cleaned_up": r.cleaned_up,
                 "cleanup_error": r.cleanup_error,
                 "cleanup_attempts": r.cleanup_attempts,
+                # A WorkerRun is retained as Job execution history after its
+                # compute resource is gone.  Keep that distinction explicit
+                # for API clients instead of asking them to infer it from a
+                # terminal process phase.
+                "worker_released": (
+                    r.cleaned_up if is_eip_bound else job.resources_released
+                ),
+                "worker_release_expected": worker_release_expected,
             }
             for r in job.runs.values()
         ],

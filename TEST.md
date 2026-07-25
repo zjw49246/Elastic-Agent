@@ -153,6 +153,9 @@ The focused suite covers:
   the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
+- Batch Console Worker history/resource separation: completed execution rows
+  report their release proof explicitly, display destroyed resources as history,
+  and suppress live log/terminate actions after teardown.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token
   one-of validation, explicit secret clearing, and token-only email-code switching, and
   write-only `has_password`/`has_email_token` REST behavior;

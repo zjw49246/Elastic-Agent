@@ -4,20 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from elastic_agent.worker.runtime import WorkerRuntime
 from elastic_agent.core.protocols.messages import (
-    AuthMessage,
     AuthResultMessage,
     HeartbeatMessage,
-    LogMessage,
-    parse_message,
 )
+from elastic_agent.worker.runtime import WorkerRuntime
 
 
 @pytest.fixture
@@ -117,14 +112,18 @@ class TestExponentialBackoff:
             heartbeat_interval=99999,
             log_dir="/tmp/test-logs",
         )
-        outer_sleep_delays = []
+        reconnect_delays = {1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0}
+        backoff_sleeps = []
         connect_attempt = 0
         orig_sleep = asyncio.sleep
 
         async def mock_sleep(delay):
-            outer_sleep_delays.append(delay)
-            if len(outer_sleep_delays) >= 8:
-                rt._running = False
+            # asyncio.wait_for() may use the patched sleep for the 10-second
+            # auth timeout. Record only reconnect backoff values.
+            if delay in reconnect_delays:
+                backoff_sleeps.append(delay)
+                if len(backoff_sleeps) >= 3:
+                    rt._running = False
             await orig_sleep(0)
 
         recv_count = 0
@@ -155,7 +154,6 @@ class TestExponentialBackoff:
             rt._running = True
             await rt.run()
 
-        backoff_sleeps = [d for d in outer_sleep_delays if d < 1000]
         assert len(backoff_sleeps) >= 3
         assert backoff_sleeps[0] == 1.0
         assert backoff_sleeps[1] == 2.0
