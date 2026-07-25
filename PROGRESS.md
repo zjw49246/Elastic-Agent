@@ -412,3 +412,13 @@
 **验证**：先以红测试复现损坏 JSON 顶层、全量日志读取、配额缺失、截断假阴性、归档/取消竞态、历史 results 饥饿、隐藏页轮询和 Fleet 0→1 空状态；修复后相关 350 项与最终完整套件 **2091 passed / 12 skipped / 0 failed**。Ruff、`compileall`、Batch/Fleet JavaScript、依赖锁 dry-run、diff check 全部通过；Chrome 149 真实 DOM/截图验证浅色表单、失败卡、任务输出、结果区和 Fleet 0→1 均正常，三轮独立复审最终无 blocker/high。
 
 **生产发布（runtime `e56a312`）**：代码推送 `origin/main` 后，先确认东京 Manager 真正内存态活跃 Job、Node、allocation、OTP challenge、非终态 managed EC2 和已挂载 EIP 均为 0；63 条 `recovered` 是旧 journal 历史，不误作活任务。最终路径 `/home/ubuntu/elastic-agent.release-e56a312` 执行 frozen AWS-extra 安装、boto3/源码路径和版本化 unit/env 校验后原子切换，旧 `8592bad` 与配置备份保留。域名 health/浅色 UI/任务输出入口正常，旧失败 Job logs 返回明确 `unavailable` 与 `Cache-Control: no-store`；发布后资源仍全为 0，3 个账号 EIP 均未挂载，新 systemd Invocation 的 ERROR/Traceback/Exception pattern 为 0。为避免无意义费用，本次未额外创建 EC2 canary。
+
+## 2026-07-25 Job 卡默认折叠与交互状态稳定（commit `6c2efe7`）
+
+**问题**：Jobs 区虽然已改成 keyed reconcile，但运行中和失败 Job 仍会自动展开 Worker 表，操作、错误与结果也始终占据页面；状态轮询替换一张已展开卡片时只保留 `open`，仍会丢键盘焦点、页面位置和表格横向滚动。执行已终态但资源尚在 final collect/cleanup 的 Worker 又过早隐藏 systemd 日志入口。
+
+**解决**：整张 Job 卡改为合法、可键盘操作的原生 `<details>/<summary>`，新卡一律收起，摘要保留名称、状态、阶段、时间与 Worker 数，展开后一次显示操作、错误、结果和 Worker 明细。节点替换同时恢复展开状态、稳定控件焦点、视口与表格滚动；终态未释放 Worker 保留只读系统日志，资源消失返回 404/409 后停止自动轮询，危险的终止按钮仍只在执行未终态时出现。
+
+**以后避免**：减少 DOM 重建不等于交互状态稳定；任何轮询替换都要逐项核对 disclosure、focus、viewport 和局部 scroll。资源生命周期与命令生命周期必须分别控制只读诊断和破坏性操作。原生 disclosure 也要遵守 HTML 内容模型，并验证 focus ring 不被圆角裁剪。
+
+**验证**：先补红测试锁定默认折叠、外层状态恢复和日志资源边界；最终完整套件 **2092 passed / 12 skipped / 0 failed**，变更模块 Ruff（忽略文件既有 E501）、`compileall`、Batch JavaScript 语法和 `git diff --check` 通过。真实 Chrome 在桌面/手机视口验证默认收起、展开、强制数据签名变化后的 open/focus/viewport/table scroll 保持，以及 Worker 404 后只请求一次；两轮独立复审无 blocker/high。
