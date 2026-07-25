@@ -412,6 +412,10 @@ For cost control, `ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES` is a comma-separated
 Job allowlist (default: only the provider's configured instance type), and
 `ELASTIC_AGENT_MAX_JOB_WORKER_HOURS` caps `fanout.workers * ttl_seconds / 3600`
 (default 1440). These checks happen before Job persistence or cloud creation.
+The checked-in Tokyo production profile permits the common x86_64 T3,
+M5/M6i/M7i, C5/C6i/C7i, and R5/R6i/R7i families from `large` through
+`4xlarge` (T3 through `2xlarge`); Graviton, GPU, metal, and larger high-cost
+shapes remain excluded.
 
 **Upload-code escape hatch**: because a Python Harness executes arbitrary code
 inside the Manager, upload and `harness_ref` use are disabled by default. A

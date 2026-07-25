@@ -60,10 +60,13 @@ and failed multipart cleanup map to `PutObject` and `AbortMultipartUpload`.
 Set the final golden AMI and dedicated Worker security group. The deployed
 `deploy/aws_manager.py` environment must match these IDs before the first Job
 launch.
-The IAM policy also intentionally pins `ec2:InstanceType` to `t3.large`, which
-matches the production Job allowlist. Before enabling another per-Job instance
-type, add it to both allowlists, re-run simulation for that type, and deploy the
-two changes together; otherwise `RunInstances` must remain denied.
+The IAM policy pins `ec2:InstanceType` to the same common x86_64 T3,
+M5/M6i/M7i, C5/C6i/C7i, and R5/R6i/R7i set as the production Job allowlist
+(`large` through `4xlarge`, with T3 ending at `2xlarge`). Keep the two sets
+identical. Before enabling another per-Job instance type, add it to both
+allowlists, re-run simulation for that type, and deploy the two changes
+together; otherwise `RunInstances` must remain denied. The example below
+exercises `r5.2xlarge`.
 
 ```bash
 export AWS_REGION=ap-northeast-1
@@ -249,7 +252,7 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
     'ContextKeyName=ec2:VolumeType,ContextKeyValues=gp3,ContextKeyType=string' \
     'ContextKeyName=ec2:Encrypted,ContextKeyValues=true,ContextKeyType=boolean' \
     'ContextKeyName=ec2:VolumeSize,ContextKeyValues=100,ContextKeyType=numeric' \
-    'ContextKeyName=ec2:InstanceType,ContextKeyValues=t3.large,ContextKeyType=string' \
+    'ContextKeyName=ec2:InstanceType,ContextKeyValues=r5.2xlarge,ContextKeyType=string' \
     'ContextKeyName=ec2:MetadataHttpTokens,ContextKeyValues=required,ContextKeyType=string' \
     'ContextKeyName=ec2:MetadataHttpPutResponseHopLimit,ContextKeyValues=1,ContextKeyType=numeric' \
     'ContextKeyName=ec2:InstanceProfile,ContextKeyValues=arn:aws:iam::297645381734:instance-profile/elastic-agent-worker,ContextKeyType=string' \

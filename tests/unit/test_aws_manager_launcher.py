@@ -20,6 +20,10 @@ from deploy.aws_manager import (
 
 CALLER_ACCOUNT = "123456789012"
 SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
+AWS_ENV = (
+    Path(__file__).resolve().parents[2]
+    / "deploy/aws/elastic-agent-manager.aws.env"
+)
 MANAGER_POLICY = (
     Path(__file__).resolve().parents[2]
     / "deploy/aws/elastic-agent-manager-policy.json"
@@ -108,6 +112,39 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     ):
         assert setting in source
     assert "UnsetEnvironment=AWS_ACCESS_KEY_ID" in source
+
+
+def test_production_allowlist_covers_common_x86_worker_families():
+    source = AWS_ENV.read_text(encoding="utf-8")
+    configured = next(
+        line.partition("=")[2]
+        for line in source.splitlines()
+        if line.startswith("ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES=")
+    )
+    actual = set(configured.split(","))
+    expected = {
+        f"{family}.{size}"
+        for family in (
+            "t3",
+            "m5", "m6i", "m7i",
+            "c5", "c6i", "c7i",
+            "r5", "r6i", "r7i",
+        )
+        for size in ("large", "xlarge", "2xlarge", "4xlarge")
+    }
+    expected.remove("t3.4xlarge")  # T3 ends at 2xlarge.
+
+    assert actual == expected
+    policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
+    launch = next(
+        statement
+        for statement in policy["Statement"]
+        if statement["Sid"] == "LaunchOnlyManagedWorkers"
+    )
+    iam_types = launch["Condition"]["StringEquals"]["ec2:InstanceType"]
+    if isinstance(iam_types, str):
+        iam_types = [iam_types]
+    assert set(iam_types) == actual
 
 
 def test_manager_policy_and_cutover_pin_real_key_pair_name():
