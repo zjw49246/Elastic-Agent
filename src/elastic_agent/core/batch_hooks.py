@@ -259,6 +259,19 @@ class AccountAllocator:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _PendingLogin:
+    """Manager-owned identity and UI context for one correlated login."""
+
+    account_id: str
+    account_email: str
+    future: asyncio.Future
+    allow_legacy_result: bool
+    job_id: str = ""
+    job_name: str = ""
+    shard_index: int | None = None
+
+
 class LoginCoordinator:
     def __init__(
         self,
@@ -273,9 +286,7 @@ class LoginCoordinator:
         self._timeout = timeout
         self._cancel_timeout = cancel_timeout
         self._quarantine_account = quarantine_account
-        self._pending: dict[
-            tuple[str, str], tuple[str, asyncio.Future, bool]
-        ] = {}
+        self._pending: dict[tuple[str, str], _PendingLogin] = {}
         self._cancel_acks: dict[
             tuple[str, str], tuple[str, asyncio.Future]
         ] = {}
@@ -314,14 +325,12 @@ class LoginCoordinator:
         self, event_type: str, worker_id: str, data: dict,
     ) -> None:
         """End login waits immediately; a disconnected browser may still run."""
-        for (pending_worker, request_id), (account_id, future, _legacy) in list(
-            self._pending.items()
-        ):
-            if pending_worker != worker_id or future.done():
+        for (pending_worker, request_id), pending in list(self._pending.items()):
+            if pending_worker != worker_id or pending.future.done():
                 continue
-            future.set_result({
+            pending.future.set_result({
                 "login_request_id": request_id,
-                "account_id": account_id,
+                "account_id": pending.account_id,
                 "success": False,
                 "error": "worker disconnected during account login",
                 "cleanup_complete": False,
@@ -371,7 +380,8 @@ class LoginCoordinator:
                 request_id or "<missing>",
             )
             return
-        expected_account_id, future, _allow_legacy = pending
+        expected_account_id = pending.account_id
+        future = pending.future
         if (
             future.done()
             or data.get("account_id") != expected_account_id
@@ -389,6 +399,10 @@ class LoginCoordinator:
             "login_request_id": request_id,
             "worker_id": worker_id,
             "account_id": expected_account_id,
+            "account_email": pending.account_email,
+            "job_id": pending.job_id,
+            "job_name": pending.job_name,
+            "shard_index": pending.shard_index,
             "challenge_id": challenge_id,
             "expires_at": expires_at,
             "status": "awaiting_otp",
@@ -427,15 +441,30 @@ class LoginCoordinator:
 
         worker_id = str(challenge["worker_id"])
         account_id = str(challenge["account_id"])
-        if (worker_id, login_request_id) not in self._pending:
+        pending = self._pending.get((worker_id, login_request_id))
+        if pending is None or pending.account_id != account_id:
             self._otp_challenges.pop(login_request_id, None)
             raise KeyError("login request is no longer active")
-        await self._conn.send_command(worker_id, AccountLoginOtpMessage(
-            login_request_id=login_request_id,
-            account_id=account_id,
-            challenge_id=challenge_id,
-            code=normalized_code,
-        ))
+        if challenge.get("status") != "awaiting_otp":
+            raise ValueError("login challenge is already being submitted")
+        # Claim the challenge before yielding to transport so concurrent POSTs
+        # cannot send the same code twice. A transport failure restores it.
+        challenge["status"] = "submitting_otp"
+        try:
+            await self._conn.send_command(worker_id, AccountLoginOtpMessage(
+                login_request_id=login_request_id,
+                account_id=account_id,
+                challenge_id=challenge_id,
+                code=normalized_code,
+            ))
+        except BaseException:
+            latest = self._otp_challenges.get(login_request_id)
+            if (
+                latest is not None
+                and latest.get("challenge_id") == challenge_id
+            ):
+                latest["status"] = "awaiting_otp"
+            raise
         # Never retain the submitted code. A visibly rejected code causes the
         # worker to publish a fresh challenge with a fresh challenge_id.
         latest = self._otp_challenges.get(login_request_id)
@@ -462,10 +491,9 @@ class LoginCoordinator:
             ]
             if len(worker_pending) == 1:
                 candidate = worker_pending[0]
-                expected_account_id, _future, allow_legacy = candidate
                 if (
-                    allow_legacy
-                    and data.get("account_id") == expected_account_id
+                    candidate.allow_legacy_result
+                    and data.get("account_id") == candidate.account_id
                 ):
                     pending = candidate
         if pending is None:
@@ -475,7 +503,8 @@ class LoginCoordinator:
                 request_id or "<missing>",
             )
             return
-        expected_account_id, fut, _allow_legacy = pending
+        expected_account_id = pending.account_id
+        fut = pending.future
         if data.get("account_id") != expected_account_id:
             logger.error(
                 "Ignoring login result account mismatch for %s request %s",
@@ -493,6 +522,9 @@ class LoginCoordinator:
         *, allow_legacy_result: bool = False,
         quarantine_on_uncertain_cleanup: bool = True,
         login_timeout_seconds: int = 900,
+        job_id: str = "",
+        job_name: str = "",
+        shard_index: int | None = None,
     ) -> LoginOutcome:
         from elastic_agent.core.protocols.messages import (
             AccountLoginCancelMessage,
@@ -551,7 +583,15 @@ class LoginCoordinator:
                 )
             return cleanup_confirmed
 
-        self._pending[key] = (account.id, fut, allow_legacy_result)
+        self._pending[key] = _PendingLogin(
+            account_id=account.id,
+            account_email=account.email,
+            future=fut,
+            allow_legacy_result=allow_legacy_result,
+            job_id=job_id,
+            job_name=job_name,
+            shard_index=shard_index,
+        )
         try:
             await self._conn.send_command(worker_id, AccountLoginMessage(
                 login_request_id=request_id,
@@ -907,6 +947,30 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
                     success=False,
                     error=f"no available account in group '{spec.account.group}'",
                 )
+
+        # Snapshot display context before waiting for the browser. In ordinary
+        # (non-EIP) jobs the WorkerRun does not receive its account identity
+        # until login succeeds, so the live OTP API cannot reconstruct this
+        # exact worker/account relationship later from workers_detail.
+        job_id = ""
+        job_name = spec.name
+        shard_index: int | None = None
+        try:
+            orchestrator = getattr(manager, "batch", None)
+            if orchestrator is not None:
+                job_id = orchestrator.job_id_for_worker(worker_id) or ""
+                job = orchestrator.get_job(job_id) if job_id else None
+                if job is not None:
+                    job_name = getattr(job.spec, "name", spec.name)
+                    run = job.runs.get(worker_id)
+                    if run is not None:
+                        shard_index = int(run.ctx.shard_index)
+        except Exception:
+            # Login correlation remains safe without optional UI context.
+            logger.warning(
+                "Could not snapshot Job context for login on worker %s",
+                worker_id,
+            )
         return await coordinator.login(
             worker_id, acct, config_dir or spec.account.config_dir,
             provider=spec.account.__dict__.get("provider") if hasattr(spec.account, "__dict__") else None,
@@ -921,6 +985,9 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
             # browser cleanup must quarantine the account from future jobs.
             quarantine_on_uncertain_cleanup=spec.account.binding != "eip",
             login_timeout_seconds=spec.account.login_timeout_seconds,
+            job_id=job_id,
+            job_name=job_name,
+            shard_index=shard_index,
         )
 
     return login

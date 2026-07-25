@@ -18,6 +18,10 @@ async def test_list_exposes_only_non_secret_challenge_metadata(monkeypatch):
         "login_request_id": "login-1",
         "worker_id": "worker-1",
         "account_id": "codex-1",
+        "account_email": "codex-1@example.com",
+        "job_id": "job-1",
+        "job_name": "otp-batch",
+        "shard_index": 3,
         "challenge_id": "a" * 32,
         "expires_at": 1_900_000_000,
         "status": "awaiting_otp",
@@ -27,8 +31,14 @@ async def test_list_exposes_only_non_secret_challenge_metadata(monkeypatch):
     result = await account_login.list_account_login_attempts()
 
     assert result["total"] == 1
+    assert result["attempts"][0]["worker_id"] == "worker-1"
+    assert result["attempts"][0]["account_id"] == "codex-1"
+    assert result["attempts"][0]["account_email"] == "codex-1@example.com"
+    assert result["attempts"][0]["job_id"] == "job-1"
+    assert result["attempts"][0]["shard_index"] == 3
     assert "code" not in result["attempts"][0]
     assert "password" not in result["attempts"][0]
+    assert "email_token" not in result["attempts"][0]
 
 
 @pytest.mark.asyncio

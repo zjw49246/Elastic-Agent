@@ -53,8 +53,9 @@ class TestDashboardEndpoint:
         assert 'id="acctClearPassword"' in html
         assert 'id="acctClearToken"' in html
         assert 'id="jAgentType"' in html
-        assert "Codex 可使用 OpenAI 密码或接码查询 Token 登录" in html
-        assert "Codex 与接码 Token 二选一" in html
+        assert "Codex 至少配置 OpenAI 密码或接码查询 Token" in html
+        assert "Codex 至少填写一项，可同时填写" in html
+        assert "查询 Token 不是 OpenAI 登录凭据" in html
         assert "/accounts/login-attempts/" in html
         assert "agent_type:" in html
         assert "clear_email_token:" in html
@@ -171,6 +172,41 @@ class TestDashboardEndpoint:
         assert '<div class="job-summary-main">' not in html
         assert "overflow-wrap:anywhere" in html
         assert ".job-summary:focus-visible" in html
+
+    @pytest.mark.asyncio
+    async def test_batch_console_places_each_otp_on_its_exact_job_worker(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert 'class="job-otp-summary-badge"' in html
+        assert 'class="job-otp-region"' in html
+        assert 'class="job-otp-list"' in html
+        assert "function otpKey(attempt)" in html
+        assert "attempt.login_request_id" in html
+        assert "attempt.challenge_id" in html
+        assert "otpCardsByKey" in html
+        assert "latestLoginAttempts" in html
+        assert "button.dataset.loginRequestId" in html
+        assert "button.dataset.challengeId" in html
+        assert "source.closest('.otp-challenge-card')" in html
+        assert "card.querySelector('.otp-account-email').textContent" in html
+        assert "card.querySelector('.otp-account-id').textContent" in html
+        assert "card.querySelector('.otp-worker').textContent" in html
+        assert "邮箱自动取码不可用或未成功，需要人工输入" in html
+        assert "openedOtpChallenges" in html
+        assert "jobNode.open = true" in html
+        assert "setOtpActionMinimized(true)" in html
+        assert "behavior:compactViewport ? 'auto' : 'smooth'" in html
+        assert "if (hasNewChallenge || !latestLoginAttempts.length)" in html
+        assert "toggleOtpActionCard" in html
+        assert ".otp-action-card.otp-minimized" in html
+        assert "const otpFocus = focusedOtpState(node)" in html
+        assert "otpFocusTarget = {node:replacement, state:otpFocus}" in html
+        assert "restoreOtpFocus(otpFocusTarget.node, otpFocusTarget.state)" in html
+        assert "otpCards.forEach(card => otpMount.appendChild(card))" in html
+        assert "otpDrafts" not in html
 
     @pytest.mark.asyncio
     async def test_batch_console_has_light_theme_help_and_job_log_viewer(

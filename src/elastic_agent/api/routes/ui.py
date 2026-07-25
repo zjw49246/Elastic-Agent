@@ -505,6 +505,44 @@ _BATCH_HTML = """\
     border-radius:9px; padding:10px; font-size:.78rem; text-align:center; }
   .workflow-step b { display:block; color:var(--accent); margin-bottom:3px; }
   .action-card { border-color:var(--orange); background:color-mix(in srgb,var(--surface) 92%,#fff7ed); }
+  .otp-action-card { position:fixed; right:18px; bottom:18px; z-index:900;
+    width:min(460px,calc(100vw - 36px)); max-height:calc(100vh - 36px);
+    overflow:auto; margin:0; box-shadow:0 20px 55px rgba(15,23,42,.24); }
+  .otp-action-card.otp-minimized { width:min(360px,calc(100vw - 36px));
+    max-height:none; overflow:hidden; padding:10px 12px; }
+  .otp-action-card.otp-minimized .otp-action-head { align-items:center; }
+  .otp-action-card.otp-minimized .otp-action-head p,
+  .otp-action-card.otp-minimized .otp-jump-list,
+  .otp-action-card.otp-minimized > .job-otp-list { display:none; }
+  .otp-action-card.otp-minimized h2 { margin:0; font-size:.92rem; }
+  .otp-action-head { display:flex; justify-content:space-between; align-items:flex-start;
+    gap:12px; }
+  .otp-action-head .btn { flex:none; margin:0; }
+  .otp-jump-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+  .otp-jump-list .btn { margin:0; padding:5px 9px; text-align:left; }
+  .job-otp-summary-badge { display:inline-block; margin-left:6px; padding:2px 8px;
+    border-radius:999px; color:var(--orange);
+    background:color-mix(in srgb,var(--orange) 13%,var(--surface)); font-size:.72rem; }
+  .job-otp-summary-badge[hidden],.job-otp-region[hidden] { display:none; }
+  .job-otp-region { margin:10px 0; border:1px solid color-mix(in srgb,var(--orange) 45%,var(--border));
+    border-radius:9px; padding:10px;
+    background:color-mix(in srgb,var(--orange) 7%,var(--surface)); }
+  .job-otp-region-head { display:flex; justify-content:space-between; gap:8px;
+    align-items:center; margin-bottom:8px; color:var(--orange); font-size:.82rem; }
+  .job-otp-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(285px,1fr));
+    gap:9px; }
+  .otp-challenge-card { min-width:0; border:1px solid var(--border); border-radius:8px;
+    padding:10px; background:var(--surface); box-shadow:var(--shadow); }
+  .otp-title { display:block; overflow-wrap:anywhere; }
+  .otp-context { display:grid; gap:2px; margin-top:5px; }
+  .otp-account-email,.otp-account-id,.otp-worker,.otp-job {
+    display:block; overflow-wrap:anywhere; }
+  .otp-explanation { color:var(--orange); margin-top:7px; }
+  .otp-expiry { margin-top:3px; }
+  .otp-controls { display:grid; grid-template-columns:minmax(0,1fr) auto;
+    gap:8px; margin-top:8px; align-items:center; }
+  .otp-controls .btn { margin:0; white-space:nowrap; }
+  .otp-code { letter-spacing:.16em; font-variant-numeric:tabular-nums; }
   .job-row { border:1px solid var(--border); border-radius:10px; padding:0;
     margin:0 0 10px; background:var(--surface); overflow:hidden; }
   .job-row.job-failed { border-left:4px solid var(--red); }
@@ -551,6 +589,13 @@ _BATCH_HTML = """\
     header,.job-head,.job-summary { align-items:flex-start; flex-direction:column; }
     .job-actions { justify-content:flex-start; }
     .log-dialog { width:96%; height:90vh; }
+    .otp-action-card { right:10px; bottom:10px; width:calc(100vw - 20px);
+      max-height:52vh; }
+    .otp-action-head,.job-otp-region-head { align-items:flex-start;
+      flex-direction:column; }
+    .otp-action-card.otp-minimized .otp-action-head { align-items:center;
+      flex-direction:row; }
+    .otp-controls { grid-template-columns:1fr; }
   }
 </style>
 </head>
@@ -580,10 +625,21 @@ _BATCH_HTML = """\
     </div>
   </div>
 
-  <div class="card action-card" id="loginActionCard" style="display:none">
-    <h2>⚠️ Job 等待登录验证码</h2>
-    <p class="muted">自动取码未成功时，请在过期前填写 OpenAI 邮件中的 6 位验证码；否则 Job 会在登录超时后失败并自动清理 Worker。</p>
-    <div id="loginAttempts"></div>
+  <div class="card action-card otp-action-card" id="loginActionCard"
+       role="alert" style="display:none">
+    <div class="otp-action-head">
+      <div>
+        <h2 id="loginActionTitle">⚠️ Worker 等待登录验证码</h2>
+        <p class="muted">
+          只有上报需要人工验证的 Worker 才会显示。每条提示都绑定到一个账号、一个 Worker
+          和一次登录请求，请在过期前填写 OpenAI 邮件中的 6 位验证码。
+        </p>
+      </div>
+      <button class="btn" id="loginActionButton"
+              onclick="toggleOtpActionCard()">查看并填写</button>
+    </div>
+    <div id="loginAttemptLinks" class="otp-jump-list"></div>
+    <div id="loginAttempts" class="job-otp-list"></div>
   </div>
 
   <!-- Accounts -->
@@ -591,9 +647,10 @@ _BATCH_HTML = """\
     <h2>Accounts</h2>
     <p class="hint">
       Manager 会把登录密码与接码查询 token 保存到权限 0600 的账号文件，提交后均不回显。
-      Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 可使用 OpenAI 密码或接码查询 Token 登录；
-      仅有 Token 时会切换到邮箱验证码并自动取码。密码登录没有 Token，或自动查询失败时，
-      会在下方等待管理员输入 6 位验证码。
+      Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 至少配置 OpenAI 密码或接码查询 Token
+      之一，也可同时配置。查询 Token 不是 OpenAI 登录凭据，只用于从接码平台读取 OpenAI 发出的邮箱验证码；
+      仅有 Token 时会切换到邮箱验证码并自动取码。没有可用查询 Token、自动查询失败，或自动验证码被拒绝时，
+      只有对应 Worker 才会弹出人工验证码卡。
     </p>
     <table><thead><tr><th>ID</th><th>Agent</th><th>Email</th><th>Secrets</th>
       <th>Group</th><th>Enabled</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
@@ -606,11 +663,11 @@ _BATCH_HTML = """\
       </select></div>
     </div>
     <div class="grid3">
-      <div><label>登录密码（Codex 与接码 Token 二选一，写入后不回显）</label>
+      <div><label>登录密码（Codex 至少填写一项，可同时填写；写入后不回显）</label>
         <input id="acctPassword" type="password" placeholder="OpenAI password">
         <label style="margin-top:5px"><input id="acctClearPassword" type="checkbox" style="width:auto">
           清除该账号已有登录密码</label></div>
-      <div><label>接码查询 Token（Codex 与密码二选一，写入后不回显）</label>
+      <div><label>接码查询 Token（只用于读取邮箱验证码；写入后不回显）</label>
         <input id="acctToken" type="password" placeholder="171mail / MailCatcher query token">
         <label style="margin-top:5px"><input id="acctClearToken" type="checkbox" style="width:auto">
           清除该账号已有查询 token</label></div>
@@ -838,6 +895,10 @@ let showLegacyHistory = false;
 let dashboardPollRunning = false;
 let dashboardPollTimer = null;
 const jobResultsCache = new Map();
+let latestLoginAttempts = [];
+const otpCardsByKey = new Map();
+const openedOtpChallenges = new Set();
+const otpSubmitting = new Set();
 function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
 function updateThemeLabel() {
   const button = document.getElementById('themeToggle');
@@ -959,52 +1020,223 @@ async function addAccount() {
   } catch(e) { toast(e.message, 'error'); }
 }
 
-function reconcileLoginAttempts(attempts) {
-  const container = document.getElementById('loginAttempts');
+function otpKey(attempt) {
+  return String(attempt.login_request_id || '') + ':'
+    + String(attempt.challenge_id || '');
+}
+function createOtpCard() {
+  const card = document.createElement('article');
+  card.className = 'otp-challenge-card';
+  const title = document.createElement('b');
+  title.className = 'otp-title';
+  const context = document.createElement('div');
+  context.className = 'otp-context muted';
+  for (const className of [
+    'otp-account-email', 'otp-account-id', 'otp-worker', 'otp-job',
+  ]) {
+    const line = document.createElement('span');
+    line.className = className;
+    context.appendChild(line);
+  }
+  const explanation = document.createElement('div');
+  explanation.className = 'hint otp-explanation';
+  explanation.textContent =
+    '邮箱自动取码不可用或未成功，需要人工输入 OpenAI 邮件中的验证码。';
+  const expiry = document.createElement('div');
+  expiry.className = 'hint otp-expiry';
+  const controls = document.createElement('div');
+  controls.className = 'otp-controls';
+  const input = document.createElement('input');
+  input.className = 'otp-code';
+  input.type = 'text';
+  input.inputMode = 'numeric';
+  input.autocomplete = 'one-time-code';
+  input.maxLength = 6;
+  input.placeholder = '6 位验证码';
+  input.setAttribute('aria-label', 'OpenAI 6 位验证码');
+  const button = document.createElement('button');
+  button.className = 'btn otp-submit';
+  button.textContent = '提交给这个 Worker';
+  button.addEventListener('click', event =>
+    submitLoginOtp(event.currentTarget));
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') button.click();
+  });
+  controls.append(input, button);
+  card.append(title, context, explanation, expiry, controls);
+  return card;
+}
+function updateOtpCard(card, attempt) {
+  const key = otpKey(attempt);
+  const email = String(attempt.account_email || '邮箱未知');
+  const accountId = String(attempt.account_id || '账号未知');
+  const workerId = String(attempt.worker_id || 'Worker 未知');
+  const jobId = String(attempt.job_id || '');
+  const jobName = String(attempt.job_name || jobId || 'Job 尚未关联');
+  const hasShard = attempt.shard_index !== null
+    && attempt.shard_index !== undefined && attempt.shard_index !== '';
+  const shard = hasShard ? `shard-${Number(attempt.shard_index)}` : 'shard 未知';
+  card.dataset.otpKey = key;
+  card.dataset.loginRequestId = String(attempt.login_request_id || '');
+  card.dataset.challengeId = String(attempt.challenge_id || '');
+  card.dataset.workerId = workerId;
+  card.dataset.accountId = accountId;
+  card.dataset.jobId = jobId;
+  card.querySelector('.otp-title').textContent = `Codex OTP · ${email}`;
+  card.querySelector('.otp-account-email').textContent = `账号邮箱：${email}`;
+  card.querySelector('.otp-account-id').textContent = `账号 ID：${accountId}`;
+  card.querySelector('.otp-worker').textContent = `Worker：${workerId}`;
+  card.querySelector('.otp-job').textContent =
+    `Job：${jobName}${jobId && jobName !== jobId ? ` (${jobId})` : ''} · ${shard}`;
+  const seconds = Math.max(
+    0, Number(attempt.expires_at || 0) - Date.now() / 1000,
+  );
+  card.querySelector('.otp-expiry').textContent = seconds > 0
+    ? `约 ${Math.ceil(seconds / 60)} 分钟后过期`
+    : '验证码已过期，等待 Job 收敛';
+  const button = card.querySelector('.otp-submit');
+  button.dataset.loginRequestId = String(attempt.login_request_id || '');
+  button.dataset.challengeId = String(attempt.challenge_id || '');
+  const submitting = otpSubmitting.has(key)
+    || String(attempt.status || '') === 'submitting_otp';
+  button.disabled = submitting;
+  button.textContent = submitting ? '正在提交…' : '提交给这个 Worker';
+}
+function insertOtpCard(container, card, index) {
+  const current = container.children[index] || null;
+  if (card !== current) container.insertBefore(card, current);
+}
+function focusLoginAttempt(key) {
+  const card = otpCardsByKey.get(String(key || ''));
+  if (!card) return;
+  const jobNode = card.closest('.job-row');
+  if (jobNode) {
+    jobNode.open = true;
+    setOtpActionMinimized(true);
+  }
+  requestAnimationFrame(() => {
+    const compactViewport = window.matchMedia('(max-width: 800px)').matches;
+    card.scrollIntoView({
+      behavior:compactViewport ? 'auto' : 'smooth',
+      block:'center',
+    });
+    card.querySelector('.otp-code')?.focus({preventScroll:true});
+  });
+}
+function focusFirstLoginAttempt() {
+  const first = otpCardsByKey.values().next().value;
+  if (first) focusLoginAttempt(first.dataset.otpKey);
+}
+function setOtpActionMinimized(minimized) {
   const actionCard = document.getElementById('loginActionCard');
-  const wanted = new Set(attempts.map(a => String(a.challenge_id)));
-  Array.from(container.querySelectorAll('[data-challenge-id]')).forEach(card => {
-    if (!wanted.has(card.dataset.challengeId)) card.remove();
+  actionCard.classList.toggle('otp-minimized', Boolean(minimized));
+  document.getElementById('loginActionButton').textContent =
+    minimized ? '展开提醒' : '查看并填写';
+}
+function toggleOtpActionCard() {
+  const actionCard = document.getElementById('loginActionCard');
+  if (actionCard.classList.contains('otp-minimized')) {
+    setOtpActionMinimized(false);
+    return;
+  }
+  focusFirstLoginAttempt();
+}
+function reconcileOtpJumpLinks(attempts) {
+  const container = document.getElementById('loginAttemptLinks');
+  const wanted = new Set(attempts.map(otpKey));
+  Array.from(container.querySelectorAll('.otp-jump')).forEach(button => {
+    if (!wanted.has(button.dataset.otpKey)) button.remove();
   });
-  attempts.forEach(a => {
-    const challengeId = String(a.challenge_id);
-    let card = Array.from(container.querySelectorAll('[data-challenge-id]'))
-      .find(node => node.dataset.challengeId === challengeId);
-    if (!card) {
-      card = document.createElement('div');
-      card.dataset.challengeId = challengeId;
-      card.style.cssText = 'border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:10px;margin-top:8px';
-      const title = document.createElement('b');
-      title.className = 'otp-title';
-      const worker = document.createElement('span');
-      worker.className = 'muted otp-worker';
-      const expiry = document.createElement('div');
-      expiry.className = 'hint otp-expiry';
-      const controls = document.createElement('div');
-      controls.className = 'grid2'; controls.style.marginTop = '7px';
-      const input = document.createElement('input');
-      input.id = 'otp-' + challengeId; input.inputMode = 'numeric';
-      input.autocomplete = 'one-time-code';
-      input.maxLength = 6; input.placeholder = '6 位验证码';
-      const button = document.createElement('button');
-      button.className = 'btn'; button.style.margin = '0';
-      button.textContent = '提交验证码';
-      button.addEventListener('click', () =>
-        submitLoginOtp(String(a.login_request_id), challengeId));
-      input.addEventListener('keydown', event => {
-        if (event.key === 'Enter') button.click();
-      });
-      controls.append(input, button);
-      card.append(title, worker, expiry, controls);
-      container.appendChild(card);
+  attempts.forEach((attempt, index) => {
+    const key = otpKey(attempt);
+    let button = Array.from(container.querySelectorAll('.otp-jump'))
+      .find(candidate => candidate.dataset.otpKey === key);
+    if (!button) {
+      button = document.createElement('button');
+      button.className = 'btn btn-ghost otp-jump';
+      button.addEventListener('click', event =>
+        focusLoginAttempt(event.currentTarget.dataset.otpKey));
     }
-    card.querySelector('.otp-title').textContent = `Codex OTP · ${a.account_id}`;
-    card.querySelector('.otp-worker').textContent = ` · Worker ${a.worker_id}`;
-    const seconds = Math.max(0, Number(a.expires_at || 0) - Date.now() / 1000);
-    card.querySelector('.otp-expiry').textContent =
-      seconds > 0 ? `约 ${Math.ceil(seconds / 60)} 分钟后过期` : '验证码已过期，等待 Job 收敛';
+    button.dataset.otpKey = key;
+    button.textContent = `${attempt.account_email || attempt.account_id}`
+      + ` · Worker ${attempt.worker_id}`;
+    const current = container.children[index] || null;
+    if (button !== current) container.insertBefore(button, current);
   });
-  actionCard.style.display = attempts.length ? 'block' : 'none';
+}
+function reconcileLoginAttempts(attempts) {
+  latestLoginAttempts = Array.isArray(attempts) ? attempts : [];
+  const actionCard = document.getElementById('loginActionCard');
+  const fallback = document.getElementById('loginAttempts');
+  const wanted = new Set(latestLoginAttempts.map(otpKey));
+  let hasNewChallenge = false;
+  for (const [key, card] of otpCardsByKey.entries()) {
+    if (wanted.has(key)) continue;
+    card.remove();
+    otpCardsByKey.delete(key);
+    openedOtpChallenges.delete(key);
+    otpSubmitting.delete(key);
+  }
+
+  const jobContexts = new Map();
+  const destinationIndexes = new Map();
+  latestLoginAttempts.forEach(attempt => {
+    const key = otpKey(attempt);
+    let card = otpCardsByKey.get(key);
+    if (!card) {
+      card = createOtpCard();
+      otpCardsByKey.set(key, card);
+      hasNewChallenge = true;
+    }
+    updateOtpCard(card, attempt);
+
+    const jobId = String(attempt.job_id || '');
+    const jobNode = jobId ? document.getElementById('jobrow-' + jobId) : null;
+    const region = jobNode?.querySelector('.job-otp-region');
+    const destination = region?.querySelector('.job-otp-list') || fallback;
+    const destinationIndex = destinationIndexes.get(destination) || 0;
+    insertOtpCard(destination, card, destinationIndex);
+    destinationIndexes.set(destination, destinationIndex + 1);
+
+    if (jobNode && region) {
+      const context = jobContexts.get(jobId) || {
+        jobNode,
+        region,
+        badge: jobNode.querySelector('.job-otp-summary-badge'),
+        count: 0,
+      };
+      context.count += 1;
+      jobContexts.set(jobId, context);
+      if (!openedOtpChallenges.has(key)) {
+        jobNode.open = true;
+        openedOtpChallenges.add(key);
+      }
+    }
+  });
+
+  for (const context of jobContexts.values()) {
+    context.region.hidden = false;
+    context.region.querySelector('.job-otp-count').textContent =
+      `${context.count} 个 Worker 等待验证码`;
+    if (context.badge) {
+      context.badge.hidden = false;
+      context.badge.textContent = `⚠ ${context.count} 个 Worker 等待验证码`;
+    }
+  }
+  document.querySelectorAll('.job-row').forEach(jobNode => {
+    if (jobContexts.has(String(jobNode.dataset.jobId || ''))) return;
+    const badge = jobNode.querySelector('.job-otp-summary-badge');
+    const region = jobNode.querySelector('.job-otp-region');
+    if (badge) badge.hidden = true;
+    if (region) region.hidden = true;
+  });
+  reconcileOtpJumpLinks(latestLoginAttempts);
+  document.getElementById('loginActionTitle').textContent =
+    `⚠️ ${latestLoginAttempts.length} 个 Worker 等待登录验证码`;
+  if (hasNewChallenge || !latestLoginAttempts.length) {
+    setOtpActionMinimized(false);
+  }
+  actionCard.style.display = latestLoginAttempts.length ? 'block' : 'none';
 }
 async function refreshLoginAttempts() {
   try {
@@ -1013,16 +1245,35 @@ async function refreshLoginAttempts() {
     reconcileLoginAttempts(attempts);
   } catch(e) { /* coordinator may not be initialized until the first Job */ }
 }
-async function submitLoginOtp(requestId, challengeId) {
-  const input = document.getElementById('otp-' + challengeId);
+async function submitLoginOtp(source) {
+  const card = source.closest('.otp-challenge-card');
+  if (!card) return;
+  const requestId = String(source.dataset.loginRequestId || '');
+  const challengeId = String(source.dataset.challengeId || '');
+  const key = card.dataset.otpKey;
+  const input = card.querySelector('.otp-code');
   const code = (input?.value || '').trim();
   if (!/^\\d{6}$/.test(code)) return toast('验证码必须是 6 位数字', 'error');
+  if (otpSubmitting.has(key)) return;
+  otpSubmitting.add(key);
+  source.disabled = true;
+  source.textContent = '正在提交…';
   try {
     await api('POST', '/accounts/login-attempts/' + encodeURIComponent(requestId) + '/otp',
       {challenge_id: challengeId, code: code});
     if (input) input.value = '';
-    toast('验证码已提交'); refreshLoginAttempts();
-  } catch(e) { toast(e.message, 'error'); }
+    toast(`验证码已提交给账号 ${card.dataset.accountId}`
+      + ` · Worker ${card.dataset.workerId}`);
+    await refreshLoginAttempts();
+  } catch(e) {
+    toast(e.message, 'error');
+  } finally {
+    otpSubmitting.delete(key);
+    if (source.isConnected) {
+      source.disabled = false;
+      source.textContent = '提交给这个 Worker';
+    }
+  }
 }
 async function terminateWorker(wid) {
   if (!window.confirm('终止 worker ' + wid + ' ？该 EC2 实例会被销毁（失败/空转的 worker 用它清理，省钱）。')) return;
@@ -1382,7 +1633,8 @@ function jobRowHtml(j, r) {
     <summary class="job-summary" data-job-focus="job-summary">
       <span class="job-summary-main">
         <span class="job-summary-title"><b>${esc(j.name||'')}</b> ${badge(state)}
-          <span class="muted">${esc(j.job_id)}</span></span>
+          <span class="muted">${esc(j.job_id)}</span>
+          <span class="job-otp-summary-badge" hidden></span></span>
         <span class="job-summary-meta muted" style="margin-top:5px">${phases || jobStateLabel(state)}
           ${created ? ` · 提交 ${esc(created)}` : ''}
           · ${recordedWorkers} 条 Worker 执行记录</span>
@@ -1403,6 +1655,13 @@ function jobRowHtml(j, r) {
       </div>
       ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
       ${cleanupPending ? `<div class="job-alert cleanup-alert">正在清理 ${cleanupPending} 个 Worker / 租约，请勿重复提交同一账号。</div>` : ''}
+      <section class="job-otp-region" hidden>
+        <div class="job-otp-region-head">
+          <b>⚠️ 此 Job 有 Worker 等待登录验证码</b>
+          <span class="job-otp-count"></span>
+        </div>
+        <div class="job-otp-list"></div>
+      </section>
       ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
       ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
       <div class="worker-records-title muted">${recordedWorkers} 条 Worker 执行记录</div>
@@ -1441,11 +1700,33 @@ function jobFocusedControl(node) {
   const active = document.activeElement;
   return active && node.contains(active) ? (active.dataset.jobFocus || '') : '';
 }
+function focusedOtpState(node) {
+  const active = document.activeElement;
+  if (!active || !node.contains(active) || !active.classList.contains('otp-code')) {
+    return null;
+  }
+  const card = active.closest('.otp-challenge-card');
+  return card ? {
+    key: card.dataset.otpKey,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd,
+  } : null;
+}
 function restoreJobFocus(node, focusKey) {
   if (!focusKey) return;
   const control = Array.from(node.querySelectorAll('[data-job-focus]'))
     .find(element => element.dataset.jobFocus === focusKey);
   if (control) control.focus({preventScroll:true});
+}
+function restoreOtpFocus(node, state) {
+  if (!state) return;
+  const card = otpCardsByKey.get(state.key);
+  const input = card?.querySelector('.otp-code');
+  if (!input || !node.contains(input)) return;
+  input.focus({preventScroll:true});
+  if (state.selectionStart !== null && state.selectionEnd !== null) {
+    input.setSelectionRange(state.selectionStart, state.selectionEnd);
+  }
 }
 function reconcileJobCards(jobs) {
   const list = document.getElementById('jobsList');
@@ -1456,6 +1737,7 @@ function reconcileJobCards(jobs) {
       empty.className = 'muted'; empty.textContent = 'No jobs yet.';
       list.appendChild(empty); list.dataset.empty = 'true';
     }
+    reconcileLoginAttempts(latestLoginAttempts);
     return;
   }
   delete list.dataset.empty;
@@ -1469,6 +1751,7 @@ function reconcileJobCards(jobs) {
   const viewportX = window.scrollX;
   const viewportY = window.scrollY;
   let replacedAny = false;
+  let otpFocusTarget = null;
   jobs.forEach((job, index) => {
     const id = String(job.job_id);
     const result = resultFor(id);
@@ -1479,10 +1762,16 @@ function reconcileJobCards(jobs) {
     } else if (node._renderSignature !== signature) {
       const wasOpen = node.open;
       const focusedControl = jobFocusedControl(node);
+      const otpFocus = focusedOtpState(node);
+      const otpCards = Array.from(
+        node.querySelectorAll('.otp-challenge-card'),
+      );
       const scrollLefts = Array.from(node.querySelectorAll('.table-scroll'))
         .map(element => element.scrollLeft);
       const replacement = makeJobNode(job);
       replacement.open = wasOpen;
+      const otpMount = replacement.querySelector('.job-otp-list');
+      otpCards.forEach(card => otpMount.appendChild(card));
       node.replaceWith(replacement);
       const replacementScrolls = replacement.querySelectorAll('.table-scroll');
       scrollLefts.forEach((scrollLeft, index) => {
@@ -1491,12 +1780,17 @@ function reconcileJobCards(jobs) {
         }
       });
       restoreJobFocus(replacement, focusedControl);
+      if (otpFocus) otpFocusTarget = {node:replacement, state:otpFocus};
       replacedAny = true;
       node = replacement;
     }
     const current = list.children[index] || null;
     if (node !== current) list.insertBefore(node, current);
   });
+  reconcileLoginAttempts(latestLoginAttempts);
+  if (otpFocusTarget) {
+    restoreOtpFocus(otpFocusTarget.node, otpFocusTarget.state);
+  }
   if (replacedAny) window.scrollTo(viewportX, viewportY);
 }
 async function refreshJobResults(jobs, force=false) {

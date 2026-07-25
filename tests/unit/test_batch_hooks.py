@@ -378,6 +378,10 @@ class TestLoginCoordinator:
             "login_request_id": login_message.login_request_id,
             "worker_id": "w1",
             "account_id": account.id,
+            "account_email": account.email,
+            "job_id": "",
+            "job_name": "",
+            "shard_index": None,
             "challenge_id": "a" * 32,
             "expires_at": attempts[0]["expires_at"],
             "status": "awaiting_otp",
@@ -398,6 +402,114 @@ class TestLoginCoordinator:
             "success": True,
         })
         assert (await task).success is True
+
+    async def test_concurrent_otp_challenges_keep_exact_worker_account_context(
+        self,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginOtpMessage
+
+        bus = EventBus()
+        conn = FakeConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        first_account = _acct(
+            1, agent_type="codex", password="first-openai-secret",
+        )
+        second_account = _acct(
+            2, agent_type="codex", password="second-openai-secret",
+        )
+        first_login = asyncio.create_task(coord.login(
+            "worker-a",
+            first_account,
+            "/home/ubuntu/.codex-a",
+            job_id="job-a",
+            job_name="batch-a",
+            shard_index=0,
+        ))
+        second_login = asyncio.create_task(coord.login(
+            "worker-b",
+            second_account,
+            "/home/ubuntu/.codex-b",
+            job_id="job-b",
+            job_name="batch-b",
+            shard_index=7,
+        ))
+        await asyncio.sleep(0)
+        requests = {
+            worker_id: message
+            for worker_id, message in conn.sent
+        }
+        expires_at = int(time.time()) + 60
+        # A valid request id cannot be replayed from another authenticated
+        # Worker, and a Worker cannot relabel it as another account.
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "worker-b", {
+            "login_request_id": requests["worker-a"].login_request_id,
+            "account_id": first_account.id,
+            "challenge_id": "c" * 32,
+            "expires_at": expires_at,
+        })
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "worker-a", {
+            "login_request_id": requests["worker-a"].login_request_id,
+            "account_id": second_account.id,
+            "challenge_id": "d" * 32,
+            "expires_at": expires_at,
+        })
+        assert coord.list_otp_challenges() == []
+
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "worker-a", {
+            "login_request_id": requests["worker-a"].login_request_id,
+            "account_id": first_account.id,
+            "challenge_id": "a" * 32,
+            "expires_at": expires_at,
+        })
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "worker-b", {
+            "login_request_id": requests["worker-b"].login_request_id,
+            "account_id": second_account.id,
+            "challenge_id": "b" * 32,
+            "expires_at": expires_at,
+        })
+
+        attempts = {
+            str(item["worker_id"]): item
+            for item in coord.list_otp_challenges()
+        }
+        assert {
+            worker_id: (
+                item["account_id"],
+                item["account_email"],
+                item["job_id"],
+                item["job_name"],
+                item["shard_index"],
+            )
+            for worker_id, item in attempts.items()
+        } == {
+            "worker-a": (first_account.id, first_account.email, "job-a", "batch-a", 0),
+            "worker-b": (second_account.id, second_account.email, "job-b", "batch-b", 7),
+        }
+
+        await coord.submit_otp(
+            requests["worker-a"].login_request_id,
+            "a" * 32,
+            "123456",
+        )
+        sent_worker_id, sent_message = conn.sent[-1]
+        assert sent_worker_id == "worker-a"
+        assert isinstance(sent_message, AccountLoginOtpMessage)
+        assert sent_message.account_id == first_account.id
+        assert sent_message.code == "123456"
+        remaining = coord.list_otp_challenges()
+        assert [item["worker_id"] for item in remaining] == ["worker-b"]
+        assert remaining[0]["account_id"] == second_account.id
+
+        for worker_id, account, login in (
+            ("worker-a", first_account, first_login),
+            ("worker-b", second_account, second_login),
+        ):
+            await bus.emit("ACCOUNT_LOGIN_RESULT", worker_id, {
+                "login_request_id": requests[worker_id].login_request_id,
+                "account_id": account.id,
+                "success": True,
+            })
+            assert (await login).success is True
 
     async def test_otp_rejects_wrong_challenge_without_sending_code(self):
         bus = EventBus()
@@ -428,6 +540,104 @@ class TestLoginCoordinator:
             "success": False,
         })
         assert (await task).success is False
+
+    async def test_concurrent_submissions_send_one_code_for_one_challenge(self):
+        bus = EventBus()
+
+        class BlockingOtpConn(FakeConn):
+            def __init__(self):
+                super().__init__()
+                self.otp_send_started = asyncio.Event()
+                self.release_otp_send = asyncio.Event()
+
+            async def send_command(self, worker_id, message):
+                if message.type == "ACCOUNT_LOGIN_OTP":
+                    self.otp_send_started.set()
+                    await self.release_otp_send.wait()
+                await super().send_command(worker_id, message)
+
+        conn = BlockingOtpConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        login = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex")
+        )
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "a" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+
+        first_submit = asyncio.create_task(coord.submit_otp(
+            request.login_request_id, "a" * 32, "123456",
+        ))
+        await conn.otp_send_started.wait()
+        with pytest.raises(ValueError, match="already being submitted"):
+            await coord.submit_otp(
+                request.login_request_id, "a" * 32, "654321",
+            )
+        conn.release_otp_send.set()
+        assert (await first_submit)["status"] == "verifying_otp"
+        otp_messages = [
+            message for _worker_id, message in conn.sent
+            if message.type == "ACCOUNT_LOGIN_OTP"
+        ]
+        assert [message.code for message in otp_messages] == ["123456"]
+
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "success": True,
+        })
+        assert (await login).success is True
+
+    async def test_otp_transport_failure_restores_active_challenge(self):
+        bus = EventBus()
+
+        class FailingOtpConn(FakeConn):
+            fail_otp = True
+
+            async def send_command(self, worker_id, message):
+                if self.fail_otp and message.type == "ACCOUNT_LOGIN_OTP":
+                    raise RuntimeError("temporary transport failure")
+                await super().send_command(worker_id, message)
+
+        conn = FailingOtpConn()
+        coord = LoginCoordinator(conn, bus, timeout=5)
+        account = _acct(2, agent_type="codex", password="openai-secret")
+        login = asyncio.create_task(
+            coord.login("w1", account, "/root/.codex")
+        )
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+        await bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "challenge_id": "a" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+
+        with pytest.raises(RuntimeError, match="temporary transport failure"):
+            await coord.submit_otp(
+                request.login_request_id, "a" * 32, "123456",
+            )
+        assert coord.list_otp_challenges()[0]["status"] == "awaiting_otp"
+
+        conn.fail_otp = False
+        assert (
+            await coord.submit_otp(
+                request.login_request_id, "a" * 32, "123456",
+            )
+        )["status"] == "verifying_otp"
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": account.id,
+            "success": True,
+        })
+        assert (await login).success is True
 
     async def test_login_timeout(self, tmp_path):
         from elastic_agent.core.protocols.messages import (
@@ -730,11 +940,30 @@ class TestLoginHook:
             run=RunSpec(command="x"),
             account={"login_timeout_seconds": 1100},
         )
+        run = SimpleNamespace(ctx=SimpleNamespace(shard_index=4))
+        job = SimpleNamespace(job_id="job-1", spec=spec, runs={"w1": run})
+        mgr.batch = SimpleNamespace(
+            job_id_for_worker=lambda worker_id: (
+                "job-1" if worker_id == "w1" else None
+            ),
+            get_job=lambda job_id: job if job_id == "job-1" else None,
+        )
 
         task = asyncio.create_task(hook("w1", spec, "/root/.claude"))
         await asyncio.sleep(0.01)
         login_message = mgr.connection_manager.sent[0][1]
         assert login_message.login_timeout_seconds == 1100
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_OTP_REQUIRED", "w1", {
+            "login_request_id": login_message.login_request_id,
+            "account_id": "a1",
+            "challenge_id": "f" * 32,
+            "expires_at": int(time.time()) + 60,
+        })
+        challenge = coord.list_otp_challenges()[0]
+        assert challenge["account_email"] == "a1@x.com"
+        assert challenge["job_id"] == "job-1"
+        assert challenge["job_name"] == "j"
+        assert challenge["shard_index"] == 4
         await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
             "login_request_id": login_message.login_request_id,
             "account_id": "a1", "success": True,
