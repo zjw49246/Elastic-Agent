@@ -386,3 +386,13 @@
 **验证**：东京 `ap-northeast-1a` offering 与 AMI x86_64 兼容性逐项确认；policy compact 大小 7649 bytes，Access Analyzer 0 finding；`r5.2xlarge`、M/C/R 7i 模拟允许，`g5.xlarge` 保持拒绝。相关测试 129 项、完整套件 `2059 passed / 12 skipped / 0 failed`，Ruff、JSON 和 diff check 均通过。
 
 **生产变更**：实际角色 `elastic-agent-manager/ElasticAgentManagerRuntime` 已更新并与版本化 policy 逐项一致，principal simulation 同样允许 `r5.2xlarge`/`m7i.4xlarge`、拒绝 `g5.xlarge`。`/etc/elastic-agent-manager.aws.env` 以 root:root 0600 原子替换，旧文件保留为 `.pre-6548a0e`，Manager 重启后 health 正常。线上 `/api/jobs/plan` 返回 39 项 allowlist，`r5.2xlarge` 与 `m7i.4xlarge` 均 valid，GPU 仍 422；plan 前后 Job 数不变，Worker/Node/allocation/非终止 managed EC2 均为 0，当前 Invocation 无 ERROR/Traceback。
+
+## 2026-07-25 Codex 登录页兼容与分层超时（commit `0f85bdc`）
+
+**问题**：生产 Job `job-9719774622ef4f3f4af8fd46f193cf23` 在 Worker 连接后固定等待 300 秒，未产生 OTP challenge 就报 `Login flow did not complete within 300s`。对照最后成功任务发现 CLI、AMI 和登录源码未漂移，但失败 Job 使用 `binding=none` 绕过了该账号历史成功使用的固定 EIP；同时 OpenAI 登录页新增 one-time/login-code 按钮文案，旧状态机无法识别，并且浏览器还伪装成与系统 Chrome binary 不一致的旧 131 UA。销毁后的 Worker 没有保留脱敏页面阶段，无法事后二选一确认具体页面。
+
+**解决**：Codex 状态机兼容 email/one-time/login-code 入口并使用系统 Chrome 原生 UA；只记录枚举后的安全页面状态，不回传 OAuth URL。可见 anti-bot challenge 等待 120 秒仍不清除时明确提示核对绑定 EIP。JobSpec/协议新增 `account.login_timeout_seconds`（默认 900、范围 60–1200），Worker 显式执行该预算，Manager 总等待提升到 3600 秒，为人工 OTP、精确账号校验、真实 smoke test 和关联清理保留余量。AWS Batch UI 默认 EIP、展示账号持久地址，并等待 provider 默认初始化后再 plan/submit；切换到非 worker-local 模式会自动关闭 EIP。API plan 对显式临时公网 IP 发出警告。旧持久化 JobSpec 在幂等比较前按当前默认值规范化，避免升级后误报 409。
+
+**以后避免**：网页登录自动化不能把“未知页面”统一折叠成一个长超时；必须识别稳定的安全状态、让反机器人页面有有界等待，并保留不含 URL/凭证的诊断类别。账号固定网络身份是登录契约的一部分，生产 UI 默认值和提交竞态也要纳入测试。新增带默认值的持久化 schema 字段时，幂等比较必须先做版本规范化。
+
+**验证**：新增页面真实文案、challenge title/selector、安全错误、协议旧 payload、超时上下界/透传、AWS plan/UI 竞态和旧 JobSpec 幂等回放测试；独立审查无安全或协议 blocker。定向回归 384 项、完整套件 **2069 passed / 12 skipped / 0 failed**；变更模块 Ruff、`compileall`、Batch Console JavaScript 语法、依赖锁上游 dry-run 和 `git diff --check` 全部通过。
