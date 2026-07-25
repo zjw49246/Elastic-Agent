@@ -106,9 +106,14 @@ class FakeManager:
         self.registry = FakeRegistry(node)
         self.provider = SimpleNamespace(
             wait_until_running=lambda iid: _async(SimpleNamespace(public_ip=host)))
+        self.archived_job_logs = []
 
     async def remove_terminated_node_record(self, worker_id):
         return await self.registry.remove(worker_id)
+
+    async def archive_job_task_log(self, job_id, worker_id, data):
+        self.archived_job_logs.append((job_id, worker_id, dict(data)))
+        return True
 
 
 async def _async(v):
@@ -1477,16 +1482,34 @@ class TestWireBatchRouting:
         orch = wire_batch(mgr)
 
         calls = {"exh": [], "exit": []}
+        exit_order = []
 
         def fake_exh(worker_id, *, task_id=None):
             calls["exh"].append((worker_id, task_id))
             return True
 
         async def fake_exit(worker_id, exit_code, task_id=None):
+            exit_order.append("handle")
             calls["exit"].append((worker_id, exit_code, task_id))
+
+        def begin_archive(worker_id, *, task_id=None):
+            exit_order.append("begin")
+            return True
+
+        def finish_archive(worker_id, *, task_id=None):
+            exit_order.append("finish")
 
         orch.defer_exhausted = fake_exh
         orch.handle_exit = fake_exit
+        orch.begin_exit_archive = begin_archive
+        orch.finish_exit_archive = finish_archive
+        original_archive = mgr.archive_job_task_log
+
+        async def archive(*args, **kwargs):
+            exit_order.append("archive")
+            return await original_archive(*args, **kwargs)
+
+        mgr.archive_job_task_log = archive
         # mark w1 as a batch-owned worker so PROCESS_EXIT routes
         orch._worker_index["w1"] = "job-1"
 
@@ -1497,6 +1520,12 @@ class TestWireBatchRouting:
                                  {"task_id": "job-1:w1:abc", "exit_code": 0})
         assert calls["exh"] == [("w1", "job-1:w1:old")]
         assert calls["exit"] == [("w1", 0, "job-1:w1:abc")]
+        assert exit_order == ["begin", "archive", "finish", "handle"]
+        assert mgr.archived_job_logs == [(
+            "job-1",
+            "w1",
+            {"task_id": "job-1:w1:abc", "exit_code": 0},
+        )]
 
     async def test_non_batch_exit_ignored(self, tmp_path):
         mgr = FakeManager(tmp_path, await _store(tmp_path, []))
@@ -1506,3 +1535,4 @@ class TestWireBatchRouting:
         # w-other is not in the worker index → should be ignored
         await mgr.event_bus.emit("PROCESS_EXIT", "w-other", {"task_id": "t", "exit_code": 1})
         assert seen == []
+        assert mgr.archived_job_logs == []

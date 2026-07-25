@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -21,13 +22,16 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from elastic_agent.api.auth import require_api_key
-from elastic_agent.core.batch_orchestrator import JobSpecPersistenceError
+from elastic_agent.core.batch_orchestrator import (
+    TERMINAL_WORKER_PHASES,
+    JobSpecPersistenceError,
+)
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import job_specs_dir
 from elastic_agent.core.secure_store import atomic_write_private, secure_state_directory
@@ -49,6 +53,8 @@ RESULT_ARCHIVE_MAX_OBJECTS = 10_000
 RESULT_ARCHIVE_MAX_BYTES = 10 * 1024 * 1024 * 1024
 RESULT_SCORE_MAX_ATTEMPTS = 500
 RESULT_SCORE_MAX_BYTES = 2_000_000
+JOB_LOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
+JOB_LOG_LINE_MAX_BYTES = 64 * 1024
 
 # ``ETag`` is retained from ListObjectsV2 so GET can use ``IfMatch``.  The
 # fourth item may be ``None`` only for an S3-compatible backend that omitted an
@@ -138,6 +144,47 @@ def _persisted_job_view(
         terminal_summary = {}
     summary_error = terminal_summary.get("error")
     errors = collection_errors + ([str(summary_error)] if summary_error else [])
+    raw_terminal_workers = terminal_summary.get("terminal_workers")
+    if not isinstance(raw_terminal_workers, list):
+        raw_terminal_workers = []
+    terminal_workers = []
+    for raw in raw_terminal_workers:
+        if not isinstance(raw, dict):
+            continue
+        worker_id = raw.get("worker_id")
+        if not isinstance(worker_id, str):
+            continue
+        try:
+            shard_index = int(raw.get("shard_index") or 0)
+        except (TypeError, ValueError):
+            shard_index = 0
+        terminal_workers.append({
+            "worker_id": worker_id,
+            "phase": str(raw.get("phase") or "failed"),
+            "shard_index": shard_index,
+            "account_id": "",
+            "account_email": "",
+            "active_slot": 0,
+            "accounts": [],
+            "rotations": 0,
+            "task_id": str(raw.get("task_id") or ""),
+            "error": str(raw["error"]) if raw.get("error") else None,
+            "lease_id": "",
+            "eip": "",
+            "eip_allocation_id": "",
+            "final_collected": True,
+            "collection_error": (
+                str(raw["collection_error"])
+                if raw.get("collection_error") else None
+            ),
+            "cleaned_up": bool(raw.get("worker_released", terminal)),
+            "cleanup_error": (
+                str(raw["cleanup_error"]) if raw.get("cleanup_error") else None
+            ),
+            "cleanup_attempts": 0,
+            "worker_released": bool(raw.get("worker_released", terminal)),
+            "worker_release_expected": True,
+        })
 
     if submission_state in {"launching", "running"}:
         state = "interrupted"
@@ -156,8 +203,13 @@ def _persisted_job_view(
         "done": terminal and cleanup_pending == 0,
         "cleanup_pending": cleanup_pending,
         "error": "; ".join(errors) or None,
+        "cancel_requested": bool(terminal_summary.get("cancel_requested")),
+        "cancel_reason": terminal_summary.get("cancel_reason"),
+        "created_at": terminal_summary.get("created_at"),
+        "started_at": terminal_summary.get("started_at"),
+        "completed_at": terminal_summary.get("completed_at"),
         "in_memory": False,
-        "workers_detail": [],
+        "workers_detail": terminal_workers,
         "recovery_leases": [lease.model_dump() for lease in recovered],
     }
     if include_spec:
@@ -231,8 +283,10 @@ def _canonical_spec(spec: object) -> object:
 def _job_detail(job) -> dict:
     is_eip_bound = job.spec.account.binding == "eip"
     worker_release_expected = is_eip_bound or job.release_workers_on_complete
+    summary = job.summary()
+    summary.pop("terminal_workers", None)
     return {
-        **job.summary(),
+        **summary,
         "spec": _redacted_spec(job.spec),
         "workers_detail": [
             {
@@ -708,6 +762,220 @@ async def get_job(job_id: str) -> dict:
             job_id, data, recovered, include_spec=True,
         )
     raise HTTPException(404, f"Job {job_id} not found")
+
+
+@router.get("/jobs/{job_id}/logs")
+async def job_logs(
+    job_id: str,
+    response: Response,
+    worker_id: str | None = Query(default=None, max_length=512),
+    task_id: str | None = Query(default=None, max_length=1_024),
+    lines: int = Query(default=400, ge=1, le=5_000),
+) -> dict:
+    """Return bounded run stdout/stderr after the ephemeral Worker is gone."""
+
+    job_id = _validate_job_id(job_id)
+    mgr = _mgr()
+    job = mgr.batch.get_job(job_id)
+    persisted = _job_spec_path(mgr, job_id).exists()
+    if job is None and not persisted:
+        raise HTTPException(404, f"Job {job_id} not found")
+    if task_id is not None and not task_id.startswith(f"{job_id}:"):
+        # Do not disclose whether a task from another Job exists.
+        raise HTTPException(404, "task output not found for this Job")
+
+    response.headers["Cache-Control"] = "no-store"
+    archived = await asyncio.to_thread(
+        mgr.job_log_store.read_job_tail,
+        job_id,
+        lines=lines,
+        worker_id=worker_id,
+        task_id=task_id,
+    )
+    archived_by_task = {
+        str(snapshot["task_id"]): snapshot
+        for snapshot in archived["tasks"]
+    }
+
+    # A task remains in the live parser until its fsynced PROCESS_EXIT snapshot
+    # succeeds.  Older attempts from credential rotation may already be
+    # archived while the latest attempt is still running.
+    live_by_task: dict[str, list[dict]] = {}
+    live_totals: dict[str, int] = {}
+    for candidate in mgr.log_event_parser.active_tasks:
+        if not candidate.startswith(f"{job_id}:"):
+            continue
+        if task_id is not None and candidate != task_id:
+            continue
+        # A completed task snapshot is authoritative; reliable LOG ordering
+        # makes a same-id live buffer a duplicate replay rather than a new run.
+        if candidate in archived_by_task:
+            continue
+        entries = mgr.log_event_parser.get_task_logs(candidate, limit=lines)
+        if worker_id is not None and not any(
+            entry.get("worker_id") == worker_id for entry in entries
+        ):
+            continue
+        live_by_task[candidate] = entries
+        live_totals[candidate] = mgr.log_event_parser.buffer_size(candidate)
+
+    # Keep only the globally newest ``lines`` while visiting each active task's
+    # already-bounded tail.  Archive reads use the same heap strategy in a
+    # worker thread, so API memory is independent of total Job history size.
+    newest: list[tuple[tuple[str, str, int, int], int, dict]] = []
+    serial = 0
+    retained_bytes = 0
+    response_truncated = False
+
+    def retain(entry: dict, candidate: str, ordinal: int) -> None:
+        nonlocal retained_bytes, response_truncated, serial
+        data = str(entry.get("data") or "")
+        raw_data = data.encode("utf-8")
+        if len(raw_data) > JOB_LOG_LINE_MAX_BYTES:
+            data = (
+                raw_data[: JOB_LOG_LINE_MAX_BYTES]
+                .decode("utf-8", errors="ignore")
+                + "\n[… live log line truncated …]"
+            )
+            raw_data = data.encode("utf-8")
+            response_truncated = True
+        item = {
+            "task_id": candidate,
+            "worker_id": str(entry.get("worker_id") or ""),
+            "stream": (
+                "stderr" if entry.get("stream") == "stderr" else "stdout"
+            ),
+            "data": data,
+            "timestamp": str(entry.get("timestamp") or ""),
+        }
+        key = (item["timestamp"], candidate, ordinal, serial)
+        serial += 1
+        item_bytes = len(raw_data)
+        heapq.heappush(newest, (key, item_bytes, item))
+        retained_bytes += item_bytes
+        while (
+            len(newest) > lines
+            or retained_bytes > JOB_LOG_RESPONSE_MAX_BYTES
+        ):
+            _old_key, old_bytes, _old_item = heapq.heappop(newest)
+            retained_bytes -= old_bytes
+
+    for ordinal, entry in enumerate(archived["entries"]):
+        retain(entry, str(entry.get("task_id") or ""), ordinal)
+
+    tasks: list[dict] = []
+    sources: set[str] = set()
+    if archived_by_task:
+        sources.add("archive")
+    for candidate, snapshot in archived_by_task.items():
+        exit_info = snapshot.get("exit", {})
+        tasks.append({
+            "task_id": candidate,
+            "worker_id": str(snapshot.get("worker_id") or ""),
+            "archived": True,
+            "complete": bool(snapshot.get("complete")),
+            "exit_code": exit_info.get("exit_code"),
+            "error_type": exit_info.get("error_type"),
+            "error_message": exit_info.get("error_message"),
+        })
+    for candidate, entries in live_by_task.items():
+        sources.add("live")
+        selected_worker = str(entries[0].get("worker_id") or "") if entries else ""
+        tasks.append({
+            "task_id": candidate,
+            "worker_id": selected_worker,
+            "archived": False,
+            "complete": False,
+            "exit_code": None,
+            "error_type": None,
+            "error_message": None,
+        })
+        for ordinal, entry in enumerate(entries):
+            retain(entry, candidate, ordinal)
+
+    returned_entries = [
+        item for _key, _size, item in sorted(newest)
+    ]
+    total = int(archived["total"]) + sum(live_totals.values())
+    tasks.sort(key=lambda item: item["task_id"])
+
+    scope_active = False
+    if job is not None:
+        if task_id is not None:
+            scope_active = any(
+                run.task_id == task_id
+                and run.phase not in TERMINAL_WORKER_PHASES
+                for run in job.runs.values()
+            )
+        elif worker_id is not None:
+            run = job.runs.get(worker_id)
+            scope_active = bool(
+                run is not None and run.phase not in TERMINAL_WORKER_PHASES
+            )
+        else:
+            scope_active = (
+                not job.launch_complete
+                or any(
+                    run.phase not in TERMINAL_WORKER_PHASES
+                    for run in job.runs.values()
+                )
+            )
+
+    if sources == {"live"}:
+        source = "live"
+        status = "live"
+    elif sources == {"archive"}:
+        source = "archive"
+        status = "live" if scope_active else "archived"
+    elif sources:
+        source = "mixed"
+        status = "live"
+    else:
+        source = "none"
+        status = "pending" if scope_active else "unavailable"
+
+    if returned_entries:
+        message = ""
+    elif status == "pending" or scope_active:
+        phases = set((job.summary().get("phases") or {}) if job else {})
+        if "logging_in" in phases:
+            message = (
+                "账号正在登录，命令尚未启动；若页面出现验证码，请先提交 6 位 OTP。"
+            )
+        elif "bootstrapping" in phases or "provisioning" in phases:
+            message = "Worker 正在初始化环境，命令尚未启动。"
+        else:
+            message = "命令尚未产生 stdout/stderr。"
+    elif status == "archived":
+        message = "命令已结束，但没有产生 stdout/stderr。"
+    else:
+        message = (
+            "Worker 已销毁且没有可用的命令输出；旧 Job 在日志归档上线前"
+            "无法回取临时实例日志。"
+        )
+
+    history_truncated = bool(archived.get("history_truncated"))
+    return {
+        "job_id": job_id,
+        "status": status,
+        "source": source,
+        "complete": (
+            bool(tasks)
+            and not scope_active
+            and not history_truncated
+            and all(task["complete"] for task in tasks)
+        ),
+        "truncated": (
+            bool(archived["truncated"])
+            or response_truncated
+            or total > len(returned_entries)
+        ),
+        "message": message,
+        "total": total,
+        "returned": len(returned_entries),
+        "tasks": tasks,
+        "entries": returned_entries,
+    }
 
 
 def _collected_dir(mgr, job_id: str) -> Path:

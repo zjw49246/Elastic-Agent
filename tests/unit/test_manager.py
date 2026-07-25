@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -888,6 +889,140 @@ class TestEventRouting:
         assert len(events) == 1
         assert events[0] == ("HEARTBEAT", "w-1")
         await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_archive_job_task_log_fsyncs_then_releases_buffer(self, manager):
+        task_id = "job-log-test:w-1:abcdef"
+        manager.log_event_parser.process_log_event("w-1", {
+            "task_id": task_id,
+            "stream": "stderr",
+            "data": "actionable error",
+            "timestamp": "2026-07-25T12:00:00+00:00",
+            "parsed": None,
+        })
+
+        archived = await manager.archive_job_task_log(
+            "job-log-test",
+            "w-1",
+            {"task_id": task_id, "exit_code": 1, "event_id": "exit-1"},
+        )
+
+        assert archived is True
+        assert manager.log_event_parser.buffer_size(task_id) == 0
+        snapshots = manager.job_log_store.read_job("job-log-test")
+        assert snapshots[0]["entries"][0]["data"] == "actionable error"
+        assert snapshots[0]["exit"]["exit_code"] == 1
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_releases_bounded_buffer_without_blocking_cleanup(
+        self, manager, monkeypatch,
+    ):
+        task_id = "job-log-failure:w-1:abcdef"
+        manager.log_event_parser.process_log_event("w-1", {
+            "task_id": task_id,
+            "stream": "stdout",
+            "data": "retain me",
+            "parsed": None,
+        })
+
+        def fail_snapshot(**_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(manager.job_log_store, "save_snapshot", fail_snapshot)
+        archived = await manager.archive_job_task_log(
+            "job-log-failure",
+            "w-1",
+            {"task_id": task_id, "exit_code": 1},
+        )
+
+        assert archived is False
+        assert manager.log_event_parser.buffer_size(task_id) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_manager_buffer_recovers_bounded_worker_ndjson(
+        self, manager, monkeypatch,
+    ):
+        task_id = "job-replay:w-1:abcdef"
+        manager.registry.get = AsyncMock(return_value=SimpleNamespace(
+            private_ip="10.0.0.8",
+            public_ip="198.51.100.8",
+        ))
+        captured = {}
+
+        class FakeSSHExecutor:
+            def __init__(self, host, **kwargs):
+                captured["host"] = host
+                captured["kwargs"] = kwargs
+
+            async def execute(self, command, timeout):
+                captured["command"] = command
+                captured["timeout"] = timeout
+                return 0, (
+                    "100\npartial-json\n"
+                    + json.dumps({
+                        "task_id": task_id,
+                        "stream": "stderr",
+                        "data": "recovered detail",
+                        "timestamp": "2026-07-25T12:00:00+00:00",
+                        "parsed": None,
+                    })
+                    + "\n"
+                ), ""
+
+        monkeypatch.setattr(
+            "elastic_agent.core.bootstrap.SSHExecutor", FakeSSHExecutor,
+        )
+
+        archived = await manager.archive_job_task_log(
+            "job-replay",
+            "w-1",
+            {"task_id": task_id, "exit_code": 1, "event_id": "replayed"},
+        )
+
+        assert archived is True
+        assert captured["host"] == "198.51.100.8"
+        assert "tail -c 8388608" in captured["command"]
+        assert captured["timeout"] == 10
+        snapshot = manager.job_log_store.read_job("job-replay")[0]
+        assert snapshot["entries"][0]["data"] == "recovered detail"
+
+    @pytest.mark.asyncio
+    async def test_worker_tail_recovery_marks_byte_truncation(
+        self, manager, monkeypatch,
+    ):
+        task_id = "job-truncated:w-1:abcdef"
+        manager.registry.get = AsyncMock(return_value=SimpleNamespace(
+            private_ip="10.0.0.8",
+            public_ip="198.51.100.8",
+        ))
+
+        class FakeSSHExecutor:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def execute(self, _command, timeout):
+                assert timeout == 10
+                return 0, (
+                    f"{8 * 1024 * 1024 + 1}\n"
+                    + json.dumps({
+                        "task_id": task_id,
+                        "stream": "stderr",
+                        "data": "tail only",
+                    })
+                    + "\n"
+                ), ""
+
+        monkeypatch.setattr(
+            "elastic_agent.core.bootstrap.SSHExecutor", FakeSSHExecutor,
+        )
+
+        assert await manager.archive_job_task_log(
+            "job-truncated",
+            "w-1",
+            {"task_id": task_id, "exit_code": 1},
+        )
+        snapshot = manager.job_log_store.read_job("job-truncated")[0]
+        assert snapshot["truncated"] is True
 
     @pytest.mark.asyncio
     async def test_on_worker_connect_emits(self, manager):

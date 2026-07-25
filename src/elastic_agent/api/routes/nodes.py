@@ -183,9 +183,12 @@ async def node_logs(
     lines: int = Query(200, ge=1, le=5000),
     unit: str = Query("ea-runtime"),
 ) -> NodeLogsResponse:
-    """Fetch a worker's runtime logs via SSH → ``journalctl``. The ea-runtime
-    unit carries bootstrap/login output and the run command's forwarded stdout,
-    so this surfaces most failures without hand-SSHing to the box."""
+    """Fetch a live Worker's runtime journal via SSH.
+
+    This includes runtime connection/login messages and forwarded command
+    output after the systemd unit starts.  Earlier SSH bootstrap steps are
+    Manager-side lifecycle work and are not part of this journal.
+    """
     mgr = _mgr()
     node = await mgr.registry.get(node_id)
     if node is None:

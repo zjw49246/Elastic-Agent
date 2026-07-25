@@ -142,6 +142,14 @@ class WorkerRun:
     # Recreated for every dispatch/rotation.  Reliable PROCESS_EXIT sets this
     # before final collection so cancel/shutdown can wait for process flush.
     exit_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # The event callback may need a bounded SSH recovery before teardown.  A
+    # concurrent cancel sees ``exit_event`` immediately, then waits on this
+    # second barrier so it cannot destroy the Worker midway through recovery.
+    exit_archive_event: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+    )
+    exit_archive_pending: bool = False
     bringup_task: asyncio.Task | None = field(default=None, repr=False)
     # RUN_EXHAUSTED is ACKed after synchronously claiming ROTATING, then the
     # potentially long account login continues outside the worker's sole WS
@@ -201,6 +209,12 @@ class BatchJob:
         by_phase: dict[str, int] = {}
         for r in self.runs.values():
             by_phase[r.phase.value] = by_phase.get(r.phase.value, 0) + 1
+        run_errors = list(dict.fromkeys(
+            str(error)
+            for r in self.runs.values()
+            for error in (r.error, r.collection_error, r.cleanup_error)
+            if error
+        ))
         terminal = all(r.phase in TERMINAL_WORKER_PHASES for r in self.runs.values())
         cleanup_pending = sum(
             1
@@ -246,7 +260,27 @@ class BatchJob:
             "done": done,
             "state": state,
             "cleanup_pending": cleanup_pending,
-            "error": self.error,
+            "error": self.error or "; ".join(run_errors[:3]) or None,
+            # Persisted only as part of the bounded terminal summary.  This is
+            # enough for post-restart diagnosis and archived-log selection
+            # without storing account secrets or the full JobSpec twice.
+            "terminal_workers": [
+                {
+                    "worker_id": r.worker_id,
+                    "shard_index": r.ctx.shard_index,
+                    "phase": r.phase.value,
+                    "task_id": r.task_id,
+                    "error": r.error,
+                    "collection_error": r.collection_error,
+                    "cleanup_error": r.cleanup_error,
+                    "worker_released": (
+                        r.cleaned_up
+                        if self.spec.account.binding == "eip"
+                        else self.resources_released
+                    ),
+                }
+                for r in self.runs.values()
+            ],
             "cancel_requested": self.cancel_requested,
             "cancel_reason": self.cancel_reason,
             "created_at": self.created_at.isoformat(),
@@ -416,6 +450,7 @@ class BatchOrchestrator:
         cancel_kill_grace_seconds: float = 5.0,
         status_reconcile_grace_seconds: float = 60.0,
         disconnect_grace_seconds: float = 60.0,
+        exit_archive_grace_seconds: float = 15.0,
     ) -> None:
         self._driver = driver
         self._scale_in_on_complete = scale_in_on_complete
@@ -430,6 +465,10 @@ class BatchOrchestrator:
             0.0, status_reconcile_grace_seconds
         )
         self._disconnect_grace_seconds = max(0.0, disconnect_grace_seconds)
+        self._exit_archive_grace_seconds = max(
+            0.01,
+            exit_archive_grace_seconds,
+        )
         self._worker_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
@@ -561,6 +600,50 @@ class BatchOrchestrator:
         job_id = self._worker_index.get(worker_id)
         if job_id is not None:
             await self.on_worker_exit(job_id, worker_id, exit_code, task_id=task_id)
+
+    def begin_exit_archive(
+        self,
+        worker_id: str,
+        *,
+        task_id: str | None,
+    ) -> bool:
+        """Fence teardown while the matching exit's output is being archived."""
+
+        job_id = self._worker_index.get(worker_id)
+        job = self._jobs.get(job_id) if job_id is not None else None
+        run = job.runs.get(worker_id) if job is not None else None
+        if (
+            run is None
+            or task_id is None
+            or not run.task_id
+            or task_id != run.task_id
+        ):
+            return False
+        run.exit_event.set()
+        run.exit_archive_pending = True
+        run.exit_archive_event.clear()
+        return True
+
+    def finish_exit_archive(
+        self,
+        worker_id: str,
+        *,
+        task_id: str | None,
+    ) -> None:
+        """Release a matching archive fence after success or bounded failure."""
+
+        job_id = self._worker_index.get(worker_id)
+        job = self._jobs.get(job_id) if job_id is not None else None
+        run = job.runs.get(worker_id) if job is not None else None
+        if (
+            run is None
+            or task_id is None
+            or not run.task_id
+            or task_id != run.task_id
+        ):
+            return
+        run.exit_archive_pending = False
+        run.exit_archive_event.set()
 
     async def reconcile_worker_status(
         self, worker_id: str, active_processes: list[str]
@@ -1437,6 +1520,8 @@ class BatchOrchestrator:
             return
         run.task_id = f"{job.job_id}:{run.worker_id}:{uuid.uuid4().hex[:6]}"
         run.exit_event = asyncio.Event()
+        run.exit_archive_event = asyncio.Event()
+        run.exit_archive_pending = False
         run.dispatched_at = time.monotonic()
         run.phase = WorkerPhase.DISPATCHING
         await self._driver.run_command(
@@ -1731,7 +1816,10 @@ class BatchOrchestrator:
         # frame is already in the WebSocket but ``send_text`` has not returned.
         # A terminal phase is therefore not proof that the remote process exited;
         # only the matching reliable PROCESS_EXIT closes that uncertainty.
-        if not run.task_id or run.exit_event.is_set():
+        if not run.task_id:
+            return
+        if run.exit_event.is_set():
+            await self._wait_for_exit_archive(run)
             return
         try:
             await self._driver.stop_command(
@@ -1741,6 +1829,7 @@ class BatchOrchestrator:
             logger.exception("failed to SIGTERM task %s", run.task_id)
         try:
             await asyncio.wait_for(run.exit_event.wait(), timeout=term_grace)
+            await self._wait_for_exit_archive(run)
             return
         except asyncio.TimeoutError:
             pass
@@ -1752,10 +1841,27 @@ class BatchOrchestrator:
             logger.exception("failed to SIGKILL task %s", run.task_id)
         try:
             await asyncio.wait_for(run.exit_event.wait(), timeout=kill_grace)
+            await self._wait_for_exit_archive(run)
         except asyncio.TimeoutError:
             logger.error(
                 "task %s did not confirm exit before cancellation collection",
                 run.task_id,
+            )
+
+    async def _wait_for_exit_archive(self, run: WorkerRun) -> None:
+        if not run.exit_archive_pending:
+            return
+        try:
+            await asyncio.wait_for(
+                run.exit_archive_event.wait(),
+                timeout=self._exit_archive_grace_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "task %s exit output archive did not finish within %ss; "
+                "continuing cleanup",
+                run.task_id,
+                self._exit_archive_grace_seconds,
             )
 
     async def _cancel_job_impl(
@@ -1842,6 +1948,7 @@ class BatchOrchestrator:
         if run.phase not in TERMINAL_WORKER_PHASES:
             return
         async with run._finalize_lock:
+            await self._wait_for_exit_archive(run)
             # Periodic SSH/rsync must cross this barrier before the lease can
             # detach its EIP and destroy the remote filesystem.
             await self._stop_periodic_collect(run.worker_id)

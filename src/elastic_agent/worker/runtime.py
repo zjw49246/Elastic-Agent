@@ -109,7 +109,13 @@ class _WorkerLoginOtpReader:
         try:
             return await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
         except asyncio.TimeoutError as exc:
-            raise RuntimeError(
+            # ``codex_login._redacted_error`` deliberately preserves only its
+            # own safe exception type.  Use that boundary so the Job reports
+            # an actionable OTP timeout instead of the opaque
+            # ``automation failed (RuntimeError)``.
+            from elastic_agent.worker.login.codex_login import CodexLoginError
+
+            raise CodexLoginError(
                 "Timed out waiting for a user-supplied verification code"
             ) from exc
         finally:

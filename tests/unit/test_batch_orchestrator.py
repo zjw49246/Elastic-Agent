@@ -1273,6 +1273,42 @@ class TestCompletion:
         assert d.collected == [(run.worker_id, job.job_id)]
         assert all(signal != "SIGKILL" for _wid, _task, signal in d.stopped)
 
+    async def test_cancel_waits_for_exit_log_archive_barrier(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, exit_archive_grace_seconds=1)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        assert orch.begin_exit_archive(run.worker_id, task_id=run.task_id) is True
+        cancelling = asyncio.create_task(orch.cancel_job(job.job_id, "admin"))
+        await asyncio.sleep(0)
+
+        assert not d.collected
+        assert cancelling.done() is False
+
+        orch.finish_exit_archive(run.worker_id, task_id=run.task_id)
+        assert await cancelling is True
+        assert d.collected == [(run.worker_id, job.job_id)]
+
+    async def test_cancel_worker_waits_for_exit_log_archive_barrier(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, exit_archive_grace_seconds=1)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        assert orch.begin_exit_archive(run.worker_id, task_id=run.task_id) is True
+        cancelling = asyncio.create_task(
+            orch.cancel_worker(run.worker_id, "admin worker stop")
+        )
+        await asyncio.sleep(0)
+
+        assert not d.collected
+        assert cancelling.done() is False
+
+        orch.finish_exit_archive(run.worker_id, task_id=run.task_id)
+        assert await cancelling is True
+        assert d.collected == [(run.worker_id, job.job_id)]
+
     async def test_cancel_completed_job_does_not_rewrite_outcome(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)

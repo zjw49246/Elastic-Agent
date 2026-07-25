@@ -415,6 +415,21 @@ write them into a collected directory if they must be retained in S3. Final
 collection also runs for failed and cancelled Jobs, so already-written partial
 results are preserved before the ephemeral EC2 is terminated.
 
+For diagnosis, the Manager separately archives the bounded tail of each
+command's stdout/stderr before Worker teardown (up to 5,000 entries, 8 MiB per
+task, 64 KiB per entry, 512 task attempts/64 MiB per Job, and 1 GiB across the
+Manager). Oldest snapshots are pruned at the configured logging retention
+boundary (30 days by default) and when a byte/task quota is reached. If a
+reliable exit event is replayed after a Manager restart, it first attempts a
+bounded recovery from the Worker's private `ea-logs` file while the instance is
+still available. Query live or archived output with
+`GET /api/jobs/{job_id}/logs?worker_id=&task_id=&lines=400`; responses are
+private, uncached, and remain available after the ephemeral Worker is
+destroyed. These diagnostic snapshots are stored in the Manager state
+directory, not uploaded to S3, because stdout/stderr may contain sensitive
+material. Jobs completed before this archive existed cannot be recovered after
+their Workers have already been destroyed.
+
 Use an `Idempotency-Key` header when retrying `POST /api/jobs`: the same key and
 spec resolve to the same deterministic Job, while reusing it for different
 content returns `409`. `POST /api/jobs/{job_id}/cancel` sends TERM/KILL as
@@ -440,16 +455,22 @@ trusted deployment may explicitly set `ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD=1`,
 then upload a `.py` through `POST /api/jobs/harness` and use the returned
 `harness_ref`. Prefer declarative JobSpec for untrusted submitters.
 
-**Frontend**: the Batch Console at `/batch` manages Claude and Codex identities,
-accepts write-only OpenAI passwords/mailbox query tokens (at least one for Codex), filters
-Job account choices by `agent_type`, and displays active Codex OTP challenges
-with a six-digit submission form. Completed Job cards label retained
-`WorkerRun` rows as execution history and separately show whether the backing
-Worker resource has been destroyed; released rows have no live log/terminate
-actions. API keys are accepted only in the
-`Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
-`sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
-`/api/accounts/login-attempts`, `/api/jobs`, and `/api/jobs/harness`.
+**Frontend**: the Batch Console at `/batch` uses a light theme by default, with
+an optional session-scoped dark theme. It manages Claude and Codex identities,
+accepts write-only OpenAI passwords/mailbox query tokens (at least one for
+Codex), filters Job account choices by `agent_type`, and promotes active Codex
+OTP challenges to a six-digit action panel. Stable keyed rendering and
+non-overlapping, visibility-aware polling preserve focus, expanded sections,
+scroll position, and log viewing instead of rebuilding the whole page every
+five seconds. Job cards show the provision → bootstrap → login → run → collect
+→ destroy workflow, terminal errors, cleanup state, results, and a top-level
+command-output viewer. Completed execution rows remain available as history,
+while live system-journal and terminate actions appear only for an existing
+Worker resource. API keys are accepted only in the `Authorization: Bearer` or
+`X-API-Key` header; the UI keeps a key in `sessionStorage` and strips legacy
+query-string credentials. REST includes `/api/accounts`,
+`/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and
+`/api/jobs/harness`.
 
 Live batch runs require provision/login hooks wired at deployment:
 `manager.configure_batch(provision_hook=..., login_hook=...)`.

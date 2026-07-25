@@ -15,6 +15,7 @@ from typing import Any
 from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.event_bus import EventBus
+from elastic_agent.core.job_log_store import JobLogStore
 from elastic_agent.core.log_event_parser import LogEventParser
 from elastic_agent.core.operations_logger import OperationsLogger
 from elastic_agent.core.protocols.messages import Message
@@ -157,6 +158,15 @@ class ElasticAgentManager:
         self.log_event_parser = LogEventParser(
             buffer_size=config.external_api.trace_buffer_size,
         )
+        self.job_log_store = JobLogStore(
+            _Path(config.registry.path).with_name("job-logs"),
+            max_entries=config.external_api.trace_buffer_size,
+            retention_days=config.logging.retention_days,
+        )
+        try:
+            self.job_log_store.prune()
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not prune historical Job logs", exc_info=True)
 
         self.connection_manager.on_message = self._on_worker_message
         self.connection_manager.on_connect = self._on_worker_connect
@@ -2135,6 +2145,137 @@ class ElasticAgentManager:
     # ------------------------------------------------------------------
     # Event callbacks
     # ------------------------------------------------------------------
+
+    async def archive_job_task_log(
+        self,
+        job_id: str,
+        worker_id: str,
+        data: dict[str, Any],
+    ) -> bool:
+        """Persist one batch task's buffered output before Worker teardown.
+
+        Log durability is important for diagnosis but must never retain a
+        billable instance: a disk error is reported and lifecycle cleanup
+        continues.  The bounded in-memory trace is released after every archive
+        attempt so acknowledged exits cannot accumulate one deque per task.
+        """
+
+        task_id = str(data.get("task_id") or "")
+        if not task_id:
+            return False
+        entries = self.log_event_parser.get_task_logs(task_id)
+        source_truncated = (
+            len(entries) >= self.config.external_api.trace_buffer_size
+        )
+        if not entries:
+            # A reliable PROCESS_EXIT can replay after a Manager restart while
+            # the in-memory LOG deque is empty.  The Worker fsyncs the same
+            # NDJSON stream locally, so recover a bounded tail before the exit
+            # handler destroys that temporary instance.
+            entries, source_truncated = await self._recover_worker_task_log(
+                worker_id,
+                task_id,
+            )
+        try:
+            await asyncio.to_thread(
+                self.job_log_store.save_snapshot,
+                job_id=job_id,
+                task_id=task_id,
+                worker_id=worker_id,
+                entries=entries,
+                exit_info=data,
+                source_truncated=source_truncated,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to archive run output for Job %s task %s",
+                job_id,
+                task_id,
+            )
+            return False
+        finally:
+            # The immutable local copy above is bounded.  A state-disk failure
+            # must not leave one deque per completed task in Manager memory
+            # after the reliable exit is ACKed and its Worker is destroyed.
+            self.log_event_parser.release_task(task_id)
+        return True
+
+    async def _recover_worker_task_log(
+        self,
+        worker_id: str,
+        task_id: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Best-effort bounded recovery of a Worker's local task NDJSON."""
+
+        node = await self.registry.get(worker_id)
+        if node is None:
+            return [], False
+        from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
+        from elastic_agent.core.network import worker_management_host
+
+        provider_config = self.config.provider
+        host = worker_management_host(node, provider_type=provider_config.type)
+        if not host:
+            return [], False
+        ssh_user = self.config.worker.ssh_user
+        ssh_key = (
+            provider_config.aliyun.ssh_key_path
+            if provider_config.type == "aliyun"
+            else provider_config.aws.ssh_key_path
+        )
+        home = "/root" if ssh_user == "root" else f"/home/{ssh_user}"
+        path = f"{home}/ea-logs/{task_id}.ndjson"
+        executor = SSHExecutor(
+            host,
+            user=ssh_user,
+            key_path=ssh_key,
+            use_sudo=False,
+        )
+        byte_limit = 8 * 1024 * 1024
+        try:
+            rc, stdout, _stderr = await executor.execute(
+                f"test -f {_shell_quote(path)} && "
+                f"stat -c %s -- {_shell_quote(path)} && "
+                f"tail -c {byte_limit} -- {_shell_quote(path)}",
+                timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Could not recover local run output for %s", task_id,
+                exc_info=True,
+            )
+            return [], False
+        if rc != 0:
+            return [], False
+
+        import json
+
+        size_line, separator, log_text = stdout.partition("\n")
+        if not separator:
+            return [], False
+        try:
+            source_truncated = int(size_line.strip()) > byte_limit
+        except ValueError:
+            return [], False
+        recovered: list[dict[str, Any]] = []
+        for raw_line in log_text.splitlines():
+            try:
+                entry = json.loads(raw_line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # tail -c may begin halfway through the oldest retained line.
+                continue
+            if (
+                not isinstance(entry, dict)
+                or entry.get("task_id") != task_id
+                or entry.get("stream") not in {"stdout", "stderr"}
+                or not isinstance(entry.get("data"), str)
+            ):
+                continue
+            entry["worker_id"] = worker_id
+            recovered.append(entry)
+        entry_limit = self.config.external_api.trace_buffer_size
+        source_truncated = source_truncated or len(recovered) > entry_limit
+        return recovered[-entry_limit:], source_truncated
 
     async def _on_worker_message(self, worker_id: str, msg: Message) -> None:
         data = msg.model_dump()

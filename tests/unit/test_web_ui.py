@@ -60,8 +60,9 @@ class TestDashboardEndpoint:
         assert "clear_email_token:" in html
         assert "manager_distribute" in html
         assert "distribute.disabled = agentType === 'codex'" in html
-        assert "container.replaceChildren()" in html
-        assert "title.textContent = `Codex OTP" in html
+        assert "reconcileLoginAttempts" in html
+        assert "container.replaceChildren()" not in html
+        assert "textContent = `Codex OTP" in html
         assert "worker 用实例角色直拉，不经 Manager" in html
         assert '<textarea id="jCollect" placeholder="results">results</textarea>' in html
         assert 'id="jLoginTimeout" type="number" value="900"' in html
@@ -102,7 +103,7 @@ class TestDashboardEndpoint:
             html.index("async function refreshJobs()")
         ]
         actions = jobs_monitor[
-            jobs_monitor.index("function workerActionsHtml(worker)"):
+            jobs_monitor.index("function workerActionsHtml(worker, jobId)"):
             jobs_monitor.index("async function downloadResults")
         ]
         terminate = html[
@@ -114,16 +115,61 @@ class TestDashboardEndpoint:
         assert "worker.worker_released === true" in jobs_monitor
         assert "worker.cleaned_up === true" in jobs_monitor
         assert "Worker 已销毁" in jobs_monitor
-        assert (
-            "if (!worker.worker_id || workerReleased(worker) "
-            "|| workerExecutionTerminal(worker))"
-        ) in actions
-        assert "workerActionsHtml(w)" in jobs_monitor
+        assert "if (!worker.worker_id || workerReleased(worker) || workerExecutionTerminal(worker))" in actions
+        assert "showJobLogs" in actions
+        assert "showWorkerLogs" in actions
+        assert "workerActionsHtml(w,j.job_id)" in jobs_monitor
         assert "terminateWorker(${jsArg(worker.worker_id)})" in actions
         assert (
             "api('POST', '/scale-in', {node_ids: [wid], force: true})"
         ) in terminate
         assert "api('DELETE'" not in terminate
+
+    @pytest.mark.asyncio
+    async def test_batch_console_updates_without_rebuilding_or_overlapping_polls(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "reconcileJobCards" in html
+        assert "jobResultsCache" in html
+        assert "dashboardPollRunning" in html
+        assert "scheduleDashboardPoll" in html
+        assert "jobs.filter(job =>" in html
+        assert ").slice(0, 30)" in html
+        assert "jobs.slice(0, 30).filter" not in html
+        assert "const olderTerminal" in html
+        assert "const hiddenHistory" in html
+        assert "jobsList.innerHTML = jobs.map" not in html
+        assert "el.outerHTML = jobRowHtml" not in html
+        assert "setInterval(() => { refreshJobs()" not in html
+        assert "if (document.hidden) clearTimeout(_logTimer)" in html
+        assert "!document.hidden && !_logPaused" in html
+
+    @pytest.mark.asyncio
+    async def test_batch_console_has_light_theme_help_and_job_log_viewer(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert 'data-theme="light"' in html
+        assert "toggleTheme" in html
+        assert "Job 怎么运行" in html
+        assert "任务输出" in html
+        assert "/jobs/' + encodeURIComponent(jobId) + '/logs" in html
+        assert "复制日志" in html
+        assert "跟随最新" in html
+        assert "j.error" in html
+        assert "cleanup_pending" in html
+
+    @pytest.mark.asyncio
+    async def test_fleet_removes_empty_state_before_first_worker(self, ui_client):
+        client, _ = ui_client
+        html = (await client.get("/fleet")).text
+
+        assert "grid.querySelector('.empty-state')?.remove()" in html
 
     @pytest.mark.asyncio
     async def test_fleet_dashboard(self, ui_client):

@@ -977,12 +977,46 @@ class TestJobsAPI:
             assert view["done"] is done
 
     @pytest.mark.asyncio
+    async def test_terminal_journal_preserves_worker_error_and_log_task_reference(
+        self, client, manager,
+    ):
+        from elastic_agent.core.batch_orchestrator import WorkerPhase
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        job = manager.batch.get_job(job_id)
+        runs = list(job.runs.values())
+        runs[0].phase = WorkerPhase.FAILED
+        runs[0].task_id = f"{job_id}:w0:abcdef"
+        runs[0].error = "run exited 1"
+        for run in runs[1:]:
+            run.phase = WorkerPhase.DONE
+        job.launch_complete = True
+        job.resources_released = True
+        await manager._update_batch_job_state(
+            job_id, "failed", job.summary(),
+        )
+        manager.batch._jobs.clear()
+
+        detail = (await client.get(f"/api/jobs/{job_id}")).json()
+
+        assert detail["state"] == "failed"
+        assert detail["error"] == "run exited 1"
+        assert detail["created_at"] == job.created_at.isoformat()
+        assert detail["started_at"] == job.started_at
+        assert detail["completed_at"] == job.completed_at
+        assert detail["workers_detail"][0]["task_id"].endswith(":w0:abcdef")
+        assert detail["workers_detail"][0]["error"] == "run exited 1"
+        assert detail["workers_detail"][0]["worker_released"] is True
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("method", "suffix"),
         [
             ("get", ""),
             ("post", "/cancel"),
             ("post", "/resubmit"),
+            ("get", "/logs"),
             ("get", "/results"),
             ("get", "/results/download"),
         ],
@@ -1013,6 +1047,132 @@ class TestJobsAPI:
     @pytest.mark.asyncio
     async def test_get_missing_404(self, client):
         assert (await client.get("/api/jobs/nope")).status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_job_logs_are_available_live_and_after_worker_release(
+        self, client, manager,
+    ):
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        task_id = f"{job_id}:w0:abcdef"
+        job = manager.batch.get_job(job_id)
+        job.runs["w0"].task_id = task_id
+        for index, (stream, data) in enumerate([
+            ("stdout", "starting"),
+            ("stderr", "useful failure detail"),
+        ]):
+            manager.log_event_parser.process_log_event("w0", {
+                "task_id": task_id,
+                "stream": stream,
+                "data": data,
+                "timestamp": f"2026-07-25T12:00:0{index}+00:00",
+                "parsed": None,
+            })
+
+        live = await client.get(f"/api/jobs/{job_id}/logs?lines=1")
+        assert live.status_code == 200
+        assert live.headers["cache-control"] == "no-store"
+        assert live.json()["source"] == "live"
+        assert live.json()["returned"] == 1
+        assert live.json()["entries"][0]["data"] == "useful failure detail"
+
+        manager.job_log_store.save_snapshot(
+            job_id=job_id,
+            task_id=task_id,
+            worker_id="w0",
+            entries=manager.log_event_parser.get_task_logs(task_id),
+            exit_info={"exit_code": 1, "error_message": "run exited 1"},
+        )
+        manager.log_event_parser.release_task(task_id)
+        job.runs["w0"].cleaned_up = True
+
+        archived = await client.get(
+            f"/api/jobs/{job_id}/logs?worker_id=w0&lines=100",
+        )
+        assert archived.status_code == 200
+        assert archived.json()["source"] == "archive"
+        assert [entry["data"] for entry in archived.json()["entries"]] == [
+            "starting",
+            "useful failure detail",
+        ]
+        assert archived.json()["tasks"][0]["exit_code"] == 1
+
+    @pytest.mark.asyncio
+    async def test_job_logs_use_bounded_tail_reader_and_keep_polling_active_scope(
+        self, client, manager, monkeypatch,
+    ):
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        old_task = f"{job_id}:w0:old"
+        manager.job_log_store.save_snapshot(
+            job_id=job_id,
+            task_id=old_task,
+            worker_id="w0",
+            entries=[{
+                "task_id": old_task,
+                "worker_id": "w0",
+                "stream": "stderr",
+                "data": "old attempt",
+            }],
+            exit_info={"exit_code": 1},
+        )
+        job = manager.batch.get_job(job_id)
+        job.runs["w0"].task_id = f"{job_id}:w0:new"
+
+        def forbid_full_read(_job_id):
+            raise AssertionError("logs API must not materialize the full Job")
+
+        monkeypatch.setattr(manager.job_log_store, "read_job", forbid_full_read)
+        response = await client.get(f"/api/jobs/{job_id}/logs?lines=1")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["returned"] == 1
+        assert payload["entries"][0]["data"] == "old attempt"
+        assert payload["status"] == "live"
+        assert payload["complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_job_logs_stop_polling_after_run_while_cleanup_is_pending(
+        self, client, manager,
+    ):
+        from elastic_agent.core.batch_orchestrator import WorkerPhase
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        job = manager.batch.get_job(job_id)
+        job.launch_complete = True
+        for index, run in enumerate(job.runs.values()):
+            run.phase = WorkerPhase.DONE
+            run.task_id = f"{job_id}:{run.worker_id}:done-{index}"
+            manager.job_log_store.save_snapshot(
+                job_id=job_id,
+                task_id=run.task_id,
+                worker_id=run.worker_id,
+                entries=[],
+                exit_info={"exit_code": 0},
+            )
+
+        # resources_released remains false, so the Job itself is not yet done;
+        # command output is nevertheless final and must not poll every 3s.
+        payload = (await client.get(f"/api/jobs/{job_id}/logs")).json()
+        assert job.summary()["done"] is False
+        assert payload["status"] == "archived"
+        assert payload["complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_job_logs_validate_job_and_bounds(self, client):
+        assert (await client.get("/api/jobs/nope/logs")).status_code == 404
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        assert (
+            await client.get(f"/api/jobs/{job_id}/logs?lines=5001")
+        ).status_code == 422
+        assert (
+            await client.get(
+                f"/api/jobs/{job_id}/logs?task_id=job-other:w0:abcdef",
+            )
+        ).status_code == 404
 
     @pytest.mark.asyncio
     async def test_invalid_spec_422(self, client):

@@ -1236,6 +1236,32 @@ class TestHandleAccountLogin:
         assert reader.submit(response) is False
 
     @pytest.mark.asyncio
+    async def test_codex_manual_otp_timeout_keeps_actionable_safe_error(
+        self, runtime,
+    ):
+        from elastic_agent.worker.login.codex_login import CodexLoginError
+        from elastic_agent.worker.runtime import _WorkerLoginOtpReader
+
+        runtime._send_event = lambda _message: asyncio.sleep(0)
+        request = self._msg(
+            agent_type="codex",
+            email_token="",
+            password="openai-secret",
+            config_dir="/root/.codex-a1",
+        )
+        reader = _WorkerLoginOtpReader(runtime, request)
+
+        with pytest.raises(
+            CodexLoginError,
+            match="Timed out waiting for a user-supplied verification code",
+        ):
+            await reader.read_code(
+                attempt_id=request.login_request_id,
+                timeout_s=0.01,
+                logs=[],
+            )
+
+    @pytest.mark.asyncio
     async def test_codex_email_token_only_login_is_forwarded(
         self, runtime,
     ):

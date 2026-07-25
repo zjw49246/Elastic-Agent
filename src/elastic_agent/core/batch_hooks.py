@@ -1333,9 +1333,26 @@ def wire_batch(
 
     async def _on_exit(event_type, worker_id, data):
         # Only route batch-owned workers; ignore other PROCESS_EXITs.
-        if orch.job_id_for_worker(worker_id) is not None:
+        job_id = orch.job_id_for_worker(worker_id)
+        if job_id is not None:
+            task_id = data.get("task_id")
+            archive_fenced = orch.begin_exit_archive(
+                worker_id,
+                task_id=task_id,
+            )
+            # Commit the bounded Manager trace before final collection destroys
+            # the temporary Worker.  Archive failure is intentionally
+            # non-fatal: lifecycle cleanup must not retain a billable instance.
+            try:
+                await manager.archive_job_task_log(job_id, worker_id, data)
+            finally:
+                if archive_fenced:
+                    orch.finish_exit_archive(
+                        worker_id,
+                        task_id=task_id,
+                    )
             await orch.handle_exit(
-                worker_id, int(data.get("exit_code", -1)), task_id=data.get("task_id"),
+                worker_id, int(data.get("exit_code", -1)), task_id=task_id,
             )
 
     async def _on_status(event_type, worker_id, data):

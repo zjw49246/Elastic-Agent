@@ -90,6 +90,7 @@ uv run pytest -q \
   tests/unit/test_batch_orchestrator.py \
   tests/unit/test_reconciler.py \
   tests/unit/test_job_spec.py \
+  tests/unit/test_job_log_store.py \
   tests/unit/test_api_batch.py \
   tests/unit/test_manager_fleet_driver.py \
   tests/unit/test_result_uploader.py \
@@ -142,6 +143,10 @@ The focused suite covers:
   reads and downloads, awaited Manager-side upload, explicit S3 failures, and
   force-termination plus Node-record removal (not registry-only draining) after
   ordinary Job completion;
+- mode-0600 bounded Job command-log snapshots, ownership/path/symlink guards,
+  replay-safe archive replacement, per-task/Job/global byte and retention
+  quotas, streaming tail API filtering, and best-effort recovery from the
+  Worker's local NDJSON before teardown after a Manager restart;
 - ordered durable lifecycle-event replay, single-handler in-flight replay with
   failure/cancellation takeover, reconnect-on-handler-failure, stale-socket ACK
   suppression with deduplicated reconnect ACK, active-socket send-error
@@ -156,6 +161,9 @@ The focused suite covers:
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   and suppress live log/terminate actions after teardown.
+- Batch/Fleet default-light theming, keyed DOM reconciliation, non-overlapping
+  visibility-aware polling, prominent OTP action state, and a persistent Job
+  output viewer that remains available for terminal execution history.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token
   one-of validation, explicit secret clearing, token-only email/one-time/login-code
   switching, bounded anti-bot diagnostics, 900-second worker timeout propagation, and

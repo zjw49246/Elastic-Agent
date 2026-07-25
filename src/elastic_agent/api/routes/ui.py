@@ -14,20 +14,34 @@ router = APIRouter(tags=["ui"])
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elastic-Agent Dashboard</title>
+<script>
+  document.documentElement.dataset.theme =
+    sessionStorage.getItem('ea_theme') === 'dark' ? 'dark' : 'light';
+</script>
 <style>
   :root {
-    --bg: #0f172a; --surface: #1e293b; --border: #334155;
-    --text: #e2e8f0; --text-muted: #94a3b8; --accent: #3b82f6;
-    --green: #22c55e; --yellow: #eab308; --red: #ef4444; --orange: #f97316;
+    color-scheme:light;
+    --bg:#f3f6fb; --surface:#ffffff; --surface-soft:#f8fafc; --border:#d7dee9;
+    --text:#172033; --text-muted:#5b6678; --accent:#2563eb;
+    --green:#16803c; --yellow:#a16207; --red:#c62828; --orange:#c4510c;
+    --hover:#e8f0ff; --shadow:0 8px 26px rgba(36,49,73,.07);
+  }
+  :root[data-theme="dark"] {
+    color-scheme:dark;
+    --bg:#121925; --surface:#1c2635; --surface-soft:#151e2b; --border:#344256;
+    --text:#e7edf6; --text-muted:#a6b2c3; --accent:#6ea8fe;
+    --green:#58cf7b; --yellow:#f3c969; --red:#ff7474; --orange:#ff9a62;
+    --hover:#203659; --shadow:0 10px 30px rgba(0,0,0,.18);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: var(--bg); color: var(--text); min-height: 100vh; }
+         background: linear-gradient(180deg,var(--hover),var(--bg) 190px);
+         color: var(--text); min-height: 100vh; }
   .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
 
   header { display: flex; justify-content: space-between; align-items: center;
@@ -38,7 +52,7 @@ _DASHBOARD_HTML = """\
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
            gap: 16px; margin-bottom: 24px; }
   .stat-card { background: var(--surface); border: 1px solid var(--border);
-               border-radius: 8px; padding: 16px; }
+               border-radius: 10px; padding: 16px; box-shadow:var(--shadow); }
   .stat-card .label { color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase;
                       letter-spacing: 0.05em; margin-bottom: 4px; }
   .stat-card .value { font-size: 1.8rem; font-weight: 700; }
@@ -47,17 +61,17 @@ _DASHBOARD_HTML = """\
   .btn { padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border);
          background: var(--surface); color: var(--text); cursor: pointer;
          font-size: 0.875rem; transition: all 0.15s; }
-  .btn:hover { border-color: var(--accent); background: #1e3a5f; }
+  .btn:hover { border-color: var(--accent); background: var(--hover); }
   .btn-primary { background: var(--accent); border-color: var(--accent); }
   .btn-primary:hover { background: #2563eb; }
   .btn-danger { border-color: var(--red); color: var(--red); }
-  .btn-danger:hover { background: #3b1111; }
+  .btn-danger:hover { background: color-mix(in srgb,var(--red) 10%,var(--surface)); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
                gap: 16px; }
   .node-card { background: var(--surface); border: 1px solid var(--border);
-               border-radius: 8px; padding: 16px; position: relative; }
+               border-radius: 10px; padding: 16px; position: relative; box-shadow:var(--shadow); }
   .node-card .node-header { display: flex; justify-content: space-between;
                             align-items: center; margin-bottom: 12px; }
   .node-card .node-id { font-weight: 600; font-size: 0.95rem; }
@@ -66,14 +80,14 @@ _DASHBOARD_HTML = """\
 
   .status-badge { display: inline-block; padding: 2px 8px; border-radius: 9999px;
                   font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
-  .status-running { background: #14532d; color: var(--green); }
-  .status-ready { background: #14532d; color: var(--green); }
+  .status-running { background: color-mix(in srgb,var(--green) 14%,var(--surface)); color: var(--green); }
+  .status-ready { background: color-mix(in srgb,var(--green) 14%,var(--surface)); color: var(--green); }
   .status-pending, .status-starting, .status-bootstrapping {
-    background: #422006; color: var(--yellow); }
-  .status-draining { background: #431407; color: var(--orange); }
+    background: color-mix(in srgb,var(--yellow) 14%,var(--surface)); color: var(--yellow); }
+  .status-draining { background: color-mix(in srgb,var(--orange) 14%,var(--surface)); color: var(--orange); }
   .status-terminated, .status-error, .status-failed {
-    background: #450a0a; color: var(--red); }
-  .status-stopped { background: #1e293b; color: var(--text-muted); }
+    background: color-mix(in srgb,var(--red) 14%,var(--surface)); color: var(--red); }
+  .status-stopped { background: var(--surface-soft); color: var(--text-muted); }
 
   .ws-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
                   margin-right: 4px; vertical-align: middle; }
@@ -99,7 +113,7 @@ _DASHBOARD_HTML = """\
                  font-size: 0.85rem; }
   .modal input, .modal select { width: 100%; padding: 8px 12px; margin-bottom: 12px;
                                  border: 1px solid var(--border); border-radius: 6px;
-                                 background: var(--bg); color: var(--text); font-size: 0.9rem; }
+                                 background: var(--surface-soft); color: var(--text); font-size: 0.9rem; }
   .modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end;
                           margin-top: 8px; }
 
@@ -107,8 +121,8 @@ _DASHBOARD_HTML = """\
            border-radius: 8px; font-size: 0.875rem; z-index: 200; display: none;
            max-width: 400px; animation: slideUp 0.3s ease; }
   .toast.show { display: block; }
-  .toast.success { background: #14532d; border: 1px solid var(--green); }
-  .toast.error { background: #450a0a; border: 1px solid var(--red); }
+  .toast.success { background: var(--surface); border: 1px solid var(--green); }
+  .toast.error { background: var(--surface); border: 1px solid var(--red); }
   @keyframes slideUp { from { transform: translateY(20px); opacity: 0; }
                         to { transform: translateY(0); opacity: 1; } }
 
@@ -122,6 +136,8 @@ _DASHBOARD_HTML = """\
     <h1>Elastic-Agent Dashboard</h1>
     <div class="refresh-info">
       <a href="/batch" id="navBatch" style="color:var(--accent);text-decoration:none;margin-right:12px">Batch Console →</a>
+      <a href="#" id="fleetThemeToggle" onclick="toggleFleetTheme();return false"
+        style="color:var(--accent);text-decoration:none;margin-right:12px">切换深色</a>
       Auto-refresh: <span id="refreshInterval">5s</span>
       &middot; Last: <span id="lastRefresh">--</span>
     </div>
@@ -191,6 +207,7 @@ const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type':
 {const nb = document.getElementById('navBatch'); if (nb) nb.href = '/';}
 
 let refreshTimer = null;
+let nodesRefreshRunning = false;
 
 async function api(method, path, body) {
   const opts = {method, headers: {...headers}};
@@ -208,6 +225,16 @@ function toast(msg, type = 'success') {
   el.textContent = msg;
   el.className = 'toast show ' + type;
   setTimeout(() => el.className = 'toast', 3000);
+}
+function updateFleetThemeLabel() {
+  document.getElementById('fleetThemeToggle').textContent =
+    document.documentElement.dataset.theme === 'dark' ? '切换亮色' : '切换深色';
+}
+function toggleFleetTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  sessionStorage.setItem('ea_theme', next);
+  updateFleetThemeLabel();
 }
 
 function showModal(id) { document.getElementById(id).classList.add('active'); }
@@ -295,7 +322,7 @@ function jsArg(value) { return esc(JSON.stringify(String(value ?? ''))); }
 function renderNode(n) {
   const isActive = ['running', 'ready', 'bootstrapping', 'draining'].includes(n.status.toLowerCase());
   return `
-    <div class="node-card">
+    <div class="node-card" data-node-id="${esc(n.node_id)}">
       <div class="node-header">
         <div>
           <span class="ws-indicator ${n.ws_connected ? 'ws-connected' : 'ws-disconnected'}"></span>
@@ -319,7 +346,40 @@ function renderNode(n) {
     </div>`;
 }
 
+function reconcileNodeCards(nodes) {
+  const grid = document.getElementById('nodeGrid');
+  if (!nodes.length) {
+    if (grid.dataset.empty !== 'true') {
+      grid.innerHTML = '<div class="empty-state"><h3>No nodes</h3><p>Job 启动后，临时 Worker 会显示在这里。</p></div>';
+      grid.dataset.empty = 'true';
+    }
+    return;
+  }
+  delete grid.dataset.empty;
+  grid.querySelector('.empty-state')?.remove();
+  const wanted = new Set(nodes.map(node => String(node.node_id)));
+  Array.from(grid.querySelectorAll('.node-card')).forEach(card => {
+    if (!wanted.has(card.dataset.nodeId)) card.remove();
+  });
+  nodes.forEach((node, index) => {
+    const signature = JSON.stringify(node);
+    let card = Array.from(grid.querySelectorAll('.node-card'))
+      .find(candidate => candidate.dataset.nodeId === String(node.node_id));
+    if (!card || card._renderSignature !== signature) {
+      const template = document.createElement('template');
+      template.innerHTML = renderNode(node).trim();
+      const replacement = template.content.firstElementChild;
+      replacement._renderSignature = signature;
+      if (card) card.replaceWith(replacement);
+      card = replacement;
+    }
+    const current = grid.children[index] || null;
+    if (card !== current) grid.insertBefore(card, current);
+  });
+}
 async function refreshNodes() {
+  if (nodesRefreshRunning) return;
+  nodesRefreshRunning = true;
   try {
     const data = await api('GET', '/nodes?limit=200');
     const nodes = data.nodes || [];
@@ -334,20 +394,28 @@ async function refreshNodes() {
     document.getElementById('statDraining').textContent =
       nodes.filter(n => n.status.toLowerCase() === 'draining').length;
 
-    const grid = document.getElementById('nodeGrid');
-    if (nodes.length === 0) {
-      grid.innerHTML = '<div class="empty-state"><h3>No nodes</h3><p>Click "Scale Out" to create worker instances.</p></div>';
-    } else {
-      grid.innerHTML = nodes.map(renderNode).join('');
-    }
+    reconcileNodeCards(nodes);
     document.getElementById('lastRefresh').textContent = new Date().toLocaleTimeString();
   } catch(e) {
     toast('Failed to load nodes: ' + e.message, 'error');
+  } finally {
+    nodesRefreshRunning = false;
   }
 }
 
-refreshNodes();
-refreshTimer = setInterval(refreshNodes, 5000);
+async function pollNodes() {
+  if (!document.hidden) await refreshNodes();
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(pollNodes, 5000);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(pollNodes, 0);
+  }
+});
+updateFleetThemeLabel();
+pollNodes();
 </script>
 </body>
 </html>
@@ -356,38 +424,61 @@ refreshTimer = setInterval(refreshNodes, 5000);
 
 _BATCH_HTML = """\
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elastic-Agent Batch Console</title>
+<script>
+  document.documentElement.dataset.theme =
+    sessionStorage.getItem('ea_theme') === 'dark' ? 'dark' : 'light';
+</script>
 <style>
   :root {
-    --bg:#0f172a; --surface:#1e293b; --border:#334155; --text:#e2e8f0;
-    --muted:#94a3b8; --accent:#3b82f6; --green:#22c55e; --yellow:#eab308;
-    --red:#ef4444; --orange:#f97316;
+    color-scheme:light;
+    --bg:#f3f6fb; --surface:#ffffff; --surface-soft:#f8fafc;
+    --border:#d7dee9; --text:#172033; --muted:#5b6678; --accent:#2563eb;
+    --accent-soft:#e8f0ff; --green:#16803c; --yellow:#a16207;
+    --red:#c62828; --orange:#c4510c; --shadow:0 8px 26px rgba(36,49,73,.07);
+    --terminal:#111827; --terminal-text:#e5e7eb; --overlay:rgba(15,23,42,.46);
+  }
+  :root[data-theme="dark"] {
+    color-scheme:dark;
+    --bg:#121925; --surface:#1c2635; --surface-soft:#151e2b;
+    --border:#344256; --text:#e7edf6; --muted:#a6b2c3; --accent:#6ea8fe;
+    --accent-soft:#203659; --green:#58cf7b; --yellow:#f3c969;
+    --red:#ff7474; --orange:#ff9a62; --shadow:0 10px 30px rgba(0,0,0,.18);
+    --terminal:#090f19; --terminal-text:#e5e7eb; --overlay:rgba(0,0,0,.66);
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-         background:var(--bg); color:var(--text); min-height:100vh; }
-  .container { max-width:1200px; margin:0 auto; padding:20px; }
+         background:linear-gradient(180deg,var(--accent-soft) 0, var(--bg) 190px);
+         color:var(--text); min-height:100vh; }
+  .container { max-width:1240px; margin:0 auto; padding:20px; }
   header { display:flex; justify-content:space-between; align-items:center;
            padding:16px 0; border-bottom:1px solid var(--border); margin-bottom:20px; }
-  header h1 { font-size:1.4rem; } header a { color:var(--accent); text-decoration:none; font-size:.9rem; }
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px;
-          padding:18px; margin-bottom:20px; }
+  header h1 { font-size:1.5rem; letter-spacing:-.02em; }
+  header a { color:var(--accent); text-decoration:none; font-size:.9rem; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+          padding:18px; margin-bottom:20px; box-shadow:var(--shadow); }
   .card h2 { font-size:1.05rem; margin-bottom:12px; }
   label { display:block; font-size:.8rem; color:var(--muted); margin:8px 0 3px; }
-  input, select, textarea { width:100%; background:var(--bg); color:var(--text);
+  input, select, textarea { width:100%; background:var(--surface-soft); color:var(--text);
     border:1px solid var(--border); border-radius:6px; padding:7px 9px; font-size:.85rem;
     font-family:inherit; }
+  input:focus, select:focus, textarea:focus { outline:2px solid color-mix(in srgb,var(--accent) 28%,transparent);
+    border-color:var(--accent); }
   textarea { resize:vertical; min-height:52px; font-family:ui-monospace,Menlo,monospace; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
   .btn { background:var(--accent); color:#fff; border:none; border-radius:6px;
     padding:8px 14px; font-size:.85rem; cursor:pointer; margin-top:10px; }
+  .btn:hover { filter:brightness(.96); }
+  .btn:focus-visible, a:focus-visible, summary:focus-visible { outline:3px solid color-mix(in srgb,var(--accent) 35%,transparent);
+    outline-offset:2px; }
+  .btn:disabled { opacity:.55; cursor:not-allowed; }
   .btn-danger { background:var(--red); }
-  .btn-ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
+  .btn-ghost { background:var(--surface-soft); border:1px solid var(--border); color:var(--text); }
   table { width:100%; border-collapse:collapse; font-size:.83rem; }
   th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
   th { color:var(--muted); font-weight:500; }
@@ -396,14 +487,56 @@ _BATCH_HTML = """\
   .b-done { background:rgba(34,197,94,.2); color:var(--green); }
   .b-failed { background:rgba(239,68,68,.2); color:var(--red); }
   .b-rotating { background:rgba(249,115,22,.2); color:var(--orange); }
-  .b-pending, .b-bootstrapping, .b-logging_in { background:rgba(148,163,184,.2); color:var(--muted); }
+  .b-pending, .b-preparing, .b-provisioning, .b-bootstrapping, .b-logging_in,
+  .b-recovered, .b-interrupted { background:rgba(100,116,139,.14); color:var(--muted); }
+  .b-succeeded { background:rgba(34,197,94,.16); color:var(--green); }
+  .b-cancelled { background:rgba(100,116,139,.14); color:var(--muted); }
   .muted { color:var(--muted); font-size:.8rem; }
   .toast { position:fixed; bottom:20px; right:20px; background:var(--surface);
     border:1px solid var(--border); border-radius:8px; padding:12px 18px; opacity:0;
-    transition:opacity .3s; pointer-events:none; }
+    transition:opacity .3s; pointer-events:none; z-index:1200; box-shadow:var(--shadow); }
   .toast.show { opacity:1; } .toast.error { border-color:var(--red); }
   details { margin-top:6px; } summary { cursor:pointer; }
   .hint { font-size:.72rem; color:var(--muted); margin-top:2px; }
+  code { background:var(--surface-soft); border:1px solid var(--border); border-radius:4px;
+    padding:1px 4px; }
+  .workflow { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-top:12px; }
+  .workflow-step { background:var(--surface-soft); border:1px solid var(--border);
+    border-radius:9px; padding:10px; font-size:.78rem; text-align:center; }
+  .workflow-step b { display:block; color:var(--accent); margin-bottom:3px; }
+  .action-card { border-color:var(--orange); background:color-mix(in srgb,var(--surface) 92%,#fff7ed); }
+  .job-row { border:1px solid var(--border); border-radius:10px; padding:12px;
+    margin-bottom:10px; background:var(--surface); }
+  .job-row.job-failed { border-left:4px solid var(--red); }
+  .job-row.job-running, .job-row.job-preparing { border-left:4px solid var(--accent); }
+  .job-head { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+  .job-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
+  .job-actions .btn { margin:0; padding:5px 10px; }
+  .job-alert { background:color-mix(in srgb,var(--red) 8%,var(--surface));
+    border:1px solid color-mix(in srgb,var(--red) 35%,var(--border));
+    color:var(--red); border-radius:7px; padding:7px 9px; margin-top:8px; font-size:.8rem;
+    white-space:pre-wrap; overflow-wrap:anywhere; }
+  .cleanup-alert { color:var(--orange); border-color:color-mix(in srgb,var(--orange) 35%,var(--border));
+    background:color-mix(in srgb,var(--orange) 8%,var(--surface)); }
+  .table-scroll { overflow-x:auto; }
+  .log-dialog { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    width:90%; max-width:1040px; height:min(82vh,760px); display:flex; flex-direction:column;
+    padding:14px; box-shadow:0 24px 70px rgba(0,0,0,.25); }
+  .log-toolbar { display:flex; justify-content:space-between; align-items:center; gap:8px;
+    margin-bottom:8px; flex-wrap:wrap; }
+  .log-toolbar .btn { margin:0; padding:4px 9px; }
+  #logContent { overflow:auto; background:var(--terminal); color:var(--terminal-text);
+    padding:12px; border-radius:7px; font-size:.76rem; line-height:1.45; flex:1;
+    white-space:pre-wrap; margin:0; tab-size:2; }
+  #logMeta { color:var(--muted); font-size:.75rem; margin-bottom:7px; min-height:1.2em; }
+  @media (max-width:800px) {
+    .grid2,.grid3 { grid-template-columns:1fr; }
+    .workflow { grid-template-columns:repeat(2,1fr); }
+    .container { padding:12px; }
+    header,.job-head { align-items:flex-start; flex-direction:column; }
+    .job-actions { justify-content:flex-start; }
+    .log-dialog { width:96%; height:90vh; }
+  }
 </style>
 </head>
 <body>
@@ -413,9 +546,30 @@ _BATCH_HTML = """\
     <div>
       <a href="/fleet" id="navFleet">Fleet Dashboard</a>
       &nbsp;·&nbsp;
+      <a href="#" onclick="toggleTheme();return false" id="themeToggle">切换深色</a>
+      &nbsp;·&nbsp;
       <a href="#" onclick="forgetKey();return false" style="color:var(--muted)">换 Key</a>
     </div>
   </header>
+
+  <div class="card">
+    <h2>Job 怎么运行</h2>
+    <p class="muted">填写代码与命令后先点「Validate / Preview」，确认计划再启动。日志用于排错，结果目录才会收集并上传 S3；Job 结束后临时 Worker 会自动销毁。</p>
+    <div class="workflow">
+      <div class="workflow-step"><b>1</b>申请机器</div>
+      <div class="workflow-step"><b>2</b>初始化环境</div>
+      <div class="workflow-step"><b>3</b>登录账号</div>
+      <div class="workflow-step"><b>4</b>运行命令</div>
+      <div class="workflow-step"><b>5</b>收集结果</div>
+      <div class="workflow-step"><b>6</b>销毁 Worker</div>
+    </div>
+  </div>
+
+  <div class="card action-card" id="loginActionCard" style="display:none">
+    <h2>⚠️ Job 等待登录验证码</h2>
+    <p class="muted">自动取码未成功时，请在过期前填写 OpenAI 邮件中的 6 位验证码；否则 Job 会在登录超时后失败并自动清理 Worker。</p>
+    <div id="loginAttempts"></div>
+  </div>
 
   <!-- Accounts -->
   <div class="card">
@@ -448,7 +602,6 @@ _BATCH_HTML = """\
       <div><label>Group</label><input id="acctGroup" value="standard"></div>
     </div>
     <button class="btn" onclick="addAccount()">Add Account</button>
-    <div id="loginAttempts" style="margin-top:12px"></div>
   </div>
 
   <!-- Job submission -->
@@ -606,25 +759,40 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
 
   <!-- Jobs monitor -->
   <div class="card">
-    <h2>Jobs <span class="muted" id="jobsRefresh"></span></h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <h2>Jobs <span class="muted" id="jobsRefresh"></span></h2>
+      <button class="btn btn-ghost" id="historyToggle" style="display:none;margin:0"
+        onclick="toggleJobHistory()">显示旧历史</button>
+    </div>
+    <p class="hint" style="margin-bottom:10px">失败时先点「任务输出」看 stderr；登录、SSH、systemd 问题可在 Worker 存活时看「系统日志」。</p>
     <div id="jobsList"><p class="muted">No jobs yet.</p></div>
   </div>
 
-  <!-- Worker log viewer (fetches GET /api/nodes/{id}/logs on demand) -->
-  <div id="logModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)closeLogs()">
-    <div style="background:#12121e;border:1px solid var(--border);border-radius:10px;width:82%;max-width:940px;max-height:82vh;display:flex;flex-direction:column;padding:12px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <b id="logTitle">Worker 日志</b>
-        <span><button class="btn btn-ghost" style="padding:3px 10px" onclick="showLogs(_logWid)">↻ 刷新</button>
-        <button class="btn btn-ghost" style="padding:3px 10px" onclick="closeLogs()">✕ 关闭</button></span>
+  <!-- Job run output remains queryable after the temporary Worker is gone. -->
+  <div id="logModal" style="display:none;position:fixed;inset:0;background:var(--overlay);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)closeLogs()">
+    <div class="log-dialog" role="dialog" aria-modal="true" aria-labelledby="logTitle">
+      <div class="log-toolbar">
+        <b id="logTitle">任务输出</b>
+        <span>
+          <button class="btn btn-ghost" onclick="refreshOpenLogs(true)">↻ 刷新</button>
+          <button class="btn btn-ghost" id="logPauseBtn" onclick="toggleLogPause()">暂停刷新</button>
+          <button class="btn btn-ghost" id="logFollowBtn" onclick="toggleLogFollow()">✓ 跟随最新</button>
+          <button class="btn btn-ghost" onclick="copyLogs()">复制日志</button>
+          <button class="btn btn-ghost" onclick="downloadLogText()">下载 .txt</button>
+          <button class="btn btn-ghost" onclick="closeLogs()">✕ 关闭</button>
+        </span>
       </div>
-      <pre id="logContent" style="overflow:auto;background:#0a0a14;padding:10px;border-radius:6px;font-size:.72rem;line-height:1.35;flex:1;white-space:pre-wrap;margin:0"></pre>
+      <div id="logMeta"></div>
+      <pre id="logContent"></pre>
     </div>
   </div>
 
   <!-- Collected results (browsable / downloadable) -->
   <div class="card">
-    <h2>已收集结果 <span class="muted">· 点击下载全部</span></h2>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2>已收集结果 <span class="muted">· 点击下载全部</span></h2>
+      <button class="btn btn-ghost" style="margin:0" onclick="refreshVisibleResults(true)">刷新结果</button>
+    </div>
     <div id="resultsList"><p class="muted">No results yet.</p></div>
   </div>
 </div>
@@ -647,12 +815,32 @@ const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'a
 let eipBindingTouched = false;
 let providerType = '';
 let providerDefaultsReady;
+let latestJobs = [];
+let showLegacyHistory = false;
+let dashboardPollRunning = false;
+let dashboardPollTimer = null;
+const jobResultsCache = new Map();
 function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
+function updateThemeLabel() {
+  const button = document.getElementById('themeToggle');
+  if (button) button.textContent =
+    document.documentElement.dataset.theme === 'dark' ? '切换亮色' : '切换深色';
+}
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  sessionStorage.setItem('ea_theme', next);
+  updateThemeLabel();
+}
 async function api(method, path, body, extraHeaders={}) {
   const opts = {method, headers:{...headers, ...extraHeaders}};
   if (body) opts.body = JSON.stringify(body);
   const resp = await fetch('/api' + path, opts);
-  if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+  if (!resp.ok) {
+    const error = new Error(`${resp.status}: ${await resp.text()}`);
+    error.status = resp.status;
+    throw error;
+  }
   return resp.status === 204 ? null : resp.json();
 }
 function toast(msg, type='success') {
@@ -753,32 +941,58 @@ async function addAccount() {
   } catch(e) { toast(e.message, 'error'); }
 }
 
-async function refreshLoginAttempts() {
-  try {
-    const data = await api('GET', '/accounts/login-attempts');
-    const attempts = data.attempts || [];
-    const container = document.getElementById('loginAttempts');
-    container.replaceChildren();
-    attempts.forEach(a => {
-      const card = document.createElement('div');
-      card.style.cssText = 'border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:6px';
+function reconcileLoginAttempts(attempts) {
+  const container = document.getElementById('loginAttempts');
+  const actionCard = document.getElementById('loginActionCard');
+  const wanted = new Set(attempts.map(a => String(a.challenge_id)));
+  Array.from(container.querySelectorAll('[data-challenge-id]')).forEach(card => {
+    if (!wanted.has(card.dataset.challengeId)) card.remove();
+  });
+  attempts.forEach(a => {
+    const challengeId = String(a.challenge_id);
+    let card = Array.from(container.querySelectorAll('[data-challenge-id]'))
+      .find(node => node.dataset.challengeId === challengeId);
+    if (!card) {
+      card = document.createElement('div');
+      card.dataset.challengeId = challengeId;
+      card.style.cssText = 'border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:10px;margin-top:8px';
       const title = document.createElement('b');
-      title.textContent = `Codex OTP · ${a.account_id}`;
+      title.className = 'otp-title';
       const worker = document.createElement('span');
-      worker.className = 'muted'; worker.textContent = ` ${a.worker_id}`;
+      worker.className = 'muted otp-worker';
+      const expiry = document.createElement('div');
+      expiry.className = 'hint otp-expiry';
       const controls = document.createElement('div');
-      controls.className = 'grid2'; controls.style.marginTop = '6px';
+      controls.className = 'grid2'; controls.style.marginTop = '7px';
       const input = document.createElement('input');
-      input.id = 'otp-' + a.challenge_id; input.inputMode = 'numeric';
+      input.id = 'otp-' + challengeId; input.inputMode = 'numeric';
+      input.autocomplete = 'one-time-code';
       input.maxLength = 6; input.placeholder = '6 位验证码';
       const button = document.createElement('button');
       button.className = 'btn'; button.style.margin = '0';
       button.textContent = '提交验证码';
       button.addEventListener('click', () =>
-        submitLoginOtp(String(a.login_request_id), String(a.challenge_id)));
-      controls.append(input, button); card.append(title, worker, controls);
+        submitLoginOtp(String(a.login_request_id), challengeId));
+      input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') button.click();
+      });
+      controls.append(input, button);
+      card.append(title, worker, expiry, controls);
       container.appendChild(card);
-    });
+    }
+    card.querySelector('.otp-title').textContent = `Codex OTP · ${a.account_id}`;
+    card.querySelector('.otp-worker').textContent = ` · Worker ${a.worker_id}`;
+    const seconds = Math.max(0, Number(a.expires_at || 0) - Date.now() / 1000);
+    card.querySelector('.otp-expiry').textContent =
+      seconds > 0 ? `约 ${Math.ceil(seconds / 60)} 分钟后过期` : '验证码已过期，等待 Job 收敛';
+  });
+  actionCard.style.display = attempts.length ? 'block' : 'none';
+}
+async function refreshLoginAttempts() {
+  try {
+    const data = await api('GET', '/accounts/login-attempts');
+    const attempts = data.attempts || [];
+    reconcileLoginAttempts(attempts);
   } catch(e) { /* coordinator may not be initialized until the first Job */ }
 }
 async function submitLoginOtp(requestId, challengeId) {
@@ -1018,12 +1232,22 @@ function workerResourceHtml(worker) {
   }
   return '<span class="badge b-pending">等待清理</span>';
 }
-function workerActionsHtml(worker) {
+function jobStateLabel(state) {
+  return ({
+    preparing:'准备中', prepared:'已准备', launching:'启动中', running:'运行中',
+    succeeded:'成功', failed:'失败', cancelled:'已取消', interrupted:'中断',
+    recovered:'旧记录', unknown:'状态未知'
+  })[String(state || '').toLowerCase()] || String(state || '未知');
+}
+function workerActionsHtml(worker, jobId) {
+  const taskLog = `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
+    onclick="showJobLogs(${jsArg(jobId)},${jsArg(worker.worker_id || '')})">任务输出</button>`;
   if (!worker.worker_id || workerReleased(worker) || workerExecutionTerminal(worker)) {
-    return '<span class="muted">—</span>';
+    return taskLog;
   }
-  return `<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
-      onclick="showLogs(${jsArg(worker.worker_id)})">📄 日志</button>
+  return `${taskLog}
+    <button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem"
+      onclick="showWorkerLogs(${jsArg(worker.worker_id)})">系统日志</button>
     <button class="btn btn-danger" style="padding:2px 8px;font-size:.72rem"
       onclick="terminateWorker(${jsArg(worker.worker_id)})">终止</button>`;
 }
@@ -1062,111 +1286,417 @@ async function mapLimit(items, limit, fn) {
   }
   await Promise.all(runners);
 }
-// One job card. `r` = its results payload (or null while not yet loaded).
+function jobTime(job) {
+  return Date.parse(job.created_at || job.started_at || job.completed_at || 0) || 0;
+}
+function sortedJobs(jobs) {
+  return [...jobs].sort((a,b) => jobTime(b) - jobTime(a)
+    || String(b.job_id).localeCompare(String(a.job_id)));
+}
+function isLegacyJob(job) {
+  return job.in_memory === false
+    && ['recovered','unknown'].includes(String(job.state || '').toLowerCase());
+}
+function visibleJobs(jobs) {
+  const sorted = sortedJobs(jobs);
+  const legacy = sorted.filter(isLegacyJob);
+  const current = sorted.filter(job => !isLegacyJob(job));
+  const active = current.filter(job => !job.done);
+  const terminal = current.filter(job => job.done);
+  const recentTerminal = terminal.slice(0, 24);
+  const olderTerminal = terminal.slice(24);
+  const hiddenHistory = [...olderTerminal, ...legacy];
+  const visible = sortedJobs([
+    ...active, ...recentTerminal, ...(showLegacyHistory ? hiddenHistory : []),
+  ]);
+  const toggle = document.getElementById('historyToggle');
+  toggle.style.display = hiddenHistory.length ? 'inline-block' : 'none';
+  toggle.textContent = showLegacyHistory
+    ? `隐藏 ${hiddenHistory.length} 条历史`
+    : `显示 ${hiddenHistory.length} 条历史`;
+  return visible;
+}
+function toggleJobHistory() {
+  showLegacyHistory = !showLegacyHistory;
+  reconcileJobCards(visibleJobs(latestJobs));
+}
+function formatWhen(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+}
+function resultFor(jobId) {
+  return jobResultsCache.get(jobId)?.value || null;
+}
 function jobRowHtml(j, r) {
   const wd = j.workers_detail || [];
   const recordedWorkers = Number.isFinite(Number(j.workers))
     ? Number(j.workers) : wd.length;
+  const state = String(j.state || (j.done ? 'succeeded' : 'preparing')).toLowerCase();
   const scoreStr = (r && r.scores && r.scores.length)
     ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
   const dlBtn = (r && r.file_count)
-    ? `<button class="btn btn-ghost" style="padding:4px 10px;margin:0" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
+    ? `<button class="btn btn-ghost" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
     : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
-  const cancelBtn = !j.done
-    ? `<button class="btn btn-danger" style="padding:4px 10px;margin:0 0 0 6px" onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
+  const cancelBtn = !j.done && j.in_memory !== false
+    ? `<button class="btn btn-danger" onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
     : '';
+  const errors = [...new Set([
+    j.error, j.note, j.cancel_reason,
+    ...wd.map(worker => worker.error),
+    ...wd.map(worker => worker.collection_error),
+    ...wd.map(worker => worker.cleanup_error),
+  ].filter(Boolean).map(String))];
+  const cleanupPending = Number(j.cleanup_pending || 0);
+  const phases = Object.entries(j.phases || {})
+    .map(([phase,count]) => badge(phase)+' '+(Number(count)||0)).join(' ');
+  const created = formatWhen(j.created_at);
+  const defaultOpen = state === 'failed' || state === 'running';
   return `
-  <div id="jobrow-${esc(j.job_id)}" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <div><b>${esc(j.name||'')}</b> <span class="muted">${esc(j.job_id)}</span> ·
-        ${Object.entries(j.phases||{}).map(([p,n]) => badge(p)+' '+(Number(n)||0)).join(' ')}</div>
-      <div>${dlBtn}${cancelBtn}</div>
+  <div id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}" data-job-id="${esc(j.job_id)}">
+    <div class="job-head">
+      <div>
+        <div><b>${esc(j.name||'')}</b> ${badge(state)}
+          <span class="muted">${esc(j.job_id)}</span></div>
+        <div class="muted" style="margin-top:5px">${phases || jobStateLabel(state)}
+          ${created ? ` · 提交 ${esc(created)}` : ''}</div>
+      </div>
+      <div class="job-actions">
+        <button class="btn btn-ghost" onclick="showJobLogs(${jsArg(j.job_id)},'')">📄 任务输出</button>
+        ${dlBtn}${cancelBtn}
+      </div>
     </div>
+    ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
+    ${cleanupPending ? `<div class="job-alert cleanup-alert">正在清理 ${cleanupPending} 个 Worker / 租约，请勿重复提交同一账号。</div>` : ''}
     ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
     ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
-    <details><summary class="muted">${recordedWorkers} 条 Worker 执行记录</summary>
-    <table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>执行状态</th>
+    <details ${defaultOpen ? 'open' : ''}><summary class="muted">${recordedWorkers} 条 Worker 执行记录</summary>
+    <div class="table-scroll"><table style="margin-top:6px"><thead><tr><th>shard</th><th>worker</th><th>执行状态</th>
       <th>资源状态</th><th>accounts (加粗=当前使用)</th><th>rot</th><th>error</th><th>操作</th></tr></thead><tbody>
-    ${wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
+    ${wd.length ? wd.map(w => `<tr><td>${Number(w.shard_index)||0}</td>
       <td>${esc((w.worker_id||'').substring(0,14))}</td><td>${badge(w.phase)}</td>
       <td>${workerResourceHtml(w)}</td>
       <td>${(w.accounts&&w.accounts.length) ? w.accounts.map(a => a.active ? '<b>'+esc(a.email||a.account_id)+'</b>' : esc(a.email||a.account_id)).join('<br>') : esc(w.account_email||'--')}</td>
       <td>${Number(w.rotations)||0}</td>
       <td class="muted">${esc(w.error||'')}</td>
-      <td>${workerActionsHtml(w)}</td></tr>`).join('')}
-    </tbody></table></details>
+      <td>${workerActionsHtml(w,j.job_id)}</td></tr>`).join('')
+      : `<tr><td colspan="8" class="muted">${j.in_memory === false
+          ? '这是 Manager 重启前的历史记录，没有可操作的在线 Worker。'
+          : 'Worker 尚未创建或状态尚未上报。'}</td></tr>`}
+    </tbody></table></div></details>
   </div>`;
 }
-async function refreshJobs() {
-  try {
-    const d = await api('GET', '/jobs');
-    const jobs = d.jobs || [];
-    if (!jobs.length) {
-      document.getElementById('jobsList').innerHTML = '<p class="muted">No jobs yet.</p>';
-      document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
-      return;
-    }
-    // Render immediately from the list response (it already carries phases +
-    // workers_detail) so the panel never blanks. Then enrich each card with its
-    // results lazily, capped concurrency + per-item catch — a slow or failing
-    // /results lookup can no longer take the whole render down. (The old code
-    // fired 2 requests per job with no catch; once jobs piled up the flood timed
-    // out, Promise.all rejected, and it silently fell back to "No jobs yet".)
-    document.getElementById('jobsList').innerHTML = jobs.map(j => jobRowHtml(j, null)).join('');
-    document.getElementById('jobsRefresh').textContent = '· ' + new Date().toLocaleTimeString();
-    await mapLimit(jobs, 4, async (j) => {
-      const r = await api('GET', '/jobs/' + j.job_id + '/results').catch(() => null);
-      if (r && (r.file_count || (r.scores && r.scores.length) || r.s3_uri)) {
-        const el = document.getElementById('jobrow-' + j.job_id);
-        if (el) el.outerHTML = jobRowHtml(j, r);
-      }
-    });
-  } catch (e) { /* silent — keep whatever is already rendered */ }
+function jobRenderSignature(job, result) {
+  return JSON.stringify([job, result || null]);
 }
-
-var _logWid = null;
-async function showLogs(wid) {
-  if (!wid) return;
-  _logWid = wid;
-  document.getElementById('logModal').style.display = 'flex';
-  document.getElementById('logTitle').textContent = 'Worker 日志 · ' + wid;
-  const pre = document.getElementById('logContent');
-  pre.textContent = '加载中…';
+function makeJobNode(job) {
+  const template = document.createElement('template');
+  const result = resultFor(job.job_id);
+  template.innerHTML = jobRowHtml(job, result).trim();
+  const node = template.content.firstElementChild;
+  node._renderSignature = jobRenderSignature(job, result);
+  return node;
+}
+function reconcileJobCards(jobs) {
+  const list = document.getElementById('jobsList');
+  if (!jobs.length) {
+    if (list.dataset.empty !== 'true') {
+      list.textContent = '';
+      const empty = document.createElement('p');
+      empty.className = 'muted'; empty.textContent = 'No jobs yet.';
+      list.appendChild(empty); list.dataset.empty = 'true';
+    }
+    return;
+  }
+  delete list.dataset.empty;
+  Array.from(list.children).forEach(node => {
+    if (!node.classList.contains('job-row')) node.remove();
+  });
+  const wanted = new Set(jobs.map(job => String(job.job_id)));
+  Array.from(list.querySelectorAll('.job-row')).forEach(node => {
+    if (!wanted.has(node.dataset.jobId)) node.remove();
+  });
+  jobs.forEach((job, index) => {
+    const id = String(job.job_id);
+    const result = resultFor(id);
+    const signature = jobRenderSignature(job, result);
+    let node = document.getElementById('jobrow-' + id);
+    if (!node) {
+      node = makeJobNode(job);
+    } else if (node._renderSignature !== signature) {
+      const wasOpen = Boolean(node.querySelector('details')?.open);
+      const replacement = makeJobNode(job);
+      const replacementDetails = replacement.querySelector('details');
+      if (replacementDetails) replacementDetails.open = wasOpen;
+      node.replaceWith(replacement);
+      node = replacement;
+    }
+    const current = list.children[index] || null;
+    if (node !== current) list.insertBefore(node, current);
+  });
+}
+async function refreshJobResults(jobs, force=false) {
+  const now = Date.now();
+  const candidates = jobs.filter(job => {
+    const cached = jobResultsCache.get(job.job_id);
+    return force || !cached || now >= Number(cached.nextCheck || 0);
+  }).slice(0, 30);
+  await mapLimit(candidates, 3, async job => {
+    try {
+      const value = await api('GET', '/jobs/' + encodeURIComponent(job.job_id) + '/results');
+      jobResultsCache.set(job.job_id, {
+        value,
+        nextCheck: job.done ? Number.POSITIVE_INFINITY : Date.now() + 30_000,
+      });
+    } catch(error) {
+      jobResultsCache.set(job.job_id, {
+        value: jobResultsCache.get(job.job_id)?.value || null,
+        nextCheck: Date.now() + (job.done ? 60_000 : 30_000),
+        error: error.message,
+      });
+    }
+  });
+  reconcileJobCards(visibleJobs(latestJobs));
+  refreshResults();
+}
+let jobsRequestRunning = false;
+async function refreshJobs() {
+  if (jobsRequestRunning) return;
+  jobsRequestRunning = true;
   try {
-    const d = await api('GET', '/nodes/' + encodeURIComponent(wid) + '/logs?lines=400');
-    pre.textContent = d.logs || '(空)';
-    pre.scrollTop = pre.scrollHeight;   // jump to newest
-  } catch(e) {
-    pre.textContent = '拉取日志失败：' + (e.message||e) + '\\n（实例可能已终止/未就绪，或 SSH 不可达）';
+    const data = await api('GET', '/jobs');
+    latestJobs = data.jobs || [];
+    const jobs = visibleJobs(latestJobs);
+    reconcileJobCards(jobs);
+    document.getElementById('jobsRefresh').textContent =
+      '· 已更新 ' + new Date().toLocaleTimeString();
+    await refreshJobResults(jobs);
+  } catch (error) {
+    document.getElementById('jobsRefresh').textContent =
+      '· 刷新失败，保留当前快照 · ' + new Date().toLocaleTimeString();
+  } finally {
+    jobsRequestRunning = false;
   }
 }
-function closeLogs() { document.getElementById('logModal').style.display = 'none'; _logWid = null; }
 
-async function refreshResults() {
+var _logWid = '';
+var _logJobId = '';
+var _logMode = 'job';
+var _logTimer = null;
+var _logPaused = false;
+var _logFollowing = true;
+var _logLoading = false;
+var _logContextVersion = 0;
+var _logLastText = '';
+function updateLogControls() {
+  document.getElementById('logPauseBtn').textContent =
+    _logPaused ? '继续刷新' : '暂停刷新';
+  document.getElementById('logFollowBtn').textContent =
+    (_logFollowing ? '✓ ' : '') + '跟随最新';
+}
+function scheduleLogRefresh() {
+  clearTimeout(_logTimer);
+  if (!document.hidden && !_logPaused
+      && document.getElementById('logModal').style.display === 'flex') {
+    _logTimer = setTimeout(() => refreshOpenLogs(false), 3_000);
+  }
+}
+function showJobLogs(jobId, wid='') {
+  if (!jobId) return;
+  const changed = _logMode !== 'job' || _logJobId !== jobId || _logWid !== wid;
+  if (changed) _logContextVersion += 1;
+  _logMode = 'job'; _logJobId = jobId; _logWid = wid;
+  _logPaused = false; _logFollowing = true;
+  document.getElementById('logModal').style.display = 'flex';
+  document.getElementById('logTitle').textContent =
+    '任务输出 · ' + jobId + (wid ? ' · ' + wid : '');
+  if (changed) {
+    document.getElementById('logContent').textContent = '加载中…';
+    document.getElementById('logMeta').textContent = '';
+  }
+  updateLogControls();
+  refreshOpenLogs(true);
+}
+function showWorkerLogs(wid) {
+  if (!wid) return;
+  const changed = _logMode !== 'worker' || _logWid !== wid;
+  if (changed) _logContextVersion += 1;
+  _logMode = 'worker'; _logWid = wid; _logJobId = '';
+  _logPaused = false; _logFollowing = true;
+  document.getElementById('logModal').style.display = 'flex';
+  document.getElementById('logTitle').textContent = 'Worker 系统日志 · ' + wid;
+  if (changed) {
+    document.getElementById('logContent').textContent = '加载中…';
+    document.getElementById('logMeta').textContent = '';
+  }
+  updateLogControls();
+  refreshOpenLogs(true);
+}
+function showLogs(wid) { showWorkerLogs(wid); }
+function formatJobLog(data) {
+  if (!(data.entries || []).length) return data.message || '(暂无命令输出)';
+  return data.entries.map(entry => {
+    const parsed = entry.timestamp ? new Date(entry.timestamp) : null;
+    const timestamp = parsed && !Number.isNaN(parsed.getTime())
+      ? parsed.toLocaleTimeString() : '--:--:--';
+    return `[${timestamp}] ${String(entry.stream || 'stdout').padEnd(6)} | ${entry.data || ''}`;
+  }).join('\\n');
+}
+async function refreshOpenLogs(force=false) {
+  if (_logLoading || (_logPaused && !force)) return;
+  _logLoading = true;
+  const contextVersion = _logContextVersion;
+  const mode = _logMode;
+  const jobId = _logJobId;
+  const workerId = _logWid;
+  const pre = document.getElementById('logContent');
+  const distance = pre.scrollHeight - pre.scrollTop - pre.clientHeight;
+  const wasNearBottom = distance < 70;
   try {
-    const d = await api('GET', '/results');
-    const jobs = d.jobs || [];
-    if (!jobs.length) { document.getElementById('resultsList').innerHTML = '<p class="muted">No results yet.</p>'; return; }
-    document.getElementById('resultsList').innerHTML = jobs.map(j => {
-      const scoreStr = (j.scores && j.scores.length)
-        ? j.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
-        : '';
-      return `<div style="display:flex;justify-content:space-between;align-items:center;
-          border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
-        <div><b>${esc(j.job_id)}</b> <span class="muted">(${Number(j.file_count)||0} 文件)</span>
-          ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
-          ${j.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(j.s3_uri)+'</div>' : ''}</div>
-        <button class="btn" style="margin:0" onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载全部</button>
-      </div>`;
-    }).join('');
-  } catch(e) { /* silent */ }
+    if (mode === 'job') {
+      let path = '/jobs/' + encodeURIComponent(jobId) + '/logs?lines=1000';
+      if (workerId) path += '&worker_id=' + encodeURIComponent(workerId);
+      const data = await api('GET', path);
+      if (contextVersion !== _logContextVersion) return;
+      _logLastText = formatJobLog(data);
+      pre.textContent = _logLastText;
+      const source = data.source === 'archive' ? '已归档'
+        : data.source === 'live' ? '实时缓冲'
+        : data.source === 'mixed' ? '实时 + 归档' : '无日志';
+      document.getElementById('logMeta').textContent =
+        `${source} · 显示 ${data.returned || 0}/${data.total || 0} 行`
+        + (data.truncated ? ' · 较早内容已裁剪' : '')
+        + (data.message ? ' · ' + data.message : '');
+      if (['live','pending'].includes(data.status)) scheduleLogRefresh();
+      else clearTimeout(_logTimer);
+    } else {
+      const data = await api(
+        'GET', '/nodes/' + encodeURIComponent(workerId) + '/logs?lines=800',
+      );
+      if (contextVersion !== _logContextVersion) return;
+      _logLastText = data.logs || '(系统日志为空)';
+      pre.textContent = _logLastText;
+      document.getElementById('logMeta').textContent =
+        '临时 Worker 的 systemd journal；Worker 销毁后请改看任务输出。';
+      scheduleLogRefresh();
+    }
+    if (_logFollowing && (wasNearBottom || force)) pre.scrollTop = pre.scrollHeight;
+  } catch(error) {
+    if (contextVersion !== _logContextVersion) return;
+    document.getElementById('logMeta').textContent =
+      '刷新失败：' + (error.message || error)
+      + (_logMode === 'worker'
+        ? '；Worker 可能已销毁，请返回 Job 卡片查看任务输出。' : '');
+    scheduleLogRefresh();
+  } finally {
+    _logLoading = false;
+    if (contextVersion !== _logContextVersion && (_logJobId || _logWid)) {
+      refreshOpenLogs(true);
+    }
+  }
+}
+function closeLogs() {
+  _logContextVersion += 1;
+  clearTimeout(_logTimer); _logTimer = null;
+  document.getElementById('logModal').style.display = 'none';
+  _logWid = ''; _logJobId = ''; _logLastText = '';
+}
+function toggleLogPause() {
+  _logPaused = !_logPaused; updateLogControls();
+  if (_logPaused) clearTimeout(_logTimer); else refreshOpenLogs(true);
+}
+function toggleLogFollow() {
+  _logFollowing = !_logFollowing; updateLogControls();
+  if (_logFollowing) {
+    const pre = document.getElementById('logContent');
+    pre.scrollTop = pre.scrollHeight;
+  }
+}
+async function copyLogs() {
+  try {
+    await navigator.clipboard.writeText(
+      _logLastText || document.getElementById('logContent').textContent,
+    );
+    toast('日志已复制');
+  } catch(error) { toast('复制失败：' + error.message, 'error'); }
+}
+function downloadLogText() {
+  const blob = new Blob([
+    _logLastText || document.getElementById('logContent').textContent,
+  ], {type:'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = (_logJobId || _logWid || 'elastic-agent') + '-logs.txt';
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function refreshResults() {
+  const list = document.getElementById('resultsList');
+  const jobs = sortedJobs(latestJobs).map(job => resultFor(job.job_id))
+    .filter(result => result && (result.file_count || result.s3_uri));
+  const signature = JSON.stringify(jobs);
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
+  if (!jobs.length) {
+    list.innerHTML = '<p class="muted">暂无已收集结果；Job 完成后会在这里显示。</p>';
+    return;
+  }
+  list.innerHTML = jobs.map(result => {
+    const scoreStr = (result.scores && result.scores.length)
+      ? result.scores.map(score => `${esc(score.task_id)} ${esc(score.prompt_level)}: <b>${Number(score.final_score||0).toFixed(1)}</b>`).join(' · ')
+      : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;
+        border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
+      <div><b>${esc(result.job_id)}</b> <span class="muted">(${Number(result.file_count)||0} 文件)</span>
+        ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
+        ${result.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(result.s3_uri)+'</div>' : ''}</div>
+      <button class="btn" style="margin:0" onclick="downloadResults(${jsArg(result.job_id)})">⬇ 下载全部</button>
+    </div>`;
+  }).join('');
+}
+async function refreshVisibleResults(force=false) {
+  const jobs = visibleJobs(latestJobs);
+  if (force) jobs.forEach(job => {
+    const cached = jobResultsCache.get(job.job_id);
+    if (cached) cached.nextCheck = 0;
+  });
+  await refreshJobResults(jobs, force);
+}
+function scheduleDashboardPoll(delay=5_000) {
+  clearTimeout(dashboardPollTimer);
+  dashboardPollTimer = setTimeout(runDashboardPoll, delay);
+}
+async function runDashboardPoll() {
+  if (dashboardPollRunning) return;
+  if (document.hidden) { scheduleDashboardPoll(5_000); return; }
+  dashboardPollRunning = true;
+  try {
+    await Promise.allSettled([refreshJobs(), refreshLoginAttempts()]);
+  } finally {
+    dashboardPollRunning = false;
+    scheduleDashboardPoll(5_000);
+  }
 }
 
+document.getElementById('logContent').addEventListener('scroll', () => {
+  const pre = document.getElementById('logContent');
+  if (_logFollowing && pre.scrollHeight - pre.scrollTop - pre.clientHeight > 90) {
+    _logFollowing = false; updateLogControls();
+  }
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) clearTimeout(_logTimer);
+  else {
+    scheduleDashboardPoll(0);
+    if (_logJobId || _logWid) scheduleLogRefresh();
+  }
+});
+updateThemeLabel();
 updateEipBindingUI(); updateAgentUI();
 providerDefaultsReady = initializeProviderDefaults();
-refreshAccounts(); refreshJobs(); refreshResults(); refreshLoginAttempts();
-setInterval(() => { refreshJobs(); refreshResults(); refreshLoginAttempts(); }, 5000);
+refreshAccounts(); refreshResults(); runDashboardPoll();
 </script>
 </body>
 </html>
