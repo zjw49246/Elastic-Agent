@@ -410,3 +410,5 @@
 **以后避免**：轮询页面不能把“拿到新响应”等同于“必须重建 DOM”，也不能让历史数线性放大请求；先按数据签名判断、保留交互状态、隐藏页停表、异步请求不重叠。临时计算资源的可观测性必须在销毁前完成耐久提交，但日志耐久性不能反过来阻止资源清理。任何按 task 有界的存储还必须同时核算 Job/全局最坏 fan-out×rotation，并让配额删除留下可查询的截断证明。
 
 **验证**：先以红测试复现损坏 JSON 顶层、全量日志读取、配额缺失、截断假阴性、归档/取消竞态、历史 results 饥饿、隐藏页轮询和 Fleet 0→1 空状态；修复后相关 350 项与最终完整套件 **2091 passed / 12 skipped / 0 failed**。Ruff、`compileall`、Batch/Fleet JavaScript、依赖锁 dry-run、diff check 全部通过；Chrome 149 真实 DOM/截图验证浅色表单、失败卡、任务输出、结果区和 Fleet 0→1 均正常，三轮独立复审最终无 blocker/high。
+
+**生产发布（runtime `e56a312`）**：代码推送 `origin/main` 后，先确认东京 Manager 真正内存态活跃 Job、Node、allocation、OTP challenge、非终态 managed EC2 和已挂载 EIP 均为 0；63 条 `recovered` 是旧 journal 历史，不误作活任务。最终路径 `/home/ubuntu/elastic-agent.release-e56a312` 执行 frozen AWS-extra 安装、boto3/源码路径和版本化 unit/env 校验后原子切换，旧 `8592bad` 与配置备份保留。域名 health/浅色 UI/任务输出入口正常，旧失败 Job logs 返回明确 `unavailable` 与 `Cache-Control: no-store`；发布后资源仍全为 0，3 个账号 EIP 均未挂载，新 systemd Invocation 的 ERROR/Traceback/Exception pattern 为 0。为避免无意义费用，本次未额外创建 EC2 canary。
