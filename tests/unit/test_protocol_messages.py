@@ -197,13 +197,28 @@ class TestManagerToWorkerMessages:
             email_token="",
             config_dir="/root/.codex-a",
             provider="imap",
+            login_timeout_seconds=1100,
         )
         restored = parse_message(msg.model_dump_json())
         assert isinstance(restored, AccountLoginMessage)
         assert restored.agent_type == "codex"
         assert restored.password == "correct horse battery staple"
         assert restored.provider == "imap"
+        assert restored.login_timeout_seconds == 1100
         assert "correct horse battery staple" not in repr(msg)
+
+    def test_account_login_old_payload_gets_safe_worker_timeout_default(self):
+        restored = parse_message({
+            "type": "ACCOUNT_LOGIN",
+            "login_request_id": "login-old",
+            "account_id": "codex-old",
+            "agent_type": "codex",
+            "email": "old@example.com",
+            "config_dir": "/root/.codex-old",
+        })
+
+        assert isinstance(restored, AccountLoginMessage)
+        assert restored.login_timeout_seconds == 900
 
     def test_account_login_otp_roundtrip(self):
         msg = AccountLoginOtpMessage(

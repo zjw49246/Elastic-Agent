@@ -138,6 +138,7 @@ class TestHealthEndpoint:
         assert data["status"] == "healthy"
         assert "uptime_seconds" in data
         assert data["worker_count"] == 0
+        assert data["provider"] == "aliyun"
 
 
 # ------------------------------------------------------------------

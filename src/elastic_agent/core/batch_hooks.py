@@ -265,7 +265,7 @@ class LoginCoordinator:
         connection_manager,
         event_bus,
         *,
-        timeout: float = 2700.0,
+        timeout: float = 3600.0,
         cancel_timeout: float = 60.0,
         quarantine_account: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
@@ -492,6 +492,7 @@ class LoginCoordinator:
         provider: str | None = None, slot_index: int = 0,
         *, allow_legacy_result: bool = False,
         quarantine_on_uncertain_cleanup: bool = True,
+        login_timeout_seconds: int = 900,
     ) -> LoginOutcome:
         from elastic_agent.core.protocols.messages import (
             AccountLoginCancelMessage,
@@ -557,6 +558,7 @@ class LoginCoordinator:
                 account_id=account.id, email=account.email, email_token=account.email_token,
                 password=account.password, agent_type=account.agent_type,
                 config_dir=config_dir, provider=provider, slot_index=slot_index,
+                login_timeout_seconds=login_timeout_seconds,
             ))
             data = await asyncio.wait_for(fut, timeout=self._timeout)
         except asyncio.TimeoutError:
@@ -918,6 +920,7 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
             # its durable claim. Ordinary workers remain alive, so uncertain
             # browser cleanup must quarantine the account from future jobs.
             quarantine_on_uncertain_cleanup=spec.account.binding != "eip",
+            login_timeout_seconds=spec.account.login_timeout_seconds,
         )
 
     return login
@@ -1288,7 +1291,7 @@ def wire_batch(
     *,
     include_pty: bool = False,
     scale_in_on_complete: bool = True,
-    login_timeout: float = 2700.0,
+    login_timeout: float = 3600.0,
 ) -> BatchOrchestrator:
     """Build a fully-wired BatchOrchestrator and route worker events into it."""
     allocator = getattr(manager, "account_allocator", None)
@@ -1322,7 +1325,7 @@ def wire_batch(
         # Claim ROTATING synchronously, then return so the connection layer can
         # ACK this durable event and resume the worker's sole WS receive loop.
         # A dynamic rotation's ACCOUNT_LOGIN_RESULT arrives on that same loop;
-        # awaiting the login here would deadlock it until the 2700s timeout.
+        # awaiting the login here would deadlock it until the 3600s timeout.
         orch.defer_exhausted(
             worker_id,
             task_id=data.get("task_id"),

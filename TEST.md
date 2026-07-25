@@ -157,7 +157,8 @@ The focused suite covers:
   report their release proof explicitly, display destroyed resources as history,
   and suppress live log/terminate actions after teardown.
 - agent-type-aware account uniqueness/allocation, Codex password/email-token
-  one-of validation, explicit secret clearing, and token-only email-code switching, and
+  one-of validation, explicit secret clearing, token-only email/one-time/login-code
+  switching, bounded anti-bot diagnostics, 900-second worker timeout propagation, and
   write-only `has_password`/`has_email_token` REST behavior;
 - correlated OTP-required events, six-digit validation, stale/mismatched
   challenge rejection, 32-hex injection protection, one-shot forwarding, retry

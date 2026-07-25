@@ -1164,6 +1164,7 @@ class TestHandleAccountLogin:
         assert kwargs["token_171"] == ""
         assert kwargs["codex_home"] == "/root/.codex-a1"
         assert kwargs["attempt_id"] == "login-request-1"
+        assert kwargs["timeout"] == 900
         result = next(
             item for item in sent if isinstance(item, AccountLoginResultMessage)
         )

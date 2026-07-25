@@ -427,7 +427,7 @@ _BATCH_HTML = """\
       会在下方等待管理员输入 6 位验证码。
     </p>
     <table><thead><tr><th>ID</th><th>Agent</th><th>Email</th><th>Secrets</th>
-      <th>Group</th><th>Enabled</th><th>当前绑定 worker</th><th></th></tr></thead>
+      <th>Group</th><th>Enabled</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
       <tbody id="acctRows"></tbody></table>
     <div class="grid3" style="margin-top:12px">
       <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
@@ -542,22 +542,25 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     </div>
     <div class="grid3">
       <div><label>Account mode</label>
-        <select id="jAcctMode"><option value="worker_local_login">worker_local_login</option>
+        <select id="jAcctMode" onchange="updateAccountModeUI()">
+          <option value="worker_local_login">worker_local_login</option>
           <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
       <div><label>Agent</label><select id="jAgentType" onchange="updateAgentUI()">
         <option value="claude">Claude</option><option value="codex">Codex</option>
       </select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
     </div>
-    <div class="grid2">
+    <div class="grid3">
       <div><label>config_dir（空 = Agent 默认目录）</label>
         <input id="jConfigDir" placeholder="留空，或填写 worker 上的绝对路径"></div>
       <div><label>Accounts per worker</label>
         <input id="jPerWorker" type="number" value="1" min="1" max="32"></div>
+      <div><label>自动登录页面超时秒（60–1200）</label>
+        <input id="jLoginTimeout" type="number" value="900" min="60" max="1200"></div>
     </div>
     <div class="grid2">
       <div><label>账号固定 EIP</label>
-        <select id="jAcctBinding" onchange="updateEipBindingUI()">
+        <select id="jAcctBinding" onchange="markEipBindingTouched()">
           <option value="none">关闭（普通临时 EC2）</option>
           <option value="eip">启用（一号一 IP）</option>
         </select></div>
@@ -641,6 +644,9 @@ if (!API_KEY) {
 const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
                         : {'Content-Type':'application/json'};
 {const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet';}
+let eipBindingTouched = false;
+let providerType = '';
+let providerDefaultsReady;
 function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
 async function api(method, path, body, extraHeaders={}) {
   const opts = {method, headers:{...headers, ...extraHeaders}};
@@ -670,18 +676,34 @@ async function refreshAccounts() {
     const d = await api('GET', '/accounts');
     const accounts = d.accounts || [];
     let alloc = {};
+    let eipBindings = {};
     try { alloc = (await api('GET', '/accounts/allocations')).allocations || {}; } catch(e) {}
+    try {
+      const response = await api('GET', '/accounts/bindings');
+      (response.bindings || []).forEach(binding => {
+        eipBindings[binding.account_id] = binding;
+      });
+    } catch(e) {}
     document.getElementById('acctRows').innerHTML = accounts.map(a => {
       const b = alloc[a.id] || [];
-      const bind = b.length
-        ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} <span class="muted">(${esc(x.job_name||x.job_id)}·${esc(x.phase)}${x.active?'·当前':''})</span>`).join('<br>')
+      const active = b.length
+        ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} `
+          + `<span class="muted">(${esc(x.job_name||x.job_id)}·`
+          + `${esc(x.phase)}${x.active?'·当前':''})</span>`).join('<br>')
         : '<span class="muted">空闲</span>';
+      const durable = eipBindings[a.id];
+      const eipValue = durable
+        ? durable.eip_ip || durable.eip_allocation_id || '分配中'
+        : '';
+      const eip = durable
+        ? `${esc(eipValue)} <span class="muted">(${esc(durable.state)})</span>`
+        : '<span class="muted">无 EIP</span>';
       const secrets = `${a.has_password ? 'password' : ''}`
         + `${a.has_password && a.has_email_token ? ' + ' : ''}`
         + `${a.has_email_token ? 'mail token' : ''}` || '—';
       return `<tr><td>${esc(a.id)}</td><td>${esc(a.agent_type)}</td><td>${esc(a.email)}</td>
         <td>${esc(secrets)}</td><td>${esc(a.group)}</td><td>${esc(a.enabled)}</td>
-        <td style="font-size:.72rem">${bind}</td>
+        <td style="font-size:.72rem">${eip}<br>${active}</td>
         <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
             onclick="removeAccount(${jsArg(a.id)})">✕</button></td></tr>`;
     }).join('') || '<tr><td colspan="8" class="muted">No accounts.</td></tr>';
@@ -695,7 +717,11 @@ async function refreshAccounts() {
       option.value = a.id;
       option.dataset.agentType = a.agent_type;
       option.dataset.enabled = String(Boolean(a.enabled));
-      option.textContent = `${a.agent_type} · ${a.email || a.id} · ${a.group || 'standard'} (${a.id})`;
+      const durable = eipBindings[a.id];
+      const eipLabel = durable
+        ? ` · EIP ${durable.eip_ip || durable.eip_allocation_id || durable.state}`
+        : '';
+      option.textContent = `${a.agent_type} · ${a.email || a.id} · ${a.group || 'standard'} (${a.id})${eipLabel}`;
       option.disabled = !a.enabled || a.agent_type !== selectedAgent;
       option.selected = selected.has(a.id) && !option.disabled;
       picker.appendChild(option);
@@ -799,8 +825,28 @@ function buildKeyValueLines(id) {
 }
 function buildEnv() { return buildKeyValueLines('jEnv'); }
 function buildSecretEnv() { return buildKeyValueLines('jSecretEnv'); }
+function markEipBindingTouched() {
+  eipBindingTouched = true;
+  updateEipBindingUI();
+}
+async function initializeProviderDefaults() {
+  try {
+    const health = await api('GET', '/health');
+    providerType = health.provider || '';
+    updateAccountModeUI();
+  } catch(e) {}
+}
+function updateAccountModeUI() {
+  const workerLocal = document.getElementById('jAcctMode').value === 'worker_local_login';
+  const binding = document.getElementById('jAcctBinding');
+  binding.disabled = !workerLocal;
+  if (!workerLocal) binding.value = 'none';
+  else if (providerType === 'aws' && !eipBindingTouched) binding.value = 'eip';
+  updateEipBindingUI();
+}
 function updateEipBindingUI() {
-  const enabled = document.getElementById('jAcctBinding').value === 'eip';
+  const enabled = document.getElementById('jAcctMode').value === 'worker_local_login'
+    && document.getElementById('jAcctBinding').value === 'eip';
   const picker = document.getElementById('jAcctIds');
   const rotation = document.getElementById('jRot');
   const perWorker = document.getElementById('jPerWorker');
@@ -822,6 +868,7 @@ function updateAgentUI() {
   if (agentType === 'codex' && accountMode.value === 'manager_distribute') {
     accountMode.value = 'worker_local_login';
   }
+  updateAccountModeUI();
   Array.from(picker.options).forEach(option => {
     option.disabled = option.dataset.enabled !== 'true' || option.dataset.agentType !== agentType;
     if (option.disabled) option.selected = false;
@@ -877,6 +924,7 @@ function buildJobSpec() {
               group: document.getElementById('jAcctGroup').value.trim() || 'standard',
               per_worker: parseInt(document.getElementById('jPerWorker').value) || 1,
               config_dir: document.getElementById('jConfigDir').value.trim(),
+              login_timeout_seconds: parseInt(document.getElementById('jLoginTimeout').value) || 900,
               binding: accountBinding,
               ids: accountIds},
     rotation: {strategy: document.getElementById('jRot').value,
@@ -905,6 +953,7 @@ async function previewJob() {
   const label = button.textContent;
   button.disabled = true; button.textContent = 'Validating…';
   try {
+    await providerDefaultsReady;
     const plan = await api('POST', '/jobs/plan', buildJobSpec());
     showJobPlan(plan); toast('Job plan valid'); return plan;
   } catch(e) { toast(e.message, 'error'); throw e; }
@@ -915,6 +964,7 @@ async function submitJob() {
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
   try {
+    await providerDefaultsReady;
     const spec = buildJobSpec();
     // Pure preflight first: no spec journal, account claim or EC2 is created
     // until this succeeds. The backend repeats the same check at submit time.
@@ -1113,7 +1163,9 @@ async function refreshResults() {
   } catch(e) { /* silent */ }
 }
 
-updateEipBindingUI(); updateAgentUI(); refreshAccounts(); refreshJobs(); refreshResults(); refreshLoginAttempts();
+updateEipBindingUI(); updateAgentUI();
+providerDefaultsReady = initializeProviderDefaults();
+refreshAccounts(); refreshJobs(); refreshResults(); refreshLoginAttempts();
 setInterval(() => { refreshJobs(); refreshResults(); refreshLoginAttempts(); }, 5000);
 </script>
 </body>

@@ -44,6 +44,8 @@ from elastic_agent.core.secret_env import parse_secret_reference
 DEFAULT_RUN_TIMEOUT_SECONDS = 86_400
 DEFAULT_JOB_TTL_SECONDS = 172_800
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
+DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
+MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _S3_URI_RE = re.compile(
     r"s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/(?P<key>.*))?"
@@ -508,6 +510,14 @@ class AccountSpec(StrictSpecModel):
     # worker; an empty list lets the allocator choose from ``group``.
     binding: Literal["none", "eip"] = "none"
     ids: list[str] = Field(default_factory=list)
+    # Browser automation only. Manager coordination has a larger fixed budget
+    # so OTP waits, identity validation, smoke testing, and cleanup cannot race
+    # this deadline.
+    login_timeout_seconds: int = Field(
+        default=DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS,
+        ge=60,
+        le=MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS,
+    )
     # Where credentials are written on the worker. Empty == the selected CLI's
     # default (~/.claude or ~/.codex). An absolute path is required when
     # per_worker > 1 (distinct dirs per account).

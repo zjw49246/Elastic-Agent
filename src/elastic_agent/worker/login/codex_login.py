@@ -32,13 +32,18 @@ from typing import Any
 
 import httpx
 
-DEFAULT_LOGIN_TIMEOUT = 300
+# Browser automation gets its own budget.  It must remain shorter than the
+# Manager's end-to-end ACCOUNT_LOGIN timeout because CLI startup, auth.json
+# commit, the real Codex smoke test, and cancellation cleanup happen outside
+# this state machine.
+DEFAULT_LOGIN_TIMEOUT = 900
 AUTH_URL_TIMEOUT = 30
 AUTH_JSON_WAIT = 30
 SMOKE_TIMEOUT = 120
 STATE_STEP_PAUSE_MS = 2_500
 MANUAL_OTP_TIMEOUT = 600
 MAX_OTP_ATTEMPTS = 3
+BOT_CHALLENGE_TIMEOUT = 120
 
 LOGIN_EVENT_PREFIX = "ELASTIC_CODEX_LOGIN_EVENT:"
 
@@ -72,6 +77,11 @@ OTP_ERROR_SELECTOR = (
     '[role="alert"], [aria-live="assertive"], [data-error-code], '
     '[data-testid*="error"], [class*="error"]'
 )
+BOT_CHALLENGE_SELECTOR = (
+    'iframe[src*="challenges.cloudflare.com"], '
+    'iframe[title*="challenge" i], '
+    '#challenge-running, #challenge-stage, [class*="cf-challenge"]'
+)
 OTP_ERROR_RE = re.compile(
     r"(?:\b(?:invalid|incorrect|wrong|expired)\b.*\bcode\b|"
     r"\bcode\b.*\b(?:invalid|incorrect|wrong|expired)\b|"
@@ -82,8 +92,10 @@ OTP_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 EMAIL_CODE_ACTION_RE = re.compile(
-    r"continue with (?:email )?code|use (?:an? )?(?:email )?code|"
-    r"email me a code|log in with (?:an? )?(?:one[- ]time )?code|"
+    r"continue with (?:an? )?(?:(?:email|one[- ]time|login) )?code|"
+    r"use (?:an? )?(?:(?:email|one[- ]time|login) )?code|"
+    r"email me (?:an? )?(?:login )?code|"
+    r"log in with (?:an? )?(?:one[- ]time )?code|"
     r"sign in with (?:an? )?(?:one[- ]time )?code",
     re.IGNORECASE,
 )
@@ -447,6 +459,51 @@ async def _visible_otp_error(page: Any) -> str | None:
     return None
 
 
+async def _is_bot_challenge(page: Any) -> bool:
+    """Detect a visible managed challenge without reading arbitrary page text."""
+    try:
+        title = await page.title()
+        if re.search(
+            r"\b(?:just a moment|attention required)\b",
+            str(title),
+            re.IGNORECASE,
+        ):
+            return True
+    except Exception:
+        pass
+    try:
+        return await _first_visible(page, BOT_CHALLENGE_SELECTOR) is not None
+    except Exception:
+        return False
+
+
+async def _timeout_page_state(page: Any, labels: list[str]) -> str:
+    """Return a bounded, credential-free description of the stalled page."""
+
+    if await _is_bot_challenge(page):
+        return "anti-bot challenge"
+    try:
+        if await _first_visible(page, OTP_SELECTOR):
+            return "verification-code form"
+        if await _first_visible(page, PASSWORD_SELECTOR):
+            return "password form"
+        if await _first_visible(page, EMAIL_SELECTOR):
+            return "email form"
+    except Exception:
+        return "unrecognized page"
+
+    combined = " ".join(labels)
+    if EMAIL_CODE_ACTION_RE.search(combined) or ALTERNATE_LOGIN_ACTION_RE.search(
+        combined
+    ):
+        return "login-method picker"
+    if re.search(r"\b(?:authorize|allow|approve|confirm)\b", combined, re.IGNORECASE):
+        return "consent page"
+    if labels:
+        return "unrecognized actions"
+    return "unrecognized page"
+
+
 async def _run_state_machine(
     *,
     page: Any,
@@ -464,6 +521,7 @@ async def _run_state_machine(
     deadline = time.time() + timeout
     otp_submitted = False
     otp_attempts = 0
+    bot_challenge_started: float | None = None
     owns_manual_reader = manual_otp_reader is None
     manual_reader = manual_otp_reader or ManualOtpReader()
 
@@ -474,6 +532,19 @@ async def _run_state_machine(
             if auth_path.exists():
                 logs.append("auth.json appeared; browser flow complete")
                 return
+
+            if await _is_bot_challenge(page):
+                if bot_challenge_started is None:
+                    bot_challenge_started = time.time()
+                    logs.append("Waiting for OpenAI anti-bot challenge to clear")
+                elif time.time() - bot_challenge_started >= BOT_CHALLENGE_TIMEOUT:
+                    raise CodexLoginError(
+                        "OpenAI anti-bot challenge did not clear within "
+                        f"{BOT_CHALLENGE_TIMEOUT}s; verify this account is using "
+                        "its bound EIP before retrying"
+                    )
+                continue
+            bot_challenge_started = None
 
             email_field = await _first_visible(page, EMAIL_SELECTOR)
             if email_field and not await email_field.input_value():
@@ -573,9 +644,13 @@ async def _run_state_machine(
 
         labels = await _visible_action_labels(page)
         logs.append(f"Timed-out page actions: {labels}")
+        page_state = await _timeout_page_state(page, labels)
         # OAuth URLs contain state/code values and must not cross back to the
         # Manager in a result error.
-        raise CodexLoginError(f"Login flow did not complete within {timeout}s")
+        raise CodexLoginError(
+            f"Login flow did not complete within {timeout}s "
+            f"(last page state: {page_state})"
+        )
     finally:
         if owns_manual_reader:
             manual_reader.close()
@@ -616,10 +691,6 @@ async def _drive_browser(
         )
         try:
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
             )

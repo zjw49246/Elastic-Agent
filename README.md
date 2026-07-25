@@ -248,6 +248,17 @@ within 60 seconds, that account is quarantined from further allocation; an EIP
 Job instead remains protected by terminating its temporary instance before the
 account claim is released.
 
+`account.login_timeout_seconds` controls only the Codex browser state machine
+(default `900`, accepted range `60`–`1200`). The Manager keeps a separate
+3600-second end-to-end budget for mailbox/manual OTP waits, exact-account
+validation, the real `codex exec` smoke test, and correlated cleanup. Current
+OpenAI email-code labels including “one-time code” and “login code” are handled;
+a timeout reports only a bounded page-state category, never the OAuth URL. The
+browser keeps the installed system Chrome's native user agent instead of
+spoofing an obsolete Chrome major version that can increase risk-page mismatch.
+A visible managed anti-bot challenge gets up to 120 seconds to clear, then fails
+with explicit bound-EIP guidance instead of consuming the full browser budget.
+
 If no mailbox token is configured, or automatic mailbox polling fails, the
 Batch Console displays the live OTP challenge. The corresponding API is:
 
@@ -277,6 +288,11 @@ mode `0600`. A Job reserves all requested account/EIP leases concurrently,
 waits for every cloud transaction to settle, and only then creates temporary
 EC2 instances and attaches the addresses. Its terminal lifecycle is:
 
+On AWS Managers the Batch Console selects EIP mode by default and shows each
+account's durable address. Selecting `binding="none"` remains available for
+ordinary fleet jobs, but the Job plan warns that it bypasses any account EIP
+and logs in from the instance's temporary public address.
+
 ```text
 final collect → detach EIP → terminate EC2 and its root EBS → release lease
               → remove disposable Node record              ↳ retain EIP
@@ -292,6 +308,7 @@ spec = JobSpec.model_validate({
         "mode": "worker_local_login",
         "binding": "eip",
         "per_worker": 1,
+        "login_timeout_seconds": 900,
         "ids": ["account-001", "account-002"],
     },
     "rotation": {"strategy": "none"},

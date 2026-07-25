@@ -304,7 +304,10 @@ class TestLoginCoordinator:
             2, agent_type="codex", password="openai-secret"
         )
         task = asyncio.create_task(
-            coord.login("w1", account, "/root/.codex")
+            coord.login(
+                "w1", account, "/root/.codex",
+                login_timeout_seconds=1100,
+            )
         )
         await asyncio.sleep(0)
 
@@ -312,6 +315,7 @@ class TestLoginCoordinator:
         assert message.agent_type == "codex"
         assert message.password == "openai-secret"
         assert message.config_dir == "/root/.codex"
+        assert message.login_timeout_seconds == 1100
         await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
             "login_request_id": message.login_request_id,
             "account_id": account.id,
@@ -716,12 +720,18 @@ class TestLoginHook:
         alloc = AccountAllocator(store)
         coord = LoginCoordinator(mgr.connection_manager, mgr.event_bus, timeout=5)
         hook = make_login_hook(mgr, alloc, coord)
-        spec = JobSpec(name="j", run=RunSpec(command="x"))
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="x"),
+            account={"login_timeout_seconds": 1100},
+        )
 
         task = asyncio.create_task(hook("w1", spec, "/root/.claude"))
         await asyncio.sleep(0.01)
+        login_message = mgr.connection_manager.sent[0][1]
+        assert login_message.login_timeout_seconds == 1100
         await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
-            "login_request_id": mgr.connection_manager.sent[0][1].login_request_id,
+            "login_request_id": login_message.login_request_id,
             "account_id": "a1", "success": True,
         })
         outcome = await task

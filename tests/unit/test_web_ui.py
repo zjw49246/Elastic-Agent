@@ -64,6 +64,17 @@ class TestDashboardEndpoint:
         assert "title.textContent = `Codex OTP" in html
         assert "worker 用实例角色直拉，不经 Manager" in html
         assert '<textarea id="jCollect" placeholder="results">results</textarea>' in html
+        assert 'id="jLoginTimeout" type="number" value="900"' in html
+        assert "login_timeout_seconds:" in html
+        assert "initializeProviderDefaults" in html
+        assert "providerType = health.provider || ''" in html
+        assert "providerDefaultsReady = initializeProviderDefaults()" in html
+        assert "await providerDefaultsReady" in html
+        assert 'id="jAcctMode" onchange="updateAccountModeUI()"' in html
+        assert "binding.disabled = !workerLocal" in html
+        assert "if (!workerLocal) binding.value = 'none'" in html
+        assert "providerType === 'aws' && !eipBindingTouched" in html
+        assert "accounts/bindings" in html
 
     @pytest.mark.asyncio
     async def test_batch_console_does_not_persist_or_put_api_key_in_download_url(

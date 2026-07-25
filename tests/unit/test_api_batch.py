@@ -803,6 +803,28 @@ class TestJobsAPI:
         assert manager.batch.started == [job_id]
 
     @pytest.mark.asyncio
+    async def test_idempotent_retry_normalizes_defaults_added_after_persistence(
+        self, client, manager,
+    ):
+        key = "prepared-before-login-timeout-field"
+        job_id = self._seed_job_journal(manager, key)
+        journal = (
+            Path(manager.config.registry.path).with_name("specs") / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text())
+        payload["spec"]["account"].pop("login_timeout_seconds")
+        journal.write_text(json.dumps(payload))
+
+        response = await client.post(
+            "/api/jobs", json=self._SPEC, headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["idempotent_replay"] is True
+        assert manager.batch.started == [job_id]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("state", ["launching", "running"])
     async def test_idempotent_retry_does_not_duplicate_interrupted_fleet(
         self, client, manager, state,
@@ -1052,6 +1074,35 @@ class TestJobsAPI:
         assert manager.provider._n == 0
         specs = Path(manager.config.registry.path).with_name("specs")
         assert list(specs.glob("*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_plan_warns_when_worker_login_bypasses_account_eip(
+        self, client,
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "codex-eip-warning",
+            "email": "warning@163.com",
+            "agent_type": "codex",
+            "email_token": "mail-query-token",
+            "group": "standard",
+        })
+        assert created.status_code == 201
+
+        response = await client.post("/api/jobs/plan", json={
+            "name": "unbound-codex",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "mode": "worker_local_login",
+                "binding": "none",
+            },
+        })
+
+        assert response.status_code == 200
+        assert any(
+            "bypasses the account's durable EIP" in warning
+            for warning in response.json()["warnings"]
+        )
 
     @pytest.mark.asyncio
     async def test_submit_preflight_rejects_unavailable_region_before_persisting(

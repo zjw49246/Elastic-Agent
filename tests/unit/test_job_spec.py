@@ -474,6 +474,7 @@ class TestJobSpecDefaults:
         assert spec.account.per_worker == 1
         assert spec.account.binding == "none"
         assert spec.account.ids == []
+        assert spec.account.login_timeout_seconds == 900
         assert spec.rotation.strategy == "none"
         assert spec.run.shell is True
         assert spec.run.timeout == DEFAULT_RUN_TIMEOUT_SECONDS
@@ -489,6 +490,11 @@ class TestJobSpecDefaults:
         )
 
         assert spec.account.agent_type == "codex"
+
+    @pytest.mark.parametrize("timeout", [59, 1201])
+    def test_account_login_timeout_is_bounded(self, timeout):
+        with pytest.raises(ValidationError):
+            AccountSpec(login_timeout_seconds=timeout)
 
     def test_unknown_agent_type_is_rejected(self):
         with pytest.raises(ValidationError):

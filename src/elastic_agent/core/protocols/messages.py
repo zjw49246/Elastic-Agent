@@ -167,6 +167,10 @@ class AccountLoginMessage(Message):
     config_dir: str
     provider: str | None = None
     slot_index: int = 0
+    # Worker-side browser state-machine budget.  This is deliberately below
+    # the Manager's end-to-end wait so post-browser validation and correlated
+    # cancellation still have time to finish.
+    login_timeout_seconds: int = Field(default=900, ge=60, le=1200)
 
 
 class AccountLoginOtpMessage(Message):

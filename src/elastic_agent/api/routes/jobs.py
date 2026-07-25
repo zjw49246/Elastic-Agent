@@ -217,6 +217,17 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
     return data
 
 
+def _canonical_spec(spec: object) -> object:
+    """Normalize legacy persisted specs before idempotency comparison."""
+
+    try:
+        return JobSpec.model_validate(spec).model_dump(mode="json")
+    except (TypeError, ValueError):
+        # An invalid/different journal must remain a mismatch. The caller
+        # reports the same 409 as before without exposing validation details.
+        return spec
+
+
 def _job_detail(job) -> dict:
     is_eip_bound = job.spec.account.binding == "eip"
     worker_release_expected = is_eip_bound or job.release_workers_on_complete
@@ -437,6 +448,15 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             "results are collected only at process exit; set an interval for "
             "long-running Jobs that need partial-result durability"
         )
+    if (
+        provider.type == "aws"
+        and spec.account.mode == "worker_local_login"
+        and spec.account.binding == "none"
+    ):
+        warnings.append(
+            "account.binding='none' uses a temporary public IP and bypasses "
+            "the account's durable EIP; use binding='eip' for stable login identity"
+        )
 
     results_bucket = _s3_bucket()
     if results_bucket and provider.type == "aws" and worker_profile:
@@ -556,7 +576,7 @@ async def submit_job(
                     raise HTTPException(
                         500, f"cannot read persisted Job {deterministic_id}"
                     ) from exc
-                if payload.get("spec") != spec.model_dump(mode="json"):
+                if _canonical_spec(payload.get("spec")) != spec.model_dump(mode="json"):
                     raise HTTPException(
                         409, "Idempotency-Key was already used for another JobSpec"
                     )

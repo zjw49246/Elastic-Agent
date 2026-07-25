@@ -1414,6 +1414,7 @@ class WorkerRuntime:
                 mail_provider=msg.provider,
                 attempt_id=msg.login_request_id,
                 manual_otp_reader=otp_reader,
+                timeout=msg.login_timeout_seconds,
             )
         except asyncio.CancelledError:
             raise

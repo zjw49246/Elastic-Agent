@@ -16,6 +16,10 @@ import pytest
 login_module = importlib.import_module("elastic_agent.worker.login.codex_login")
 
 
+def test_default_browser_login_timeout_leaves_manager_cleanup_headroom():
+    assert login_module.DEFAULT_LOGIN_TIMEOUT == 900
+
+
 def test_163_email_uses_mailcatcher_backend():
     assert login_module.detect_mail_provider("user@163.com") == "mailcatcher"
 
@@ -744,7 +748,7 @@ async def test_switch_to_email_code_clicks_visible_matching_action():
     hidden = Element(text="Continue with email code", visible=False)
     inert = Element(text="Continue with email code")
     action = Element(
-        text="Continue with email code",
+        text="Continue with a one-time code",
         on_click=lambda: setattr(page, "state", "otp"),
     )
 
@@ -764,7 +768,7 @@ async def test_switch_to_email_code_clicks_visible_matching_action():
     assert hidden.clicked is False
     assert inert.clicked is True
     assert action.clicked is True
-    assert logs[-1] == "Switched to email-code login via 'Continue with email code'"
+    assert logs[-1] == "Switched to email-code login via 'Continue with a one-time code'"
 
 
 @pytest.mark.asyncio
@@ -971,6 +975,7 @@ async def test_drive_browser_uses_headed_system_chrome_and_dev_shm_guard(tmp_pat
     assert calls["launch"]["headless"] is False
     assert calls["launch"]["channel"] == "chrome"
     assert "--disable-dev-shm-usage" in calls["launch"]["args"]
+    assert "user_agent" not in calls["context"]
     assert calls["closed"] is True
     state_machine.assert_awaited_once()
 
@@ -1038,6 +1043,88 @@ async def test_state_machine_timeout_does_not_expose_oauth_url(monkeypatch, tmp_
     assert "secret-state" not in str(failure.value)
     assert "secret-code" not in str(failure.value)
     assert secret_url not in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_state_machine_timeout_reports_only_safe_page_state(monkeypatch, tmp_path):
+    page = SimpleNamespace(
+        url="https://auth.openai.com/oauth/authorize?state=secret",
+        wait_for_timeout=AsyncMock(),
+        title=AsyncMock(return_value="OpenAI"),
+    )
+    page.locator = lambda _selector: SimpleNamespace(count=AsyncMock(return_value=0))
+
+    async def first_visible(_page, selector):
+        return object() if selector == login_module.OTP_SELECTOR else None
+
+    monkeypatch.setattr(login_module, "_first_visible", first_visible)
+    monkeypatch.setattr(
+        login_module, "_visible_action_labels", AsyncMock(return_value=[])
+    )
+
+    with pytest.raises(login_module.CodexLoginError) as failure:
+        await login_module._run_state_machine(
+            page=page,
+            email="user@example.com",
+            password="",
+            email_token="mail-token",
+            timeout=0,
+            auth_path=tmp_path / "auth.json",
+            logs=[],
+            manual_otp_reader=SimpleNamespace(),
+        )
+
+    assert "last page state: verification-code form" in str(failure.value)
+    assert "secret" not in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_timeout_page_state_recognizes_cloudflare_title():
+    page = SimpleNamespace(title=AsyncMock(return_value="Just a moment..."))
+
+    state = await login_module._timeout_page_state(page, [])
+
+    assert state == "anti-bot challenge"
+
+
+@pytest.mark.asyncio
+async def test_timeout_page_state_recognizes_visible_challenge_selector(monkeypatch):
+    page = SimpleNamespace(title=AsyncMock(return_value="OpenAI"))
+
+    async def first_visible(_page, selector):
+        return object() if selector == login_module.BOT_CHALLENGE_SELECTOR else None
+
+    monkeypatch.setattr(login_module, "_first_visible", first_visible)
+
+    state = await login_module._timeout_page_state(page, [])
+
+    assert state == "anti-bot challenge"
+
+
+@pytest.mark.asyncio
+async def test_persistent_cloudflare_challenge_fails_with_bound_eip_guidance(
+    monkeypatch, tmp_path,
+):
+    page = SimpleNamespace(
+        title=AsyncMock(return_value="Just a moment..."),
+        wait_for_timeout=AsyncMock(),
+    )
+    monkeypatch.setattr(login_module, "BOT_CHALLENGE_TIMEOUT", 0)
+
+    with pytest.raises(login_module.CodexLoginError) as failure:
+        await login_module._run_state_machine(
+            page=page,
+            email="user@example.com",
+            password="",
+            email_token="mail-token",
+            timeout=30,
+            auth_path=tmp_path / "auth.json",
+            logs=[],
+            manual_otp_reader=SimpleNamespace(),
+        )
+
+    assert "anti-bot challenge did not clear" in str(failure.value)
+    assert "bound EIP" in str(failure.value)
 
 
 @pytest.mark.asyncio

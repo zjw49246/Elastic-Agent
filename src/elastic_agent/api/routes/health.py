@@ -21,4 +21,5 @@ async def health() -> dict:
         "status": "healthy",
         "uptime_seconds": round(time.monotonic() - _start_time, 1),
         "worker_count": worker_count,
+        "provider": mgr.config.provider.type,
     }

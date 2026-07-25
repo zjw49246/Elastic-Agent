@@ -721,7 +721,7 @@ class BatchOrchestrator:
 
             # Mark/cancel every launch before waiting for it.  In particular an
             # ACCOUNT_LOGIN await would otherwise keep shutdown blocked for its
-            # full 2700-second OTP timeout.  The cancellation path waits for the
+            # full 3600-second OTP timeout.  The cancellation path waits for the
             # worker's correlated login-cleanup ACK, then stops live commands
             # and performs final collection for ordinary and EIP jobs alike.
             jobs = list(self._jobs.values())
@@ -1781,7 +1781,7 @@ class BatchOrchestrator:
             # Provision/login is part of the launch task.  Cancelling the exact
             # per-worker task invokes LoginCoordinator's correlated cleanup and
             # waits for ACCOUNT_LOGIN_CANCELLED instead of leaving Chrome/CLI
-            # running for the remainder of its 2700-second login timeout.
+            # running for the remainder of its 3600-second login timeout.
             owned_run_tasks = {
                 task
                 for run in job.runs.values()
