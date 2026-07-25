@@ -396,3 +396,7 @@
 **以后避免**：网页登录自动化不能把“未知页面”统一折叠成一个长超时；必须识别稳定的安全状态、让反机器人页面有有界等待，并保留不含 URL/凭证的诊断类别。账号固定网络身份是登录契约的一部分，生产 UI 默认值和提交竞态也要纳入测试。新增带默认值的持久化 schema 字段时，幂等比较必须先做版本规范化。
 
 **验证**：新增页面真实文案、challenge title/selector、安全错误、协议旧 payload、超时上下界/透传、AWS plan/UI 竞态和旧 JobSpec 幂等回放测试；独立审查无安全或协议 blocker。定向回归 384 项、完整套件 **2069 passed / 12 skipped / 0 failed**；变更模块 Ruff、`compileall`、Batch Console JavaScript 语法、依赖锁上游 dry-run 和 `git diff --check` 全部通过。
+
+**生产发布与真机验证（runtime `8592bad`）**：东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-8592bad`，旧 `/home/ubuntu/elastic-agent.release-a8d8da2` 保留为 rollback。首次 release 只执行 `uv sync --no-dev`，遗漏非基础依赖的 `aws` extra，launcher 在导入 `boto3` 时按设计 fail closed，未启动 API、未产生任何 Worker/账号/云副作用；在最终 release 路径补执行 `uv sync --frozen --no-dev --extra aws` 后启动成功。runbook 已固定最终路径安装和 AWS extra 导入检查，避免重复发生。
+
+绑定 EIP 的 token-only Codex canary `job-026acbf6153d0621f17af1245d6cb507` 在 EC2 `i-02113f0d54de134b8` 上完成自动登录、smoke test 和真实 `codex exec`，无人工 OTP；返回 `RELEASE_8592BAD_EIP_OK`，S3 五个对象记录的出口精确为账号 EIP `13.112.54.251`。终态 `succeeded/done=true/cleanup_pending=0`；实例 terminated，root EBS `vol-0893898bd57872708` 已删除，EIP 解绑保留并回到 `ready`。最终 Node、allocation、login challenge、活动 managed EC2 和附着 EIP 均为 0，域名 health 正常，当前 systemd Invocation 的 ERROR/Traceback/Exception 为 0。

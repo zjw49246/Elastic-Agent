@@ -365,6 +365,19 @@ credential providers disabled.
 export RELEASE=/home/ubuntu/elastic-agent.release-<git-short-sha>
 export BACKUP_SUFFIX=pre-<git-short-sha>
 
+# Extract/clone directly into the final path before installing the editable
+# project. Moving it afterwards leaves the .pth entry pointing at the old path.
+# The AWS extra is mandatory: boto3 is deliberately not a base dependency, and
+# aws_manager.py will fail closed during AMI/STS validation when it is absent.
+ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
+  bash -s -- "$RELEASE" <<'REMOTE'
+set -Eeuo pipefail
+release=$1
+cd "$release"
+/home/ubuntu/.local/bin/uv sync --frozen --no-dev --extra aws
+.venv/bin/python -c 'import boto3'
+REMOTE
+
 ssh -i ~/.ssh/interview-key.pem -o BatchMode=yes ubuntu@172.31.46.129 \
   sudo bash -s -- "$RELEASE" "$BACKUP_SUFFIX" \
   "$FINAL_AMI_ID" "$FINAL_WORKER_SECURITY_GROUP_ID" <<'REMOTE'
