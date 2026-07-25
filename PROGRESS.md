@@ -400,3 +400,13 @@
 **生产发布与真机验证（runtime `8592bad`）**：东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-8592bad`，旧 `/home/ubuntu/elastic-agent.release-a8d8da2` 保留为 rollback。首次 release 只执行 `uv sync --no-dev`，遗漏非基础依赖的 `aws` extra，launcher 在导入 `boto3` 时按设计 fail closed，未启动 API、未产生任何 Worker/账号/云副作用；在最终 release 路径补执行 `uv sync --frozen --no-dev --extra aws` 后启动成功。runbook 已固定最终路径安装和 AWS extra 导入检查，避免重复发生。
 
 绑定 EIP 的 token-only Codex canary `job-026acbf6153d0621f17af1245d6cb507` 在 EC2 `i-02113f0d54de134b8` 上完成自动登录、smoke test 和真实 `codex exec`，无人工 OTP；返回 `RELEASE_8592BAD_EIP_OK`，S3 五个对象记录的出口精确为账号 EIP `13.112.54.251`。终态 `succeeded/done=true/cleanup_pending=0`；实例 terminated，root EBS `vol-0893898bd57872708` 已删除，EIP 解绑保留并回到 `ready`。最终 Node、allocation、login challenge、活动 managed EC2 和附着 EIP 均为 0，域名 health 正常，当前 systemd Invocation 的 ERROR/Traceback/Exception 为 0。
+
+## 2026-07-25 Job 诊断日志与控制台稳定性（commit `d4737bf`）
+
+**问题**：生产 Batch 页面每 5 秒重建全部 Job DOM，并为 82 条历史逐卡请求 results；单个浏览器 5 分钟产生 6,577 次 API 请求，造成页面跳动、焦点/展开状态丢失。终态 Worker 销毁后 systemd journal 不可回取，Job 又只显示 `run exited 1`，用户无法判断失败发生在登录、命令还是结果收集。最近 seed2233 AI4Sci Job 实际在第 19 个 `deployment_prediction_sets` 生成阶段连续 20 次拒绝样本后退出，Codex 尚未启动；另一个 Job 是自动取码失败后人工 OTP 过期，旧 UI 都没有把关键阶段讲清楚。
+
+**解决**：Batch/Fleet 默认浅色并保留 session 级深色切换；Jobs/Nodes/OTP 改为 keyed reconcile、串行且隐藏页暂停的轮询，results 按可见历史限并发渐进缓存，完整历史可显式展开。Job 卡展示申请机器→初始化→登录→运行→收集→销毁、顶层/Worker/collection/cleanup 错误和醒目的任务输出入口；OTP 提升为顶部操作卡。Manager 在可靠退出、final collect 和销毁前把 stdout/stderr 原子归档到私有 `JobLogStore`，重启 replay 可从存活 Worker 的本地 NDJSON 有界回取；API 逐 snapshot 流式合并 live/archive tail。单 task、单 Job、全局、行长、响应、task 数和 30 天 retention 均有硬边界，裁剪前写 durable marker，损坏/归档失败 fail-closed 且绝不为日志保留收费实例；统一 exit archive barrier 阻止取消/reconcile 抢先销毁。Codex 人工 OTP 超时现在保留可操作错误，而不是退化为 `RuntimeError`。
+
+**以后避免**：轮询页面不能把“拿到新响应”等同于“必须重建 DOM”，也不能让历史数线性放大请求；先按数据签名判断、保留交互状态、隐藏页停表、异步请求不重叠。临时计算资源的可观测性必须在销毁前完成耐久提交，但日志耐久性不能反过来阻止资源清理。任何按 task 有界的存储还必须同时核算 Job/全局最坏 fan-out×rotation，并让配额删除留下可查询的截断证明。
+
+**验证**：先以红测试复现损坏 JSON 顶层、全量日志读取、配额缺失、截断假阴性、归档/取消竞态、历史 results 饥饿、隐藏页轮询和 Fleet 0→1 空状态；修复后相关 350 项与最终完整套件 **2091 passed / 12 skipped / 0 failed**。Ruff、`compileall`、Batch/Fleet JavaScript、依赖锁 dry-run、diff check 全部通过；Chrome 149 真实 DOM/截图验证浅色表单、失败卡、任务输出、结果区和 Fleet 0→1 均正常，三轮独立复审最终无 blocker/high。
