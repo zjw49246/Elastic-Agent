@@ -372,3 +372,5 @@
 **以后避免**：进程终态、结果收集完成和云资源销毁是三个不同事实，前端不能从 `done/failed` 或历史记录数量推断实例存活；`false` 的释放证明也只表示“尚无完整完成证明”，不等于实例必然存在。涉及云销毁的按钮必须调用保留所有权与失败重试语义的资源回收入口。
 
 **验证**：API/UI 聚焦测试 84 项全绿；完整套件 `2058 passed / 12 skipped / 0 failed`，Ruff、`compileall`、Batch Console JavaScript 语法和 `git diff --check` 均通过。
+
+**生产发布（runtime `a8d8da2`）**：代码已推送 `origin/main`，东京 Manager 原子切换到 `/home/ubuntu/elastic-agent.release-a8d8da2` 并重启。首轮把 editable 环境装在 `.staging` 后再改目录名，导致 `.pth` 仍指向旧路径，启动检查以 `ModuleNotFoundError` fail closed；旧进程已正常停机且当时 Worker/Node/账号占用均为 0。随后在最终 release 路径用 `uv sync --reinstall-package elastic-agent` 修正引用并启动成功。域名 health、目标 Job、页面新文案、systemd Invocation 与 AWS 状态复核通过：Worker/Node/存活 managed EC2 均为 0，目标 EIP 保留且未关联实例。以后构建不可变 release 时必须先确定最终目录再安装 editable 项目，或安装 wheel，不能在安装后移动虚拟环境的源码根。
