@@ -384,3 +384,5 @@
 **以后避免**：实例类型存在应用 preflight 与 AWS IAM 两道 fail-closed 白名单，任何扩容必须同一变更、同一验证窗口更新；Region/AZ offering、AMI 架构、inline policy 大小、Access Analyzer 和 allow/deny simulation 都要在生产变更前核对。
 
 **验证**：东京 `ap-northeast-1a` offering 与 AMI x86_64 兼容性逐项确认；policy compact 大小 7649 bytes，Access Analyzer 0 finding；`r5.2xlarge`、M/C/R 7i 模拟允许，`g5.xlarge` 保持拒绝。相关测试 129 项、完整套件 `2059 passed / 12 skipped / 0 failed`，Ruff、JSON 和 diff check 均通过。
+
+**生产变更**：实际角色 `elastic-agent-manager/ElasticAgentManagerRuntime` 已更新并与版本化 policy 逐项一致，principal simulation 同样允许 `r5.2xlarge`/`m7i.4xlarge`、拒绝 `g5.xlarge`。`/etc/elastic-agent-manager.aws.env` 以 root:root 0600 原子替换，旧文件保留为 `.pre-6548a0e`，Manager 重启后 health 正常。线上 `/api/jobs/plan` 返回 39 项 allowlist，`r5.2xlarge` 与 `m7i.4xlarge` 均 valid，GPU 仍 422；plan 前后 Job 数不变，Worker/Node/allocation/非终止 managed EC2 均为 0，当前 Invocation 无 ERROR/Traceback。
