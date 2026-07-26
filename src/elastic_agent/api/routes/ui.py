@@ -564,6 +564,7 @@ _BATCH_HTML = """\
   .job-head { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
   .job-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
   .job-actions .btn { margin:0; padding:5px 10px; }
+  .job-actions [data-result-action] { min-width:132px; }
   .worker-records-title { margin-top:10px; margin-bottom:4px; }
   .job-alert { background:color-mix(in srgb,var(--red) 8%,var(--surface));
     border:1px solid color-mix(in srgb,var(--red) 35%,var(--border));
@@ -838,6 +839,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     </div>
     <p class="hint" style="margin-bottom:10px">
       Job 默认收起，点击摘要查看详情。失败时先看「任务输出」中的 stderr；
+      命令 stdout/stderr 在 Worker 销毁后仍可查看，默认保留 30 天；
       登录、SSH、systemd 问题可在 Worker 存活时看「系统日志」。
     </p>
     <div id="jobsList"><p class="muted">No jobs yet.</p></div>
@@ -854,11 +856,11 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
           <button class="btn btn-ghost" id="logFollowBtn" onclick="toggleLogFollow()">✓ 跟随最新</button>
           <button class="btn btn-ghost" onclick="copyLogs()">复制日志</button>
           <button class="btn btn-ghost" onclick="downloadLogText()">下载 .txt</button>
-          <button class="btn btn-ghost" onclick="closeLogs()">✕ 关闭</button>
+          <button class="btn btn-ghost" id="logCloseBtn" onclick="closeLogs()">✕ 关闭</button>
         </span>
       </div>
-      <div id="logMeta"></div>
-      <pre id="logContent"></pre>
+      <div id="logMeta" role="status" aria-live="polite"></div>
+      <pre id="logContent" tabindex="0"></pre>
     </div>
   </div>
 
@@ -895,6 +897,8 @@ let showLegacyHistory = false;
 let dashboardPollRunning = false;
 let dashboardPollTimer = null;
 const jobResultsCache = new Map();
+const jobResultsRequestVersions = new Map();
+const resultDownloadsInFlight = new Set();
 let latestLoginAttempts = [];
 const otpCardsByKey = new Map();
 const openedOtpChallenges = new Set();
@@ -1510,9 +1514,11 @@ function jobStateLabel(state) {
 }
 function workerActionsHtml(worker, jobId) {
   const focusId = esc(worker.worker_id || `shard-${Number(worker.shard_index)||0}`);
+  const outputLabel = String(worker.phase || '') === 'failed'
+    ? '查看失败日志' : '任务输出';
   const taskLog = `<button class="btn btn-ghost" data-job-focus="worker-output-${focusId}"
     style="padding:2px 8px;font-size:.72rem"
-    onclick="showJobLogs(${jsArg(jobId)},${jsArg(worker.worker_id || '')})">任务输出</button>`;
+    onclick="showJobLogs(${jsArg(jobId)},${jsArg(worker.worker_id || '')})">${outputLabel}</button>`;
   if (!worker.worker_id || workerReleased(worker)) {
     return taskLog;
   }
@@ -1526,6 +1532,10 @@ function workerActionsHtml(worker, jobId) {
   return `${taskLog}${systemLog}${terminate}`;
 }
 async function downloadResults(jobId) {
+  if (resultDownloadsInFlight.has(jobId)) return;
+  resultDownloadsInFlight.add(jobId);
+  reconcileJobCards(visibleJobs(latestJobs));
+  refreshResults();
   try {
     const resp = await fetch(
       '/api/jobs/' + encodeURIComponent(jobId) + '/results/download',
@@ -1539,6 +1549,11 @@ async function downloadResults(jobId) {
     document.body.appendChild(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch(e) { toast('下载失败：' + e.message, 'error'); }
+  finally {
+    resultDownloadsInFlight.delete(jobId);
+    reconcileJobCards(visibleJobs(latestJobs));
+    refreshResults();
+  }
 }
 async function cancelJob(jobId) {
   if (!window.confirm('取消 Job ' + jobId + '？将收集已有结果并销毁全部 Worker。')) return;
@@ -1602,6 +1617,44 @@ function formatWhen(value) {
 function resultFor(jobId) {
   return jobResultsCache.get(jobId)?.value || null;
 }
+function resultFileCount(result) {
+  const count = Number(result?.file_count);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+function jobResultActionHtml(job, result) {
+  const jobId = String(job.job_id);
+  const cached = jobResultsCache.get(jobId);
+  const fileCount = resultFileCount(result);
+  const downloading = resultDownloadsInFlight.has(jobId);
+  let state = 'empty';
+  let label = '暂无结果';
+  let enabled = false;
+  let title = '当前尚未发现已收集文件';
+  if (downloading) {
+    state = 'downloading'; label = '正在打包下载…';
+    title = '正在生成并下载结果压缩包';
+  } else if (fileCount > 0) {
+    state = 'available'; label = `⬇ 下载结果 (${fileCount})`;
+    title = '下载已经收集的结果';
+    enabled = true;
+  } else if (cached?.error) {
+    const missing = Number(cached.errorStatus) === 404;
+    const waiting = missing && !job.done;
+    state = waiting ? 'checking' : (missing ? 'empty' : 'unavailable');
+    label = waiting ? '⏳ 等待结果…' : (missing ? '暂无结果' : '结果暂不可用');
+    title = waiting
+      ? 'Job 仍在运行，等待首次结果收集'
+      : missing
+      ? 'Job 已结束，但没有可下载文件'
+      : '结果查询暂时失败，页面会自动重试';
+  } else if (!cached || cached.loading) {
+    state = 'checking'; label = '⏳ 检查结果…';
+    title = '正在检查结果是否已经可用';
+  }
+  return `<button class="btn btn-ghost" data-job-focus="job-results"
+    data-result-action="${state}" title="${esc(title)}"
+    ${enabled ? `onclick="downloadResults(${jsArg(jobId)})"` : 'disabled aria-disabled="true"'}>${label}</button>`;
+}
 function jobRowHtml(j, r) {
   const wd = j.workers_detail || [];
   const recordedWorkers = Number.isFinite(Number(j.workers))
@@ -1610,10 +1663,7 @@ function jobRowHtml(j, r) {
   const scoreStr = (r && r.scores && r.scores.length)
     ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
-  const dlBtn = (r && r.file_count)
-    ? `<button class="btn btn-ghost" data-job-focus="job-results"
-        onclick="downloadResults(${jsArg(j.job_id)})">⬇ 下载结果 (${Number(r.file_count)||0})</button>`
-    : '<span class="muted" style="font-size:.75rem">（暂无结果）</span>';
+  const dlBtn = jobResultActionHtml(j, r);
   const cancelBtn = !j.done && j.in_memory !== false
     ? `<button class="btn btn-danger" data-job-focus="job-cancel"
         onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
@@ -1625,6 +1675,8 @@ function jobRowHtml(j, r) {
     ...wd.map(worker => worker.cleanup_error),
   ].filter(Boolean).map(String))];
   const cleanupPending = Number(j.cleanup_pending || 0);
+  const outputLabel = state === 'failed' ? '📄 查看失败日志' : '📄 任务输出';
+  const outputClass = state === 'failed' ? 'btn' : 'btn btn-ghost';
   const phases = Object.entries(j.phases || {})
     .map(([phase,count]) => badge(phase)+' '+(Number(count)||0)).join(' ');
   const created = formatWhen(j.created_at);
@@ -1648,8 +1700,8 @@ function jobRowHtml(j, r) {
       <div class="job-head">
         <span class="muted">操作与运行详情</span>
         <div class="job-actions">
-          <button class="btn btn-ghost" data-job-focus="job-output"
-            onclick="showJobLogs(${jsArg(j.job_id)},'')">📄 任务输出</button>
+          <button class="${outputClass}" data-job-focus="job-output"
+            onclick="showJobLogs(${jsArg(j.job_id)},'')">${outputLabel}</button>
           ${dlBtn}${cancelBtn}
         </div>
       </div>
@@ -1686,7 +1738,14 @@ function jobRowHtml(j, r) {
   </details>`;
 }
 function jobRenderSignature(job, result) {
-  return JSON.stringify([job, result || null]);
+  const jobId = String(job.job_id);
+  const cached = jobResultsCache.get(jobId);
+  const resultUiState = [
+    Boolean(cached?.loading),
+    Number(cached?.errorStatus) || Boolean(cached?.error),
+    resultDownloadsInFlight.has(jobId),
+  ];
+  return JSON.stringify([job, result || null, resultUiState]);
 }
 function makeJobNode(job) {
   const template = document.createElement('template');
@@ -1793,25 +1852,71 @@ function reconcileJobCards(jobs) {
   }
   if (replacedAny) window.scrollTo(viewportX, viewportY);
 }
+function nextResultCheck(job, incomingFileCount, previous) {
+  if (incomingFileCount > 0) {
+    return job.done ? Number.POSITIVE_INFINITY : Date.now() + 30_000;
+  }
+  const misses = Math.min(6, Number(previous?.misses || 0) + 1);
+  const base = job.done ? 15_000 : 5_000;
+  const ceiling = job.done ? 300_000 : 30_000;
+  return Date.now() + Math.min(ceiling, base * (2 ** (misses - 1)));
+}
+function commitJobResult(job, value, requestVersion) {
+  const jobId = String(job.job_id);
+  if (requestVersion !== jobResultsRequestVersions.get(jobId)) return false;
+  const previous = jobResultsCache.get(jobId) || {};
+  const knownFileCount = resultFileCount(previous.value);
+  const incomingFileCount = resultFileCount(value);
+  const preserveKnown = knownFileCount > 0 && incomingFileCount <= 0;
+  let nextCheck = nextResultCheck(job, incomingFileCount, previous);
+  if (preserveKnown && job.done) nextCheck = Number.POSITIVE_INFINITY;
+  jobResultsCache.set(jobId, {
+    value: preserveKnown ? previous.value : value,
+    nextCheck,
+    misses: incomingFileCount > 0 ? 0 : Number(previous.misses || 0) + 1,
+    loading: false,
+    error: null,
+    errorStatus: null,
+  });
+  return true;
+}
+function commitJobResultError(job, error, requestVersion) {
+  const jobId = String(job.job_id);
+  if (requestVersion !== jobResultsRequestVersions.get(jobId)) return false;
+  const previous = jobResultsCache.get(jobId) || {};
+  const knownFileCount = resultFileCount(previous.value);
+  jobResultsCache.set(jobId, {
+    ...previous,
+    nextCheck: knownFileCount > 0 && job.done
+      ? Number.POSITIVE_INFINITY
+      : nextResultCheck(job, 0, previous),
+    misses: Number(previous.misses || 0) + 1,
+    loading: false,
+    error: error.message || String(error),
+    errorStatus: Number(error.status) || null,
+  });
+  return true;
+}
 async function refreshJobResults(jobs, force=false) {
   const now = Date.now();
   const candidates = jobs.filter(job => {
     const cached = jobResultsCache.get(job.job_id);
-    return force || !cached || now >= Number(cached.nextCheck || 0);
+    return force || !cached
+      || (!cached.loading && now >= Number(cached.nextCheck || 0));
   }).slice(0, 30);
   await mapLimit(candidates, 3, async job => {
+    const jobId = String(job.job_id);
+    const requestVersion = Number(jobResultsRequestVersions.get(jobId) || 0) + 1;
+    jobResultsRequestVersions.set(jobId, requestVersion);
+    jobResultsCache.set(jobId, {
+      ...(jobResultsCache.get(jobId) || {}),
+      loading: true,
+    });
     try {
-      const value = await api('GET', '/jobs/' + encodeURIComponent(job.job_id) + '/results');
-      jobResultsCache.set(job.job_id, {
-        value,
-        nextCheck: job.done ? Number.POSITIVE_INFINITY : Date.now() + 30_000,
-      });
+      const value = await api('GET', '/jobs/' + encodeURIComponent(jobId) + '/results');
+      commitJobResult(job, value, requestVersion);
     } catch(error) {
-      jobResultsCache.set(job.job_id, {
-        value: jobResultsCache.get(job.job_id)?.value || null,
-        nextCheck: Date.now() + (job.done ? 60_000 : 30_000),
-        error: error.message,
-      });
+      commitJobResultError(job, error, requestVersion);
     }
   });
   reconcileJobCards(visibleJobs(latestJobs));
@@ -1891,14 +1996,44 @@ function showWorkerLogs(wid) {
   refreshOpenLogs(true);
 }
 function showLogs(wid) { showWorkerLogs(wid); }
+function formatTaskExitSummary(tasks) {
+  return tasks.map(task => {
+    const parts = [];
+    const taskId = String(task.task_id || '');
+    if (taskId) parts.push('执行 ' + taskId.split(':').slice(-1)[0]);
+    if (task.exit_code !== null && task.exit_code !== undefined) {
+      parts.push('退出码 ' + Number(task.exit_code));
+    }
+    if (task.error_type) parts.push(String(task.error_type));
+    if (task.error_message) {
+      parts.push(String(task.error_message).replace(/\\s+/g, ' ').slice(0, 240));
+    }
+    return parts.join(' · ');
+  }).filter(Boolean).join(' | ');
+}
 function formatJobLog(data) {
-  if (!(data.entries || []).length) return data.message || '(暂无命令输出)';
-  return data.entries.map(entry => {
+  const exitSummary = formatTaskExitSummary(data.tasks || []);
+  const output = !(data.entries || []).length
+    ? (data.message || '(暂无命令输出)')
+    : data.entries.map(entry => {
     const parsed = entry.timestamp ? new Date(entry.timestamp) : null;
     const timestamp = parsed && !Number.isNaN(parsed.getTime())
       ? parsed.toLocaleTimeString() : '--:--:--';
     return `[${timestamp}] ${String(entry.stream || 'stdout').padEnd(6)} | ${entry.data || ''}`;
   }).join('\\n');
+  return exitSummary ? exitSummary + '\\n\\n' + output : output;
+}
+function jobLogLineLimit(jobId, workerId) {
+  const job = latestJobs.find(item => String(item.job_id) === String(jobId));
+  const workers = job?.workers_detail || [];
+  const worker = workerId
+    ? workers.find(item => String(item.worker_id) === String(workerId))
+    : null;
+  const terminal = workerId
+    ? Boolean(worker && workerExecutionTerminal(worker))
+    : Boolean(job && (job.done
+      || (workers.length && workers.every(workerExecutionTerminal))));
+  return terminal ? 5_000 : 1_000;
 }
 async function refreshOpenLogs(force=false) {
   if (_logLoading || (_logPaused && !force)) return;
@@ -1912,7 +2047,8 @@ async function refreshOpenLogs(force=false) {
   const wasNearBottom = distance < 70;
   try {
     if (mode === 'job') {
-      let path = '/jobs/' + encodeURIComponent(jobId) + '/logs?lines=1000';
+      const lineLimit = jobLogLineLimit(jobId, workerId);
+      let path = '/jobs/' + encodeURIComponent(jobId) + '/logs?lines=' + lineLimit;
       if (workerId) path += '&worker_id=' + encodeURIComponent(workerId);
       const data = await api('GET', path);
       if (contextVersion !== _logContextVersion) return;
@@ -1921,9 +2057,11 @@ async function refreshOpenLogs(force=false) {
       const source = data.source === 'archive' ? '已归档'
         : data.source === 'live' ? '实时缓冲'
         : data.source === 'mixed' ? '实时 + 归档' : '无日志';
+      const exitSummary = formatTaskExitSummary(data.tasks || []);
       document.getElementById('logMeta').textContent =
         `${source} · 显示 ${data.returned || 0}/${data.total || 0} 行`
         + (data.truncated ? ' · 较早内容已裁剪' : '')
+        + (exitSummary ? ' · ' + exitSummary : '')
         + (data.message ? ' · ' + data.message : '');
       if (['live','pending'].includes(data.status)) scheduleLogRefresh();
       else clearTimeout(_logTimer);
@@ -2002,7 +2140,10 @@ function refreshResults() {
   const list = document.getElementById('resultsList');
   const jobs = sortedJobs(latestJobs).map(job => resultFor(job.job_id))
     .filter(result => result && (result.file_count || result.s3_uri));
-  const signature = JSON.stringify(jobs);
+  const signature = JSON.stringify([
+    jobs,
+    jobs.map(result => resultDownloadsInFlight.has(String(result.job_id))),
+  ]);
   if (list.dataset.signature === signature) return;
   list.dataset.signature = signature;
   if (!jobs.length) {
@@ -2013,12 +2154,16 @@ function refreshResults() {
     const scoreStr = (result.scores && result.scores.length)
       ? result.scores.map(score => `${esc(score.task_id)} ${esc(score.prompt_level)}: <b>${Number(score.final_score||0).toFixed(1)}</b>`).join(' · ')
       : '';
+    const downloading = resultDownloadsInFlight.has(String(result.job_id));
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;
         border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
       <div><b>${esc(result.job_id)}</b> <span class="muted">(${Number(result.file_count)||0} 文件)</span>
         ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
         ${result.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(result.s3_uri)+'</div>' : ''}</div>
-      <button class="btn" style="margin:0" onclick="downloadResults(${jsArg(result.job_id)})">⬇ 下载全部</button>
+      <button class="btn" style="margin:0" ${downloading
+        ? 'disabled aria-disabled="true"'
+        : `onclick="downloadResults(${jsArg(result.job_id)})"`}>${downloading
+          ? '正在打包下载…' : '⬇ 下载全部'}</button>
     </div>`;
   }).join('');
 }

@@ -989,6 +989,19 @@ class TestJobsAPI:
         runs[0].phase = WorkerPhase.FAILED
         runs[0].task_id = f"{job_id}:w0:abcdef"
         runs[0].error = "run exited 1"
+        manager.job_log_store.save_snapshot(
+            job_id=job_id,
+            task_id=runs[0].task_id,
+            worker_id="w0",
+            entries=[{
+                "task_id": runs[0].task_id,
+                "worker_id": "w0",
+                "stream": "stderr",
+                "data": "durable failure detail",
+                "timestamp": "2026-07-26T00:00:00+00:00",
+            }],
+            exit_info={"exit_code": 1, "error_message": "run exited 1"},
+        )
         for run in runs[1:]:
             run.phase = WorkerPhase.DONE
         job.launch_complete = True
@@ -1008,6 +1021,17 @@ class TestJobsAPI:
         assert detail["workers_detail"][0]["task_id"].endswith(":w0:abcdef")
         assert detail["workers_detail"][0]["error"] == "run exited 1"
         assert detail["workers_detail"][0]["worker_released"] is True
+
+        archived = await client.get(f"/api/jobs/{job_id}/logs?lines=5000")
+        assert archived.status_code == 200
+        assert archived.headers["cache-control"] == "no-store"
+        payload = archived.json()
+        assert payload["source"] == "archive"
+        assert payload["status"] == "archived"
+        assert payload["complete"] is True
+        assert payload["tasks"][0]["exit_code"] == 1
+        assert payload["tasks"][0]["error_message"] == "run exited 1"
+        assert payload["entries"][0]["data"] == "durable failure detail"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -151,6 +151,25 @@ class TestDashboardEndpoint:
         assert "!document.hidden && !_logPaused" in html
 
     @pytest.mark.asyncio
+    async def test_batch_console_keeps_failed_logs_and_download_action_stable(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "const jobResultsRequestVersions = new Map()" in html
+        assert "function commitJobResult" in html
+        assert "requestVersion !== jobResultsRequestVersions.get(jobId)" in html
+        assert "knownFileCount > 0 && incomingFileCount <= 0" in html
+        assert "nextResultCheck(job, incomingFileCount, previous)" in html
+        assert "function jobResultActionHtml(job, result)" in html
+        assert 'data-result-action="' in html
+        assert "📄 查看失败日志" in html
+        assert "function jobLogLineLimit(jobId, workerId)" in html
+        assert "return terminal ? 5_000 : 1_000" in html
+        assert "formatTaskExitSummary(data.tasks || [])" in html
+
+    @pytest.mark.asyncio
     async def test_batch_console_jobs_start_collapsed_and_keep_user_choice(
         self, ui_client
     ):
