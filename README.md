@@ -441,7 +441,9 @@ private, uncached, and remain available after the ephemeral Worker is
 destroyed. These diagnostic snapshots are stored in the Manager state
 directory, not uploaded to S3, because stdout/stderr may contain sensitive
 material. Jobs completed before this archive existed cannot be recovered after
-their Workers have already been destroyed.
+their Workers have already been destroyed. In the Batch Console, a failed Job
+uses a prominent **查看失败日志** action; terminal runs load the complete bounded
+5,000-line archive and show the task exit code/error summary alongside stderr.
 
 Use an `Idempotency-Key` header when retrying `POST /api/jobs`: the same key and
 spec resolve to the same deterministic Job, while reusing it for different
@@ -487,7 +489,11 @@ the user's open/closed choice. Completed execution rows remain available as
 history. Command output remains queryable after teardown; the read-only live
 system-journal action remains available until the Worker resource is released,
 then stops polling on a not-found/conflict response; destructive terminate
-actions disappear at execution terminal state. API keys are accepted only in
+actions disappear at execution terminal state. Each Job keeps a stable result
+action while metadata loads. Per-Job request versions reject stale responses,
+known non-empty results never regress to empty on a transient or out-of-order
+refresh, terminal empty results retry with bounded backoff, and duplicate
+archive downloads are suppressed. API keys are accepted only in
 the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
 `sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and

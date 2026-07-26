@@ -146,7 +146,11 @@ The focused suite covers:
 - mode-0600 bounded Job command-log snapshots, ownership/path/symlink guards,
   replay-safe archive replacement, per-task/Job/global byte and retention
   quotas, streaming tail API filtering, and best-effort recovery from the
-  Worker's local NDJSON before teardown after a Manager restart;
+  Worker's local NDJSON before teardown after a Manager restart, including
+  archived failed-task access after the in-memory Job is gone;
+- stable failed-Job log/result controls, 5,000-line terminal log requests with
+  exit summaries, per-Job result request versions, non-empty monotonic cache
+  protection, finite terminal-empty retry, and duplicate-download suppression;
 - ordered durable lifecycle-event replay, single-handler in-flight replay with
   failure/cancellation takeover, reconnect-on-handler-failure, stale-socket ACK
   suppression with deduplicated reconnect ACK, active-socket send-error

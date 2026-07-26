@@ -436,3 +436,13 @@
 **验证**：先补红测试覆盖两 Worker/两账号并发、交叉事件拒绝、单卡提交不影响另一卡、双提交 claim、transport 失败恢复、非秘密 REST 元数据和 Job 内 UI 契约。最终完整套件 **2096 passed / 12 skipped / 0 failed**；变更模块 Ruff、Batch JavaScript 语法、diff check 全部通过。Chrome 149 真实浏览器验证双 Job 精确落位、XSS text-only、未知 Job fallback、Job replacement 后值/焦点/选区不变，以及 390px 视口 10 个 Worker 时目标输入完整可见且不被提醒层遮挡；两轮独立后端/UI 审查最终无 blocker。
 
 **生产发布（runtime `f6d510b`）**：发布前确认活跃 Job、Node、账号占用、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0。精确 Git archive 已安装到最终路径 `/home/ubuntu/elastic-agent.release-f6d510b`，东京 Manager 原子切换成功，旧 `/home/ubuntu/elastic-agent.release-05a1181` 由 rollback symlink 保留。域名 health、线上按需 OTP 源码标记、运行时进程路径和当前 systemd Invocation 均复核通过，ERROR pattern 为 0；发布后资源仍全为 0，4 个账号 EIP 均为 `ready`。本次只改登录控制面与 UI，没有为制造人工 OTP 而创建收费 EC2 canary。
+
+## 2026-07-26 失败日志与下载操作稳定（commit `e296484`）
+
+**问题**：失败 Job 的命令输出已经在 Worker 销毁前归档，但入口藏在折叠详情中且只显示通用“任务输出”，终态页面只取 1000 行，也没有展示归档任务的退出码。结果按钮又完全依赖异步内存缓存：页面先画 Job 再查 S3 时会短暂移除按钮；手动刷新可与自动轮询重叠，较旧的空响应晚到后会覆盖较新的非空结果；终态 `file_count=0` 还会被永久缓存。
+
+**解决**：失败 Job/Worker 使用明确的“查看失败日志”入口，终态读取后端允许的完整 5000 行有界归档，并把 task exit code/error summary 与 stderr 一起显示；持久化 Job journal 对应的归档在 Manager 内存 Job 消失后仍可查询。结果操作节点始终保留，以检查中、等待、暂无、暂不可用、可下载和下载中表达状态；每个 Job 的 results 请求带前端 generation，只允许最新请求提交缓存，已知非空结果不会回退为空，终态空结果有限退避复查，错误保留最后有效快照，同一 Job 同时只生成一个下载压缩包。
+
+**以后避免**：轮询接口的响应完成顺序不等于请求发出顺序，任何会改变可操作性的异步缓存都必须有 request identity，并明确哪些状态可单调推进。加载占位不能通过删除操作节点表达，否则正常瀑布加载也会被用户看成“按钮消失”；后台完成标记也不等于文件一定存在，下载可用性必须以实际结果元数据为准。
+
+**验证**：先以红测试锁定持久化失败 Job 的归档访问和新的结果状态契约；最终完整套件 **2097 passed / 12 skipped / 0 failed**，Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。Chrome 149 真实复现新结果先返回、旧空结果后返回，修复后文件数保持非空且按钮不消失；下载中 Job 卡被轮询替换仍保持单请求状态；失败归档请求 5000 行、显示退出摘要/stderr，并在终态停止轮询。独立日志、结果和 UI 测试审查无 blocker。
