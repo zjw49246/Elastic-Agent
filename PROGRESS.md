@@ -446,3 +446,5 @@
 **以后避免**：轮询接口的响应完成顺序不等于请求发出顺序，任何会改变可操作性的异步缓存都必须有 request identity，并明确哪些状态可单调推进。加载占位不能通过删除操作节点表达，否则正常瀑布加载也会被用户看成“按钮消失”；后台完成标记也不等于文件一定存在，下载可用性必须以实际结果元数据为准。
 
 **验证**：先以红测试锁定持久化失败 Job 的归档访问和新的结果状态契约；最终完整套件 **2097 passed / 12 skipped / 0 failed**，Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。Chrome 149 真实复现新结果先返回、旧空结果后返回，修复后文件数保持非空且按钮不消失；下载中 Job 卡被轮询替换仍保持单请求状态；失败归档请求 5000 行、显示退出摘要/stderr，并在终态停止轮询。独立日志、结果和 UI 测试审查无 blocker。
+
+**生产发布（runtime `4348521`）**：发布前后均确认活跃 Job、Node、账号占用、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-4348521`，旧 `f6d510b` 由 rollback symlink 保留；域名 health、运行时路径和新 Invocation 均正常，ERROR pattern 为 0。Chrome 149 通过线上失败 Job `job-c4827c3f4bcc992fb6dbea99a925ad29` 验证“查看失败日志”显示退出码 1、101 行归档及 instance-generation 根因，3.5 秒后仍只有一次日志请求；结果操作稳定显示 607 个文件且可下载。此次复用已有失败历史做无副作用验收，没有创建收费 EC2 canary。
