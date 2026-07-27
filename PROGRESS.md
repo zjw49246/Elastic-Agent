@@ -457,3 +457,5 @@
 **以后避免**：面向多对象存储的下载不能把“完整预构建 + 整包浏览器 Blob”当作普通小文件路径；要同时核算对象 RTT、首字节时间、Manager 磁盘、浏览器内存、代理空闲超时和取消后的服务端资源。高频进度不能进入整卡渲染签名。任何内存 fallback 的上限必须覆盖所有后端响应元数据，而不只覆盖主存储路径。运行中结果的 UI 也必须区分“Worker 当前文件”与“最近一次已完成收集快照”。
 
 **验证**：新增归档有效性、后续对象阻塞时提前产出、active body close 异常下取消清理，以及 UI 流读取、直接落盘、大文件保护、原位进度和运行中快照测试。API/UI 聚焦测试 **101 passed**；完整套件 **2101 passed / 12 skipped / 0 failed**；变更模块 Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。后端与浏览器侧独立复核最终均无 blocker/high。
+
+**生产发布（runtime `a44e38c`）**：首次候选 `01a78dc` 已证明大 Job 首字节和取消正常；真实 Chrome 进一步发现下载状态虽然从 Map 清除，按钮却因开始时没有提交一次 active 渲染签名而停在“正在取消”。follow-up `a44e38c` 在下载开始时只做一次 keyed reconcile，传输进度仍全部原位更新，终止时签名可靠回到 idle。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-a44e38c`，`release-01a78dc` 与对应 unit/env 作为即时回滚。公网大 Job首字节 1.649 秒、5 秒传输 7,004,160 bytes 后主动取消；Chrome 验证写入、取消、toast 和按钮恢复为“下载结果 (5184)”；另一个 628 对象 Job 在 25.33 秒完整下载 34,151,654-byte 有效 tar。发布后公网 health 正常，新 Invocation 的 ERROR/Traceback/Exception 为 0，活跃 Job、Node、账号占用、OTP、非终态 managed EC2 与已挂载 EIP 均为 0，4 个绑定全部 `ready`。
