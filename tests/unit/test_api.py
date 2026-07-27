@@ -11,7 +11,13 @@ from httpx import ASGITransport, AsyncClient
 from elastic_agent.api.app import create_app
 from elastic_agent.api.auth import reset_api_keys
 from elastic_agent.core.config import ElasticAgentConfig
-from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
+from elastic_agent.core.providers.base import (
+    CloudProvider,
+    Instance,
+    InstanceConfig,
+    InstanceNotFoundError,
+    InstanceState,
+)
 from elastic_agent.core.registry import NodeRecord, NodeStatus
 from elastic_agent.manager.manager import ElasticAgentManager
 
@@ -66,14 +72,16 @@ class InMemoryProvider(CloudProvider):
     async def list_instances(self, filters: dict | None = None) -> list[Instance]:
         return list(self._instances.values())
 
-    async def get_instance(self, instance_id: str) -> Instance | None:
+    async def get_instance(self, instance_id: str) -> Instance:
         native = instance_id.split(":", 1)[-1] if ":" in instance_id else instance_id
-        return self._instances.get(native)
+        instance = self._instances.get(native)
+        if instance is None:
+            raise InstanceNotFoundError(f"Instance not found: {instance_id}")
+        return instance
 
     async def wait_until_running(self, instance_id: str, timeout: int = 300) -> Instance:
         inst = await self.get_instance(instance_id)
-        if inst:
-            inst.state = InstanceState.RUNNING
+        inst.state = InstanceState.RUNNING
         return inst
 
 

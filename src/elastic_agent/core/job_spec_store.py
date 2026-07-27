@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import time
 from pathlib import Path
 
@@ -18,10 +19,15 @@ from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.secure_store import (
     atomic_write_private,
     tighten_private_json_directory,
+    tighten_state_file,
 )
 
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _JOB_STATES = {"prepared", "launching", "running", "succeeded", "failed", "cancelled"}
+_UNBOUND_LAUNCH_INTENTS_VERSION = 1
+_MAX_UNBOUND_LAUNCH_JOBS = 10_000
+_MAX_UNBOUND_LAUNCHES_PER_JOB = 1_000
+_MAX_UNBOUND_LAUNCH_INTENTS_BYTES = 2 * 1024 * 1024
 
 
 def job_specs_dir(registry_path: str | Path) -> Path:
@@ -97,3 +103,180 @@ def update_job_state(
         destination,
         json.dumps(payload, ensure_ascii=False, indent=2),
     )
+
+
+def _unbound_launch_intents_path(registry_path: str | Path) -> Path:
+    return Path(os.fspath(registry_path)).expanduser().with_name(
+        "unbound-launches.json"
+    )
+
+
+def _new_unbound_launch_intents(controller_id: str) -> dict:
+    return {
+        "version": _UNBOUND_LAUNCH_INTENTS_VERSION,
+        "controller_id": controller_id,
+        "jobs": {},
+    }
+
+
+def _read_unbound_launch_intents(
+    registry_path: str | Path,
+    controller_id: str,
+) -> tuple[Path, dict]:
+    """Strictly read the dedicated ordinary-RunInstances intent journal."""
+
+    if not controller_id or len(controller_id) > 256:
+        raise ValueError("invalid controller id for unbound launch intents")
+    path = _unbound_launch_intents_path(registry_path)
+    if not path.exists() and not path.is_symlink():
+        return path, _new_unbound_launch_intents(controller_id)
+    tighten_state_file(path)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > _MAX_UNBOUND_LAUNCH_INTENTS_BYTES
+        ):
+            raise ValueError("unsafe unbound launch intent journal")
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read <= _MAX_UNBOUND_LAUNCH_INTENTS_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    64 * 1024,
+                    _MAX_UNBOUND_LAUNCH_INTENTS_BYTES + 1 - bytes_read,
+                ),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        payload_bytes = b"".join(chunks)
+        if len(payload_bytes) > _MAX_UNBOUND_LAUNCH_INTENTS_BYTES:
+            raise ValueError("unbound launch intent journal is too large")
+        current = path.stat(follow_symlinks=False)
+        if (
+            current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            raise ValueError("unbound launch intent journal changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid unbound launch intent journal") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "controller_id", "jobs"}
+        or isinstance(payload.get("version"), bool)
+        or not isinstance(payload.get("version"), int)
+        or payload.get("version") != _UNBOUND_LAUNCH_INTENTS_VERSION
+        or payload.get("controller_id") != controller_id
+        or not isinstance(payload.get("jobs"), dict)
+        or len(payload["jobs"]) > _MAX_UNBOUND_LAUNCH_JOBS
+    ):
+        raise ValueError("invalid unbound launch intent journal")
+    for job_id, count in payload["jobs"].items():
+        if (
+            not isinstance(job_id, str)
+            or _SAFE_JOB_ID.fullmatch(job_id) is None
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= _MAX_UNBOUND_LAUNCHES_PER_JOB
+        ):
+            raise ValueError("invalid unbound launch intent entry")
+    return path, payload
+
+
+def load_unbound_launch_intents(
+    registry_path: str | Path,
+    controller_id: str,
+) -> dict[str, int]:
+    """Load outstanding ordinary creates for this durable Manager controller."""
+
+    _path, payload = _read_unbound_launch_intents(
+        registry_path,
+        controller_id,
+    )
+    return dict(payload["jobs"])
+
+
+def add_unbound_launch_intent(
+    registry_path: str | Path,
+    controller_id: str,
+    job_id: str,
+    *,
+    expected_count: int | None = None,
+) -> int:
+    """Persist intent before an ordinary Job calls the cloud create API."""
+
+    if _SAFE_JOB_ID.fullmatch(job_id) is None:
+        raise ValueError(f"invalid job id for unbound launch: {job_id!r}")
+    path, payload = _read_unbound_launch_intents(
+        registry_path,
+        controller_id,
+    )
+    jobs = payload["jobs"]
+    current = int(jobs.get(job_id, 0))
+    if expected_count is not None and current != expected_count:
+        raise RuntimeError(
+            "unbound launch intent journal changed unexpectedly"
+        )
+    count = current + 1
+    if count > _MAX_UNBOUND_LAUNCHES_PER_JOB:
+        raise ValueError("too many uncertain unbound launches for one Job")
+    if job_id not in jobs and len(jobs) >= _MAX_UNBOUND_LAUNCH_JOBS:
+        raise ValueError("too many uncertain unbound launch Jobs")
+    jobs[job_id] = count
+    atomic_write_private(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+    return count
+
+
+def resolve_unbound_launch_intent(
+    registry_path: str | Path,
+    controller_id: str,
+    job_id: str,
+    *,
+    all_launches: bool = False,
+    expected_count: int | None = None,
+) -> int:
+    """Durably resolve one confirmed instance, or all after stable miss scans."""
+
+    if _SAFE_JOB_ID.fullmatch(job_id) is None:
+        raise ValueError(f"invalid job id for unbound launch: {job_id!r}")
+    path, payload = _read_unbound_launch_intents(
+        registry_path,
+        controller_id,
+    )
+    jobs = payload["jobs"]
+    current = int(jobs.get(job_id, 0))
+    if expected_count is not None and current != expected_count:
+        raise RuntimeError(
+            "unbound launch intent journal changed unexpectedly"
+        )
+    if current == 0:
+        return 0
+    remaining = 0 if all_launches else current - 1
+    if remaining:
+        jobs[job_id] = remaining
+    else:
+        jobs.pop(job_id, None)
+    atomic_write_private(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+    return remaining

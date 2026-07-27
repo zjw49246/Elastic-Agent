@@ -96,12 +96,14 @@ uv run pytest -q \
   tests/unit/test_result_uploader.py \
   tests/unit/test_manager.py \
   tests/unit/test_account_store.py \
+  tests/unit/test_agent_api_accounts.py \
   tests/unit/test_account_login_api.py \
   tests/unit/test_codex_login.py \
   tests/unit/test_generic_harness.py \
   tests/unit/test_protocol_messages.py \
   tests/unit/test_connection_manager.py \
   tests/unit/test_worker_runtime.py \
+  tests/unit/test_worker_agent_api.py \
   tests/unit/test_bootstrap_steps.py \
   tests/unit/test_web_ui.py
 ```
@@ -159,12 +161,52 @@ The focused suite covers:
   suppression with deduplicated reconnect ACK, active-socket send-error
   propagation, STATUS coverage during final sync, cancellation during dispatch,
   non-blocking exhaustion/login rotation, and live compensation retry after
-  ordinary EC2 creation failures;
+  ordinary EC2 creation failures, including timeout/cancellation after cloud
+  acceptance, eventual-consistency tag rescans, and a create-to-event
+  publication fence that protects current Jobs from orphan recovery;
 - `run.secret_env` resolution only at dispatch and rejection of plaintext
   cross-host WebSockets before AWS secrets are read; worker clone never receives
   the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
+- CloudRouter Agent API provider registration (Apex rejected until implemented),
+  15-second wall-clock-bounded no-redirect Bearer model/usage requests,
+  30-second/concurrency-16 automatic pool refresh with unfinished-key OAuth
+  fallback, one shared 60-second usage→key-delivery→Worker-ACK deadline,
+  Claude/Codex model projection,
+  optional exact `account.model` admission at plan/allocation/configure,
+  60-second usage caching, unlimited/exhausted/auth/transient-last-known-dead
+  admission, invalid-schema/numeric/expiry fail-closed behavior, per-account
+  concurrent refresh, deterministic model-refresh benching, and private atomic
+  Manager storage;
+- correlated Manager-to-Worker API-key projection, 0700/0600 ownership and
+  no-symlink checks, version-2 marker, fixed Claude/Codex routing, byte-exact
+  helper plus environment-sanitizing launcher integrity,
+  inherited auth/base/provider scrubbing, Claude project/local settings and
+  hook/MCP exclusion, PTY wrapper selection, structured provider error
+  promotion from exit 0, durable runtime hard-quota benching with successful
+  re-probe recovery, API-first OAuth fallback, explicit-ID mapping, and
+  projection-external sibling slots for dynamic API→OAuth rotation,
+  claim release only after ordinary Worker teardown, and startup-recovery
+  admission fencing before any API key read or Worker send while OAuth remains
+  available; runtime auth feedback is pinned to an immutable
+  `task_id/account_id/auth_kind` dispatch snapshot so stale exhaustion/exit
+  replay cannot bench a newly rotated account;
+- Mode-B POSIX process-group teardown for STOP, timeout, exhaustion, and
+  parent-before-child exit; terminal CloudRouter 500/502 fails without emitting
+  `RUN_EXHAUSTED` or triggering `rotation.resume_args`; PTY hard limits terminate
+  without claiming an automatic cross-account resume; PTY launch/STOP/shutdown
+  cancellation and teardown exceptions still converge on one reliable terminal
+  handoff;
+- reserved nested-container projection hand-off scrubbing/override across
+  subprocess, login shell, and PTY paths; compatible container runners must
+  validate the marker and use an exact one-root read-only mount without putting
+  the key in environment variables or Docker arguments; EIP JobSpec rejects
+  HTTP(S)/ALL proxy variables from both plain and secret env so managed traffic
+  cannot bypass the account's stable public egress;
+- Agent API REST/UI write-only behavior, CloudRouter add/refresh/usage controls,
+  one identity selectable for both supported Agent types, quota/model display,
+  no browser-persisted Key, and sanitized validation/upstream errors.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   suppress live actions after teardown, keep read-only system logs until release,
@@ -263,6 +305,16 @@ IPv4 addresses incur hourly charges even while detached.
    verify the temporary EC2 is still terminated while the EIP remains.
 8. When testing is complete, call the explicit decommission endpoint and
    confirm the EIP allocation is released. Then remove the account identity.
+
+For an ordinary (non-EIP) Job recovery drill, inject a provider timeout after
+`RunInstances` acceptance, persist the Job as failed, and restart the Manager
+before its first recovery scan. Verify that `unbound-launches.json` keeps Agent
+API admission closed across an initially empty cloud scan, then that a later
+visible matching instance is collected, confirmed terminated, and removed
+from the intent journal. Repeat once with a fully published NodeRecord and no
+remaining launch intent: make both the first tag-list lookup and first exact-ID
+lookup miss, then verify startup stays blocked until the exact durable worker
+appears and is terminated.
 
 Do not infer login persistence from a repeated EIP. Each new instance must run
 the worker-local login again; this feature does not persist auth files, browser

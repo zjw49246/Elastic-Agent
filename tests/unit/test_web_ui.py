@@ -53,6 +53,8 @@ class TestDashboardEndpoint:
         assert 'id="acctClearPassword"' in html
         assert 'id="acctClearToken"' in html
         assert 'id="jAgentType"' in html
+        assert 'id="jAgentModel"' in html
+        assert "model: document.getElementById('jAgentModel').value.trim()" in html
         assert "Codex 至少配置 OpenAI 密码或接码查询 Token" in html
         assert "Codex 至少填写一项，可同时填写" in html
         assert "查询 Token 不是 OpenAI 登录凭据" in html
@@ -77,6 +79,44 @@ class TestDashboardEndpoint:
         assert "if (!workerLocal) binding.value = 'none'" in html
         assert "providerType === 'aws' && !eipBindingTouched" in html
         assert "accounts/bindings" in html
+
+    @pytest.mark.asyncio
+    async def test_batch_console_exposes_cloudrouter_agent_api_accounts(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "CloudRouter Agent API" in html
+        assert 'id="apiAcctProvider"' in html
+        assert 'value="cloudrouter"' in html
+        assert 'id="apiAcctName"' in html
+        assert 'id="apiAcctGroup"' in html
+        assert 'id="apiAcctKey" type="password"' in html
+        assert "async function addCloudRouterAccount()" in html
+        assert "provider: 'cloudrouter'" in html
+        assert "api('POST', '/agent-api/accounts'" in html
+        assert "document.getElementById('apiAcctKey').value = ''" in html
+        assert "sessionStorage.setItem('apiAcctKey'" not in html
+        assert "localStorage" not in html
+
+    @pytest.mark.asyncio
+    async def test_batch_console_projects_agent_api_accounts_into_jobs(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "a.auth_kind === 'agent_api'" in html
+        assert "a.supported_agent_types" in html
+        assert "a.supported_models" in html
+        assert "a.api_usage" in html
+        assert "CloudRouter · API" in html
+        assert "function accountSupportedAgentTypes(a)" in html
+        assert "option.dataset.agentTypes = supported.join(',')" in html
+        assert "option.dataset.agentTypes.split(',').includes(agentType)" in html
+        assert "async function refreshAgentApiAccount(id)" in html
+        assert "'/agent-api/accounts/' + encodeURIComponent(id) + '/refresh'" in html
 
     @pytest.mark.asyncio
     async def test_batch_console_does_not_persist_or_put_api_key_in_download_url(

@@ -427,6 +427,44 @@ class TestRenderEnv:
 
         assert spec.run.env[unrelated_name] == "/tmp/unused"
 
+    @pytest.mark.parametrize(
+        "unsafe_name",
+        [
+            "http_proxy",
+            "https_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "all_proxy",
+        ],
+    )
+    @pytest.mark.parametrize("field", ["env", "secret_env"])
+    def test_eip_rejects_proxy_environment_that_bypasses_stable_egress(
+        self, unsafe_name, field
+    ):
+        value = (
+            "http://proxy.invalid"
+            if field == "env"
+            else "aws-ssm:///jobs/proxy"
+        )
+        with pytest.raises(ValidationError, match="direct EIP egress"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="x", **{field: {unsafe_name: value}}),
+                account={"binding": "eip"},
+            )
+
+    def test_non_eip_job_may_use_proxy_environment(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(
+                command="x",
+                env={"HTTPS_PROXY": "http://proxy.invalid"},
+            ),
+        )
+
+        assert spec.run.env["HTTPS_PROXY"] == "http://proxy.invalid"
+
 
 class TestResolvedCwd:
     def test_default_is_repo_root(self):
@@ -471,6 +509,7 @@ class TestJobSpecDefaults:
         assert spec.fanout.shard_by == "hostname"
         assert spec.account.mode == "worker_local_login"
         assert spec.account.agent_type == "claude"
+        assert spec.account.model == ""
         assert spec.account.per_worker == 1
         assert spec.account.binding == "none"
         assert spec.account.ids == []
@@ -490,6 +529,15 @@ class TestJobSpecDefaults:
         )
 
         assert spec.account.agent_type == "codex"
+
+    def test_optional_agent_model_is_normalized_and_bounded(self):
+        account = AccountSpec(model="  gpt-5.4  ")
+
+        assert account.model == "gpt-5.4"
+        with pytest.raises(ValidationError):
+            AccountSpec(model="bad\nmodel")
+        with pytest.raises(ValidationError):
+            AccountSpec(model="x" * 201)
 
     @pytest.mark.parametrize("timeout", [59, 1201])
     def test_account_login_timeout_is_bounded(self, timeout):
@@ -586,3 +634,33 @@ class TestEipAccountBinding:
         assert spec.account.binding == "none"
         assert spec.account.per_worker == 2
         assert spec.rotation.strategy == "on_exhaust_restart_resume"
+
+    def test_unbound_explicit_ids_cover_every_worker_slot(self):
+        spec = JobSpec(
+            name="explicit",
+            run=RunSpec(command="bench"),
+            account={
+                "per_worker": 2,
+                "config_dir": "/root/.claude",
+                "ids": ["a1", "a2", "a3", "a4"],
+            },
+            fanout={"workers": 2},
+        )
+
+        assert spec.account.ids == ["a1", "a2", "a3", "a4"]
+
+    def test_unbound_explicit_ids_reject_partial_assignment(self):
+        with pytest.raises(
+            ValidationError,
+            match="account.ids must contain exactly 4",
+        ):
+            JobSpec(
+                name="explicit",
+                run=RunSpec(command="bench"),
+                account={
+                    "per_worker": 2,
+                    "config_dir": "/root/.claude",
+                    "ids": ["a1", "a2"],
+                },
+                fanout={"workers": 2},
+            )

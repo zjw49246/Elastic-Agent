@@ -82,10 +82,14 @@ class ElasticAgentManager:
 
         from elastic_agent.core.account_binding import AccountBindingStore
         from elastic_agent.core.account_store import AccountStore
+        from elastic_agent.core.agent_api import AgentApiAccountStore
         from elastic_agent.core.binding_manager import BindingManager
 
         self.account_store = AccountStore(
             str(_Path(config.registry.path).with_name("accounts.json"))
+        )
+        self.agent_api_store = AgentApiAccountStore(
+            _Path(config.registry.path).with_name("agent-api-accounts")
         )
         self.account_binding_store = AccountBindingStore(
             str(_Path(config.registry.path).with_name("bindings.json"))
@@ -106,12 +110,39 @@ class ElasticAgentManager:
         self._recovery_allocation_attempts: dict[str, int] = {}
         self._recovery_instances: dict[str, Any] = {}
         self._recovery_unbound_instances: dict[str, Any] = {}
+        # A provider timeout/cancellation can occur after RunInstances was
+        # accepted but before it returned an instance id.  Keep scanning the
+        # exact controller/job tag scope for a full visibility quarantine.
+        self._recovery_unbound_launch_scans: dict[str, int] = {}
+        # Once registry/event publication succeeds, the durable NodeRecord is
+        # the exact recovery handle.  On a fresh process, quarantine those ids
+        # across eventual-consistency misses before declaring them gone.
+        self._recovery_unbound_registry_scans: dict[str, int] = {}
+        # Unlike the scan countdown, this count is durably journaled before
+        # each ordinary Job create call and remains until the instance has a
+        # durable exact registry handle (or its teardown is confirmed).  It
+        # survives a second Manager crash after the orchestrator has already
+        # marked the Job failed.
+        self._unbound_launch_intent_counts: dict[str, int] = {}
+        # Once an exact instance has consumed/transferred its no-id launch
+        # intent, it may still need compensation or local cleanup retries.
+        # Prevent those retries from decrementing another same-Job launch.
+        self._resolved_unbound_instance_ids: set[str] = set()
         self._binding_recovery_task: asyncio.Task | None = None
+        self._binding_recovery_wakeup = asyncio.Event()
         self._bound_disconnect_tasks: dict[str, asyncio.Task] = {}
         self._bound_disconnect_cancel_events: dict[str, asyncio.Event] = {}
         self._shutdown_event = asyncio.Event()
         self._binding_lock_fd: int | None = None
         self._instance_capacity_lock = asyncio.Lock()
+        # Startup/live recovery and instance publication share this fence.
+        # Otherwise a controller-tag scan can observe RunInstances after the
+        # cloud accepted it but before the ordinary Job's registry row exists,
+        # and mistake the current worker for a previous-process orphan.
+        self._instance_lifecycle_lock = asyncio.Lock()
+        # This is deliberately process-local.  Durable registry metadata alone
+        # must never suppress startup cleanup after a Manager restart.
+        self._current_unbound_instance_ids: set[str] = set()
         self._job_state_lock = asyncio.Lock()
         self._inflight_instance_creates = 0
         self._instance_capacity_holds: dict[str, int] = {}
@@ -191,6 +222,20 @@ class ElasticAgentManager:
             await self.registry.load()
             await self.task_registry.load()
             await self.account_store.load()
+            native_account_ids = {
+                account.id for account in await self.account_store.list()
+            }
+            api_account_ids = {
+                account.id for account in await self.agent_api_store.list()
+            }
+            duplicate_account_ids = sorted(
+                native_account_ids & api_account_ids
+            )
+            if duplicate_account_ids:
+                raise RuntimeError(
+                    "duplicate account ids across OAuth and Agent API stores: "
+                    + ", ".join(duplicate_account_ids)
+                )
             await self.account_binding_store.load()
             self.reconciler.set_controller_id(
                 self.account_binding_store.controller_id
@@ -276,6 +321,7 @@ class ElasticAgentManager:
     async def _quiesce_background_tasks(self) -> None:
         """Quiesce and await every owner task before controller unlock."""
         self._shutdown_event.set()
+        self._binding_recovery_wakeup.set()
         for event in self._bound_disconnect_cancel_events.values():
             event.set()
         # Stop the reconciler first so it cannot start a fresh bound-loss
@@ -383,6 +429,42 @@ class ElasticAgentManager:
         self._startup_binding_recovery = True
         self._recovery_unsafe_lease_ids.clear()
         self._recovery_unknown_lease_ids.clear()
+        self._resolved_unbound_instance_ids.clear()
+        self._current_unbound_instance_ids.clear()
+        from elastic_agent.core.job_spec_store import (
+            load_unbound_launch_intents,
+        )
+
+        async with self._job_state_lock:
+            self._unbound_launch_intent_counts = await asyncio.to_thread(
+                load_unbound_launch_intents,
+                self.config.registry.path,
+                self.account_binding_store.controller_id,
+            )
+        self._recovery_unbound_launch_scans = {
+            job_id: BOUND_RECOVERY_STABLE_SCANS
+            for job_id in self._unbound_launch_intent_counts
+        }
+        self._recovery_unbound_registry_scans = {}
+        for node in await self.registry.list_all():
+            job_id = str(node.metadata.get("job_id") or "")
+            controller_id = str(
+                node.metadata.get("controller_id") or ""
+            )
+            if (
+                node.metadata.get("lease_id")
+                or node.status == NodeStatus.TERMINATED
+                or not job_id
+                or (
+                    controller_id
+                    and controller_id
+                    != self.account_binding_store.controller_id
+                )
+            ):
+                continue
+            self._recovery_unbound_registry_scans[node.node_id] = (
+                BOUND_RECOVERY_STABLE_SCANS
+            )
         active = await self.account_binding_store.list_leases(active_only=True)
         self._recovery_lease_ids = {lease.lease_id for lease in active}
         bindings = await self.account_binding_store.list_bindings()
@@ -424,11 +506,14 @@ class ElasticAgentManager:
                 )
                 try:
                     await asyncio.wait_for(
-                        self._shutdown_event.wait(), timeout=delay
+                        self._binding_recovery_wakeup.wait(),
+                        timeout=delay,
                     )
-                    return
                 except asyncio.TimeoutError:
                     pass
+                self._binding_recovery_wakeup.clear()
+                if self._shutdown_event.is_set():
+                    return
                 await self._recover_bound_resources_once()
         except asyncio.CancelledError:
             return
@@ -499,7 +584,7 @@ class ElasticAgentManager:
                 errors.append(exc)
                 logger.exception("Failed to detach EIP from orphan %s", instance_id)
         try:
-            await self.provider.terminate_instance(instance_id)
+            await self._terminate_instance_confirmed(instance_id)
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
             logger.exception("Failed to terminate orphan %s", instance_id)
@@ -509,16 +594,106 @@ class ElasticAgentManager:
                 + "; ".join(str(error) or type(error).__name__ for error in errors)
             )
 
+    async def _terminate_instance_confirmed(self, instance_id: str) -> None:
+        """Request termination and fence on terminal cloud readback."""
+
+        # Once teardown/compensation starts, recovery may adopt and retry this
+        # exact instance if the direct cloud request fails.  Keeping it marked
+        # as a live current Job would make that retry incorrectly skip it.
+        self._current_unbound_instance_ids.discard(instance_id)
+        await self.provider.terminate_instance(instance_id)
+        await self.binding_manager.wait_instance_terminated(instance_id)
+
     async def _recover_bound_resources_once(self) -> None:
+        """Serialize one recovery pass with cloud create -> registry publication."""
+
+        async with self._instance_lifecycle_lock:
+            await self._recover_bound_resources_once_locked()
+
+    async def _current_unbound_instance_is_live(self, instance) -> bool:
+        """Prove an unbound cloud row still belongs to this process's live Job."""
+
+        instance_id = instance.instance_id
+        if instance_id not in self._current_unbound_instance_ids:
+            return False
+        tags = instance.tags
+        job_id = str(tags.get("ElasticAgentJob") or "")
+        controller_id = str(tags.get("ElasticAgentController") or "")
+        if (
+            instance.state == InstanceState.TERMINATED
+            or tags.get("ElasticAgentLease")
+            or not job_id
+            or controller_id != self.account_binding_store.controller_id
+        ):
+            self._current_unbound_instance_ids.discard(instance_id)
+            return False
+        node_id = f"{instance.platform}:{instance.native_id}"
+        node = await self.registry.get(node_id)
+        if (
+            node is None
+            or node.instance_id != instance_id
+            or str(node.metadata.get("job_id") or "") != job_id
+            or str(node.metadata.get("controller_id") or "") != controller_id
+            or node.metadata.get("lease_id")
+            or node.status == NodeStatus.TERMINATED
+        ):
+            self._current_unbound_instance_ids.discard(instance_id)
+            return False
+        return True
+
+    def _unbound_registry_instance_validation_error(
+        self,
+        instance,
+        node: NodeRecord,
+    ) -> str | None:
+        """Validate an exact cloud row before recovering a durable Job node."""
+
+        job_id = str(node.metadata.get("job_id") or "")
+        if instance.instance_id != node.instance_id:
+            return "exact lookup returned a different instance id"
+        if (
+            instance.tags.get(CloudProvider.MANAGED_TAG_KEY)
+            != CloudProvider.MANAGED_TAG_VALUE
+        ):
+            return "instance is not tagged ManagedBy=elastic-agent"
+        if (
+            instance.tags.get("ElasticAgentController")
+            != self.account_binding_store.controller_id
+        ):
+            return "instance controller tag does not match this Manager"
+        if str(instance.tags.get("ElasticAgentJob") or "") != job_id:
+            return "instance Job tag does not match durable registry"
+        if instance.tags.get("ElasticAgentLease"):
+            return "unbound registry node unexpectedly has a lease tag"
+        return None
+
+    async def _recover_bound_resources_once_locked(self) -> None:
         """One idempotent pass over startup leases and tagged orphan EC2s."""
         if self._binding_recovery_scan_pending:
+            visible_unbound_jobs = {
+                str(instance.tags.get("ElasticAgentJob") or "")
+                for instance_id, instance
+                in self._recovery_unbound_instances.items()
+                if (
+                    instance.state != InstanceState.TERMINATED
+                    and instance_id
+                    not in self._resolved_unbound_instance_ids
+                )
+            }
             try:
                 instances = await self.provider.list_instances(filters={
                     CloudProvider.MANAGED_TAG_KEY: CloudProvider.MANAGED_TAG_VALUE,
                     "ElasticAgentController": self.account_binding_store.controller_id,
                 })
+                listed_instances = {
+                    instance.instance_id: instance
+                    for instance in instances
+                }
                 for instance in instances:
                     if (
+                        instance.tags.get(CloudProvider.MANAGED_TAG_KEY)
+                        != CloudProvider.MANAGED_TAG_VALUE
+                        or
                         instance.tags.get("ElasticAgentController")
                         != self.account_binding_store.controller_id
                     ):
@@ -529,13 +704,27 @@ class ElasticAgentManager:
                         and instance.tags.get("ElasticAgentJob")
                         and instance.state != InstanceState.TERMINATED
                     ):
+                        if await self._current_unbound_instance_is_live(instance):
+                            # A process-local ownership token plus an exact
+                            # registry/controller/Job match proves this is a
+                            # current ordinary Job, not restart debris.
+                            continue
                         # Ordinary Jobs now carry the same controller/job
-                        # ownership tags as EIP Jobs.  Since BatchJob state is
-                        # process-local, a startup instance cannot have a live
-                        # owner and must be collected/terminated fail-closed.
+                        # ownership tags as EIP Jobs.  Anything not proven live
+                        # by this process is collected/terminated fail-closed.
                         self._recovery_unbound_instances[
                             instance.instance_id
                         ] = instance
+                        if (
+                            instance.instance_id
+                            not in self._resolved_unbound_instance_ids
+                        ):
+                            visible_unbound_jobs.add(
+                                str(
+                                    instance.tags.get("ElasticAgentJob")
+                                    or ""
+                                )
+                            )
                         continue
                     if lease_id and (
                         self._startup_binding_recovery
@@ -600,6 +789,101 @@ class ElasticAgentManager:
                             self._recovery_unsafe_lease_ids.discard(lease_id)
                             self._recovery_unknown_lease_ids.discard(lease_id)
                         self._recovery_instances[instance.instance_id] = instance
+                # A crash can occur after the launch intent was cleared by
+                # durable registry/event publication but before scale_out
+                # returned ownership to the in-memory orchestrator.  Recover
+                # every previous-process unbound NodeRecord by its exact id;
+                # a single eventually-consistent tag-list miss is not proof
+                # that the billable instance never existed.
+                for node_id, remaining in list(
+                    self._recovery_unbound_registry_scans.items()
+                ):
+                    node = await self.registry.get(node_id)
+                    if node is None:
+                        self._recovery_unbound_registry_scans.pop(
+                            node_id, None
+                        )
+                        continue
+                    candidate = listed_instances.get(node.instance_id)
+                    if candidate is None:
+                        try:
+                            candidate = await self.provider.get_instance(
+                                node.instance_id
+                            )
+                        except InstanceNotFoundError:
+                            if remaining > 1:
+                                self._recovery_unbound_registry_scans[
+                                    node_id
+                                ] = remaining - 1
+                            else:
+                                try:
+                                    await self.registry.update(
+                                        node_id,
+                                        status=NodeStatus.TERMINATED,
+                                    )
+                                    await self.connection_manager.disconnect_worker(
+                                        node_id
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    self._recovery_unbound_registry_scans[
+                                        node_id
+                                    ] = 1
+                                    logger.exception(
+                                        "Cannot settle missing recovered "
+                                        "unbound node %s",
+                                        node_id,
+                                    )
+                                else:
+                                    self._recovery_unbound_registry_scans.pop(
+                                        node_id, None
+                                    )
+                            continue
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "Cannot verify recovered unbound node %s "
+                                "instance %s",
+                                node_id,
+                                node.instance_id,
+                            )
+                            continue
+                    if candidate is None:
+                        logger.error(
+                            "Exact lookup returned no state for recovered "
+                            "unbound node %s instance %s",
+                            node_id,
+                            node.instance_id,
+                        )
+                        continue
+                    validation_error = (
+                        self._unbound_registry_instance_validation_error(
+                            candidate,
+                            node,
+                        )
+                    )
+                    if validation_error:
+                        logger.error(
+                            "Refusing exact unbound recovery for node %s "
+                            "instance %s: %s",
+                            node_id,
+                            node.instance_id,
+                            validation_error,
+                        )
+                        continue
+                    if candidate.state == InstanceState.TERMINATED:
+                        await self.registry.update(
+                            node_id,
+                            status=NodeStatus.TERMINATED,
+                        )
+                        await self.connection_manager.disconnect_worker(
+                            node_id
+                        )
+                        self._recovery_unbound_registry_scans.pop(
+                            node_id, None
+                        )
+                        continue
+                    self._recovery_unbound_instances[
+                        candidate.instance_id
+                    ] = candidate
                 # Upgrade/crash compatibility: an active durable lease may
                 # reference a pre-controller instance that strict tag filters
                 # cannot return.  Verify only that exact immutable id; never
@@ -671,8 +955,38 @@ class ElasticAgentManager:
                     self._binding_recovery_scans_remaining = max(
                         0, self._binding_recovery_scans_remaining - 1
                     )
+                # The controller-scoped list call itself succeeded even if an
+                # unrelated exact bound-instance lookup was UNKNOWN.  Advance
+                # each ordinary Job only when neither this scan nor a retained
+                # exact recovery handle found one of its instances.
+                for job_id, remaining in list(
+                    self._recovery_unbound_launch_scans.items()
+                ):
+                    if job_id in visible_unbound_jobs:
+                        continue
+                    if remaining > 1:
+                        self._recovery_unbound_launch_scans[
+                            job_id
+                        ] = remaining - 1
+                        continue
+                    try:
+                        await self._resolve_unbound_launch_intent(
+                            job_id,
+                            all_launches=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Clearing the durable intent is part of proving
+                        # recovery complete.  Keep one scan pending and retry
+                        # instead of admitting Agent API key use prematurely.
+                        self._recovery_unbound_launch_scans[job_id] = 1
+                        logger.exception(
+                            "Cannot clear settled unbound launch intent for %s",
+                            job_id,
+                        )
                 self._binding_recovery_scan_pending = (
                     self._binding_recovery_scans_remaining > 0
+                    or bool(self._recovery_unbound_launch_scans)
+                    or bool(self._recovery_unbound_registry_scans)
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -720,9 +1034,13 @@ class ElasticAgentManager:
             if not unresolved_launch:
                 # Once every active lease's exact instance id is visible, the
                 # ambiguous post-RunInstances crash window is closed and no
-                # additional eventual-consistency quarantine is needed.
+                # additional bound-launch quarantine is needed.  An unbound
+                # timeout still keeps its independent tag scan active.
                 self._binding_recovery_scans_remaining = 0
-                self._binding_recovery_scan_pending = False
+                self._binding_recovery_scan_pending = bool(
+                    self._recovery_unbound_launch_scans
+                    or self._recovery_unbound_registry_scans
+                )
 
         async def cleanup_control_plane(lease) -> None:
             worker_id = self._durable_lease_worker_target(
@@ -924,13 +1242,39 @@ class ElasticAgentManager:
                     instance_id,
                 )
             try:
-                await self.provider.terminate_instance(instance_id)
+                await self._terminate_instance_confirmed(instance_id)
+                job_id = str(instance.tags.get("ElasticAgentJob") or "")
+                registry_node_ids: list[str] = []
+                for node_id in self._recovery_unbound_registry_scans:
+                    node = await self.registry.get(node_id)
+                    if node is not None and node.instance_id == instance_id:
+                        registry_node_ids.append(node_id)
+                if (
+                    not registry_node_ids
+                    and job_id in self._unbound_launch_intent_counts
+                ):
+                    # One cloud row proves one accepted create.  Resolve it
+                    # only after terminal readback; additional same-Job
+                    # uncertain creates keep their independent scan fence.
+                    await self._resolve_unbound_launch_intent(
+                        job_id,
+                        instance_id=instance_id,
+                    )
+                for node_id in registry_node_ids:
+                    self._recovery_unbound_registry_scans.pop(
+                        node_id, None
+                    )
+                self._binding_recovery_scan_pending = (
+                    self._binding_recovery_scans_remaining > 0
+                    or bool(self._recovery_unbound_launch_scans)
+                    or bool(self._recovery_unbound_registry_scans)
+                )
                 await self.registry.update(
                     instance_id, status=NodeStatus.TERMINATED
                 )
                 await self.connection_manager.disconnect_worker(instance_id)
                 self._recovery_unbound_instances.pop(instance_id, None)
-                job_id = str(instance.tags.get("ElasticAgentJob") or "")
+                self._resolved_unbound_instance_ids.discard(instance_id)
                 if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id):
                     try:
                         await self._update_batch_job_state(
@@ -994,6 +1338,8 @@ class ElasticAgentManager:
             and not self._recovery_lease_ids
             and not self._recovery_instances
             and not self._recovery_unbound_instances
+            and not self._recovery_unbound_launch_scans
+            and not self._recovery_unbound_registry_scans
             and not self._recovery_decommission_ids
             and not self._recovery_allocation_attempts
         )
@@ -1163,10 +1509,95 @@ class ElasticAgentManager:
     def _ensure_binding_recovery_task(self) -> None:
         if self._shutdown_event.is_set():
             return
+        self._binding_recovery_wakeup.set()
         if self._binding_recovery_task is None or self._binding_recovery_task.done():
             self._binding_recovery_task = asyncio.create_task(
                 self._binding_recovery_loop()
             )
+
+    async def _begin_unbound_launch_intent(self, job_id: str) -> int:
+        """Durably fence one ordinary create before entering the cloud API."""
+
+        from elastic_agent.core.job_spec_store import add_unbound_launch_intent
+
+        async def commit() -> int:
+            async with self._job_state_lock:
+                expected_count = self._unbound_launch_intent_counts.get(
+                    job_id, 0
+                )
+                count = await asyncio.to_thread(
+                    add_unbound_launch_intent,
+                    self.config.registry.path,
+                    self.account_binding_store.controller_id,
+                    job_id,
+                    expected_count=expected_count,
+                )
+                self._unbound_launch_intent_counts[job_id] = count
+                return count
+
+        # A cancelled request cannot abandon the fsync thread halfway through
+        # and leave in-memory recovery unaware of the now-durable intent.
+        return await self._await_owned_task(asyncio.create_task(commit()))
+
+    async def _resolve_unbound_launch_intent(
+        self,
+        job_id: str,
+        *,
+        all_launches: bool = False,
+        instance_id: str = "",
+    ) -> int:
+        """Commit that one create, or a stable all-miss scan, is harmless."""
+
+        from elastic_agent.core.job_spec_store import (
+            resolve_unbound_launch_intent,
+        )
+
+        async def commit() -> int:
+            async with self._job_state_lock:
+                if (
+                    instance_id
+                    and instance_id in self._resolved_unbound_instance_ids
+                ):
+                    return self._unbound_launch_intent_counts.get(job_id, 0)
+                expected_count = self._unbound_launch_intent_counts.get(
+                    job_id, 0
+                )
+                remaining = await asyncio.to_thread(
+                    resolve_unbound_launch_intent,
+                    self.config.registry.path,
+                    self.account_binding_store.controller_id,
+                    job_id,
+                    all_launches=all_launches,
+                    expected_count=expected_count,
+                )
+                if remaining:
+                    self._unbound_launch_intent_counts[job_id] = remaining
+                else:
+                    self._unbound_launch_intent_counts.pop(job_id, None)
+                    self._recovery_unbound_launch_scans.pop(job_id, None)
+                if instance_id:
+                    self._resolved_unbound_instance_ids.add(instance_id)
+                self._binding_recovery_scan_pending = (
+                    self._binding_recovery_scans_remaining > 0
+                    or bool(self._recovery_unbound_launch_scans)
+                    or bool(self._recovery_unbound_registry_scans)
+                )
+                return remaining
+
+        return await self._await_owned_task(asyncio.create_task(commit()))
+
+    def _mark_unbound_launch_recovery_needed(self, job_id: str) -> None:
+        """Activate bounded scans for an already-durable ordinary intent."""
+
+        if not job_id or not self._unbound_launch_intent_counts.get(job_id):
+            return
+        self._recovery_unbound_launch_scans[job_id] = max(
+            self._recovery_unbound_launch_scans.get(job_id, 0),
+            BOUND_RECOVERY_STABLE_SCANS,
+        )
+        self._binding_recovery_scan_pending = True
+        self._binding_recovery_ready = False
+        self._ensure_binding_recovery_task()
 
     # ------------------------------------------------------------------
     # Node operations
@@ -1208,7 +1639,11 @@ class ElasticAgentManager:
         if self._account_allocator is None:
             from elastic_agent.core.batch_hooks import AccountAllocator
 
-            self._account_allocator = AccountAllocator(self.account_store)
+            self._account_allocator = AccountAllocator(
+                self.account_store,
+                self.agent_api_store,
+                agent_api_admission=lambda: self.binding_recovery_ready,
+            )
         return self._account_allocator
 
     @property
@@ -1249,6 +1684,7 @@ class ElasticAgentManager:
             )
             return
         from elastic_agent.core.batch_hooks import (
+            AgentApiCoordinator,
             LoginCoordinator,
             make_bound_hooks,
             make_login_hook,
@@ -1263,13 +1699,24 @@ class ElasticAgentManager:
             quarantine_account=allocator.quarantine,
         )
         self._account_login_coordinator = coordinator
+        agent_api_coordinator = AgentApiCoordinator(
+            self.connection_manager,
+            self.event_bus,
+            self.agent_api_store,
+            agent_api_admission=lambda: self.binding_recovery_ready,
+        )
         bound_reserve, bound_attach, bound_release = make_bound_hooks(self, allocator)
         driver = ManagerFleetDriver(
             self,
             provision_hook=provision_hook or make_provision_hook(
                 self, include_pty=include_pty,
             ),
-            login_hook=login_hook or make_login_hook(self, allocator, coordinator),
+            login_hook=login_hook or make_login_hook(
+                self,
+                allocator,
+                coordinator,
+                agent_api_coordinator,
+            ),
             bound_reserve_hook=bound_reserve,
             bound_attach_hook=bound_attach,
             bound_release_hook=bound_release,
@@ -1408,15 +1855,16 @@ class ElasticAgentManager:
     ) -> list[NodeRecord]:
         reserved_capacity = await self._reserve_instance_capacity(count, tags)
         try:
-            return await self._scale_out_unchecked(
-                count=count,
-                instance_type=instance_type,
-                region=region,
-                name_prefix=name_prefix,
-                disk_gb=disk_gb,
-                spot=spot,
-                tags=tags,
-            )
+            async with self._instance_lifecycle_lock:
+                return await self._scale_out_unchecked(
+                    count=count,
+                    instance_type=instance_type,
+                    region=region,
+                    name_prefix=name_prefix,
+                    disk_gb=disk_gb,
+                    spot=spot,
+                    tags=tags,
+                )
         finally:
             async with self._instance_capacity_lock:
                 self._inflight_instance_creates = max(
@@ -1484,24 +1932,47 @@ class ElasticAgentManager:
             instance = None
             record = None
             lease_id = instance_cfg.tags.get("ElasticAgentLease", "")
-            if lease_id:
-                import hashlib
-
-                instance_cfg.client_token = (
-                    "ea-" + hashlib.sha256(lease_id.encode()).hexdigest()[:61]
-                )
-                # Persist intent before RunInstances.  The SDK can time out
-                # after AWS accepted the request, in which case no Instance is
-                # returned to this coroutine even though a billable EC2 will
-                # become visible later.
-                await self.account_binding_store.update_lease(
-                    lease_id,
-                    launch_uncertain=True,
-                    last_operation="create_instance",
-                    error=None,
-                )
+            job_id = str(instance_cfg.tags.get("ElasticAgentJob") or "")
+            unbound_intent_before = self._unbound_launch_intent_counts.get(
+                job_id, 0
+            )
+            unbound_intent_started = False
             try:
+                if lease_id:
+                    import hashlib
+
+                    instance_cfg.client_token = (
+                        "ea-" + hashlib.sha256(lease_id.encode()).hexdigest()[:61]
+                    )
+                    # Persist intent before RunInstances.  The SDK can time out
+                    # after AWS accepted the request, in which case no Instance
+                    # is returned to this coroutine even though a billable EC2
+                    # will become visible later.
+                    await self.account_binding_store.update_lease(
+                        lease_id,
+                        launch_uncertain=True,
+                        last_operation="create_instance",
+                        error=None,
+                    )
+                elif job_id:
+                    # A random idempotency token prevents transport-level SDK
+                    # retries from creating duplicates.  The separate durable
+                    # counter is the recovery authority across Manager restarts.
+                    instance_cfg.client_token = f"ea-u-{uuid.uuid4().hex}"
+                    await self._begin_unbound_launch_intent(job_id)
+                    unbound_intent_started = True
                 instance = await self.provider.create_instance(instance_cfg)
+                if (
+                    not lease_id
+                    and instance_cfg.tags.get("ElasticAgentJob")
+                ):
+                    # Record exact current-process ownership immediately after
+                    # the cloud returns.  The lifecycle lock prevents recovery
+                    # from inspecting it until registry/event publication has
+                    # either completed or compensation has started.
+                    self._current_unbound_instance_ids.add(
+                        instance.instance_id
+                    )
                 node_id = f"{instance.platform}:{instance.native_id}"
                 if lease_id:
                     # Persist the new instance against its pre-reserved lease
@@ -1512,17 +1983,25 @@ class ElasticAgentManager:
                         lease_id, instance.instance_id, node_id
                     )
                 token = generate_worker_token()
-                metadata: dict[str, Any] = {}
+                controller_id = str(
+                    instance_cfg.tags.get("ElasticAgentController") or ""
+                )
+                metadata: dict[str, Any] = (
+                    {
+                        "job_id": job_id,
+                        "controller_id": controller_id,
+                    }
+                    if job_id
+                    else {}
+                )
                 if lease_id:
                     metadata = {
-                        "job_id": instance_cfg.tags.get("ElasticAgentJob", ""),
+                        "job_id": job_id,
                         "account_id": instance_cfg.tags.get(
                             "ElasticAgentAccount", ""
                         ),
                         "lease_id": lease_id,
-                        "controller_id": instance_cfg.tags.get(
-                            "ElasticAgentController", ""
-                        ),
+                        "controller_id": controller_id,
                     }
                 record = NodeRecord(
                     node_id=node_id,
@@ -1540,12 +2019,31 @@ class ElasticAgentManager:
                     record.node_id,
                     {"instance_id": instance.instance_id},
                 )
+                if unbound_intent_started:
+                    await self._resolve_unbound_launch_intent(
+                        job_id,
+                        instance_id=instance.instance_id,
+                    )
+                    unbound_intent_started = False
                 records.append(record)
             except BaseException as exc:  # noqa: BLE001
+                # The cancellation-safe durable helper may finish its fsync
+                # and then re-raise the caller's cancellation.  Infer that
+                # completion from the protected count before compensating.
+                unbound_intent_started = (
+                    unbound_intent_started
+                    or (
+                        bool(job_id)
+                        and self._unbound_launch_intent_counts.get(job_id, 0)
+                        > unbound_intent_before
+                    )
+                )
                 compensation_succeeded = instance is None
                 if instance is not None:
                     try:
-                        await self.provider.terminate_instance(instance.instance_id)
+                        await self._terminate_instance_confirmed(
+                            instance.instance_id
+                        )
                         compensation_succeeded = True
                         if record is not None:
                             await self.registry.update(
@@ -1559,6 +2057,33 @@ class ElasticAgentManager:
                                 "Compensating termination failed for %s",
                                 instance.instance_id,
                             )
+                if (
+                    unbound_intent_started
+                    and instance is not None
+                    and compensation_succeeded
+                ):
+                    try:
+                        await self._resolve_unbound_launch_intent(
+                            job_id,
+                            instance_id=instance.instance_id,
+                        )
+                    except BaseException as resolution_exc:  # noqa: BLE001
+                        if isinstance(resolution_exc, Exception):
+                            logger.exception(
+                                "Could not resolve compensated unbound launch "
+                                "intent for %s",
+                                job_id,
+                            )
+                    unbound_intent_started = (
+                        self._unbound_launch_intent_counts.get(job_id, 0)
+                        > unbound_intent_before
+                    )
+                    if unbound_intent_started:
+                        self._mark_unbound_launch_recovery_needed(job_id)
+                    else:
+                        self._resolved_unbound_instance_ids.discard(
+                            instance.instance_id
+                        )
                 if lease_id and instance is not None and not compensation_succeeded:
                     # Keep the current Manager fail-closed too; startup recovery
                     # is not the only time a post-RunInstances compensation can
@@ -1582,8 +2107,11 @@ class ElasticAgentManager:
                     self._recovery_unbound_instances[
                         instance.instance_id
                     ] = instance
-                    self._binding_recovery_ready = False
-                    self._ensure_binding_recovery_task()
+                    if unbound_intent_started:
+                        self._mark_unbound_launch_recovery_needed(job_id)
+                    else:
+                        self._binding_recovery_ready = False
+                        self._ensure_binding_recovery_task()
                 elif lease_id and instance is not None and compensation_succeeded:
                     # The exact returned instance was successfully destroyed;
                     # release no longer needs an eventual-consistency scan.
@@ -1602,6 +2130,16 @@ class ElasticAgentManager:
                     self._binding_recovery_scan_pending = True
                     self._binding_recovery_ready = False
                     self._ensure_binding_recovery_task()
+                elif (
+                    not lease_id
+                    and instance is None
+                    and unbound_intent_started
+                ):
+                    # The provider may have accepted RunInstances before a
+                    # timeout/cancellation prevented it from returning the
+                    # instance id.  The controller/job tags are the only safe
+                    # recovery handle for this ordinary launch.
+                    self._mark_unbound_launch_recovery_needed(job_id)
 
                 # ``scale_out(count=N)`` is one ownership transaction.  If a
                 # later create fails, every earlier success from this call must
@@ -1609,8 +2147,22 @@ class ElasticAgentManager:
                 # orchestrator never receives their ids and cannot tear down
                 # those billable instances.
                 for created in reversed(records):
+                    created_job_id = str(
+                        created.metadata.get("job_id") or ""
+                    )
                     try:
-                        await self.provider.terminate_instance(
+                        await self._terminate_instance_confirmed(
+                            created.instance_id
+                        )
+                        if (
+                            created_job_id
+                            in self._unbound_launch_intent_counts
+                        ):
+                            await self._resolve_unbound_launch_intent(
+                                created_job_id,
+                                instance_id=created.instance_id,
+                            )
+                        self._resolved_unbound_instance_ids.discard(
                             created.instance_id
                         )
                         await self.registry.update(
@@ -1630,6 +2182,9 @@ class ElasticAgentManager:
                         # Trigger the same retry scanner used at startup now;
                         # waiting for a future process restart would leave a
                         # billable ordinary Job worker running indefinitely.
+                        self._mark_unbound_launch_recovery_needed(
+                            created_job_id
+                        )
                         self._binding_recovery_scan_pending = True
                         self._binding_recovery_ready = False
                         self._ensure_binding_recovery_task()
@@ -1658,7 +2213,12 @@ class ElasticAgentManager:
                             reason="worker force-scaled in by administrator",
                         )
                     else:
-                        await self.provider.terminate_instance(node.instance_id)
+                        await self._terminate_instance_confirmed(
+                            node.instance_id
+                        )
+                        self._resolved_unbound_instance_ids.discard(
+                            node.instance_id
+                        )
                         await self.registry.update(nid, status=NodeStatus.TERMINATED)
                         await self.connection_manager.disconnect_worker(nid)
                     terminated.append(nid)
@@ -2098,7 +2658,10 @@ class ElasticAgentManager:
             # after a failed cloud termination would report success while losing
             # the only handle to a still-billable instance.
             try:
-                await self.provider.terminate_instance(node.instance_id)
+                await self._terminate_instance_confirmed(node.instance_id)
+                self._resolved_unbound_instance_ids.discard(
+                    node.instance_id
+                )
             except Exception:
                 logger.exception(
                     "Failed to terminate instance %s during removal",
@@ -2115,6 +2678,7 @@ class ElasticAgentManager:
         await self.task_registry.cleanup_worker(node_id)
         if node is None:
             return False
+        self._current_unbound_instance_ids.discard(node.instance_id)
         if node.status not in (NodeStatus.TERMINATED, NodeStatus.FAILED):
             await self.registry.update(node_id, status=NodeStatus.TERMINATED)
         removed = await self.registry.remove(node_id)

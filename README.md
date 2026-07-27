@@ -63,8 +63,8 @@ session, the prompt is injected into the warm session as a new turn — no
 process respawn, no cold `--resume` (verified: ~3x faster turnaround).
 A STOP tears the session down; the next resume is cold.
 
-Requires claude-pty >= commit aa23aab (cross-host inject isolation: OS-assigned
-inject ports + session_id validation on /inject).
+The lock currently pins claude-pty commit `7d5a0e5` (cross-host inject
+isolation plus cancellation-safe Session publication and cleanup).
 
 Credential rotation: account swaps are in-place (new tokens written into the
 same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
@@ -83,6 +83,9 @@ Protocol notes:
 - Interactive sessions emit no `result` line; the Worker synthesizes one at
   turn end (`synthesized_by: "pty_backend"`) carrying the session_id.
   `cost_usd` is not available in PTY mode.
+- STOP, shutdown, and transient-retry launch cancellation converge through one
+  terminal finalizer. A PTY teardown exception is logged but cannot suppress
+  the reliable `PROCESS_EXIT` handoff.
 
 ## Batch jobs (declarative)
 
@@ -100,6 +103,19 @@ The worker keeps a stdin pipe open so interactive callers can send
 `SEND_INPUT`. For an unattended CLI that waits for stdin EOF even when a prompt
 argument is present, redirect stdin explicitly in `run.command`; for example,
 use `codex exec ... </dev/null`.
+
+On POSIX, each Mode-B command runs in its own process session. STOP, timeout,
+exhaustion, and a parent that exits while leaving children behind terminate the
+whole process group before the Worker publishes its terminal event. A
+CloudRouter 500/502 is classified as transient and the CLI may recover
+internally, but Elastic does not silently replay an arbitrary outer Mode-B
+command after the CLI gives up: that could duplicate benchmark side effects.
+The Job therefore fails even when `rotation.resume_args` is configured; that
+policy responds only to proven account auth/hard-quota exhaustion, not terminal
+500/502. Put any idempotent transient retry inside the harness itself. Likewise,
+a hard CloudRouter limit observed by a custom Mode-A PTY task durably benches
+that account and terminates the current task; it does not automatically
+cross-account-resume the PTY session.
 
 Mode-B jobs are described declaratively as a **JobSpec** — no Python subclass
 needed — and fanned out across the fleet:
@@ -189,11 +205,107 @@ Select the implementation with `account.agent_type` (`"claude"` by default):
 ```python
 "account": {
     "agent_type": "codex",
+    "model": "gpt-5.4",  # optional CloudRouter model admission
     "mode": "worker_local_login",
     "group": "standard",
     "config_dir": "",  # Codex uses the runtime user's ~/.codex
 }
 ```
+
+The same account pool can also contain CloudRouter Agent API identities. Add
+one from the Batch Console's **CloudRouter Agent API** form or through the
+authenticated management API:
+
+```bash
+curl -fsS -X POST "$EA_URL/api/agent-api/accounts" \
+  -H "Authorization: Bearer $EA_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"cloudrouter","name":"research-router","group":"standard","api_key":"<write-only-key>"}'
+```
+
+The Manager validates the key with CloudRouter's fixed `/v1/models` endpoint
+and projects it into Claude, Codex, or both according to the returned model
+IDs. Fresh allocation prefers a compatible, available API identity and falls
+back to OAuth; `account.ids` can select the generated ID such as
+`cloudrouter-1` explicitly. Set optional `account.model` to require an exact
+advertised model (Claude stable aliases also match their dated variants);
+without it, admission checks only the selected Agent family for backward
+compatibility. This field validates routing but does not rewrite the opaque run
+command's own model arguments. Jobs do not need a separate API mode and API
+identities support the same persistent EIP binding flow.
+
+Provider waits have nested wall-clock bounds: each CloudRouter HTTP request is
+limited to 15 seconds; automatic pool selection refreshes at most 16 keys
+concurrently for 30 seconds total, excludes unfinished keys for that attempt,
+and can fall back to OAuth. An explicit native/OAuth ID skips unrelated API
+probes. For a selected API identity, usage admission, key read/delivery, and the
+Worker acknowledgement share one 60-second deadline and fail closed.
+
+For non-EIP rotation, pre-logged credential slots are used first. If a dynamic
+Agent-API-to-OAuth fallback is then needed, the OAuth login goes to a sibling
+`<source-slot>-rot-N` directory outside `.elastic-agent-api`; Elastic never
+writes OAuth state into a delegated-key projection and fails closed if the
+source slot cannot be derived safely.
+
+CloudRouter keys live in a mode-`0700` Manager account directory with
+mode-`0600` files. They are never returned by REST and never enter JobSpec,
+CLI configuration, process environment, or command arguments. After the same
+WSS transport check used for login secrets, a correlated setup message writes
+the key once to the selected Worker. Claude and Codex read it through a private
+helper; their endpoints are fixed to `console.cloudrouter.online`, inherited
+official auth/base overrides are removed, and a structured provider failure is
+reported as a failed Job even when the CLI process exits `0`. Managed Claude
+loads only its Worker-owned user settings; project/local settings, hooks, and
+MCP configuration are excluded so Job files cannot redirect the provider or
+credential helper.
+
+During Manager startup recovery, Agent API allocation stays closed until every
+previous Worker has a confirmed terminal cloud readback. OAuth allocation can
+continue. This prevents a surviving orphan Worker and a new Job from using the
+same API key concurrently.
+
+Nested containers require an explicit container-owner contract. For a validated
+projection the Worker exports the non-secret
+`ELASTIC_AGENT_API_PROJECTION_ROOT` path; ordinary/OAuth Jobs have any
+user-supplied value removed. A compatible runner validates the projection
+version-2 marker and ownership, mounts exactly that account root read-only at
+the same absolute path, and forwards `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
+Version 2 adds a byte-exact mode-`0700` launcher that clears the inherited
+environment before invoking the credential helper, so a task-writable
+`PATH`/`PYTHONPATH` cannot replace the Python interpreter that reads the key.
+The supported AI4Sci OS sandbox consumes this contract and starts managed Codex
+through the root-owned Node binary and exact npm entrypoint, bypassing its
+`#!/usr/bin/env node` wrapper.
+
+Managed Agent API traffic uses direct Worker egress. EIP Job preflight rejects
+`HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (including lowercase variants) in
+`run.env` or `run.secret_env`; the supported container consumer independently
+rejects ambient or adapter-supplied routing proxies. This prevents CloudRouter
+from observing a proxy's public IP instead of the account's bound EIP. Ordinary
+non-managed CLI Jobs retain their existing proxy support. Elastic-Agent
+deliberately does not intercept arbitrary `docker`, Compose, or SDK calls.
+
+`GET /api/agent-api/accounts`, `POST
+/api/agent-api/accounts/{id}/refresh`, and `GET
+/api/agent-api/accounts/{id}/usage` expose only non-secret models and normalized
+usage. Usage is cached for 60 seconds; invalid, expired, or exhausted keys are
+not allocated. The last known unavailable result is fingerprint-bound and
+durable across Manager restart, so a transient refresh cannot revive it. A
+runtime hard-quota event writes the same recoverable durable state; a later
+successful provider probe clears it, while invalid-key/model tombstones require
+an explicit refresh. Invalid/unknown 200-response schemas fail closed, numeric
+and nested display fields are bounded and allowlisted, and deterministic
+model-refresh failures bench the stale catalog. Deletion is intentionally
+disabled until every delegated Worker can be durably fenced; terminate Jobs and
+retire the upstream key when necessary.
+The provider adapter is ready for a future Apex implementation, but Apex is not
+registered or accepted in this release.
+
+An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
+as that user can invoke the helper or read the private key file, so use Agent
+API accounts only with trusted Job code. Ordinary ephemeral Workers are
+destroyed before the account claim returns to the pool; EIP Jobs retain the
+existing durable detach/terminate/release ordering.
 
 A Codex account must contain at least one of its OpenAI login password or a
 supported mailbox-query `email_token`; both may be configured:
@@ -395,7 +507,10 @@ Job cleanup or account edit from losing its stable address.
 Manager-wired `submit()` and `launch()` (including REST) atomically persist the
 JobSpec in a mode-`0600` recovery journal before registration, account/EIP
 reservation, or cloud creation; a journal failure produces no launch side
-effect. An EIP Job also reserves the whole fanout against provider
+effect. Ordinary instance publication is fenced against live recovery, and a
+cloud create that times out or is cancelled after acceptance triggers a bounded
+controller/Job-tag scan so an instance that appears later is collected and
+terminated without waiting for a Manager restart. An EIP Job also reserves the whole fanout against provider
 `max_instances` before allocating any EIP. Schema limits are 100 workers, 32
 accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for run timeout/Job TTL,
 and an 86,400-second collection interval; provider `max_instances` defaults to
@@ -460,6 +575,15 @@ their lease). Disposable ordinary Workers are also removed from the live Node
 registry after cloud termination, preventing unbounded dashboard/state growth.
 On restart, durable `prepared/launching/running/terminal` state is
 used to resume preparation or collect and clean up interrupted Workers.
+Ordinary Job cloud creates also have a separate private
+`unbound-launches.json` intent journal, written before the provider call.
+That journal remains authoritative even after the Job is marked failed, so an
+accepted create hidden by a timeout or cancellation is still scanned,
+collected, and terminated after a later Manager restart. An intent is cleared
+only after confirmed instance termination, a complete successful no-match
+visibility window, or transfer to a durably published exact NodeRecord. A
+fresh Manager also quarantines and checks those exact instance IDs across the
+full visibility window, covering a crash immediately after publication.
 
 For cost control, `ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES` is a comma-separated
 Job allowlist (default: only the provider's configured instance type), and
@@ -512,7 +636,8 @@ The original strict download endpoint remains available to API clients that
 prefer a prebuilt archive and an HTTP error before response headers. API keys
 are accepted only in
 the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
-`sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
+`sessionStorage` and strips legacy query-string credentials. REST includes
+`/api/accounts`, `/api/agent-api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and
 `/api/jobs/harness`.
 

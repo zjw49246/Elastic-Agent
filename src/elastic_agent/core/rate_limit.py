@@ -20,6 +20,7 @@ These detectors are deliberately narrow to avoid false positives.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 
@@ -56,6 +57,247 @@ _TRANSIENT_OVERLOAD_RE = re.compile(
     r"|api overloaded",
     re.IGNORECASE,
 )
+
+# Third-party gateway errors are intentionally separate from the generic
+# Anthropic detectors. Callers must apply these only after proving that the
+# task uses a managed CloudRouter projection.
+_CLOUDROUTER_TRANSIENT_RE = re.compile(
+    r"^\s*(?:CloudRouter(?:\s+(?:API|gateway))?|API\s+Error|HTTP"
+    r"(?:\s+Error)?|status(?:\s+code)?|upstream(?:\s+error)?)"
+    r"\s*[:=-]?[^\n]{0,120}(?:\b50[02]\b|upstream[ _-]?error|"
+    r"internal[ _-]?server[ _-]?error|overloaded[ _-]?error)\b",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_STRUCTURED_TRANSIENT_RE = re.compile(
+    r"\b(?:unexpected\s+status\s+)?(?:500|502)\b"
+    r"|upstream[ _-]?error"
+    r"|internal[ _-]?server[ _-]?error"
+    r"|overloaded[ _-]?error",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_AUTH_RE = re.compile(
+    r"^\s*(?:CloudRouter(?:\s+(?:API|gateway))?|API\s+Error|HTTP"
+    r"(?:\s+Error)?|status(?:\s+code)?)\s*[:=-]?[^\n]{0,40}"
+    r"(?:\b401\b[^\n]{0,100}(?:unauthori[sz]ed|invalid|API[ _-]?key))"
+    r"|^\s*(?:error\s*:\s*)?(?:invalid[ _-]?api[ _-]?key"
+    r"|API[ _-]?key[^\n]{0,40}invalid)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_STRUCTURED_AUTH_RE = re.compile(
+    r"\b(?:unexpected\s+status\s+)?401\b[^\n]{0,160}"
+    r"(?:unauthori[sz]ed|invalid[ _-]?api[ _-]?key)"
+    r"|\binvalid[ _-]?api[ _-]?key\b",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_HARD_LIMIT_RE = re.compile(
+    r"\b(?:unexpected\s+status\s+|last\s+status\s*:\s*)?(?:403|429)\b"
+    r"|API_KEY_RATE_(?:5H|1D|7D)_EXCEEDED"
+    r"|quota[ _-]?(?:exhausted|exceeded)"
+    r"|too many requests"
+    r"|rate[ _-]?limit(?:ed|_error)?",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_HARD_LIMIT_FALLBACK_RE = re.compile(
+    r"^\s*(?:CloudRouter(?:\s+(?:API|gateway))?|API\s+Error|HTTP"
+    r"(?:\s+Error)?|status(?:\s+code)?|error)\s*[:=-]?"
+    r"[^\n]{0,160}(?:\b403\b|\b429\b|too many requests|"
+    r"quota[ _-]?(?:exhausted|exceeded)|rate[ _-]?limit)"
+    r"|^\s*API_KEY_RATE_(?:5H|1D|7D)_EXCEEDED\b",
+    re.IGNORECASE,
+)
+_CLOUDROUTER_AUTH_ERROR_TYPES = frozenset(
+    {
+        "authentication_error",
+        "authentication_failed",
+        "authentication_failure",
+        "invalid_api_key",
+        "unauthorized",
+    }
+)
+_CLOUDROUTER_TRANSIENT_ERROR_TYPES = frozenset(
+    {
+        "internal_server_error",
+        "overloaded_error",
+        "server_error",
+        "upstream_error",
+    }
+)
+_CLOUDROUTER_HARD_LIMIT_ERROR_TYPES = frozenset(
+    {
+        "api_key_rate_5h_exceeded",
+        "api_key_rate_1d_exceeded",
+        "api_key_rate_7d_exceeded",
+        "forbidden",
+        "permission_error",
+        "quota_exhausted",
+        "quota_exceeded",
+        "rate_limit_error",
+        "rate_limited",
+        "too_many_requests",
+    }
+)
+
+
+def _normalise_error_type(value: object) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    return re.sub(r"[\s-]+", "_", str(value).strip().lower())
+
+
+def _cloudrouter_structured_error(
+    text: str,
+) -> tuple[frozenset[str], str] | None:
+    """Return bounded type/message fields from a known provider-error frame.
+
+    Claude stream-json nests API-error text below ``message.content`` while
+    Codex normally puts it below ``error`` or ``result``. Only traverse a
+    small allowlist after the outer frame itself has proved error semantics;
+    otherwise normal assistant/task output containing error documentation
+    could bench a healthy account.
+    """
+
+    try:
+        event = json.loads(text)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    event_type = str(event.get("type") or "")
+    error = event.get("error")
+    recognized = (
+        event_type in {"error", "turn.failed", "session_crashed"}
+        or (
+            event_type in {"assistant", "message", "result"}
+            and bool(event.get("isApiErrorMessage"))
+        )
+        or (
+            event_type == "result"
+            and (
+                bool(event.get("is_error"))
+                or str(event.get("subtype") or "").lower()
+                in {"error", "api_error"}
+            )
+        )
+    )
+    if not recognized:
+        return None
+
+    error_types: set[str] = set()
+    text_parts: list[str] = []
+    text_chars = 0
+
+    def add_type(value: object) -> None:
+        normalized = _normalise_error_type(value)
+        if normalized:
+            error_types.add(normalized)
+
+    def add_text(value: object, *, depth: int = 0) -> None:
+        nonlocal text_chars
+        if depth > 4 or text_chars >= 16_384:
+            return
+        if isinstance(value, str):
+            selected = value[: 16_384 - text_chars]
+            if selected:
+                text_parts.append(selected)
+                text_chars += len(selected)
+            return
+        if isinstance(value, list):
+            for item in value[:32]:
+                add_text(item, depth=depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in (
+            "message",
+            "detail",
+            "text",
+            "content",
+            "result",
+            "error",
+            "reason",
+        ):
+            if key in value:
+                add_text(value[key], depth=depth + 1)
+
+    for key in (
+        "error_type",
+        "code",
+        "status",
+        "status_code",
+        "api_error_status",
+    ):
+        add_type(event.get(key))
+    if isinstance(error, dict):
+        for key in (
+            "type",
+            "code",
+            "error_type",
+            "status",
+            "status_code",
+            "api_error_status",
+        ):
+            add_type(error.get(key))
+    elif isinstance(error, (str, int)):
+        add_type(error)
+
+    for key in ("error", "message", "content", "result", "detail", "reason"):
+        if key in event:
+            add_text(event[key])
+    return frozenset(error_types), " ".join(text_parts)
+
+
+def is_cloudrouter_transient(text: str | None) -> bool:
+    """Retryable CloudRouter platform/upstream failure on the same key."""
+
+    if not text:
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _CLOUDROUTER_TRANSIENT_ERROR_TYPES)
+            or bool(error_types & {"500", "502"})
+            or bool(_CLOUDROUTER_STRUCTURED_TRANSIENT_RE.search(message))
+        )
+    return bool(_CLOUDROUTER_TRANSIENT_RE.search(text))
+
+
+def is_cloudrouter_auth_failure(text: str | None) -> bool:
+    """Gateway key rejection for a proven CloudRouter task."""
+
+    if not text:
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _CLOUDROUTER_AUTH_ERROR_TYPES)
+            or "401" in error_types
+            or bool(_CLOUDROUTER_STRUCTURED_AUTH_RE.search(message))
+        )
+    return bool(_CLOUDROUTER_AUTH_RE.search(text))
+
+
+def is_cloudrouter_hard_limit(text: str | None) -> bool:
+    """CloudRouter key/quota/rate condition that needs another account.
+
+    CloudRouter documents 403 as a balance/quota/key-expiry class and 429 as a
+    key-window/quota/concurrency class.  When a CLI drops the response body and
+    retains only the status, treating these as hard is safer than repeatedly
+    hammering the same key.
+    """
+
+    if not text:
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _CLOUDROUTER_HARD_LIMIT_ERROR_TYPES)
+            or bool(error_types & {"403", "429"})
+            or bool(_CLOUDROUTER_HARD_LIMIT_RE.search(message))
+        )
+    return bool(_CLOUDROUTER_HARD_LIMIT_FALLBACK_RE.search(text))
 
 
 def is_rate_limited(text: str | None) -> bool:

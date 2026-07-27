@@ -7,7 +7,7 @@ OAuth tokens are minted on the worker at login time and never enter this API.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -69,23 +69,65 @@ class AccountResponse(BaseModel):
 
     id: str
     email: str
-    agent_type: Literal["claude", "codex"]
+    agent_type: Literal["claude", "codex"] | None = None
     group: str
     enabled: bool
+    auth_kind: Literal["oauth", "agent_api"] = "oauth"
+    api_provider: str | None = None
+    supported_agent_types: list[Literal["claude", "codex"]] = Field(
+        default_factory=list
+    )
+    models: dict[str, list[str]] = Field(default_factory=dict)
+    has_api_key: bool = False
+    api_usage: dict[str, Any] | None = None
     has_email_token: bool = False
     has_password: bool = False
 
 
-def _public_account(account: AccountDefinition) -> AccountResponse:
+def _public_account(account: Any, *, api_usage: dict | None = None) -> AccountResponse:
+    if getattr(account, "auth_kind", "oauth") == "agent_api":
+        return AccountResponse(
+            id=account.id,
+            email=account.email,
+            agent_type=None,
+            group=account.group,
+            enabled=account.enabled,
+            auth_kind="agent_api",
+            api_provider=account.api_provider,
+            supported_agent_types=list(account.supported_agent_types),
+            models={
+                agent_type: list(models)
+                for agent_type, models in account.models.items()
+            },
+            has_api_key=bool(account.has_api_key),
+            api_usage=api_usage,
+        )
     return AccountResponse(
         id=account.id,
         email=account.email,
         agent_type=account.agent_type,
         group=account.group,
         enabled=account.enabled,
+        auth_kind="oauth",
+        supported_agent_types=[account.agent_type],
         has_email_token=bool(account.email_token),
         has_password=bool(account.password),
     )
+
+
+async def _get_account_identity(account_id: str) -> Any | None:
+    """Resolve one id across the shared OAuth/API claim namespace."""
+
+    manager = _mgr()
+    api_store = getattr(manager, "agent_api_store", None)
+    if api_store is not None:
+        from elastic_agent.core.agent_api import ACCOUNT_ID_RE
+
+        if ACCOUNT_ID_RE.fullmatch(account_id):
+            account = await api_store.get(account_id)
+            if account is not None:
+                return account
+    return await manager.account_store.get(account_id)
 
 
 class AccountBindingListResponse(BaseModel):
@@ -108,9 +150,25 @@ class DecommissionAccountBindingRequest(BaseModel):
 
 @router.get("/accounts", response_model=AccountListResponse)
 async def list_accounts() -> AccountListResponse:
-    accounts = await _mgr().account_store.list()
+    manager = _mgr()
+    native_accounts = await manager.account_store.list()
+    api_store = getattr(manager, "agent_api_store", None)
+    api_accounts = await api_store.list() if api_store is not None else []
+    accounts = [*api_accounts, *native_accounts]
+    if len({account.id for account in accounts}) != len(accounts):
+        raise HTTPException(500, "duplicate account ids across credential stores")
     return AccountListResponse(
-        accounts=[_public_account(account) for account in accounts],
+        accounts=[
+            _public_account(
+                account,
+                api_usage=(
+                    api_store.usage_snapshot(account.id)
+                    if getattr(account, "auth_kind", "oauth") == "agent_api"
+                    else None
+                ),
+            )
+            for account in accounts
+        ],
         total=len(accounts),
     )
 
@@ -219,7 +277,7 @@ async def ensure_account_binding(
         # inside ensure_binding, so the global lock order remains allocator ->
         # binding and account_transaction must not be nested here.
         async with _account_allocator().mutation_guard(account_id):
-            account = await mgr.account_store.get(account_id)
+            account = await _get_account_identity(account_id)
             if account is None:
                 raise HTTPException(404, f"Account {account_id} not found")
             if not account.enabled:
@@ -307,6 +365,16 @@ async def add_account(req: AccountRequest) -> AccountResponse:
             # every fact under both locks before changing the identity.
             async with _binding_manager().account_transaction(req.id):
                 existing = await manager.account_store.get(req.id)
+                api_store = getattr(manager, "agent_api_store", None)
+                if api_store is not None and existing is None:
+                    reserved_prefixes = tuple(
+                        f"{provider}-" for provider in api_store.registry.providers
+                    )
+                    if req.id.startswith(reserved_prefixes):
+                        raise HTTPException(
+                            409,
+                            "account id uses a reserved Agent API provider prefix",
+                        )
                 binding = await _binding_manager().get_binding(req.id)
                 active_leases = await _binding_manager().list_leases(
                     account_id=req.id, active_only=True,

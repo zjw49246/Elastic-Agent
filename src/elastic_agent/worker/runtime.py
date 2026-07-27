@@ -16,6 +16,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -35,6 +36,8 @@ from elastic_agent.core.protocols.messages import (
     AccountLoginOtpMessage,
     AccountLoginOtpRequiredMessage,
     AccountLoginResultMessage,
+    AgentApiConfigureMessage,
+    AgentApiConfigureResultMessage,
     AuthMessage,
     AuthResultMessage,
     CredentialLoginMessage,
@@ -63,7 +66,13 @@ from elastic_agent.core.protocols.messages import (
     WatchFilesMessage,
     parse_message,
 )
-from elastic_agent.core.rate_limit import is_auth_failure, is_rate_limited
+from elastic_agent.core.rate_limit import (
+    is_auth_failure,
+    is_cloudrouter_auth_failure,
+    is_cloudrouter_hard_limit,
+    is_cloudrouter_transient,
+    is_rate_limited,
+)
 from elastic_agent.core.secure_store import atomic_write_private, secure_state_directory
 
 logger = logging.getLogger(__name__)
@@ -72,6 +81,12 @@ logger = logging.getLogger(__name__)
 # giving up — a lingering child (e.g. a docker container from `--sandbox os`)
 # can hold the pipe open so it never EOFs. Bounded so the exit is always reported.
 _EXIT_DRAIN_TIMEOUT = 10.0
+_AGENT_API_ERROR_PRIORITY = {
+    "agent_api_error": 1,
+    "agent_api_transient_error": 2,
+    "agent_api_rate_limited": 3,
+    "agent_api_auth_failure": 4,
+}
 
 
 def _utcnow() -> datetime:
@@ -170,6 +185,12 @@ class WorkerRuntime:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._process_tasks: dict[str, asyncio.Task] = {}
         self._stdin_pipes: dict[str, asyncio.StreamWriter | None] = {}
+        # Every Mode-B command is a POSIX session leader.  Keep its process
+        # group until terminal hand-off so STOP, exhaustion, timeout, and a
+        # naturally exiting shell all clean up descendants before credentials
+        # can be delegated to another run.
+        self._process_groups: dict[str, int] = {}
+        self._process_group_locks: dict[str, asyncio.Lock] = {}
         # A process is removed from ``_processes`` before potentially slow final
         # file sync and durable PROCESS_EXIT persistence.  Keep that transition
         # visible to STATUS reconciliation so the Manager cannot mistake the
@@ -181,6 +202,10 @@ class WorkerRuntime:
         # dedupes so we signal + interrupt only once per run.
         self._exhaustion_watch: dict[str, str] = {}
         self._exhaustion_fired: set[str] = set()
+        # Only tasks launched from a validated managed API projection receive
+        # provider-specific environment hardening and semantic error handling.
+        self._agent_api_tasks: dict[str, Any] = {}
+        self._agent_api_task_errors: dict[str, tuple[str, str]] = {}
 
         self._send_queue: asyncio.Queue[str] = asyncio.Queue()
         self._reconnect_event = asyncio.Event()
@@ -371,6 +396,7 @@ class WorkerRuntime:
             "ACCOUNT_LOGIN": self._handle_account_login,
             "ACCOUNT_LOGIN_OTP": self._handle_account_login_otp,
             "ACCOUNT_LOGIN_CANCEL": self._handle_account_login_cancel,
+            "AGENT_API_CONFIGURE": self._handle_agent_api_configure,
             "EVENT_ACK": self._handle_event_ack,
         }
         handler = handlers.get(msg.type)
@@ -427,6 +453,51 @@ class WorkerRuntime:
 
     # ---- Command handlers ----
 
+    async def _handle_agent_api_configure(
+        self,
+        msg: AgentApiConfigureMessage,
+    ) -> None:
+        """Atomically install a correlated, worker-local API credential."""
+
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        try:
+            actual_home = await asyncio.to_thread(
+                configure_agent_api,
+                provider=msg.provider,
+                agent_type=msg.agent_type,
+                config_dir=msg.config_dir or None,
+                api_key=msg.api_key,
+                account_id=msg.account_id,
+                models=msg.models,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Neither third-party exceptions nor validation values are safe to
+            # reflect: the request contains a write-only key.
+            logger.warning(
+                "Agent API configuration failed (%s)",
+                type(exc).__name__,
+            )
+            await self._send_event(AgentApiConfigureResultMessage(
+                request_id=msg.request_id,
+                account_id=msg.account_id,
+                provider=msg.provider,
+                agent_type=msg.agent_type,
+                success=False,
+                error="Agent API configuration failed",
+                config_dir="",
+            ))
+            return
+
+        await self._send_event(AgentApiConfigureResultMessage(
+            request_id=msg.request_id,
+            account_id=msg.account_id,
+            provider=msg.provider,
+            agent_type=msg.agent_type,
+            success=True,
+            config_dir=actual_home,
+        ))
+
     async def _handle_execute(self, msg: ExecuteMessage) -> None:
         task_id = msg.task_id
         if task_id in self._processes or (
@@ -451,18 +522,122 @@ class WorkerRuntime:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         env = {**os.environ, **msg.env}
+        from elastic_agent.worker.agent_api import (
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+        )
+
+        # This is a reserved, trusted Worker-to-container-runner hand-off.  A
+        # regular/OAuth Job must never be able to turn it into an arbitrary
+        # host bind mount.
+        env.pop(ELASTIC_AGENT_API_PROJECTION_ROOT_ENV, None)
+        command = list(msg.command)
+        try:
+            projection = self._agent_api_projection_for_execute(msg)
+            if projection is not None:
+                from elastic_agent.worker.agent_api import (
+                    CLOUDROUTER_CLAUDE_BASE_URL,
+                    CLOUDROUTER_CLAUDE_BINARY_ENV,
+                    CLOUDROUTER_CODEX_BASE_URL,
+                    apply_agent_api_runtime_env,
+                    claude_shim_directory_for_home,
+                    claude_wrapper_for_home,
+                )
+
+                apply_agent_api_runtime_env(env, projection)
+                self._agent_api_tasks[task_id] = projection
+                env.pop(CLOUDROUTER_CLAUDE_BINARY_ENV, None)
+                if (
+                    projection.agent_type == "claude"
+                    and command
+                    and Path(command[0]).name == "claude"
+                ):
+                    original_binary = (
+                        command[0]
+                        if Path(command[0]).is_absolute()
+                        else shutil.which(
+                            command[0],
+                            path=env.get("PATH"),
+                        )
+                    )
+                    if not original_binary:
+                        raise RuntimeError("Claude CLI is unavailable")
+                    env[CLOUDROUTER_CLAUDE_BINARY_ENV] = original_binary
+                    command[0] = claude_wrapper_for_home(projection.home)
+                elif (
+                    len(command) >= 3
+                    and Path(command[0]).name in {"bash", "sh", "zsh"}
+                    and command[1] in {"-c", "-lc", "-cl"}
+                ):
+                    exports = [
+                        "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY "
+                        "CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY "
+                        "CLOUDROUTER_API_KEY OPENAI_BASE_URL CODEX_BASE_URL"
+                    ]
+                    credential_name = (
+                        "CLAUDE_CONFIG_DIR"
+                        if projection.agent_type == "claude"
+                        else "CODEX_HOME"
+                    )
+                    exports.append(
+                        f"export {credential_name}={shlex.quote(str(projection.home))}"
+                    )
+                    exports.append(
+                        "export "
+                        f"{ELASTIC_AGENT_API_PROJECTION_ROOT_ENV}="
+                        f"{shlex.quote(str(projection.root))}"
+                    )
+                    if projection.agent_type == "claude":
+                        original_binary = shutil.which(
+                            "claude",
+                            path=env.get("PATH"),
+                        )
+                        if not original_binary:
+                            raise RuntimeError("Claude CLI is unavailable")
+                        env[CLOUDROUTER_CLAUDE_BINARY_ENV] = original_binary
+                        exports.extend([
+                            "export ANTHROPIC_BASE_URL="
+                            f"{shlex.quote(CLOUDROUTER_CLAUDE_BASE_URL)}",
+                            "export PATH="
+                            f"{shlex.quote(claude_shim_directory_for_home(projection.home))}:$PATH",
+                        ])
+                    else:
+                        exports.append(
+                            "export OPENAI_BASE_URL="
+                            f"{shlex.quote(CLOUDROUTER_CODEX_BASE_URL)}"
+                        )
+                    command[2] = "; ".join([*exports, command[2]])
+        except Exception as exc:  # noqa: BLE001
+            self._agent_api_tasks.pop(task_id, None)
+            self._agent_api_task_errors.pop(task_id, None)
+            logger.warning(
+                "Refusing unsafe Agent API execution for task %s (%s)",
+                task_id,
+                type(exc).__name__,
+            )
+            await self._send_process_exit(ProcessExitMessage(
+                task_id=task_id,
+                exit_code=-1,
+                error_type="agent_api_configuration_error",
+                error_message="Managed Agent API configuration is invalid",
+            ))
+            return
         cwd = msg.cwd if msg.cwd else None
 
+        spawn_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            spawn_kwargs["start_new_session"] = True
         try:
             proc = await asyncio.create_subprocess_exec(
-                *msg.command,
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=cwd,
+                **spawn_kwargs,
             )
         except Exception as exc:
+            self._agent_api_tasks.pop(task_id, None)
             await self._send_event(ErrorMessage(
                 error_type="execute_failed",
                 message=f"Failed to start process: {exc}",
@@ -477,6 +652,10 @@ class WorkerRuntime:
             return
 
         self._processes[task_id] = proc
+        if os.name == "posix":
+            # start_new_session=True guarantees pid == sid == pgid.
+            self._process_groups[task_id] = proc.pid
+            self._process_group_locks[task_id] = asyncio.Lock()
         self._stdin_pipes[task_id] = proc.stdin
         if getattr(msg, "watch_exhaustion", False):
             self._exhaustion_watch[task_id] = getattr(msg, "job_id", None) or ""
@@ -537,8 +716,19 @@ class WorkerRuntime:
                 logger.warning("Task %s timed out after %ds, sending SIGINT", task_id, timeout)
                 await self._stop_process(task_id, "SIGINT")
                 if not await self._wait_process_exit(proc, 15):
-                    proc.kill()
+                    await self._stop_process(task_id, "SIGKILL")
                     await self._wait_process_exit(proc, 5)
+
+            # A shell/CLI may exit while a background child keeps the inherited
+            # pipes and delegated key alive.  End the whole task-owned process
+            # group before draining output or publishing PROCESS_EXIT.
+            await asyncio.shield(
+                self._ensure_process_group_stopped(
+                    task_id,
+                    proc,
+                    initial_signal=signal.SIGTERM,
+                )
+            )
 
             # Best-effort drain of any buffered output, bounded for the same
             # reason (the pipe may be held open past exit).
@@ -549,15 +739,32 @@ class WorkerRuntime:
                     _stream_task.cancel()
 
         finally:
+            # Also cover exceptions/cancellation before the normal cleanup
+            # point.  The helper is serialized and idempotent.
+            await asyncio.shield(
+                self._ensure_process_group_stopped(
+                    task_id,
+                    proc,
+                    initial_signal=signal.SIGTERM,
+                )
+            )
             if log_file is not None:
                 log_file.close()
             exit_code = proc.returncode if proc.returncode is not None else -1
+            semantic_error = self._agent_api_task_errors.pop(task_id, None)
+            if semantic_error is not None and exit_code == 0:
+                # Both CLIs can report a structurally failed provider turn while
+                # exiting cleanly. Process health must not mark that Job done.
+                exit_code = 1
             await self._mark_task_exiting(task_id)
             self._processes.pop(task_id, None)
             self._process_tasks.pop(task_id, None)
             self._stdin_pipes.pop(task_id, None)
+            self._process_groups.pop(task_id, None)
+            self._process_group_locks.pop(task_id, None)
             self._exhaustion_watch.pop(task_id, None)
             self._exhaustion_fired.discard(task_id)
+            self._agent_api_tasks.pop(task_id, None)
             logger.info("Process for task %s exited with code %d", task_id, exit_code)
 
             if self._file_sync_manager:
@@ -568,7 +775,12 @@ class WorkerRuntime:
                     logger.exception("Failed to force-sync files for task %s on exit", task_id)
 
             await self._send_process_exit(
-                ProcessExitMessage(task_id=task_id, exit_code=exit_code)
+                ProcessExitMessage(
+                    task_id=task_id,
+                    exit_code=exit_code,
+                    error_type=semantic_error[0] if semantic_error else None,
+                    error_message=semantic_error[1] if semantic_error else None,
+                )
             )
 
     # ---- PTY-hosted execution (claude-pty) ----
@@ -588,6 +800,11 @@ class WorkerRuntime:
         task_id = msg.task_id
         config_dir = params.get("config_dir") or msg.env.get("CLAUDE_CONFIG_DIR")
         env_overrides = {k: v for k, v in msg.env.items() if k != "CLAUDE_CONFIG_DIR"}
+        from elastic_agent.worker.agent_api import (
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+        )
+
+        env_overrides.pop(ELASTIC_AGENT_API_PROJECTION_ROOT_ENV, None)
 
         # Workers run as root; claude refuses --dangerously-skip-permissions
         # under root unless it believes it's sandboxed. Cloud workers are
@@ -596,6 +813,21 @@ class WorkerRuntime:
             env_overrides.setdefault("IS_SANDBOX", "1")
 
         try:
+            projection = self._agent_api_projection_for_execute(msg)
+            if projection is not None:
+                if projection.agent_type != "claude":
+                    raise RuntimeError("PTY requires a Claude Agent API home")
+                from elastic_agent.worker.agent_api import (
+                    apply_agent_api_runtime_env,
+                )
+
+                apply_agent_api_runtime_env(env_overrides, projection)
+                self._agent_api_tasks[task_id] = projection
+                # Never let an unvalidated agent_params directory shadow the
+                # managed home selected from CLAUDE_CONFIG_DIR.  The backend
+                # uses config_dir both for its pool identity and to select the
+                # final credential wrapper.
+                config_dir = str(projection.home)
             session_id = await self._pty_backend.launch(
                 key=task_id,
                 prompt=params.get("prompt", ""),
@@ -609,6 +841,7 @@ class WorkerRuntime:
                 response_timeout=params.get("response_timeout") or msg.timeout,
             )
         except Exception as exc:
+            self._agent_api_tasks.pop(task_id, None)
             logger.exception("PTY launch failed for task %s", task_id)
             await self._send_event(ErrorMessage(
                 error_type="execute_failed",
@@ -666,6 +899,7 @@ class WorkerRuntime:
             timer.cancel()
         session_id = session_id or self._pty_session_ids.pop(task_id, None)
         self._pty_session_ids.pop(task_id, None)
+        self._agent_api_tasks.pop(task_id, None)
 
         logger.info("PTY task %s finished with exit code %d", task_id, exit_code)
 
@@ -726,18 +960,89 @@ class WorkerRuntime:
                 parsed=parsed,
             ))
 
+            projection = self._agent_api_tasks.get(task_id)
+            if projection is not None:
+                if self._agent_api_terminal_success(line):
+                    previous = self._agent_api_task_errors.get(task_id)
+                    # Codex emits reconnecting ``type=error`` frames for
+                    # retryable 500/502 responses before a later successful
+                    # turn.completed. Only durable auth/hard-limit evidence
+                    # survives a success terminal.
+                    if previous is not None and previous[0] in {
+                        "agent_api_error",
+                        "agent_api_transient_error",
+                    }:
+                        self._agent_api_task_errors.pop(task_id, None)
+                if (
+                    projection.provider == "cloudrouter"
+                    and is_cloudrouter_auth_failure(line)
+                ):
+                    semantic_error = (
+                        "agent_api_auth_failure",
+                        "CloudRouter rejected the delegated API key",
+                    )
+                elif (
+                    projection.provider == "cloudrouter"
+                    and is_cloudrouter_hard_limit(line)
+                ):
+                    semantic_error = (
+                        "agent_api_rate_limited",
+                        "CloudRouter key quota or rate limit was reached",
+                    )
+                elif (
+                    projection.provider == "cloudrouter"
+                    and is_cloudrouter_transient(line)
+                ):
+                    semantic_error = (
+                        "agent_api_transient_error",
+                        "CloudRouter temporarily rate limited the request",
+                    )
+                else:
+                    semantic_error = self._agent_api_fatal_error(line)
+                if semantic_error is not None:
+                    previous = self._agent_api_task_errors.get(task_id)
+                    if (
+                        previous is None
+                        or _AGENT_API_ERROR_PRIORITY.get(semantic_error[0], 0)
+                        > _AGENT_API_ERROR_PRIORITY.get(previous[0], 0)
+                    ):
+                        self._agent_api_task_errors[task_id] = semantic_error
+
             # Mode-B rotation (a): the opaque command consumes the Claude account
             # internally, so we can't rotate per turn — instead we watch its
             # output and, on the first exhaustion banner, interrupt + signal the
             # Manager to swap accounts and restart with --resume.
+            exhaustion_reason = None
             if (
                 task_id in self._exhaustion_watch
                 and task_id not in self._exhaustion_fired
-                and (is_rate_limited(line) or is_auth_failure(line))
             ):
-                await self._signal_exhaustion(task_id)
+                if (
+                    projection is not None
+                    and projection.provider == "cloudrouter"
+                    and is_cloudrouter_auth_failure(line)
+                ):
+                    exhaustion_reason = "agent_api_auth_failure"
+                elif (
+                    projection is not None
+                    and projection.provider == "cloudrouter"
+                    and is_cloudrouter_hard_limit(line)
+                ):
+                    exhaustion_reason = "agent_api_rate_limited"
+                elif is_rate_limited(line) or is_auth_failure(line):
+                    exhaustion_reason = "rate_limit"
+            if exhaustion_reason is not None:
+                await self._signal_exhaustion(
+                    task_id,
+                    reason=exhaustion_reason,
+                )
 
-    async def _signal_exhaustion(self, task_id: str) -> None:
+    async def _signal_exhaustion(
+        self,
+        task_id: str,
+        *,
+        reason: str = "rate_limit",
+    ) -> None:
         """Emit RunExhaustedMessage once and interrupt the run so the
         orchestrator can rotate the account and resume."""
         if task_id in self._exhaustion_fired:
@@ -774,7 +1079,7 @@ class WorkerRuntime:
             task_id=task_id,
             job_id=job_id,
             worker_id=self._worker_id or "unknown",
-            reason="rate_limit",
+            reason=reason,
         ))
 
     @staticmethod
@@ -788,9 +1093,109 @@ class WorkerRuntime:
                     "cost_usd": obj.get("cost_usd"),
                     "session_id": obj.get("session_id"),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (TypeError, ValueError, RecursionError):
             pass
         return None
+
+    @staticmethod
+    def _agent_api_fatal_error(line: str) -> tuple[str, str] | None:
+        """Recognize terminal provider failures without matching tool errors."""
+
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, RecursionError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        event_type = str(event.get("type") or "")
+        if event.get("isApiErrorMessage") and event_type in {
+            "assistant",
+            "message",
+            "result",
+        }:
+            return (
+                "agent_api_error",
+                "CloudRouter Claude API request failed",
+            )
+        if event_type == "turn.failed":
+            return (
+                "agent_api_error",
+                "CloudRouter Codex turn failed",
+            )
+        if event_type == "result" and (
+            event.get("is_error")
+            or str(event.get("subtype") or "").lower() in {
+                "error",
+                "api_error",
+            }
+        ):
+            return (
+                "agent_api_error",
+                "CloudRouter Claude turn failed",
+            )
+        if event_type == "session_crashed":
+            return (
+                "agent_api_error",
+                "CloudRouter agent turn failed",
+            )
+        return None
+
+    @staticmethod
+    def _agent_api_terminal_success(line: str) -> bool:
+        """Recognize a provider turn that conclusively completed successfully."""
+
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, RecursionError):
+            return False
+        if not isinstance(event, dict):
+            return False
+        event_type = str(event.get("type") or "")
+        if event_type == "turn.completed":
+            return True
+        if event_type != "result":
+            return False
+        return (
+            not bool(event.get("is_error"))
+            and not bool(event.get("isApiErrorMessage"))
+            and str(event.get("subtype") or "").lower()
+            not in {"error", "api_error"}
+        )
+
+    @staticmethod
+    def _agent_api_projection_for_execute(msg: ExecuteMessage):
+        """Return a validated projection, or None for an ordinary OAuth task."""
+
+        from elastic_agent.worker.agent_api import agent_api_marker_for_home
+
+        params = msg.agent_params or {}
+        candidates = [
+            (params.get("config_dir"), "claude"),
+            (msg.env.get("CLAUDE_CONFIG_DIR"), "claude"),
+            (msg.env.get("CODEX_HOME"), "codex"),
+        ]
+        projection = None
+        for candidate, expected_agent_type in candidates:
+            if not candidate:
+                continue
+            # Managed projections always live below this worker-owned namespace.
+            # Avoid probing ordinary OAuth homes (which can legitimately be
+            # inaccessible in local tests or mixed-user installations).
+            if ".elastic-agent-api" not in Path(candidate).expanduser().parts:
+                continue
+            current = agent_api_marker_for_home(candidate)
+            if current is None:
+                raise RuntimeError(
+                    "Agent API projection marker is missing",
+                )
+            if current.agent_type != expected_agent_type:
+                raise RuntimeError(
+                    "Agent API projection has the wrong agent type",
+                )
+            if projection is not None and current != projection:
+                raise RuntimeError("conflicting Agent API homes")
+            projection = current
+        return projection
 
     async def _handle_stop(self, msg: StopMessage) -> None:
         sig_name = msg.signal or "SIGTERM"
@@ -805,7 +1210,7 @@ class WorkerRuntime:
 
     async def _stop_process(self, task_id: str, sig_name: str) -> None:
         proc = self._processes.get(task_id)
-        if proc is None or proc.returncode is not None:
+        if proc is None:
             return
 
         sig_map = {
@@ -815,30 +1220,144 @@ class WorkerRuntime:
         }
         sig = sig_map.get(sig_name, signal.SIGTERM)
 
+        if task_id in self._process_groups:
+            await self._ensure_process_group_stopped(
+                task_id,
+                proc,
+                initial_signal=sig,
+            )
+            return
+
+        # Non-POSIX fallback. Poll returncode rather than proc.wait(), because
+        # descendants can retain inherited stdout/stderr handles.
+        if proc.returncode is None:
+            try:
+                proc.send_signal(sig)
+                logger.info(
+                    "Sent %s to task %s (pid=%d)",
+                    sig_name,
+                    task_id,
+                    proc.pid,
+                )
+            except ProcessLookupError:
+                return
+        if sig == signal.SIGKILL or await self._wait_process_exit(proc, 10):
+            return
         try:
-            proc.send_signal(sig)
-            logger.info("Sent %s to task %s (pid=%d)", sig_name, task_id, proc.pid)
+            proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if await self._wait_process_exit(proc, 5):
+            return
+        try:
+            proc.kill()
         except ProcessLookupError:
             pass
 
-        if sig != signal.SIGKILL:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10.0)
-                return
-            except asyncio.TimeoutError:
-                pass
+    @staticmethod
+    def _process_group_exists(pgid: int) -> bool:
+        if os.name != "posix" or pgid <= 1:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # A task group is always created by this runtime under the same
+            # user. Treat an ownership mismatch as alive but refuse to signal.
+            return True
+        return True
 
-            try:
-                proc.send_signal(signal.SIGTERM)
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-                return
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
+    async def _wait_process_group_exit(
+        self,
+        pgid: int,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._process_group_exists(pgid):
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
 
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+    async def _ensure_process_group_stopped(
+        self,
+        task_id: str,
+        proc: asyncio.subprocess.Process,
+        *,
+        initial_signal: signal.Signals,
+    ) -> None:
+        """Terminate exactly the POSIX group created for ``task_id``.
+
+        The stored pgid must equal this process object's pid, which is guaranteed
+        only because spawn used ``start_new_session=True``.  A live leader is
+        checked against the kernel before signaling; once it exits, an extant
+        process group retains that pgid and therefore prevents pid/pgid reuse.
+        """
+
+        pgid = self._process_groups.get(task_id)
+        lock = self._process_group_locks.get(task_id)
+        if (
+            os.name != "posix"
+            or pgid is None
+            or pgid <= 1
+            or pgid != proc.pid
+            or lock is None
+        ):
+            return
+
+        async with lock:
+            if not self._process_group_exists(pgid):
+                return
+            if proc.returncode is None:
+                try:
+                    if os.getpgid(proc.pid) != pgid:
+                        logger.error(
+                            "Refusing to signal mismatched process group %d "
+                            "for task %s",
+                            pgid,
+                            task_id,
+                        )
+                        return
+                except ProcessLookupError:
+                    # The leader exited between returncode observation and the
+                    # check. Any remaining members still reserve this pgid.
+                    pass
+
+            async def send(sig: signal.Signals) -> bool:
+                try:
+                    os.killpg(pgid, sig)
+                    logger.info(
+                        "Sent %s to task %s process group %d",
+                        sig.name,
+                        task_id,
+                        pgid,
+                    )
+                    return True
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    logger.error(
+                        "Refusing process group %d for task %s: ownership "
+                        "verification failed",
+                        pgid,
+                        task_id,
+                    )
+                    return False
+
+            if not await send(initial_signal):
+                return
+            first_grace = 5.0 if initial_signal == signal.SIGKILL else 10.0
+            if await self._wait_process_group_exit(pgid, first_grace):
+                return
+            if initial_signal not in {signal.SIGTERM, signal.SIGKILL}:
+                if not await send(signal.SIGTERM):
+                    return
+                if await self._wait_process_group_exit(pgid, 5.0):
+                    return
+            if initial_signal != signal.SIGKILL:
+                await send(signal.SIGKILL)
+                await self._wait_process_group_exit(pgid, 5.0)
 
     async def _handle_read_file(self, msg: ReadFileMessage) -> None:
         try:

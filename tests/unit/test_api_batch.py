@@ -11,6 +11,7 @@ import stat
 import tarfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -19,6 +20,7 @@ from elastic_agent.api.app import create_app
 from elastic_agent.api.auth import reset_api_keys
 from elastic_agent.core.account_binding import AccountBinding, BindingState
 from elastic_agent.core.config import ElasticAgentConfig
+from elastic_agent.core.credential_pool import AccountDefinition
 from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
 from elastic_agent.manager.manager import ElasticAgentManager
 
@@ -213,6 +215,223 @@ async def client(manager):
 
 
 class TestAccountsAPI:
+    @pytest.mark.asyncio
+    async def test_cloudrouter_agent_api_account_is_write_only_and_shared(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        key = "cloudrouter-key-that-must-never-echo"
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={
+                "claude": ["claude-opus-4-8"],
+                "codex": ["gpt-5.4"],
+            }),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "state": "active",
+                "status": "active",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "mode": "wallet",
+                "windows": [],
+            }),
+        )
+
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Shared CloudRouter",
+            "group": "research",
+            "api_key": key,
+        })
+
+        assert created.status_code == 201
+        body = created.json()
+        assert body["id"] == "cloudrouter-1"
+        assert body["auth_kind"] == "agent_api"
+        assert body["agent_type"] is None
+        assert body["supported_agent_types"] == ["claude", "codex"]
+        assert body["has_api_key"] is True
+        assert body["api_usage"]["available"] is True
+        assert key not in created.text
+        assert "api_key" not in body
+
+        combined = (await client.get("/api/accounts")).json()
+        assert combined["total"] == 1
+        assert combined["accounts"][0]["id"] == "cloudrouter-1"
+        assert combined["accounts"][0]["supported_agent_types"] == [
+            "claude",
+            "codex",
+        ]
+        assert key not in json.dumps(combined)
+
+        provider_accounts = (
+            await client.get("/api/agent-api/accounts")
+        ).json()
+        assert provider_accounts["total"] == 1
+        assert key not in json.dumps(provider_accounts)
+        for agent_type in ("claude", "codex"):
+            plan = await client.post("/api/jobs/plan", json={
+                "name": f"cloudrouter-{agent_type}",
+                "run": {"command": "true"},
+                "account": {
+                    "agent_type": agent_type,
+                    "ids": ["cloudrouter-1"],
+                    "binding": "none",
+                },
+            })
+            assert plan.status_code == 200
+            assert plan.json()["valid"] is True
+            assert key not in plan.text
+        incompatible = await client.post("/api/jobs/plan", json={
+            "name": "cloudrouter-unsupported-model",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "model": "gpt-not-on-router",
+                "ids": ["cloudrouter-1"],
+                "binding": "none",
+            },
+        })
+        assert incompatible.status_code == 422
+        assert "gpt-not-on-router" in incompatible.json()["detail"]
+        key_file = (
+            Path(manager.config.registry.path).with_name("agent-api-accounts")
+            / "cloudrouter-1"
+            / "api.key"
+        )
+        assert key_file.read_text() == key
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+        assert (
+            await client.delete("/api/agent-api/accounts/cloudrouter-1")
+        ).status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_cloudrouter_invalid_key_errors_are_sanitized(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.agent_api import AgentApiUpstreamError
+
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        key = "rejected-key-that-must-not-echo"
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(
+                side_effect=AgentApiUpstreamError("invalid_api_key", 401)
+            ),
+        )
+
+        rejected = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Rejected",
+            "api_key": key,
+        })
+        malformed = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Malformed",
+            "api_key": {"secret": key},
+        })
+        apex = await client.post("/api/agent-api/accounts", json={
+            "provider": "apex",
+            "name": "Not implemented",
+            "api_key": key,
+        })
+
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == "CloudRouter rejected the API key"
+        assert malformed.status_code == 422
+        assert apex.status_code == 422
+        assert key not in rejected.text
+        assert key not in malformed.text
+        assert key not in apex.text
+        assert await manager.agent_api_store.list() == []
+
+    @pytest.mark.asyncio
+    async def test_native_account_cannot_use_agent_api_reserved_id(
+        self, client,
+    ):
+        response = await client.post("/api/accounts", json={
+            "id": "cloudrouter-1",
+            "email": "native@example.com",
+        })
+        assert response.status_code == 409
+        assert "reserved" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_agent_api_id_skips_legacy_native_collision(
+        self, client, manager, monkeypatch,
+    ):
+        await manager.account_store.add(AccountDefinition(
+            id="cloudrouter-1",
+            email="legacy-native@example.com",
+        ))
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={
+                "claude": ["claude-opus-4-8"],
+                "codex": [],
+            }),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-2",
+                "state": "active",
+                "status": "active",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "mode": "wallet",
+                "windows": [],
+            }),
+        )
+
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "API after legacy row",
+            "api_key": "cloudrouter-private",
+        })
+
+        assert created.status_code == 201
+        assert created.json()["id"] == "cloudrouter-2"
+        combined = await client.get("/api/accounts")
+        assert combined.status_code == 200
+        assert {row["id"] for row in combined.json()["accounts"]} == {
+            "cloudrouter-1",
+            "cloudrouter-2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_native_reserved_id_can_still_be_updated(
+        self, client, manager,
+    ):
+        await manager.account_store.add(AccountDefinition(
+            id="cloudrouter-1",
+            email="legacy-native@example.com",
+            group="legacy",
+        ))
+
+        updated = await client.post("/api/accounts", json={
+            "id": "cloudrouter-1",
+            "email": "legacy-native@example.com",
+            "group": "updated",
+        })
+
+        assert updated.status_code == 201
+        assert updated.json()["auth_kind"] == "oauth"
+        assert updated.json()["group"] == "updated"
+
     @pytest.mark.asyncio
     async def test_add_list_remove(self, client):
         assert (await client.get("/api/accounts")).json()["total"] == 0

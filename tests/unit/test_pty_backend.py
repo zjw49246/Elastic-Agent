@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+import os
+import sys
+from contextlib import suppress
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,9 +22,9 @@ from elastic_agent.core.protocols.messages import (
 )
 from elastic_agent.worker.pty_backend import (
     PTY_AVAILABLE,
+    classify_turn_error,
     event_to_log_line,
     synthesize_result_line,
-    classify_turn_error,
 )
 from elastic_agent.worker.runtime import WorkerRuntime
 
@@ -120,6 +124,25 @@ class TestEventToLogLine:
         assert error_type == "claude_rate_limited"
         assert "usage limit was reached" in message
         assert "usage limit reached" in message
+
+    def test_cloudrouter_gateway_429_rotates_only_when_projection_is_proven(self):
+        text = "API Error: HTTP 429 too many requests from upstream"
+
+        assert classify_turn_error(text)[0] == "pty_turn_error"
+        error_type, message = classify_turn_error(
+            text,
+            cloudrouter=True,
+        )
+        assert error_type == "agent_api_rate_limited"
+        assert "current PTY task cannot continue" in message
+        assert "rotate" not in message
+
+    def test_cloudrouter_key_rejection_is_exactly_classified(self):
+        error_type, _message = classify_turn_error(
+            "HTTP 401 Unauthorized: invalid API key",
+            cloudrouter=True,
+        )
+        assert error_type == "agent_api_auth_failure"
 
     def test_generic_error_stays_pty_turn_error(self):
         error_type, message = classify_turn_error("the turn failed unexpectedly")
@@ -234,6 +257,101 @@ class TestRuntimePTYDispatch:
         assert launch["config_dir"] == "/root/.claude-prod"
         # CLAUDE_CONFIG_DIR is consumed, the rest passes through
         assert launch["env_overrides"] == {"FOO": "bar"}
+
+    @pytest.mark.asyncio
+    async def test_managed_pty_exports_validated_projection_root(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.worker.agent_api import (
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-pty",
+        )
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"agent": "claude-code", "prompt": "hi"},
+            env={
+                "CLAUDE_CONFIG_DIR": home,
+                ELASTIC_AGENT_API_PROJECTION_ROOT_ENV: "/attacker-controlled",
+            },
+        ))
+
+        launch = fake.launches[0]
+        assert launch["config_dir"] == home
+        assert launch["env_overrides"][ELASTIC_AGENT_API_PROJECTION_ROOT_ENV] == str(
+            Path(home).parent
+        )
+
+    @pytest.mark.asyncio
+    async def test_managed_pty_canonicalizes_shadowing_config_dir(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-canonical-pty",
+        )
+        ordinary_home = tmp_path / "ordinary-claude-home"
+        ordinary_home.mkdir()
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+
+        await runtime._handle_execute(_exec_msg(
+            agent_params={
+                "agent": "claude-code",
+                "prompt": "hi",
+                "config_dir": str(ordinary_home),
+            },
+            env={"CLAUDE_CONFIG_DIR": home},
+        ))
+
+        assert fake.launches[0]["config_dir"] == home
+        assert runtime._agent_api_tasks["t1:abc"].home == Path(home)
+
+    @pytest.mark.asyncio
+    async def test_managed_codex_home_cannot_pose_as_claude_pty(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-cross-type",
+        )
+        fake = _FakeBackend()
+        runtime._pty_backend = fake
+        runtime._send_event = AsyncMock()
+
+        await runtime._handle_execute(_exec_msg(
+            agent_params={"agent": "claude-code", "prompt": "hi"},
+            env={"CLAUDE_CONFIG_DIR": home},
+        ))
+
+        assert fake.launches == []
+        exit_events = [
+            call.args[0]
+            for call in runtime._send_event.call_args_list
+            if call.args[0].type == "PROCESS_EXIT"
+        ]
+        assert len(exit_events) == 1
+        assert exit_events[0].exit_code == -1
+        assert runtime._agent_api_tasks == {}
 
     @pytest.mark.asyncio
     async def test_no_agent_params_keeps_subprocess_path(self, runtime, monkeypatch):
@@ -361,6 +479,12 @@ def _make_backend(tmp_path):
     backend._consumers = {}
     backend._launch_kwargs = {}
     backend._transient_retries = {}
+    backend._transient_retry_tasks = {}
+    backend._transient_retry_phases = {}
+    backend._stopping_tasks = set()
+    backend._stop_tasks = {}
+    backend._finalizer_tasks = {}
+    backend._finalized_tasks = set()
     backend._transient_retry_max = 5
     backend._transient_retry_base = 10.0
     backend._transient_retry_cap = 120.0
@@ -460,6 +584,74 @@ class TestElasticPTYBackendEvents:
             error_type="runtime_timeout",
             error_message="Worker runtime timed out and interrupted the Claude process (Response timed out after 600s)",
         )
+
+    @pytest.mark.asyncio
+    async def test_cloudrouter_auth_frame_overrides_prior_generic_error(
+        self, tmp_path,
+    ):
+        backend = _make_backend(tmp_path)
+        projection = MagicMock()
+        projection.provider = "cloudrouter"
+        backend._runtime._agent_api_tasks = {"t1": projection}
+        await backend.on_event("t1", {
+            "event_type": "message",
+            "content": "the turn failed unexpectedly",
+            "is_error": True,
+            "raw_json": json.dumps({"type": "assistant"}),
+            "session_id": "sess-1",
+        })
+        await backend.on_event("t1", {
+            "event_type": "result",
+            "content": "API Error: HTTP 401 Unauthorized: invalid API key",
+            "is_error": True,
+            "raw_json": json.dumps({"type": "result", "is_error": True}),
+            "session_id": "sess-1",
+        })
+
+        await backend.on_exit("t1", 0)
+
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1",
+            1,
+            session_id="sess-1",
+            error_type="agent_api_auth_failure",
+            error_message="CloudRouter rejected the delegated API key",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "expected_error_type"),
+        [
+            (401, "agent_api_auth_failure"),
+            (403, "agent_api_rate_limited"),
+            (429, "agent_api_rate_limited"),
+            (502, "transient_overload"),
+        ],
+    )
+    async def test_cloudrouter_real_result_status_is_read_from_raw_json(
+        self, tmp_path, status, expected_error_type,
+    ):
+        backend = _make_backend(tmp_path)
+        projection = MagicMock()
+        projection.provider = "cloudrouter"
+        backend._runtime._agent_api_tasks = {"t1": projection}
+        raw = json.dumps({
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "api_error_status": status,
+            "result": "API request failed",
+        })
+
+        await backend.on_event("t1", {
+            "event_type": "result",
+            "content": "API request failed",
+            "is_error": True,
+            "raw_json": raw,
+            "session_id": "sess-1",
+        })
+
+        assert backend._turn_error_types["t1"] == expected_error_type
 
     @pytest.mark.asyncio
     async def test_on_exit_skips_result_if_real_one_seen(self, tmp_path):
@@ -806,6 +998,63 @@ class TestCredentialLoginRecyclesPTY:
 
 @pty_required
 class TestResponseTimeoutPlumbing:
+    def test_cloudrouter_home_uses_final_wrapper_and_scrubs_auth(
+        self, tmp_path,
+    ):
+        from pathlib import Path
+
+        from elastic_agent.worker.agent_api import (
+            CLOUDROUTER_CLAUDE_BASE_URL,
+            CLOUDROUTER_CLAUDE_BINARY_ENV,
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-1",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        backend = _make_backend(tmp_path)
+
+        config = backend.build_config(
+            config_dir=home,
+            env_overrides={
+                "ANTHROPIC_API_KEY": "official-secret",
+                "ANTHROPIC_AUTH_TOKEN": "official-token",
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-token",
+                "ANTHROPIC_BASE_URL": "https://attacker.invalid",
+                "SAFE": "kept",
+            },
+        )
+
+        assert config.claude_binary == str(
+            Path(home).parent / "claude-wrapper"
+        )
+        assert config.env_overrides["ANTHROPIC_BASE_URL"] == (
+            CLOUDROUTER_CLAUDE_BASE_URL
+        )
+        assert config.env_overrides["SAFE"] == "kept"
+        assert config.env_overrides["CLAUDE_CONFIG_DIR"] == home
+        assert config.env_overrides[
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV
+        ] == str(Path(home).parent)
+        assert Path(
+            config.env_overrides[CLOUDROUTER_CLAUDE_BINARY_ENV]
+        ).is_absolute()
+        assert Path(
+            config.env_overrides[CLOUDROUTER_CLAUDE_BINARY_ENV]
+        ).name == "claude"
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            assert key not in config.env_overrides
+
     def test_build_config_sets_response_timeout(self, tmp_path):
         backend = _make_backend(tmp_path)
         config = backend.build_config(response_timeout=7200)
@@ -976,10 +1225,216 @@ class TestTransientOverloadRetry:
         backend.launch = AsyncMock(side_effect=RuntimeError("boom"))
         backend._launch_kwargs["t1"] = {"key": "t1"}
         await backend._run_transient_retry("t1", "s1", delay=0.0)
+        backend._runtime._mark_task_exiting.assert_awaited_once_with("t1")
         backend._runtime._on_pty_exit.assert_awaited_once()
         args, kwargs = backend._runtime._on_pty_exit.await_args
         assert args[1] == 1
         assert kwargs["error_type"] == "transient_overload"
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_pending_retry_without_resurrection(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "elastic_agent.worker.pty_backend.transient_retry_delay",
+            lambda *a, **k: 3600.0,
+        )
+        backend = _make_backend(tmp_path)
+        backend.launch = AsyncMock()
+        backend._launch_kwargs["t1"] = {
+            "key": "t1",
+            "prompt": "hi",
+            "cwd": "/x",
+        }
+
+        assert backend._schedule_transient_retry("t1", "s1") is True
+        assert backend.has_task("t1") is True
+        assert backend.active_tasks == ["t1"]
+
+        await backend.stop("t1")
+        await asyncio.sleep(0)
+
+        backend.launch.assert_not_awaited()
+        backend._runtime._mark_task_exiting.assert_awaited_once_with("t1")
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1",
+            130,
+            session_id=None,
+            error_type="pty_stopped",
+            error_message="PTY task stopped during transient retry backoff",
+        )
+        assert backend.has_task("t1") is False
+        assert backend.active_tasks == []
+        assert "t1" not in backend._transient_retry_tasks
+        assert "t1" not in backend._transient_retries
+        assert "t1" not in backend._launch_kwargs
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stops_publish_one_terminal(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "elastic_agent.worker.pty_backend.transient_retry_delay",
+            lambda *a, **k: 3600.0,
+        )
+        backend = _make_backend(tmp_path)
+        backend._launch_kwargs["t1"] = {
+            "key": "t1",
+            "prompt": "hi",
+            "cwd": "/x",
+        }
+        assert backend._schedule_transient_retry("t1", "s1") is True
+
+        await asyncio.gather(backend.stop("t1"), backend.stop("t1"))
+
+        backend._runtime._mark_task_exiting.assert_awaited_once_with("t1")
+        backend._runtime._on_pty_exit.assert_awaited_once()
+        result_logs = [
+            call.args[0]
+            for call in backend._runtime._send_event.await_args_list
+            if isinstance(call.args[0], LogMessage)
+            and json.loads(call.args[0].data).get("type") == "result"
+        ]
+        assert len(result_logs) == 1
+
+    @pytest.mark.asyncio
+    async def test_teardown_failure_still_publishes_one_terminal_and_unregisters(
+        self,
+        tmp_path,
+    ):
+        from claude_pty.adapters.base import BasePTYBackend
+
+        backend = _make_backend(tmp_path)
+        backend._sessions["t1"] = object()
+        backend._task_session_ids["t1"] = "s1"
+
+        teardown = AsyncMock(side_effect=RuntimeError("teardown boom"))
+        with patch.object(BasePTYBackend, "stop", new=teardown):
+            await asyncio.gather(backend.stop("t1"), backend.stop("t1"))
+
+        teardown.assert_awaited_once_with("t1")
+        backend._runtime._mark_task_exiting.assert_awaited_once_with("t1")
+        backend._runtime._on_pty_exit.assert_awaited_once_with(
+            "t1",
+            130,
+            session_id="s1",
+            error_type="pty_stopped",
+            error_message="PTY task stopped during transient retry backoff",
+        )
+        result_logs = [
+            call.args[0]
+            for call in backend._runtime._send_event.await_args_list
+            if isinstance(call.args[0], LogMessage)
+            and json.loads(call.args[0].data).get("type") == "result"
+        ]
+        assert len(result_logs) == 1
+        assert "t1" not in backend._sessions
+        assert "t1" not in backend._consumers
+        assert backend.has_task("t1") is False
+        assert backend.active_tasks == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_consumer_cannot_cancel_slow_terminal_handoff(
+        self,
+        tmp_path,
+    ):
+        backend = _make_backend(tmp_path)
+        backend._saw_claude_output.add("t1")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def slow_terminal(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            finished.set()
+
+        backend._runtime._on_pty_exit = AsyncMock(side_effect=slow_terminal)
+        consumer = asyncio.create_task(backend.on_exit("t1", 0))
+        await entered.wait()
+
+        # Model BasePTYBackend.stop timing out and cancelling its consumer.
+        consumer.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer
+        assert not finished.is_set()
+
+        release.set()
+        await asyncio.wait_for(backend._finalizer_tasks["t1"], timeout=2)
+
+        assert finished.is_set()
+        backend._runtime._mark_task_exiting.assert_awaited_once_with("t1")
+        backend._runtime._on_pty_exit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process test")
+    async def test_stop_waits_for_launch_registration_then_kills_process(
+        self,
+        tmp_path,
+    ):
+        from claude_pty.adapters.base import BasePTYBackend
+
+        backend = _make_backend(tmp_path)
+        backend._launch_kwargs["t1"] = {
+            "key": "t1",
+            "prompt": "hi",
+            "cwd": "/x",
+        }
+        spawned = asyncio.Event()
+        allow_registration = asyncio.Event()
+        process: asyncio.subprocess.Process | None = None
+
+        class Session:
+            session_id = "s1"
+
+        async def launch(**kwargs):
+            nonlocal process
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+                start_new_session=True,
+            )
+            spawned.set()
+            await allow_registration.wait()
+            backend._sessions[kwargs["key"]] = Session()
+            return "s1"
+
+        async def base_stop(_self, key):
+            assert process is not None
+            process.terminate()
+            await process.wait()
+            backend._sessions.pop(key, None)
+            await backend.on_exit(key, 130)
+
+        backend.launch = launch
+        retry = asyncio.create_task(
+            backend._run_transient_retry("t1", "s1", delay=0.0)
+        )
+        backend._transient_retry_tasks["t1"] = retry
+        backend._transient_retry_phases["t1"] = "backoff"
+        await spawned.wait()
+
+        try:
+            with patch.object(BasePTYBackend, "stop", new=base_stop):
+                stopper = asyncio.create_task(backend.stop("t1"))
+                await asyncio.sleep(0.05)
+                assert not stopper.done()
+                assert not retry.cancelled()
+                assert process is not None and process.returncode is None
+
+                allow_registration.set()
+                await asyncio.wait_for(stopper, timeout=3)
+
+            assert process.returncode is not None
+            backend._runtime._on_pty_exit.assert_awaited_once()
+        finally:
+            allow_registration.set()
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
 
     @pytest.mark.asyncio
     async def test_exhausted_budget_fails_normally(self, tmp_path):

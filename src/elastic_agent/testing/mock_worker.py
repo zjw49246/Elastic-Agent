@@ -274,6 +274,28 @@ class MockWorker:
                         account_id = msg.get("credentials", {}).get("account_id", "unknown")
                         slot_index = msg.get("slot_index", 0)
                         await self.send_credential_login_result(account_id, slot_index, True)
+                    elif msg_type == "AGENT_API_CONFIGURE":
+                        # The mock deliberately never persists or reflects the
+                        # write-only key. It only models the correlated Worker
+                        # result and the nested actual CLI home.
+                        slot = str(msg.get("config_dir") or "/tmp/agent-api")
+                        provider = str(msg.get("provider") or "cloudrouter")
+                        account_id = str(msg.get("account_id") or "unknown")
+                        agent_type = str(msg.get("agent_type") or "claude")
+                        actual_home = (
+                            f"{slot}/.elastic-agent-api/{provider}/"
+                            f"{account_id}/{agent_type}"
+                        )
+                        await self.send_raw({
+                            "type": "AGENT_API_CONFIGURE_RESULT",
+                            "request_id": msg.get("request_id", ""),
+                            "account_id": account_id,
+                            "provider": provider,
+                            "agent_type": agent_type,
+                            "success": True,
+                            "error": None,
+                            "config_dir": actual_home,
+                        })
         except asyncio.CancelledError:
             pass
 

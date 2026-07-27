@@ -653,8 +653,8 @@ _BATCH_HTML = """\
       仅有 Token 时会切换到邮箱验证码并自动取码。没有可用查询 Token、自动查询失败，或自动验证码被拒绝时，
       只有对应 Worker 才会弹出人工验证码卡。
     </p>
-    <table><thead><tr><th>ID</th><th>Agent</th><th>Email</th><th>Secrets</th>
-      <th>Group</th><th>Enabled</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
+    <table><thead><tr><th>ID</th><th>类型 / 支持 Agent</th><th>账号</th><th>Secrets</th>
+      <th>Group</th><th>Enabled</th><th>额度</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
       <tbody id="acctRows"></tbody></table>
     <div class="grid3" style="margin-top:12px">
       <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
@@ -675,6 +675,25 @@ _BATCH_HTML = """\
       <div><label>Group</label><input id="acctGroup" value="standard"></div>
     </div>
     <button class="btn" onclick="addAccount()">Add Account</button>
+
+    <div style="border-top:1px solid var(--border);margin-top:18px;padding-top:16px">
+      <h3 style="font-size:.95rem;margin-bottom:6px">CloudRouter Agent API</h3>
+      <p class="hint">
+        一把 CloudRouter API Key 会按可用模型自动加入 Claude、Codex 或两者的账号池；
+        不需要浏览器登录，也不会触发验证码。Key 只写入 Manager 的私有账号文件，提交后不回显。
+      </p>
+      <div class="grid3" style="margin-top:8px">
+        <div><label>Provider</label><select id="apiAcctProvider" disabled>
+          <option value="cloudrouter">CloudRouter</option>
+        </select></div>
+        <div><label>Name</label><input id="apiAcctName" placeholder="research-router"></div>
+        <div><label>Group</label><input id="apiAcctGroup" value="standard"></div>
+      </div>
+      <label>API Key（写入后不回显）</label>
+      <input id="apiAcctKey" type="password" autocomplete="new-password"
+             placeholder="CloudRouter API Key">
+      <button class="btn" onclick="addCloudRouterAccount()">Add CloudRouter API</button>
+    </div>
   </div>
 
   <!-- Job submission -->
@@ -776,6 +795,8 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       </select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
     </div>
+    <div><label>Agent model（可选；CloudRouter 账号按 /v1/models 精确校验）</label>
+      <input id="jAgentModel" placeholder="如 gpt-5.4 或 claude-opus-4-8"></div>
     <div class="grid3">
       <div><label>config_dir（空 = Agent 默认目录）</label>
         <input id="jConfigDir" placeholder="留空，或填写 worker 上的绝对路径"></div>
@@ -942,6 +963,60 @@ function esc(value) {
 function jsArg(value) { return esc(JSON.stringify(String(value ?? ''))); }
 
 // ---- Accounts ----
+function accountSupportedAgentTypes(a) {
+  const declared = Array.isArray(a.supported_agent_types)
+    ? a.supported_agent_types
+    : [];
+  const supported = declared.length ? declared : (a.agent_type ? [a.agent_type] : []);
+  return [...new Set(supported.map(value => String(value).toLowerCase())
+    .filter(value => value === 'claude' || value === 'codex'))];
+}
+function formatAgentApiModels(a) {
+  const modelGroups = a.supported_models || a.models || {};
+  if (!modelGroups || typeof modelGroups !== 'object') return '—';
+  const labels = [];
+  for (const agentType of accountSupportedAgentTypes(a)) {
+    const values = Array.isArray(modelGroups[agentType])
+      ? modelGroups[agentType].map(String)
+      : [];
+    if (values.length) labels.push(`${agentType}: ${values.join(', ')}`);
+  }
+  return labels.length ? labels.join(' · ') : '—';
+}
+function formatAgentApiUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return '<span class="muted">未检查</span>';
+  }
+  const state = String(usage.state || usage.status || '');
+  if (usage.known === false) {
+    const stale = usage.stale ? '（沿用上次状态）' : '';
+    return `<span class="muted">暂时未知${stale}</span>`;
+  }
+  if (usage.available === false) {
+    return `<span style="color:var(--red)">不可用 · ${esc(usage.reason || state || '额度耗尽')}</span>`;
+  }
+  const quota = usage.quota && typeof usage.quota === 'object'
+    ? usage.quota
+    : null;
+  const windows = Array.isArray(usage.windows) ? usage.windows : [];
+  const unlimited = usage.remaining_unlimited || usage.balance_unlimited
+    || (quota && quota.unlimited) || windows.some(window => window && window.unlimited);
+  if (unlimited) return '<span style="color:var(--green)">无限额度</span>';
+  const remaining = usage.remaining ?? usage.balance ?? (quota && quota.remaining);
+  const limit = quota && quota.limit;
+  const unit = usage.currency || usage.unit || '';
+  if (remaining !== undefined && remaining !== null) {
+    const total = limit !== undefined && limit !== null ? ` / ${esc(limit)}` : '';
+    return `剩余 ${esc(remaining)}${total}${unit ? ' ' + esc(unit) : ''}`;
+  }
+  const primary = windows.find(window => window
+    && window.remaining !== undefined && window.remaining !== null);
+  if (primary) {
+    return `${esc(primary.label || primary.id || '额度')}：剩余 ${esc(primary.remaining)}`
+      + `${primary.limit !== undefined ? ' / ' + esc(primary.limit) : ''}`;
+  }
+  return `<span class="muted">${esc(state || '可用')}</span>`;
+}
 async function refreshAccounts() {
   try {
     const d = await api('GET', '/accounts');
@@ -956,6 +1031,8 @@ async function refreshAccounts() {
       });
     } catch(e) {}
     document.getElementById('acctRows').innerHTML = accounts.map(a => {
+      const isAgentApi = a.auth_kind === 'agent_api';
+      const supported = accountSupportedAgentTypes(a);
       const b = alloc[a.id] || [];
       const active = b.length
         ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} `
@@ -969,31 +1046,55 @@ async function refreshAccounts() {
       const eip = durable
         ? `${esc(eipValue)} <span class="muted">(${esc(durable.state)})</span>`
         : '<span class="muted">无 EIP</span>';
-      const secrets = `${a.has_password ? 'password' : ''}`
-        + `${a.has_password && a.has_email_token ? ' + ' : ''}`
-        + `${a.has_email_token ? 'mail token' : ''}` || '—';
-      return `<tr><td>${esc(a.id)}</td><td>${esc(a.agent_type)}</td><td>${esc(a.email)}</td>
-        <td>${esc(secrets)}</td><td>${esc(a.group)}</td><td>${esc(a.enabled)}</td>
-        <td style="font-size:.72rem">${eip}<br>${active}</td>
-        <td><button class="btn btn-danger" style="margin:0;padding:3px 9px"
-            onclick="removeAccount(${jsArg(a.id)})">✕</button></td></tr>`;
-    }).join('') || '<tr><td colspan="8" class="muted">No accounts.</td></tr>';
+      const secrets = isAgentApi
+        ? (a.has_api_key ? 'API key' : '—')
+        : (`${a.has_password ? 'password' : ''}`
+          + `${a.has_password && a.has_email_token ? ' + ' : ''}`
+          + `${a.has_email_token ? 'mail token' : ''}` || '—');
+      const providerLabel = a.api_provider === 'cloudrouter'
+        ? 'CloudRouter · API'
+        : `${a.api_provider || 'Agent'} · API`;
+      const accountType = isAgentApi
+        ? `<b>${esc(providerLabel)}</b><br>${esc(supported.join(' / ') || '—')}`
+          + `<br><span class="muted">${esc(formatAgentApiModels(a))}</span>`
+        : esc(a.agent_type);
+      const identity = a.name || a.email || a.id;
+      const quota = isAgentApi
+        ? formatAgentApiUsage(a.api_usage)
+        : '<span class="muted">OAuth</span>';
+      const action = isAgentApi
+        ? `<button class="btn btn-ghost" style="margin:0;padding:3px 9px"
+            onclick="refreshAgentApiAccount(${jsArg(a.id)})">刷新</button>`
+        : `<button class="btn btn-danger" style="margin:0;padding:3px 9px"
+            onclick="removeAccount(${jsArg(a.id)})">✕</button>`;
+      return `<tr><td>${esc(a.id)}</td><td style="font-size:.72rem">${accountType}</td>
+        <td>${esc(identity)}</td><td>${esc(secrets)}</td><td>${esc(a.group)}</td>
+        <td>${esc(a.enabled !== false)}</td><td style="font-size:.72rem">${quota}</td>
+        <td style="font-size:.72rem">${eip}<br>${active}</td><td>${action}</td></tr>`;
+    }).join('') || '<tr><td colspan="9" class="muted">No accounts.</td></tr>';
 
     const picker = document.getElementById('jAcctIds');
     const selectedAgent = document.getElementById('jAgentType').value;
     const selected = new Set(Array.from(picker.selectedOptions).map(o => o.value));
     picker.replaceChildren();
     accounts.forEach(a => {
+      const supported = accountSupportedAgentTypes(a);
+      const enabled = a.enabled !== false;
+      const isAgentApi = a.auth_kind === 'agent_api';
       const option = document.createElement('option');
       option.value = a.id;
-      option.dataset.agentType = a.agent_type;
-      option.dataset.enabled = String(Boolean(a.enabled));
+      option.dataset.agentTypes = supported.join(',');
+      option.dataset.enabled = String(enabled);
       const durable = eipBindings[a.id];
       const eipLabel = durable
         ? ` · EIP ${durable.eip_ip || durable.eip_allocation_id || durable.state}`
         : '';
-      option.textContent = `${a.agent_type} · ${a.email || a.id} · ${a.group || 'standard'} (${a.id})${eipLabel}`;
-      option.disabled = !a.enabled || a.agent_type !== selectedAgent;
+      const typeLabel = isAgentApi
+        ? `CloudRouter API · ${supported.join('/')}`
+        : supported.join('/');
+      option.textContent = `${typeLabel} · ${a.name || a.email || a.id}`
+        + ` · ${a.group || 'standard'} (${a.id})${eipLabel}`;
+      option.disabled = !enabled || !supported.includes(selectedAgent);
       option.selected = selected.has(a.id) && !option.disabled;
       picker.appendChild(option);
     });
@@ -1021,6 +1122,28 @@ async function addAccount() {
     document.getElementById('acctToken').value = '';
     document.getElementById('acctClearToken').checked = false;
     toast('Account added'); refreshAccounts();
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function addCloudRouterAccount() {
+  const name = document.getElementById('apiAcctName').value.trim();
+  const group = document.getElementById('apiAcctGroup').value.trim() || 'standard';
+  const apiKey = document.getElementById('apiAcctKey').value.trim();
+  if (!name || !apiKey) return toast('name + API key required', 'error');
+  try {
+    await api('POST', '/agent-api/accounts', {
+      provider: 'cloudrouter', name: name, group: group, api_key: apiKey
+    });
+    document.getElementById('apiAcctKey').value = '';
+    document.getElementById('apiAcctName').value = '';
+    toast('CloudRouter API account added');
+    await refreshAccounts();
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function refreshAgentApiAccount(id) {
+  try {
+    await api('POST', '/agent-api/accounts/' + encodeURIComponent(id) + '/refresh');
+    toast('CloudRouter models and quota refreshed');
+    await refreshAccounts();
   } catch(e) { toast(e.message, 'error'); }
 }
 
@@ -1357,7 +1480,8 @@ function updateAgentUI() {
   }
   updateAccountModeUI();
   Array.from(picker.options).forEach(option => {
-    option.disabled = option.dataset.enabled !== 'true' || option.dataset.agentType !== agentType;
+    option.disabled = option.dataset.enabled !== 'true'
+      || !option.dataset.agentTypes.split(',').includes(agentType);
     if (option.disabled) option.selected = false;
   });
   document.getElementById('jConfigDir').placeholder =
@@ -1408,6 +1532,7 @@ function buildJobSpec() {
     ttl_seconds: parseInt(document.getElementById('jTtl').value) || 172800,
     account: {mode: document.getElementById('jAcctMode').value,
               agent_type: document.getElementById('jAgentType').value,
+              model: document.getElementById('jAgentModel').value.trim(),
               group: document.getElementById('jAcctGroup').value.trim() || 'standard',
               per_worker: parseInt(document.getElementById('jPerWorker').value) || 1,
               config_dir: document.getElementById('jConfigDir').value.trim(),

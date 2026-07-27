@@ -342,6 +342,26 @@ class TestLaunch:
         assert spec.run.secret_env == {"TOKEN": "aws-ssm:///prod/token"}
         assert "resolved-plaintext" not in spec.model_dump_json()
 
+    async def test_selected_credential_home_wins_after_secret_resolution(self):
+        d = FakeDriver()
+        d.resolved_secret_env = {
+            "CLAUDE_CONFIG_DIR": "/attacker/credential-home",
+        }
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            account={"config_dir": "/managed/selected-home"},
+            run={
+                "command": "true",
+                "secret_env": {
+                    "CLAUDE_CONFIG_DIR": "aws-ssm:///prod/credential-home",
+                },
+            },
+        ))
+        run = next(iter(job.runs.values()))
+
+        assert run.config_dir == "/managed/selected-home"
+        assert d.dispatched[-1]["env"]["CLAUDE_CONFIG_DIR"] == run.config_dir
+
     async def test_secret_resolution_failure_fails_worker_before_dispatch(self):
         d = FakeDriver()
         d.secret_resolve_error = "AccessDenied"
@@ -878,6 +898,34 @@ class TestRotation:
         await orch.on_worker_exit(job.job_id, wid, 130)  # 128+SIGINT
         assert job.runs[wid].phase == WorkerPhase.ROTATING  # unchanged
 
+    async def test_runtime_account_snapshot_does_not_follow_active_slot(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1},
+            account={"per_worker": 2},
+        ))
+        wid = next(iter(job.runs))
+        run = job.runs[wid]
+        task_id = run.task_id
+        first_account = run.account_ids[0]
+        run.task_auth_kind = "agent_api"
+
+        assert orch.runtime_account_for_task(
+            wid, task_id=task_id,
+        ) == (first_account, "agent_api")
+
+        # Rotation advances the selected slot before the replacement dispatch
+        # receives its new task id. Feedback for the old id remains pinned to A.
+        run.active_slot = 1
+        assert run.account_id != first_account
+        assert orch.runtime_account_for_task(
+            wid, task_id=task_id,
+        ) == (first_account, "agent_api")
+        assert orch.runtime_account_for_task(
+            wid, task_id="stale-or-future",
+        ) is None
+
     async def test_stale_exit_after_rotation_ignored_by_task_id(self):
         # Race: after rotation re-dispatches (new task_id, phase RUNNING again),
         # the interrupted run's stale exit arrives with the OLD task_id — it must
@@ -1081,6 +1129,52 @@ class TestMultiAccountPerWorker:
         # each slot logged into its own dir
         assert sorted(c[1] for c in d.login_calls) == run.config_dirs
 
+    async def test_explicit_ids_are_mapped_by_worker_then_slot(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 2},
+            account={
+                "per_worker": 2,
+                "config_dir": "/root/.claude",
+                "ids": ["a1", "a2", "a3", "a4"],
+            },
+        ))
+
+        requested = [
+            event[2] for event in d.events if event[0] == "login"
+        ]
+        assert requested == ["a1", "a2", "a3", "a4"]
+        by_shard = sorted(job.runs.values(), key=lambda run: run.ctx.shard_index)
+        assert by_shard[0].account_ids == ["a1", "a2"]
+        assert by_shard[1].account_ids == ["a3", "a4"]
+
+    async def test_login_may_return_a_nested_agent_api_home(self):
+        class AgentApiDriver(FakeDriver):
+            async def login(
+                self, worker_id, spec, config_dir, *,
+                account_id="", claim_id="",
+            ):
+                outcome = await super().login(
+                    worker_id,
+                    spec,
+                    config_dir,
+                    account_id=account_id,
+                    claim_id=claim_id,
+                )
+                outcome.config_dir = f"{config_dir}/claude"
+                return outcome
+
+        d = AgentApiDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            account={"config_dir": "/managed/cloudrouter-1"},
+        ))
+        run = next(iter(job.runs.values()))
+
+        assert run.config_dir == "/managed/cloudrouter-1/claude"
+        assert d.dispatched[-1]["env"]["CLAUDE_CONFIG_DIR"] == run.config_dir
+
     async def test_rotation_uses_prelogged_slots_before_relogin(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
@@ -1115,6 +1209,94 @@ class TestMultiAccountPerWorker:
         run = SimpleNamespace(config_dirs=[""], rotations=2)
 
         with pytest.raises(RuntimeError, match="worker-writable config_dir"):
+            BatchOrchestrator._extra_dir(job, run)
+
+    @pytest.mark.parametrize(
+        ("agent_type", "explicit_slot"),
+        [("claude", False), ("codex", True)],
+    )
+    async def test_agent_api_rotation_uses_source_slot_outside_projection(
+        self,
+        tmp_path,
+        agent_type,
+        explicit_slot,
+    ):
+        from pathlib import Path, PurePosixPath
+        from types import SimpleNamespace
+
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+        from elastic_agent.worker.runtime import WorkerRuntime
+
+        slot = tmp_path / f"{agent_type}-slot"
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type=agent_type,
+            config_dir=slot,
+            api_key="cloudrouter-secret",
+            account_id="cloudrouter-1",
+            models=[
+                "claude-opus-4-8"
+                if agent_type == "claude"
+                else "gpt-5.4"
+            ],
+        )
+        spec = _spec(
+            account={
+                "agent_type": agent_type,
+                "config_dir": str(slot) if explicit_slot else "",
+            },
+            rotation={
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "--resume",
+            },
+        )
+        job = SimpleNamespace(spec=spec)
+        run = SimpleNamespace(
+            config_dirs=[home],
+            account_ids=["cloudrouter-1"],
+            account_auth_kinds=["agent_api"],
+            rotations=1,
+        )
+
+        rotation_home = BatchOrchestrator._extra_dir(job, run)
+
+        assert rotation_home == f"{slot}-rot-1"
+        assert ".elastic-agent-api" not in PurePosixPath(rotation_home).parts
+        Path(rotation_home).mkdir(mode=0o700)
+        credential_env = (
+            "CLAUDE_CONFIG_DIR"
+            if agent_type == "claude"
+            else "CODEX_HOME"
+        )
+        execute = ExecuteMessage(
+            task_id="rotation-task",
+            command=["true"],
+            cwd="/",
+            env={credential_env: rotation_home},
+        )
+        assert WorkerRuntime._agent_api_projection_for_execute(execute) is None
+
+    async def test_agent_api_rotation_rejects_mismatched_projection_home(self):
+        from types import SimpleNamespace
+
+        spec = _spec(
+            rotation={
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "--resume",
+            },
+        )
+        job = SimpleNamespace(spec=spec)
+        run = SimpleNamespace(
+            config_dirs=[
+                "/safe/.elastic-agent-api/cloudrouter/cloudrouter-other/claude"
+            ],
+            account_ids=["cloudrouter-1"],
+            account_auth_kinds=["agent_api"],
+            rotations=1,
+        )
+
+        with pytest.raises(RuntimeError, match="cannot derive rotation slot"):
             BatchOrchestrator._extra_dir(job, run)
 
 
@@ -1404,6 +1586,106 @@ class TestAccountRelease:
         wid = next(iter(job.runs))
         await orch.on_worker_exit(job.job_id, wid, 0)  # DONE
         assert alloc.released == [wid]
+
+    async def test_ordinary_account_is_not_released_until_worker_teardown_succeeds(
+        self,
+    ):
+        driver = FakeDriver()
+        driver.scale_in_failures = 1
+        orch = BatchOrchestrator(driver, cleanup_retry_seconds=60)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+        assert job.resources_released is False
+        assert job.accounts_released is False
+        assert allocator.released == []
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+        assert job.resources_released is True
+        assert job.accounts_released is True
+        assert allocator.released == [run.worker_id]
+
+    async def test_agent_api_forces_ephemeral_teardown_when_global_scale_in_is_off(
+        self,
+    ):
+        class AgentApiDriver(FakeDriver):
+            async def login(
+                self, worker_id, spec, config_dir, *,
+                account_id="", claim_id="",
+            ):
+                outcome = await super().login(
+                    worker_id,
+                    spec,
+                    config_dir,
+                    account_id=account_id,
+                    claim_id=claim_id,
+                )
+                outcome.auth_kind = "agent_api"
+                outcome.config_dir = (
+                    f"{config_dir}/.elastic-agent-api/cloudrouter/"
+                    f"{outcome.account_id}/claude"
+                )
+                return outcome
+
+        driver = AgentApiDriver()
+        orch = BatchOrchestrator(driver, scale_in_on_complete=False)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(
+            account={"config_dir": "/managed/slot"},
+        ))
+        run = next(iter(job.runs.values()))
+
+        assert job.release_workers_on_complete is True
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+        assert driver.scaled_in == [run.worker_id]
+        assert allocator.released == [run.worker_id]
+
+    async def test_failed_agent_api_delivery_still_forces_worker_teardown(
+        self,
+    ):
+        class FailedAgentApiDriver(FakeDriver):
+            async def login(
+                self, worker_id, spec, config_dir, *,
+                account_id="", claim_id="",
+            ):
+                return LoginOutcome(
+                    success=False,
+                    account_id="cloudrouter-1",
+                    auth_kind="agent_api",
+                    error="worker disconnected after key delivery",
+                )
+
+        driver = FailedAgentApiDriver()
+        orch = BatchOrchestrator(driver, scale_in_on_complete=False)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(
+            account={"config_dir": "/managed/slot"},
+        ))
+        run = next(iter(job.runs.values()))
+
+        assert run.phase == WorkerPhase.FAILED
+        assert driver.scaled_in == [run.worker_id]
+        assert allocator.released == [run.worker_id]
 
     async def test_release_on_failed_run_exit(self):
         d = FakeDriver()

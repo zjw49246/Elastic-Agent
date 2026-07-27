@@ -179,9 +179,16 @@ class TestManagerLifecycle:
         await previous.stop()
 
         restarted = ElasticAgentManager(tmp_config, provider)
+        real_wait_terminated = restarted.binding_manager.wait_instance_terminated
+        restarted.binding_manager.wait_instance_terminated = AsyncMock(
+            side_effect=real_wait_terminated
+        )
         await restarted.start()
         try:
             assert provider._instances == {}
+            restarted.binding_manager.wait_instance_terminated.assert_awaited_once_with(
+                instance.instance_id
+            )
             recovered = await restarted.registry.get(instance.instance_id)
             assert recovered.status == NodeStatus.TERMINATED
             assert restarted.binding_recovery_ready is True
@@ -197,6 +204,206 @@ class TestManagerLifecycle:
             await restarted.stop()
 
     @pytest.mark.asyncio
+    async def test_restart_does_not_trust_previous_process_unbound_ownership(
+        self, tmp_config, provider
+    ):
+        from elastic_agent.core.job_spec_store import (
+            load_unbound_launch_intents,
+        )
+
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        record = (
+            await previous.scale_out(
+                tags={"ElasticAgentJob": "job-previous-process"},
+            )
+        )[0]
+        assert (
+            record.instance_id
+            in previous._current_unbound_instance_ids
+        )
+        assert record.metadata == {
+            "job_id": "job-previous-process",
+            "controller_id": (
+                previous.account_binding_store.controller_id
+            ),
+        }
+        assert load_unbound_launch_intents(
+            tmp_config.registry.path,
+            previous.account_binding_store.controller_id,
+        ) == {}
+        await previous.stop()
+
+        visible = list(provider._instances.values())
+        provider.list_instances = AsyncMock(side_effect=[[], visible])
+        real_get_instance = provider.get_instance
+        exact_attempts = 0
+
+        async def eventually_visible_exact(instance_id):
+            nonlocal exact_attempts
+            exact_attempts += 1
+            if exact_attempts == 1:
+                raise InstanceNotFoundError("not visible by exact id yet")
+            return await real_get_instance(instance_id)
+
+        provider.get_instance = eventually_visible_exact
+        restarted = ElasticAgentManager(tmp_config, provider)
+        assert restarted._current_unbound_instance_ids == set()
+        await restarted.start()
+        try:
+            # Full registry/event publication does not discard the durable
+            # ownership fence. A first eventually-consistent miss after a
+            # crash must therefore remain quarantined.
+            assert len(provider._instances) == 1
+            assert restarted.binding_recovery_ready is False
+            assert restarted._recovery_unbound_registry_scans == {
+                record.node_id: 29
+            }
+            recovery_task = restarted._binding_recovery_task
+            if recovery_task is not None:
+                recovery_task.cancel()
+                await recovery_task
+                restarted._binding_recovery_task = None
+            await restarted._recover_bound_resources_once()
+
+            assert provider._instances == {}
+            recovered = await restarted.registry.get(record.node_id)
+            assert recovered.status == NodeStatus.TERMINATED
+            assert restarted.binding_recovery_ready is True
+            assert load_unbound_launch_intents(
+                tmp_config.registry.path,
+                restarted.account_binding_store.controller_id,
+            ) == {}
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_unbound_intent_survives_second_restart(
+        self, tmp_config, provider
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            load_unbound_launch_intents,
+        )
+
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        await previous._persist_batch_job_spec(
+            "job-failed-before-scan",
+            JobSpec.model_validate({
+                "name": "failed-before-recovery-scan",
+                "run": {"command": "true"},
+                "account": {"mode": "none"},
+            }),
+        )
+        await previous._update_batch_job_state(
+            "job-failed-before-scan", "launching",
+        )
+        real_create = provider.create_instance
+
+        async def timeout_after_acceptance(config):
+            await real_create(config)
+            raise TimeoutError("cloud accepted before SDK timeout")
+
+        provider.create_instance = timeout_after_acceptance
+        previous._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(TimeoutError, match="SDK timeout"):
+            await previous.scale_out(
+                tags={"ElasticAgentJob": "job-failed-before-scan"},
+            )
+        await previous._update_batch_job_state(
+            "job-failed-before-scan",
+            "failed",
+            {"state": "failed", "done": True},
+        )
+        journal_path = (
+            Path(tmp_config.registry.path).with_name("specs")
+            / "job-failed-before-scan.json"
+        )
+        assert json.loads(
+            journal_path.read_text(encoding="utf-8")
+        )["submission_state"] == "failed"
+        assert load_unbound_launch_intents(
+            tmp_config.registry.path,
+            previous.account_binding_store.controller_id,
+        ) == {"job-failed-before-scan": 1}
+        await previous.stop()
+
+        # A fresh process initially misses the eventually-consistent cloud row.
+        visible = list(provider._instances.values())
+        provider.list_instances = AsyncMock(side_effect=[[], visible])
+        restarted = ElasticAgentManager(tmp_config, provider)
+        restarted._collect_recovered_unbound = AsyncMock()
+        real_wait_terminated = restarted.binding_manager.wait_instance_terminated
+        restarted.binding_manager.wait_instance_terminated = AsyncMock(
+            side_effect=real_wait_terminated
+        )
+        await restarted.start()
+        try:
+            assert restarted.binding_recovery_ready is False
+            assert len(provider._instances) == 1
+            assert restarted._unbound_launch_intent_counts == {
+                "job-failed-before-scan": 1
+            }
+
+            # Avoid waiting for the production polling interval; the second
+            # successful scan sees, collects, and confirms termination.
+            recovery_task = restarted._binding_recovery_task
+            if recovery_task is not None:
+                recovery_task.cancel()
+                await recovery_task
+                restarted._binding_recovery_task = None
+            await restarted._recover_bound_resources_once()
+
+            assert provider._instances == {}
+            restarted._collect_recovered_unbound.assert_awaited_once()
+            restarted.binding_manager.wait_instance_terminated.assert_awaited_once()
+            assert restarted.binding_recovery_ready is True
+            assert restarted._unbound_launch_intent_counts == {}
+            assert load_unbound_launch_intents(
+                tmp_config.registry.path,
+                restarted.account_binding_store.controller_id,
+            ) == {}
+            assert json.loads(
+                journal_path.read_text(encoding="utf-8")
+            )["submission_state"] == "failed"
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_unsafe_unbound_launch_intent_job_id(
+        self, tmp_config, provider
+    ):
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        controller_id = previous.account_binding_store.controller_id
+        await previous.stop()
+
+        intent_path = Path(tmp_config.registry.path).with_name(
+            "unbound-launches.json"
+        )
+        intent_path.write_text(
+            json.dumps({
+                "version": 1,
+                "controller_id": controller_id,
+                "jobs": {"../escape": 1},
+            }),
+            encoding="utf-8",
+        )
+        restarted = ElasticAgentManager(tmp_config, provider)
+        with pytest.raises(ValueError, match="invalid unbound launch intent"):
+            await restarted.start()
+        assert restarted._started is False
+        assert restarted._binding_lock_fd is None
+
+        # Repairing the corrupt journal makes the controller immediately
+        # startable; failure did not trust the path or retain the leader lock.
+        intent_path.unlink()
+        clean = ElasticAgentManager(tmp_config, provider)
+        await clean.start()
+        await clean.stop()
+
+    @pytest.mark.asyncio
     async def test_start_stop(self, manager):
         await manager.start()
         assert manager._started is True
@@ -209,6 +416,34 @@ class TestManagerLifecycle:
         nodes = await manager.registry.list_all()
         assert nodes == []
         await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_never_adopts_unmanaged_controller_tagged_instance(
+        self, tmp_config, provider
+    ):
+        manager = ElasticAgentManager(tmp_config, provider)
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="key",
+            tags={
+                # A provider/mock may ignore the requested ManagedBy filter.
+                # Controller/Job tags alone are not destructive authority.
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentJob": "job-not-owned",
+            },
+        ))
+
+        await manager.start()
+        try:
+            assert await provider.get_instance(instance.instance_id) is instance
+            assert manager._recovery_unbound_instances == {}
+            assert manager.binding_recovery_ready is True
+        finally:
+            await manager.stop()
+            await provider.terminate_instance(instance.instance_id)
 
     @pytest.mark.asyncio
     async def test_binding_store_has_single_manager_leader(self, tmp_config, provider):
@@ -431,6 +666,29 @@ class TestManagerLifecycle:
             assert after_first_scan.state == LeaseState.RESERVED
             assert after_first_scan.instance_id is None
             assert restarted.binding_recovery_ready is False
+            api_account = SimpleNamespace(
+                id="cloudrouter-recovery",
+                email="CloudRouter recovery",
+                group="standard",
+                enabled=True,
+                auth_kind="agent_api",
+                supports_agent_type=lambda value: value == "codex",
+            )
+            restarted.agent_api_store.list = AsyncMock(
+                return_value=[api_account]
+            )
+            restarted.agent_api_store.fetch_usage = AsyncMock()
+            restarted.agent_api_store.availability_decision = MagicMock(
+                return_value={"available": True}
+            )
+            blocked = await restarted.account_allocator.reserve(
+                "job-during-recovery",
+                "standard",
+                account_id=api_account.id,
+                agent_type="codex",
+            )
+            assert blocked is None
+            restarted.agent_api_store.list.assert_not_awaited()
 
             # Drive the next pass directly so this test does not sleep for the
             # production scan interval. The immutable cloud tags reconnect the
@@ -444,6 +702,13 @@ class TestManagerLifecycle:
             assert provider.instances[instance.instance_id].state == InstanceState.TERMINATED
             assert restarted.binding_recovery_ready is True
             assert provider.list_instances.await_count == 2
+            admitted = await restarted.account_allocator.reserve(
+                "job-after-recovery",
+                "standard",
+                account_id=api_account.id,
+                agent_type="codex",
+            )
+            assert admitted.account is api_account
         finally:
             await restarted.stop()
 
@@ -454,6 +719,26 @@ class TestManagerLifecycle:
 
 
 class TestScaleOut:
+    @pytest.mark.asyncio
+    async def test_unbound_create_never_reaches_cloud_without_durable_intent(
+        self, manager, provider
+    ):
+        await manager.start()
+        real_create = provider.create_instance
+        provider.create_instance = AsyncMock(side_effect=real_create)
+        manager._begin_unbound_launch_intent = AsyncMock(
+            side_effect=OSError("intent fsync failed")
+        )
+
+        with pytest.raises(OSError, match="fsync failed"):
+            await manager.scale_out(
+                tags={"ElasticAgentJob": "job-no-journal-no-create"},
+            )
+
+        provider.create_instance.assert_not_awaited()
+        assert provider._instances == {}
+        await manager.stop()
+
     @pytest.mark.asyncio
     async def test_partial_scale_out_failure_terminates_every_created_instance(
         self, manager, provider
@@ -519,6 +804,332 @@ class TestScaleOut:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_published_worker_compensation_retry_does_not_consume_other_intent(
+        self, manager, provider
+    ):
+        await manager.start()
+        real_create = provider.create_instance
+        create_attempts = 0
+
+        async def fail_second_before_acceptance(config):
+            nonlocal create_attempts
+            create_attempts += 1
+            if create_attempts == 2:
+                raise RuntimeError("second create rejected")
+            return await real_create(config)
+
+        provider.create_instance = fail_second_before_acceptance
+        real_terminate = provider.terminate_instance
+        terminate_attempts = 0
+
+        async def fail_first_termination(instance_id):
+            nonlocal terminate_attempts
+            terminate_attempts += 1
+            if terminate_attempts == 1:
+                raise RuntimeError("known worker termination failed")
+            await real_terminate(instance_id)
+
+        provider.terminate_instance = fail_first_termination
+        manager._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(RuntimeError, match="second create rejected"):
+            await manager.scale_out(
+                count=2,
+                tags={"ElasticAgentJob": "job-partial-known"},
+            )
+
+        assert len(provider._instances) == 1
+        known = next(iter(provider._instances.values()))
+        assert known.instance_id in manager._resolved_unbound_instance_ids
+        # Only the rejected second create remains uncertain.
+        assert manager._unbound_launch_intent_counts == {
+            "job-partial-known": 1
+        }
+
+        await manager._recover_bound_resources_once()
+
+        assert provider._instances == {}
+        assert manager._unbound_launch_intent_counts == {
+            "job-partial-known": 1
+        }
+        assert manager._recovery_unbound_instances == {}
+        # The known, already-published worker was retried and destroyed but
+        # did not consume the distinct no-id intent.
+        assert (
+            manager._recovery_unbound_launch_scans[
+                "job-partial-known"
+            ]
+            > 0
+        )
+        manager._recovery_unbound_launch_scans[
+            "job-partial-known"
+        ] = 1
+        await manager._recover_bound_resources_once()
+        assert manager._unbound_launch_intent_counts == {}
+        assert manager.binding_recovery_ready is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_unbound_timeout_after_cloud_acceptance_scans_until_visible(
+        self, manager, provider
+    ):
+        await manager.start()
+        real_create = provider.create_instance
+
+        async def timeout_after_create(config):
+            await real_create(config)
+            raise TimeoutError("SDK timed out after cloud acceptance")
+
+        provider.create_instance = timeout_after_create
+        manager._ensure_binding_recovery_task = MagicMock()
+        with pytest.raises(TimeoutError, match="cloud acceptance"):
+            await manager.scale_out(
+                tags={"ElasticAgentJob": "job-unbound-timeout"},
+            )
+
+        assert len(provider._instances) == 1
+        assert (
+            manager._recovery_unbound_launch_scans[
+                "job-unbound-timeout"
+            ]
+            > 1
+        )
+        assert manager._binding_recovery_scan_pending is True
+        assert manager.binding_recovery_ready is False
+        manager._ensure_binding_recovery_task.assert_called_once_with()
+
+        # Model EC2 eventual consistency: the first controller-tag scan misses
+        # the accepted request, while the next pass can see it.
+        real_list_instances = provider.list_instances
+        visible = await real_list_instances()
+        provider.list_instances = AsyncMock(
+            side_effect=[[], visible],
+        )
+        manager._recovery_unbound_launch_scans[
+            "job-unbound-timeout"
+        ] = 2
+
+        await manager._recover_bound_resources_once()
+        assert len(provider._instances) == 1
+        assert manager._binding_recovery_scan_pending is True
+
+        await manager._recover_bound_resources_once()
+        assert provider._instances == {}
+        assert manager._recovery_unbound_launch_scans == {}
+        assert manager.binding_recovery_ready is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_unbound_cancel_after_cloud_acceptance_uses_live_recovery(
+        self, manager, provider
+    ):
+        await manager.start()
+        real_create = provider.create_instance
+        cloud_created = asyncio.Event()
+
+        async def create_then_block(config):
+            await real_create(config)
+            cloud_created.set()
+            await asyncio.Future()
+
+        provider.create_instance = create_then_block
+        manager._ensure_binding_recovery_task = MagicMock()
+        scale_task = asyncio.create_task(manager.scale_out(
+            tags={"ElasticAgentJob": "job-unbound-cancel"},
+        ))
+        await cloud_created.wait()
+        scale_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await scale_task
+
+        assert len(provider._instances) == 1
+        initial_scans = manager._recovery_unbound_launch_scans[
+            "job-unbound-cancel"
+        ]
+        assert initial_scans > 1
+        assert manager._binding_recovery_scan_pending is True
+        assert manager.binding_recovery_ready is False
+        manager._ensure_binding_recovery_task.assert_called_once_with()
+
+        await manager._recover_bound_resources_once()
+        assert provider._instances == {}
+        # The durable counter proves this Job had exactly one unresolved
+        # create.  Confirmed termination resolves it immediately rather than
+        # keeping Agent API admission blocked for the remaining quarantine.
+        assert manager._recovery_unbound_launch_scans == {}
+        assert manager._unbound_launch_intent_counts == {}
+        assert manager.binding_recovery_ready is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_same_job_unbound_intents_resolve_each_confirmed_instance(
+        self, manager, provider
+    ):
+        from elastic_agent.core.job_spec_store import (
+            load_unbound_launch_intents,
+        )
+
+        await manager.start()
+        real_create = provider.create_instance
+
+        async def timeout_after_create(config):
+            await real_create(config)
+            raise TimeoutError("accepted without returning an instance")
+
+        provider.create_instance = timeout_after_create
+        manager._ensure_binding_recovery_task = MagicMock()
+        for _ in range(2):
+            with pytest.raises(TimeoutError, match="without returning"):
+                await manager.scale_out(
+                    tags={"ElasticAgentJob": "job-two-uncertain"},
+                )
+
+        assert len(provider._instances) == 2
+        assert manager._unbound_launch_intent_counts == {
+            "job-two-uncertain": 2
+        }
+        assert load_unbound_launch_intents(
+            manager.config.registry.path,
+            manager.account_binding_store.controller_id,
+        ) == {"job-two-uncertain": 2}
+
+        await manager._recover_bound_resources_once()
+
+        assert provider._instances == {}
+        assert manager._recovery_unbound_launch_scans == {}
+        assert manager._unbound_launch_intent_counts == {}
+        assert load_unbound_launch_intents(
+            manager.config.registry.path,
+            manager.account_binding_store.controller_id,
+        ) == {}
+        assert manager.binding_recovery_ready is True
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_recovery_scan_skips_current_unbound_job(
+        self, manager, provider
+    ):
+        await manager.start()
+        record = (
+            await manager.scale_out(
+                tags={"ElasticAgentJob": "job-current-oauth"},
+            )
+        )[0]
+        manager._collect_recovered_unbound = AsyncMock()
+        manager._binding_recovery_scan_pending = True
+        manager._binding_recovery_scans_remaining = 1
+
+        await manager._recover_bound_resources_once()
+
+        assert await provider.get_instance(record.instance_id) is not None
+        assert await manager.registry.get(record.node_id) is not None
+        assert (
+            record.instance_id
+            in manager._current_unbound_instance_ids
+        )
+        assert (
+            record.instance_id
+            not in manager._recovery_unbound_instances
+        )
+        manager._collect_recovered_unbound.assert_not_awaited()
+
+        await manager.scale_in([record.node_id], force=True)
+        assert (
+            record.instance_id
+            not in manager._current_unbound_instance_ids
+        )
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_recovery_waits_for_unbound_registry_publication(
+        self, manager, provider
+    ):
+        await manager.start()
+        publication_entered = asyncio.Event()
+        publish = asyncio.Event()
+        real_emit = manager.event_bus.emit
+
+        async def block_node_creating(event_type, source, data=None):
+            if event_type == "NODE_CREATING":
+                publication_entered.set()
+                await publish.wait()
+            await real_emit(event_type, source, data)
+
+        manager.event_bus.emit = block_node_creating
+        real_list_instances = provider.list_instances
+        provider.list_instances = AsyncMock(
+            side_effect=real_list_instances
+        )
+        manager._collect_recovered_unbound = AsyncMock()
+        manager._binding_recovery_scan_pending = True
+        manager._binding_recovery_scans_remaining = 1
+
+        scale_task = asyncio.create_task(manager.scale_out(
+            tags={"ElasticAgentJob": "job-publication-fence"},
+        ))
+        await publication_entered.wait()
+        # The registry write has completed, but scale_out still owns the
+        # lifecycle fence until NODE_CREATING publication also completes.
+        assert len(await manager.registry.list_all()) == 1
+        scans_before_recovery = provider.list_instances.await_count
+        recovery_task = asyncio.create_task(
+            manager._recover_bound_resources_once()
+        )
+        await asyncio.sleep(0)
+
+        assert recovery_task.done() is False
+        assert provider.list_instances.await_count == scans_before_recovery
+
+        publish.set()
+        records = await scale_task
+        await recovery_task
+        record = records[0]
+        assert await provider.get_instance(record.instance_id) is not None
+        assert await manager.registry.get(record.node_id) is not None
+        manager._collect_recovered_unbound.assert_not_awaited()
+
+        await manager.scale_in([record.node_id], force=True)
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_finalizing_failed_unbound_worker_stays_with_current_job(
+        self, manager, provider
+    ):
+        await manager.start()
+        record = (
+            await manager.scale_out(
+                tags={"ElasticAgentJob": "job-current-failed"},
+            )
+        )[0]
+        await manager.registry.update(
+            record.node_id, status=NodeStatus.FAILED
+        )
+        manager._collect_recovered_unbound = AsyncMock()
+        manager._binding_recovery_scan_pending = True
+        manager._binding_recovery_scans_remaining = 1
+
+        await manager._recover_bound_resources_once()
+
+        assert await provider.get_instance(record.instance_id) is not None
+        assert (
+            record.instance_id
+            in manager._current_unbound_instance_ids
+        )
+        assert (
+            record.instance_id
+            not in manager._recovery_unbound_instances
+        )
+        manager._collect_recovered_unbound.assert_not_awaited()
+
+        # The normal terminal path explicitly relinquishes process ownership
+        # as it starts confirmed teardown.
+        await manager.scale_in([record.node_id], force=True)
+        assert (
+            record.instance_id
+            not in manager._current_unbound_instance_ids
+        )
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_scale_out_single(self, manager):
         await manager.start()
         records = await manager.scale_out(count=1)
@@ -529,6 +1140,36 @@ class TestScaleOut:
         assert rec.node_id.startswith("dryrun:")
         all_nodes = await manager.registry.list_all()
         assert len(all_nodes) == 1
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_unbound_intent_clears_after_durable_publication(
+        self, manager
+    ):
+        from elastic_agent.core.job_spec_store import (
+            load_unbound_launch_intents,
+        )
+
+        await manager.start()
+        record = (
+            await manager.scale_out(
+                tags={"ElasticAgentJob": "job-normal-lifecycle"},
+            )
+        )[0]
+
+        assert manager._unbound_launch_intent_counts == {}
+        assert load_unbound_launch_intents(
+            manager.config.registry.path,
+            manager.account_binding_store.controller_id,
+        ) == {}
+
+        await manager.scale_in([record.node_id], force=True)
+
+        assert manager._unbound_launch_intent_counts == {}
+        assert load_unbound_launch_intents(
+            manager.config.registry.path,
+            manager.account_binding_store.controller_id,
+        ) == {}
         await manager.stop()
 
     @pytest.mark.asyncio
@@ -705,6 +1346,7 @@ class TestScaleIn:
     @pytest.mark.asyncio
     async def test_scale_in_force(self, manager, provider):
         await manager.start()
+        manager.binding_manager.wait_instance_terminated = AsyncMock()
         records = await manager.scale_out(count=2)
         node_ids = [r.node_id for r in records]
         terminated = await manager.scale_in(node_ids, force=True)
@@ -712,6 +1354,14 @@ class TestScaleIn:
         for nid in node_ids:
             node = await manager.registry.get(nid)
             assert node.status == NodeStatus.TERMINATED
+        assert (
+            manager.binding_manager.wait_instance_terminated.await_count
+            == len(records)
+        )
+        assert {
+            call.args[0]
+            for call in manager.binding_manager.wait_instance_terminated.await_args_list
+        } == {record.instance_id for record in records}
         await manager.stop()
 
     @pytest.mark.asyncio

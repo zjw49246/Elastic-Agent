@@ -6,6 +6,7 @@ import asyncio
 import time
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from elastic_agent.core.account_store import AccountStore
 from elastic_agent.core.batch_hooks import (
     AccountAllocator,
     AccountClaimConflictError,
+    AgentApiCoordinator,
     LoginCoordinator,
     make_bound_hooks,
     make_login_hook,
@@ -107,6 +109,7 @@ class FakeManager:
         self.provider = SimpleNamespace(
             wait_until_running=lambda iid: _async(SimpleNamespace(public_ip=host)))
         self.archived_job_logs = []
+        self.binding_recovery_ready = True
 
     async def remove_terminated_node_record(self, worker_id):
         return await self.registry.remove(worker_id)
@@ -262,6 +265,73 @@ class TestAccountAllocator:
         claim = await reserve
         assert claim.account.email == "updated@x.com"
         assert claim.account.email_token == "new-token"
+
+    async def test_mutation_guard_does_not_block_unrelated_claim_lifecycle(
+        self,
+        tmp_path,
+    ):
+        alloc = AccountAllocator(
+            await _store(tmp_path, [_acct(1), _acct(2)])
+        )
+        existing = await alloc.reserve(
+            "job-old:0",
+            "standard",
+            account_id="a2",
+        )
+
+        async with alloc.mutation_guard("a1"):
+            await asyncio.wait_for(
+                alloc.release_claim(existing.claim_id),
+                timeout=0.5,
+            )
+            unrelated = await asyncio.wait_for(
+                alloc.reserve(
+                    "job-new:0",
+                    "standard",
+                    account_id="a2",
+                ),
+                timeout=0.5,
+            )
+            assert unrelated is not None
+            assert unrelated.account.id == "a2"
+
+    async def test_mutation_guard_repeated_cancel_still_releases_marker(
+        self,
+        tmp_path,
+    ):
+        alloc = AccountAllocator(await _store(tmp_path, [_acct(1)]))
+        entered = asyncio.Event()
+
+        async def mutate_forever():
+            async with alloc.mutation_guard("a1"):
+                entered.set()
+                await asyncio.Future()
+
+        mutation = asyncio.create_task(mutate_forever())
+        await entered.wait()
+        completed = alloc._account_mutations["a1"]
+
+        # Hold the allocator lock so cancellation enters marker cleanup but
+        # cannot finish before a second cancellation arrives.
+        await alloc._lock.acquire()
+        try:
+            mutation.cancel()
+            await asyncio.sleep(0)
+            mutation.cancel()
+        finally:
+            alloc._lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await mutation
+        assert completed.is_set()
+        assert "a1" not in alloc._account_mutations
+
+        claim = await asyncio.wait_for(
+            alloc.reserve("job-next:0", "standard", account_id="a1"),
+            timeout=0.5,
+        )
+        assert claim is not None
+        assert claim.account.id == "a1"
 
 
 # --------------------------------------------------------------------------
@@ -923,11 +993,651 @@ class TestLoginCoordinator:
 
 
 # --------------------------------------------------------------------------
+# AgentApiCoordinator
+# --------------------------------------------------------------------------
+
+
+class _FakeAgentApiStore:
+    def __init__(self, account):
+        self.account = account
+        self.api_key = "cloudrouter-manager-secret"
+        self.usage = {
+            "state": "active",
+            "known": True,
+            "available": True,
+            "reason": "active",
+        }
+        self.decision = {
+            "known": True,
+            "available": True,
+            "reason": "active",
+        }
+        self.fetch_calls = 0
+        self.read_calls = 0
+        self.runtime_marks: list[tuple[str, str]] = []
+        self.runtime_quota_marks: list[tuple[str, str]] = []
+
+    async def list(self):
+        return [self.account]
+
+    async def fetch_usage(self, account_id, force=False):
+        assert account_id == self.account.id
+        self.fetch_calls += 1
+        return dict(self.usage)
+
+    def availability_decision(self, account_id):
+        assert account_id == self.account.id
+        return dict(self.decision)
+
+    def read_api_key(self, account_id):
+        assert account_id == self.account.id
+        self.read_calls += 1
+        return self.api_key
+
+    async def mark_runtime_unavailable(self, account_id, reason):
+        self.runtime_marks.append((account_id, reason))
+
+    async def mark_runtime_quota_unavailable(self, account_id, reason):
+        self.runtime_quota_marks.append((account_id, reason))
+
+
+def _api_acct():
+    return SimpleNamespace(
+        id="cloudrouter-1",
+        email="Shared CloudRouter",
+        name="Shared CloudRouter",
+        group="standard",
+        enabled=True,
+        auth_kind="agent_api",
+        api_provider="cloudrouter",
+        models={
+            "claude": ["claude-opus-4-8"],
+            "codex": ["gpt-5.4"],
+        },
+        supported_agent_types=["claude", "codex"],
+        supports_agent_type=lambda agent_type: agent_type in {"claude", "codex"},
+        supports_model=lambda agent_type, model: (
+            not model
+            or model
+            in {
+                "claude": {"claude-opus-4-8"},
+                "codex": {"gpt-5.4"},
+            }.get(agent_type, set())
+        ),
+    )
+
+
+class TestAgentApiCoordinator:
+    @pytest.mark.parametrize("probe_kind", ["never", "drip"])
+    async def test_configure_absolute_deadline_covers_usage_probe(
+        self,
+        probe_kind,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+        probe_started = asyncio.Event()
+        probe_cancelled = asyncio.Event()
+
+        async def stalled_probe(*_args, **_kwargs):
+            probe_started.set()
+            try:
+                if probe_kind == "never":
+                    await asyncio.Future()
+                while True:
+                    # Activity more frequent than an inactivity timeout models
+                    # an upstream response that drip-feeds bytes forever.
+                    await asyncio.sleep(0.001)
+            finally:
+                probe_cancelled.set()
+
+        store.fetch_usage = AsyncMock(side_effect=stalled_probe)
+        coordinator = AgentApiCoordinator(
+            conn,
+            bus,
+            store,
+            timeout=0.01,
+        )
+
+        outcome = await asyncio.wait_for(
+            coordinator.configure(
+                "worker-1",
+                account,
+                agent_type="codex",
+                config_dir="/home/ubuntu/.codex-slot-1",
+            ),
+            timeout=0.5,
+        )
+
+        assert outcome.success is False
+        assert outcome.auth_kind == "agent_api"
+        assert outcome.error == "Agent API configuration timed out"
+        assert probe_started.is_set()
+        assert probe_cancelled.is_set()
+        assert conn.sent == []
+        assert coordinator._pending == {}
+
+    async def test_startup_recovery_gate_excludes_api_but_keeps_oauth(
+        self, tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        recovery_ready = False
+        allocator = AccountAllocator(
+            native_store,
+            api_store,
+            agent_api_admission=lambda: recovery_ready,
+        )
+
+        fallback = await allocator.allocate(
+            "worker-native",
+            "standard",
+            agent_type="codex",
+        )
+        assert fallback.id == "a9"
+        assert api_store.fetch_calls == 0
+        await allocator.release_worker("worker-native")
+
+        blocked = await allocator.allocate(
+            "worker-explicit-api",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+        )
+        assert blocked is None
+        assert api_store.fetch_calls == 0
+
+        recovery_ready = True
+        selected = await allocator.allocate(
+            "worker-api",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+        )
+        assert selected.id == account.id
+        assert api_store.fetch_calls == 1
+
+    async def test_allocator_prefers_live_api_and_falls_back_when_unavailable(
+        self, tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        allocator = AccountAllocator(native_store, api_store)
+
+        preferred = await allocator.allocate(
+            "worker-api",
+            "standard",
+            agent_type="codex",
+        )
+        assert preferred.id == account.id
+        await allocator.release_worker("worker-api")
+
+        api_store.decision = {
+            "known": True,
+            "available": False,
+            "reason": "quota_exhausted",
+        }
+        fallback = await allocator.allocate(
+            "worker-native",
+            "standard",
+            agent_type="codex",
+        )
+        assert fallback.id == "a9"
+
+    async def test_explicit_oauth_does_not_wait_for_unrelated_api_refresh(
+        self,
+        tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        api_store = _FakeAgentApiStore(_api_acct())
+        refresh_started = asyncio.Event()
+
+        async def never_finishes(*_args, **_kwargs):
+            refresh_started.set()
+            await asyncio.Future()
+
+        api_store.fetch_usage = AsyncMock(side_effect=never_finishes)
+        allocator = AccountAllocator(native_store, api_store)
+
+        claim = await asyncio.wait_for(
+            allocator.reserve(
+                "worker-native",
+                "standard",
+                account_id="a9",
+                agent_type="codex",
+            ),
+            timeout=0.5,
+        )
+        assert claim is not None
+        assert claim.account.id == "a9"
+        assert refresh_started.is_set() is False
+        api_store.fetch_usage.assert_not_awaited()
+
+    async def test_api_refresh_deadline_excludes_stalled_key_and_falls_back(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "elastic_agent.core.batch_hooks."
+            "_AGENT_API_USAGE_REFRESH_TIMEOUT_SECONDS",
+            0.01,
+        )
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        api_store = _FakeAgentApiStore(_api_acct())
+        refresh_started = asyncio.Event()
+        refresh_cancelled = asyncio.Event()
+
+        async def stalls_until_cancelled(*_args, **_kwargs):
+            refresh_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                refresh_cancelled.set()
+
+        api_store.fetch_usage = AsyncMock(side_effect=stalls_until_cancelled)
+        allocator = AccountAllocator(native_store, api_store)
+
+        selected = await asyncio.wait_for(
+            allocator.allocate(
+                "worker-fallback",
+                "standard",
+                agent_type="codex",
+            ),
+            timeout=0.5,
+        )
+        assert selected.id == "a9"
+        assert refresh_started.is_set()
+        assert refresh_cancelled.is_set()
+
+    async def test_allocator_honors_declared_agent_api_model(
+        self, tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        allocator = AccountAllocator(native_store, api_store)
+
+        fallback = await allocator.allocate(
+            "worker-model-fallback",
+            "standard",
+            agent_type="codex",
+            model="gpt-not-on-router",
+        )
+        assert fallback.id == "a9"
+        await allocator.release_worker("worker-model-fallback")
+
+        selected = await allocator.allocate(
+            "worker-model-match",
+            "standard",
+            agent_type="codex",
+            model="gpt-5.4",
+        )
+        assert selected.id == account.id
+
+    async def test_correlated_config_returns_actual_cli_home_without_key_leak(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+        coordinator = AgentApiCoordinator(conn, bus, store, timeout=5)
+
+        pending = asyncio.create_task(coordinator.configure(
+            "worker-1",
+            account,
+            agent_type="codex",
+            config_dir="/home/ubuntu/.codex-slot-1",
+        ))
+        await asyncio.sleep(0)
+        worker_id, message = conn.sent[0]
+        assert worker_id == "worker-1"
+        assert message.type == "AGENT_API_CONFIGURE"
+        assert message.api_key == store.api_key
+        assert store.api_key not in repr(message)
+
+        actual_home = (
+            "/home/ubuntu/.codex-slot-1/.elastic-agent-api/"
+            "cloudrouter/cloudrouter-1/codex"
+        )
+        await bus.emit("AGENT_API_CONFIGURE_RESULT", "worker-1", {
+            "request_id": message.request_id,
+            "account_id": account.id,
+            "provider": "cloudrouter",
+            "agent_type": "codex",
+            "success": True,
+            "error": None,
+            "config_dir": actual_home,
+        })
+
+        outcome = await pending
+        assert outcome.success is True
+        assert outcome.account_id == account.id
+        assert outcome.config_dir == actual_home
+
+    async def test_configure_rejects_wrong_worker_home_for_correlated_result(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+        coordinator = AgentApiCoordinator(conn, bus, store, timeout=5)
+
+        pending = asyncio.create_task(coordinator.configure(
+            "worker-1",
+            account,
+            agent_type="claude",
+            config_dir="/home/ubuntu/.claude-slot-2",
+        ))
+        await asyncio.sleep(0)
+        message = conn.sent[0][1]
+        common = {
+            "request_id": message.request_id,
+            "account_id": account.id,
+            "provider": "cloudrouter",
+            "agent_type": "claude",
+            "success": True,
+            "error": None,
+        }
+        await bus.emit("AGENT_API_CONFIGURE_RESULT", "worker-1", {
+            **common,
+            "config_dir": (
+                "/home/ubuntu/.claude-slot-1/.elastic-agent-api/"
+                "cloudrouter/cloudrouter-1/claude"
+            ),
+        })
+        await asyncio.sleep(0)
+        assert pending.done() is False
+
+        expected = (
+            "/home/ubuntu/.claude-slot-2/.elastic-agent-api/"
+            "cloudrouter/cloudrouter-1/claude"
+        )
+        await bus.emit("AGENT_API_CONFIGURE_RESULT", "worker-1", {
+            **common,
+            "config_dir": expected,
+        })
+        outcome = await pending
+        assert outcome.success is True
+        assert outcome.config_dir == expected
+
+    async def test_transient_usage_cannot_revive_last_known_exhausted_key(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+        store.usage = {
+            "state": "unknown",
+            "known": False,
+            "available": True,
+            "reason": "upstream_unavailable",
+            "last_known_available": False,
+        }
+        store.decision = {
+            "known": True,
+            "available": False,
+            "reason": "quota_exhausted",
+        }
+        coordinator = AgentApiCoordinator(conn, bus, store, timeout=5)
+
+        outcome = await coordinator.configure(
+            "worker-1",
+            account,
+            agent_type="claude",
+            config_dir="/home/ubuntu/.claude-slot-1",
+        )
+
+        assert outcome.success is False
+        assert "quota_exhausted" in outcome.error
+        assert conn.sent == []
+
+    async def test_rechecks_recovery_admission_immediately_before_key_read(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+        admission = {"ready": True}
+        real_fetch_usage = store.fetch_usage
+
+        async def fetch_then_close_gate(account_id, force=False):
+            usage = await real_fetch_usage(account_id, force=force)
+            admission["ready"] = False
+            return usage
+
+        store.fetch_usage = fetch_then_close_gate
+        coordinator = AgentApiCoordinator(
+            conn,
+            bus,
+            store,
+            timeout=5,
+            agent_api_admission=lambda: admission["ready"],
+        )
+
+        outcome = await coordinator.configure(
+            "worker-1",
+            account,
+            agent_type="claude",
+            config_dir="/home/ubuntu/.claude-slot-1",
+        )
+
+        assert outcome.success is False
+        assert outcome.auth_kind == "agent_api"
+        assert "recovery" in outcome.error.lower()
+        assert store.fetch_calls == 1
+        assert store.read_calls == 0
+        assert conn.sent == []
+
+    async def test_recovery_admission_callback_error_fails_closed(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _api_acct()
+        store = _FakeAgentApiStore(account)
+
+        def broken_admission():
+            raise RuntimeError("internal recovery detail")
+
+        coordinator = AgentApiCoordinator(
+            conn,
+            bus,
+            store,
+            timeout=5,
+            agent_api_admission=broken_admission,
+        )
+
+        outcome = await coordinator.configure(
+            "worker-1",
+            account,
+            agent_type="codex",
+            config_dir="/home/ubuntu/.codex-slot-1",
+        )
+
+        assert outcome.success is False
+        assert "recovery" in outcome.error.lower()
+        assert "internal recovery detail" not in outcome.error
+        assert store.read_calls == 0
+        assert conn.sent == []
+
+
+# --------------------------------------------------------------------------
 # login hook
 # --------------------------------------------------------------------------
 
 
 class TestLoginHook:
+    async def test_recovery_gate_blocks_preclaimed_api_before_key_send(
+        self, tmp_path,
+    ):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        native_store = await _store(tmp_path, [_acct(1)])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        mgr = FakeManager(tmp_path, native_store)
+        mgr.binding_recovery_ready = False
+        allocator = AccountAllocator(native_store, api_store)
+        claim = await allocator.reserve(
+            "worker-1",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+        )
+        coordinator = LoginCoordinator(
+            mgr.connection_manager,
+            mgr.event_bus,
+            timeout=5,
+        )
+        hook = make_login_hook(
+            mgr,
+            allocator,
+            coordinator,
+            AgentApiCoordinator(
+                mgr.connection_manager,
+                mgr.event_bus,
+                api_store,
+                timeout=5,
+            ),
+        )
+
+        outcome = await hook(
+            "worker-1",
+            JobSpec(
+                name="api-job",
+                run=RunSpec(command="x"),
+                account={"agent_type": "codex"},
+            ),
+            "/home/ubuntu/.codex-slot",
+            account.id,
+            claim.claim_id,
+        )
+
+        assert outcome.success is False
+        assert outcome.auth_kind == "agent_api"
+        assert "recovery" in outcome.error.lower()
+        assert api_store.read_calls == 0
+        assert mgr.connection_manager.sent == []
+
+    async def test_recovery_gate_does_not_block_oauth_login(self, tmp_path):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        store = await _store(tmp_path, [_acct(1)])
+        mgr = FakeManager(tmp_path, store)
+        mgr.binding_recovery_ready = False
+        coordinator = LoginCoordinator(
+            mgr.connection_manager,
+            mgr.event_bus,
+            timeout=5,
+        )
+        hook = make_login_hook(mgr, AccountAllocator(store), coordinator)
+        spec = JobSpec(name="oauth-job", run=RunSpec(command="x"))
+
+        pending = asyncio.create_task(
+            hook("worker-oauth", spec, "/home/ubuntu/.claude")
+        )
+        await asyncio.sleep(0)
+        worker_id, message = mgr.connection_manager.sent[0]
+        assert message.type == "ACCOUNT_LOGIN"
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", worker_id, {
+            "login_request_id": message.login_request_id,
+            "account_id": "a1",
+            "success": True,
+        })
+        assert (await pending).success is True
+
+    async def test_explicit_api_account_uses_api_projection_not_browser_login(
+        self, tmp_path,
+    ):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        native_store = await _store(tmp_path, [_acct(1)])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        mgr = FakeManager(tmp_path, native_store)
+        mgr.agent_api_store = api_store
+        allocator = AccountAllocator(native_store, api_store)
+        login_coordinator = LoginCoordinator(
+            mgr.connection_manager,
+            mgr.event_bus,
+            timeout=5,
+        )
+        api_coordinator = AgentApiCoordinator(
+            mgr.connection_manager,
+            mgr.event_bus,
+            api_store,
+            timeout=5,
+        )
+        hook = make_login_hook(
+            mgr,
+            allocator,
+            login_coordinator,
+            api_coordinator,
+        )
+        spec = JobSpec(
+            name="api-job",
+            run=RunSpec(command="x"),
+            account={
+                "agent_type": "codex",
+                "ids": [account.id],
+            },
+        )
+
+        pending = asyncio.create_task(hook(
+            "worker-1",
+            spec,
+            "/home/ubuntu/.codex-slot",
+            account.id,
+        ))
+        for _ in range(20):
+            if mgr.connection_manager.sent:
+                break
+            await asyncio.sleep(0)
+        assert mgr.connection_manager.sent
+        worker_id, message = mgr.connection_manager.sent[0]
+        assert worker_id == "worker-1"
+        assert message.type == "AGENT_API_CONFIGURE"
+        assert all(
+            sent.type != "ACCOUNT_LOGIN"
+            for _worker_id, sent in mgr.connection_manager.sent
+        )
+        await mgr.event_bus.emit("AGENT_API_CONFIGURE_RESULT", worker_id, {
+            "request_id": message.request_id,
+            "account_id": account.id,
+            "provider": "cloudrouter",
+            "agent_type": "codex",
+            "success": True,
+            "config_dir": (
+                "/home/ubuntu/.codex-slot/.elastic-agent-api/"
+                "cloudrouter/cloudrouter-1/codex"
+            ),
+        })
+
+        outcome = await pending
+        assert outcome.success is True
+        assert outcome.account_id == account.id
+        assert outcome.config_dir.endswith(
+            "/.elastic-agent-api/cloudrouter/cloudrouter-1/codex"
+        )
+
     async def test_allocates_and_logs_in(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
         store = await _store(tmp_path, [_acct(1)])
@@ -1706,6 +2416,85 @@ class TestProvisionHook:
 
 
 class TestWireBatchRouting:
+    async def test_runtime_api_feedback_is_bound_to_exact_dispatch(
+        self, tmp_path,
+    ):
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []))
+        api_store = _FakeAgentApiStore(_api_acct())
+        mgr.agent_api_store = api_store
+        orch = wire_batch(mgr)
+        orch._worker_index["w1"] = "job-1"
+        current_task = "job-1:w1:a"
+        current_account = "cloudrouter-a"
+
+        def runtime_account(worker_id, *, task_id=None):
+            if worker_id != "w1" or task_id != current_task:
+                return None
+            return current_account, "agent_api"
+
+        def rotate(worker_id, *, task_id=None):
+            nonlocal current_task, current_account
+            if worker_id != "w1" or task_id != current_task:
+                return False
+            current_task = "job-1:w1:b"
+            current_account = "cloudrouter-b"
+            return True
+
+        orch.runtime_account_for_task = runtime_account
+        orch.defer_exhausted = rotate
+
+        await mgr.event_bus.emit("RUN_EXHAUSTED", "w1", {
+            "task_id": "job-1:w1:a",
+            "reason": "agent_api_auth_failure",
+        })
+        assert api_store.runtime_marks == [
+            ("cloudrouter-a", "runtime_invalid_api_key")
+        ]
+
+        # Both late events belong to A. They cannot bench newly active B.
+        await mgr.event_bus.emit("PROCESS_EXIT", "w1", {
+            "task_id": "job-1:w1:a",
+            "exit_code": 1,
+            "error_type": "agent_api_auth_failure",
+        })
+        await mgr.event_bus.emit("RUN_EXHAUSTED", "w1", {
+            "task_id": "job-1:w1:a",
+            "reason": "agent_api_auth_failure",
+        })
+        assert api_store.runtime_marks == [
+            ("cloudrouter-a", "runtime_invalid_api_key")
+        ]
+
+        # A current non-rotation failure still benches its exact account.
+        await mgr.event_bus.emit("PROCESS_EXIT", "w1", {
+            "task_id": "job-1:w1:b",
+            "exit_code": 1,
+            "error_type": "agent_api_auth_failure",
+        })
+        assert api_store.runtime_marks == [
+            ("cloudrouter-a", "runtime_invalid_api_key"),
+            ("cloudrouter-b", "runtime_invalid_api_key"),
+        ]
+
+        # A hard provider limit is non-sticky but must survive account release
+        # and be tied to the exact dispatch that observed it.
+        await mgr.event_bus.emit("PROCESS_EXIT", "w1", {
+            "task_id": "job-1:w1:b",
+            "exit_code": 1,
+            "error_type": "agent_api_rate_limited",
+        })
+        assert api_store.runtime_quota_marks == [
+            ("cloudrouter-b", "runtime_rate_limited"),
+        ]
+        await mgr.event_bus.emit("PROCESS_EXIT", "w1", {
+            "task_id": "job-1:w1:a",
+            "exit_code": 1,
+            "error_type": "agent_api_rate_limited",
+        })
+        assert api_store.runtime_quota_marks == [
+            ("cloudrouter-b", "runtime_rate_limited"),
+        ]
+
     async def test_routes_exhausted_and_exit(self, tmp_path):
         mgr = FakeManager(tmp_path, await _store(tmp_path, [_acct(1)]))
         orch = wire_batch(mgr)

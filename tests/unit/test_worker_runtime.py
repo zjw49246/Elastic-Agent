@@ -15,6 +15,30 @@ import pytest
 from elastic_agent.worker.runtime import WorkerRuntime
 
 
+def _pid_is_running(pid: int) -> bool:
+    """Return False for a missing process or a not-yet-reaped zombie."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat_path = Path(f"/proc/{pid}/stat")
+    if stat_path.exists():
+        try:
+            return stat_path.read_text().split()[2] != "Z"
+        except (IndexError, OSError):
+            pass
+    return True
+
+
+async def _wait_for_path(path: Path, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not path.exists():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(f"timed out waiting for {path}")
+        await asyncio.sleep(0.02)
+
+
 @pytest.fixture
 def runtime(tmp_path):
     rt = WorkerRuntime(
@@ -303,8 +327,661 @@ class TestNDJSONParsing:
     def test_json_array(self):
         assert WorkerRuntime._try_parse_ndjson("[1,2,3]") is None
 
+    def test_pathological_json_is_ignored(self):
+        line = '{"type":"result","cost_usd":' + ("9" * 5000) + "}"
+
+        assert WorkerRuntime._try_parse_ndjson(line) is None
+        assert WorkerRuntime._agent_api_fatal_error(line) is None
+        assert WorkerRuntime._agent_api_terminal_success(line) is False
+
 
 class TestProcessExecution:
+    @pytest.mark.asyncio
+    async def test_agent_api_configure_result_is_correlated_and_key_stays_private(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import (
+            AgentApiConfigureMessage,
+            AgentApiConfigureResultMessage,
+        )
+
+        sent = []
+
+        async def capture(message):
+            sent.append(message)
+
+        runtime._send_event = capture
+        key = "cloudrouter-worker-secret"
+        message = AgentApiConfigureMessage(
+            request_id="request-1",
+            account_id="cloudrouter-1",
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=str(tmp_path / "slot"),
+            api_key=key,
+            models={"codex": ["gpt-5.4"]},
+        )
+
+        await runtime._handle_agent_api_configure(message)
+
+        assert len(sent) == 1
+        result = sent[0]
+        assert isinstance(result, AgentApiConfigureResultMessage)
+        assert result.request_id == "request-1"
+        assert result.account_id == "cloudrouter-1"
+        assert result.success is True
+        assert result.config_dir.endswith("/cloudrouter-1/codex")
+        assert key not in result.model_dump_json()
+        assert (
+            Path(result.config_dir).parent / "api.key"
+        ).read_text() == key
+
+    @pytest.mark.asyncio
+    async def test_agent_api_configure_failure_never_reflects_key(
+        self, runtime, tmp_path, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import AgentApiConfigureMessage
+
+        key = "key-in-third-party-error"
+
+        def fail(**_kwargs):
+            raise RuntimeError(key)
+
+        monkeypatch.setattr(
+            "elastic_agent.worker.agent_api.configure_agent_api",
+            fail,
+        )
+        runtime._send_event = AsyncMock()
+        await runtime._handle_agent_api_configure(AgentApiConfigureMessage(
+            request_id="request-2",
+            account_id="cloudrouter-2",
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=str(tmp_path / "slot"),
+            api_key=key,
+        ))
+
+        result = runtime._send_event.call_args.args[0]
+        assert result.success is False
+        assert result.error == "Agent API configuration failed"
+        assert key not in result.model_dump_json()
+        assert key not in repr(result)
+
+    @pytest.mark.asyncio
+    async def test_managed_codex_env_is_scrubbed_and_turn_failed_overrides_exit_zero(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import (
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-3",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[str] = []
+
+        async def capture(message):
+            sent.append(message.model_dump_json())
+
+        runtime._send_event = capture
+        script = (
+            "import json, os;"
+            "print('auth=' + str([os.getenv(k) for k in "
+            "['OPENAI_API_KEY','CODEX_API_KEY','CLOUDROUTER_API_KEY']]));"
+            "print('base=' + str([os.getenv(k) for k in "
+            "['OPENAI_BASE_URL','CODEX_BASE_URL']]));"
+            f"print('projection=' + str(os.getenv("
+            f"'{ELASTIC_AGENT_API_PROJECTION_ROOT_ENV}')));"
+            "print(json.dumps({'type':'turn.failed',"
+            "'error':{'message':'provider rejected'}}))"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-codex-task",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={
+                "CODEX_HOME": home,
+                "OPENAI_API_KEY": "official-secret",
+                "CODEX_API_KEY": "codex-secret",
+                "CLOUDROUTER_API_KEY": "cloudrouter-env-secret",
+                "OPENAI_BASE_URL": "https://attacker.invalid",
+                "CODEX_BASE_URL": "https://attacker.invalid",
+            },
+        ))
+        await runtime._process_tasks["cloudrouter-codex-task"]
+
+        logs = [
+            json.loads(item) for item in sent if '"type":"LOG"' in item
+        ]
+        assert any("auth=[None, None, None]" in item["data"] for item in logs)
+        assert any("base=[None, None]" in item["data"] for item in logs)
+        assert any(
+            f"projection={Path(home).parent}" in item["data"]
+            for item in logs
+        )
+        exits = [
+            json.loads(item) for item in sent if '"type":"PROCESS_EXIT"' in item
+        ]
+        assert len(exits) == 1
+        assert exits[0]["exit_code"] == 1
+        assert exits[0]["error_type"] == "agent_api_error"
+        assert exits[0]["error_message"] == "CloudRouter Codex turn failed"
+        assert runtime._agent_api_tasks == {}
+        assert runtime._agent_api_task_errors == {}
+
+    @pytest.mark.asyncio
+    async def test_managed_output_documenting_provider_errors_stays_successful(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-documentation",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        script = (
+            "print('The operation is forbidden by policy.');"
+            "print('authentication_error is an API error type we document.');"
+            "print('Experiment notes: HTTP 429 errors should be retried.')"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-documentation",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+            job_id="job-documentation",
+            watch_exhaustion=True,
+        ))
+        await runtime._process_tasks["cloudrouter-documentation"]
+
+        assert not [
+            message for message in sent
+            if message["type"] == "RUN_EXHAUSTED"
+        ]
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 0
+        assert exit_event["error_type"] is None
+
+    @pytest.mark.asyncio
+    async def test_managed_nested_api_auth_error_rotates_exact_account(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-6",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        provider_error = {
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "API Error: HTTP 401 Unauthorized: invalid API key"
+                    ),
+                }],
+            },
+        }
+        script = (
+            "import json,time;"
+            f"print(json.dumps({provider_error!r}),flush=True);"
+            "time.sleep(30)"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-nested-auth",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CLAUDE_CONFIG_DIR": home},
+            job_id="job-nested-auth",
+            watch_exhaustion=True,
+        ))
+        await asyncio.wait_for(
+            runtime._process_tasks["cloudrouter-nested-auth"],
+            timeout=20,
+        )
+
+        exhausted = [
+            message for message in sent
+            if message["type"] == "RUN_EXHAUSTED"
+        ]
+        assert len(exhausted) == 1
+        assert exhausted[0]["reason"] == "agent_api_auth_failure"
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["error_type"] == "agent_api_auth_failure"
+
+    @pytest.mark.asyncio
+    async def test_managed_auth_failure_is_not_overwritten_by_result_frame(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-auth-priority",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        auth_error = {
+            "type": "turn.failed",
+            "error": {
+                "type": "authentication_error",
+                "message": "HTTP 401 Unauthorized: invalid API key",
+            },
+        }
+        trailing_result = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+        }
+        script = (
+            "import json;"
+            f"print(json.dumps({auth_error!r}));"
+            f"print(json.dumps({trailing_result!r}))"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-auth-priority",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+        ))
+        await runtime._process_tasks["cloudrouter-auth-priority"]
+
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 1
+        assert exit_event["error_type"] == "agent_api_auth_failure"
+        assert exit_event["error_message"] == (
+            "CloudRouter rejected the delegated API key"
+        )
+
+    @pytest.mark.asyncio
+    async def test_managed_auth_failure_overrides_earlier_hard_limit(
+        self,
+        runtime,
+        tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-auth-after-hard",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+        runtime._send_event = lambda message: (
+            sent.append(json.loads(message.model_dump_json()))
+            or asyncio.sleep(0)
+        )
+        frames = [
+            {
+                "type": "turn.failed",
+                "error": {"message": "last status: 429 Too Many Requests"},
+            },
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": (
+                        "unexpected status 401 Unauthorized: Invalid API key"
+                    ),
+                },
+            },
+        ]
+        script = (
+            "import json;"
+            f"[print(json.dumps(frame)) for frame in {frames!r}]"
+        )
+
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-auth-after-hard",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+        ))
+        await runtime._process_tasks["cloudrouter-auth-after-hard"]
+
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["error_type"] == "agent_api_auth_failure"
+
+    @pytest.mark.asyncio
+    async def test_successful_codex_retry_clears_transient_error_frame(
+        self,
+        runtime,
+        tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-transient-recovery",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+        runtime._send_event = lambda message: (
+            sent.append(json.loads(message.model_dump_json()))
+            or asyncio.sleep(0)
+        )
+        reconnect = {
+            "type": "error",
+            "message": (
+                "Reconnecting... unexpected status 502 Bad Gateway: "
+                "upstream_error"
+            ),
+        }
+        completed = {"type": "turn.completed", "usage": {}}
+        script = (
+            "import json;"
+            f"print(json.dumps({reconnect!r}));"
+            f"print(json.dumps({completed!r}))"
+        )
+
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-transient-recovery",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+        ))
+        await runtime._process_tasks["cloudrouter-transient-recovery"]
+
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 0
+        assert exit_event["error_type"] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_gateway_error_does_not_request_outer_rotation(
+        self,
+        runtime,
+        tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-terminal-transient",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+        runtime._send_event = lambda message: (
+            sent.append(json.loads(message.model_dump_json()))
+            or asyncio.sleep(0)
+        )
+        failed = {
+            "type": "turn.failed",
+            "error": {
+                "message": (
+                    "unexpected status 502 Bad Gateway: upstream_error"
+                ),
+            },
+        }
+        script = "import json;" f"print(json.dumps({failed!r}))"
+
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-terminal-transient",
+            command=[sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+            job_id="job-terminal-transient",
+            watch_exhaustion=True,
+        ))
+        await runtime._process_tasks["cloudrouter-terminal-transient"]
+
+        assert not [
+            message for message in sent
+            if message["type"] == "RUN_EXHAUSTED"
+        ]
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 1
+        assert exit_event["error_type"] == "agent_api_transient_error"
+
+    @pytest.mark.asyncio
+    async def test_reserved_projection_without_marker_is_rejected_before_spawn(
+        self, runtime, tmp_path, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = Path(configure_agent_api(
+            provider="cloudrouter",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-marker",
+            models={"codex": ["gpt-5.4"]},
+        ))
+        (home.parent / "projection.json").unlink()
+        spawn = AsyncMock()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        runtime._send_event = AsyncMock()
+
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-missing-marker",
+            command=[sys.executable, "-c", "raise SystemExit(0)"],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": str(home)},
+        ))
+
+        spawn.assert_not_awaited()
+        exit_event = runtime._send_event.call_args.args[0]
+        assert exit_event.type == "PROCESS_EXIT"
+        assert exit_event.exit_code == -1
+        assert exit_event.error_type == "agent_api_configuration_error"
+
+    @pytest.mark.asyncio
+    async def test_managed_setup_failure_does_not_retain_task_projection(
+        self, runtime, tmp_path, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-missing-cli",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        spawn = AsyncMock()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(
+            "elastic_agent.worker.runtime.shutil.which",
+            lambda *_a, **_k: None,
+        )
+        runtime._send_event = AsyncMock()
+
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-missing-cli",
+            command=["claude", "-p", "hello"],
+            cwd=str(tmp_path),
+            env={"CLAUDE_CONFIG_DIR": home},
+        ))
+
+        spawn.assert_not_awaited()
+        assert runtime._agent_api_tasks == {}
+        assert runtime._agent_api_task_errors == {}
+        exit_event = runtime._send_event.call_args.args[0]
+        assert exit_event.type == "PROCESS_EXIT"
+        assert exit_event.error_type == "agent_api_configuration_error"
+
+    @pytest.mark.asyncio
+    async def test_unmanaged_execute_scrubs_reserved_projection_root(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import (
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+        )
+
+        sent: list[str] = []
+
+        async def capture(message):
+            sent.append(message.model_dump_json())
+
+        runtime._send_event = capture
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="ordinary-task",
+            command=[
+                sys.executable,
+                "-c",
+                (
+                    "import os;"
+                    f"print(os.getenv('{ELASTIC_AGENT_API_PROJECTION_ROOT_ENV}'))"
+                ),
+            ],
+            cwd=str(tmp_path),
+            env={ELASTIC_AGENT_API_PROJECTION_ROOT_ENV: "/etc"},
+        ))
+        await runtime._process_tasks["ordinary-task"]
+
+        logs = [
+            json.loads(item) for item in sent if '"type":"LOG"' in item
+        ]
+        assert any(item["data"].strip() == "None" for item in logs)
+
+    @pytest.mark.asyncio
+    async def test_managed_claude_shell_uses_final_wrapper_after_login_profile(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import (
+            CLOUDROUTER_CLAUDE_BINARY_ENV,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="cloudrouter-private",
+            account_id="cloudrouter-4",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        fake_claude = fake_bin / "claude"
+        fake_claude.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1-}" != "--setting-sources" ] || '
+            '[ "${2-}" != "user" ]; then exit 98; fi\n'
+            "shift 2\n"
+            'if [ "${1-}" = "outer" ]; then '
+            "export ANTHROPIC_BASE_URL=https://attacker.invalid; "
+            "exec claude inner; fi\n"
+            "printf 'auth=%s|%s|base=%s|binary=%s|arg=%s\\n' "
+            '"${ANTHROPIC_AUTH_TOKEN-unset}" '
+            '"${ANTHROPIC_API_KEY-unset}" '
+            '"${ANTHROPIC_BASE_URL-unset}" '
+            f'"${{{CLOUDROUTER_CLAUDE_BINARY_ENV}-unset}}" "$1"\n'
+        )
+        fake_claude.chmod(0o700)
+        sent: list[str] = []
+
+        async def capture(message):
+            sent.append(message.model_dump_json())
+
+        runtime._send_event = capture
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="cloudrouter-claude-shell",
+            command=["bash", "-lc", "claude outer"],
+            cwd=str(tmp_path),
+            env={
+                "CLAUDE_CONFIG_DIR": home,
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "ANTHROPIC_AUTH_TOKEN": "oauth-secret",
+                "ANTHROPIC_API_KEY": "official-secret",
+                CLOUDROUTER_CLAUDE_BINARY_ENV: "/bin/true",
+            },
+        ))
+        await runtime._process_tasks["cloudrouter-claude-shell"]
+
+        logs = [
+            json.loads(item) for item in sent if '"type":"LOG"' in item
+        ]
+        assert any(
+            "auth=unset|unset|"
+            f"base=https://console.cloudrouter.online|binary={fake_claude}|"
+            "arg=inner"
+            in item["data"]
+            for item in logs
+        )
+        exit_event = next(
+            json.loads(item) for item in sent if '"type":"PROCESS_EXIT"' in item
+        )
+        assert exit_event["exit_code"] == 0
+
+    def test_application_error_json_is_not_a_provider_fatal(self):
+        assert WorkerRuntime._agent_api_fatal_error(
+            '{"type":"error","message":"application-level event"}'
+        ) is None
+
     @pytest.mark.asyncio
     async def test_execute_and_capture_output(self, runtime, tmp_path):
         """Test that EXECUTE starts a process and captures stdout/stderr."""
@@ -383,6 +1060,7 @@ class TestProcessExecution:
         before ProcessExitMessage is sent (else the Manager's run phase sticks at
         RUNNING and collect/S3 never fire). This was the real 'stuck at running'."""
         import builtins
+
         import elastic_agent.worker.runtime as rt_mod
         from elastic_agent.core.protocols.messages import ExecuteMessage
 
@@ -435,9 +1113,12 @@ class TestProcessExecution:
 
         log_file = runtime._log_dir / "task-log.ndjson"
         assert log_file.exists()
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [
+            json.loads(line)
+            for line in log_file.read_text().strip().splitlines()
+        ]
         assert len(lines) >= 1
-        assert any(l["data"] == "logged line" for l in lines)
+        assert any(line["data"] == "logged line" for line in lines)
 
     @pytest.mark.asyncio
     async def test_execute_nonexistent_command(self, runtime, tmp_path):
@@ -670,6 +1351,94 @@ class TestStopProcess:
         stop_msg = StopMessage(task_id="nonexistent", signal="SIGTERM")
         await runtime._handle_stop(stop_msg)
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+    async def test_stop_kills_background_descendant_before_terminal(
+        self,
+        runtime,
+        tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import (
+            ExecuteMessage,
+            StopMessage,
+        )
+
+        child_pid_path = tmp_path / "stop-child.pid"
+        terminal_seen = asyncio.Event()
+        task_pgid: int | None = None
+
+        async def send(message):
+            if message.type == "PROCESS_EXIT":
+                child_pid = int(child_pid_path.read_text())
+                assert task_pgid is not None
+                assert not runtime._process_group_exists(task_pgid)
+                assert not _pid_is_running(child_pid)
+                terminal_seen.set()
+
+        runtime._send_event = send
+        code = (
+            "import pathlib,subprocess,sys,time;"
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "'import time; time.sleep(60)']);"
+            f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid));"
+            "time.sleep(60)"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="task-stop-tree",
+            command=[sys.executable, "-c", code],
+            cwd=str(tmp_path),
+        ))
+        task_pgid = runtime._process_groups["task-stop-tree"]
+        await _wait_for_path(child_pid_path)
+
+        process_task = runtime._process_tasks["task-stop-tree"]
+        await runtime._handle_stop(StopMessage(
+            task_id="task-stop-tree",
+            signal="SIGTERM",
+        ))
+        await asyncio.wait_for(process_task, timeout=10)
+
+        assert terminal_seen.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+    async def test_natural_parent_exit_kills_background_descendant(
+        self,
+        runtime,
+        tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+
+        child_pid_path = tmp_path / "natural-child.pid"
+        terminal_seen = asyncio.Event()
+        task_pgid: int | None = None
+
+        async def send(message):
+            if message.type == "PROCESS_EXIT":
+                child_pid = int(child_pid_path.read_text())
+                assert task_pgid is not None
+                assert not runtime._process_group_exists(task_pgid)
+                assert not _pid_is_running(child_pid)
+                terminal_seen.set()
+
+        runtime._send_event = send
+        code = (
+            "import pathlib,subprocess,sys;"
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "'import time; time.sleep(60)']);"
+            f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="task-natural-tree",
+            command=[sys.executable, "-c", code],
+            cwd=str(tmp_path),
+        ))
+        task_pgid = runtime._process_groups["task-natural-tree"]
+        process_task = runtime._process_tasks["task-natural-tree"]
+        await asyncio.wait_for(process_task, timeout=10)
+
+        assert terminal_seen.is_set()
+
 
 class TestReadFile:
     @pytest.mark.asyncio
@@ -716,8 +1485,9 @@ class TestReadFile:
 class TestUploadFile:
     @pytest.mark.asyncio
     async def test_upload_file(self, runtime, tmp_path):
-        from elastic_agent.core.protocols.messages import UploadFileMessage
         import base64
+
+        from elastic_agent.core.protocols.messages import UploadFileMessage
 
         target = tmp_path / "uploaded" / "data.txt"
         content = base64.b64encode(b"file content here").decode()
@@ -800,8 +1570,9 @@ class TestForceSyncOnExit:
     @pytest.mark.asyncio
     async def test_force_sync_called_on_process_exit(self, runtime, tmp_path):
         """T-038: FileSyncManager.force_sync() is called when process exits."""
-        from elastic_agent.core.protocols.messages import ExecuteMessage
         from unittest.mock import AsyncMock
+
+        from elastic_agent.core.protocols.messages import ExecuteMessage
 
         sent_messages: list[str] = []
 
@@ -828,8 +1599,9 @@ class TestForceSyncOnExit:
     @pytest.mark.asyncio
     async def test_force_sync_error_does_not_block_exit(self, runtime, tmp_path):
         """T-038: Even if force_sync fails, PROCESS_EXIT is still sent."""
-        from elastic_agent.core.protocols.messages import ExecuteMessage
         from unittest.mock import AsyncMock
+
+        from elastic_agent.core.protocols.messages import ExecuteMessage
 
         sent_messages: list[str] = []
 

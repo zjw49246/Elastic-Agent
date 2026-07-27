@@ -46,6 +46,8 @@ from elastic_agent.harness.generic import (
 )
 
 logger = logging.getLogger(__name__)
+_AGENT_API_USAGE_REFRESH_CONCURRENCY = 16
+_AGENT_API_USAGE_REFRESH_TIMEOUT_SECONDS = 30.0
 
 
 async def _await_cleanup_task(task: asyncio.Task) -> Any:
@@ -69,7 +71,7 @@ async def _await_cleanup_task(task: asyncio.Task) -> Any:
 class AccountClaim:
     claim_id: str
     owner: str
-    account: AccountDefinition
+    account: Any
 
 
 class AccountClaimConflictError(RuntimeError):
@@ -77,21 +79,138 @@ class AccountClaimConflictError(RuntimeError):
 
 
 class AccountAllocator:
-    def __init__(self, account_store) -> None:
+    def __init__(
+        self,
+        account_store,
+        agent_api_store=None,
+        *,
+        agent_api_admission: Callable[[], bool] | None = None,
+    ) -> None:
         self._store = account_store
+        self._agent_api_store = agent_api_store
+        self._agent_api_admission = agent_api_admission or (lambda: True)
         self._claims: dict[str, AccountClaim] = {}
         self._claim_by_account: dict[str, str] = {}
         self._by_owner: dict[str, set[str]] = {}
         self._quarantined_account_ids: set[str] = set()
+        self._account_mutations: dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
+
+    async def _accounts(
+        self,
+        *,
+        refresh_agent_api_usage: bool = True,
+        refresh_agent_api_ids: frozenset[str] | None = None,
+    ) -> list[Any]:
+        """Return one claim namespace, with compatible Agent API keys first."""
+
+        native = await self._store.list()
+        if (
+            self._agent_api_store is None
+            or not self._agent_api_admission()
+        ):
+            return list(native)
+        api_accounts = await self._agent_api_store.list()
+        native_ids = {account.id for account in native}
+        duplicate_ids = sorted(
+            account.id for account in api_accounts if account.id in native_ids
+        )
+        if duplicate_ids:
+            raise RuntimeError(
+                "duplicate account ids across OAuth and Agent API stores: "
+                + ", ".join(duplicate_ids)
+            )
+        # Refresh independent provider keys concurrently. The store keeps one
+        # single-flight lock per account and never holds its global mutation
+        # lock across network I/O. A whole-pool absolute deadline prevents a
+        # drip-fed provider response from keeping already-provisioned Jobs
+        # waiting indefinitely. Accounts whose probe did not finish before the
+        # deadline are excluded from this allocation attempt.
+        timed_out_account_ids: set[str] = set()
+        if refresh_agent_api_usage:
+            semaphore = asyncio.Semaphore(
+                _AGENT_API_USAGE_REFRESH_CONCURRENCY
+            )
+            refresh_targets = [
+                account
+                for account in api_accounts
+                if (
+                    refresh_agent_api_ids is None
+                    or account.id in refresh_agent_api_ids
+                )
+            ]
+            completed_account_ids: set[str] = set()
+
+            async def refresh_usage(account_id: str) -> None:
+                async with semaphore:
+                    await self._agent_api_store.fetch_usage(account_id)
+                    completed_account_ids.add(account_id)
+
+            try:
+                async with asyncio.timeout(
+                    _AGENT_API_USAGE_REFRESH_TIMEOUT_SECONDS
+                ):
+                    await asyncio.gather(*(
+                        refresh_usage(account.id)
+                        for account in refresh_targets
+                    ))
+            except TimeoutError:
+                timed_out_account_ids = {
+                    account.id for account in refresh_targets
+                } - completed_account_ids
+                logger.warning(
+                    "Agent API usage refresh exceeded %.1fs; "
+                    "excluding %d unfinished account(s) from this allocation",
+                    _AGENT_API_USAGE_REFRESH_TIMEOUT_SECONDS,
+                    len(timed_out_account_ids),
+                )
+        available_api_accounts: list[Any] = []
+        for account in api_accounts:
+            if account.id in timed_out_account_ids:
+                continue
+            # A dead API key must fall through to a compatible OAuth identity
+            # rather than fail the entire Job after allocation.
+            decision = self._agent_api_store.availability_decision(account.id)
+            if decision.get("available") is False:
+                logger.info(
+                    "Skipping unavailable Agent API account %s: %s",
+                    account.id,
+                    decision.get("reason") or "unavailable",
+                )
+                continue
+            available_api_accounts.append(account)
+        # CCM routes fresh sessions through a compatible API identity first and
+        # falls back to native OAuth. Existing claimed sessions remain pinned.
+        return [*available_api_accounts, *native]
+
+    @staticmethod
+    def _supports_agent_type(account: Any, agent_type: str) -> bool:
+        supports = getattr(account, "supports_agent_type", None)
+        if callable(supports):
+            return bool(supports(agent_type))
+        return getattr(account, "agent_type", "claude") == agent_type
+
+    @classmethod
+    def _supports_request(
+        cls,
+        account: Any,
+        agent_type: str,
+        model: str = "",
+    ) -> bool:
+        if not cls._supports_agent_type(account, agent_type):
+            return False
+        supports_model = getattr(account, "supports_model", None)
+        return not model or not callable(supports_model) or bool(
+            supports_model(agent_type, model)
+        )
 
     @asynccontextmanager
     async def mutation_guard(self, account_id: str) -> AsyncIterator[None]:
         """Serialize account CRUD with claim selection and reject live owners.
 
-        The guard intentionally remains held while the caller re-reads and
-        mutates ``AccountStore``.  ``reserve`` uses the same lock while reading
-        that store, so a Job can only observe the complete old or new identity.
+        Only this identity is fenced while the caller performs provider I/O.
+        Releasing another claim or allocating an unrelated account must not be
+        blocked for the duration of a CloudRouter timeout.
         """
 
         async with self._lock:
@@ -101,12 +220,34 @@ class AccountAllocator:
                 raise AccountClaimConflictError(
                     f"account {account_id!r} is actively claimed by {claim.owner!r}"
                 )
+            if account_id in self._account_mutations:
+                raise AccountClaimConflictError(
+                    f"account {account_id!r} is already being mutated"
+                )
+            completed = asyncio.Event()
+            self._account_mutations[account_id] = completed
+        try:
             yield
+        finally:
+            async def release_marker() -> None:
+                async with self._lock:
+                    current = self._account_mutations.get(account_id)
+                    if current is completed:
+                        self._account_mutations.pop(account_id, None)
+                        completed.set()
+
+            # A caller can be cancelled repeatedly while this finally block is
+            # waiting for the allocator lock. Keep marker release in an
+            # independently owned task and settle it before re-raising;
+            # otherwise one interrupted cleanup leaves an Event that can never
+            # be set and every later explicit claim waits forever.
+            cleanup_task = asyncio.create_task(release_marker())
+            await _await_cleanup_task(cleanup_task)
 
     async def reserve(
         self, owner: str, group: str, *, account_id: str = "",
         claim_id: str = "", excluded_account_ids: set[str] | None = None,
-        agent_type: str = "claude",
+        agent_type: str = "claude", model: str = "",
     ) -> AccountClaim | None:
         """Atomically claim an explicit account, or the next account in group.
 
@@ -116,48 +257,111 @@ class AccountAllocator:
         not need to match ``group`` — explicit selection supersedes the pool
         filter.
         """
-        async with self._lock:
-            accounts = await self._store.list()
+        # Provider I/O must not hold the allocator's global claim lock:
+        # unrelated releases, CRUD guards, and OAuth allocations must remain
+        # responsive during a slow CloudRouter usage call.  Re-read all local
+        # account state under the lock before committing a claim.
+        while True:
+            explicit_native = False
             if account_id:
-                candidates = [
-                    a for a in accounts
-                    if a.id == account_id
-                    and a.enabled
-                    and a.agent_type == agent_type
-                ]
+                explicit_native = any(
+                    account.id == account_id
+                    for account in await self._store.list()
+                )
+            if explicit_native:
+                refreshed_accounts = await self._accounts(
+                    refresh_agent_api_usage=False,
+                )
             else:
-                candidates = [
-                    a for a in accounts
-                    if a.enabled
-                    and a.group == group
-                    and a.agent_type == agent_type
-                ]
+                refreshed_accounts = await self._accounts(
+                    refresh_agent_api_usage=True,
+                    refresh_agent_api_ids=(
+                        frozenset({account_id})
+                        if account_id
+                        else None
+                    ),
+                )
+            eligible_agent_api_ids = {
+                account.id
+                for account in refreshed_accounts
+                if getattr(account, "auth_kind", "oauth") == "agent_api"
+            }
+            wait_for_mutation: asyncio.Event | None = None
+            async with self._lock:
+                accounts = await self._accounts(
+                    refresh_agent_api_usage=False,
+                )
+                if account_id:
+                    candidates = [
+                        a for a in accounts
+                        if a.id == account_id
+                        and a.enabled
+                        and (
+                            getattr(a, "auth_kind", "oauth") != "agent_api"
+                            or a.id in eligible_agent_api_ids
+                        )
+                        and self._supports_request(a, agent_type, model)
+                    ]
+                else:
+                    candidates = [
+                        a for a in accounts
+                        if a.enabled
+                        and a.group == group
+                        and (
+                            getattr(a, "auth_kind", "oauth") != "agent_api"
+                            or a.id in eligible_agent_api_ids
+                        )
+                        and self._supports_request(a, agent_type, model)
+                    ]
 
-            excluded = excluded_account_ids or set()
-            account = next(
-                (
-                    a for a in candidates
-                    if a.id not in self._claim_by_account
-                    and a.id not in self._quarantined_account_ids
-                    and a.id not in excluded
-                ),
-                None,
-            )
-            if account is None:
+                excluded = excluded_account_ids or set()
+                account = next(
+                    (
+                        a for a in candidates
+                        if a.id not in self._claim_by_account
+                        and a.id not in self._quarantined_account_ids
+                        and a.id not in excluded
+                        and a.id not in self._account_mutations
+                    ),
+                    None,
+                )
+                if account is not None:
+                    cid = claim_id or f"claim-{uuid.uuid4().hex}"
+                    if cid in self._claims:
+                        raise ValueError(f"duplicate account claim id {cid}")
+                    claim = AccountClaim(
+                        claim_id=cid,
+                        owner=owner,
+                        account=account,
+                    )
+                    self._claims[cid] = claim
+                    self._claim_by_account[account.id] = cid
+                    self._by_owner.setdefault(owner, set()).add(cid)
+                    return claim
+                wait_for_mutation = next(
+                    (
+                        self._account_mutations[candidate.id]
+                        for candidate in candidates
+                        if (
+                            candidate.id not in excluded
+                            and candidate.id in self._account_mutations
+                        )
+                    ),
+                    None,
+                )
+            if wait_for_mutation is None:
                 return None
-
-            cid = claim_id or f"claim-{uuid.uuid4().hex}"
-            if cid in self._claims:
-                raise ValueError(f"duplicate account claim id {cid}")
-            claim = AccountClaim(claim_id=cid, owner=owner, account=account)
-            self._claims[cid] = claim
-            self._claim_by_account[account.id] = cid
-            self._by_owner.setdefault(owner, set()).add(cid)
-            return claim
+            await wait_for_mutation.wait()
 
     async def allocate(
-        self, worker_id: str, group: str, *, agent_type: str = "claude",
-    ) -> AccountDefinition | None:
+        self,
+        worker_id: str,
+        group: str,
+        *,
+        account_id: str = "",
+        agent_type: str = "claude",
+        model: str = "",
+    ) -> Any | None:
         """Backward-compatible worker allocation used by unbound jobs.
 
         Each call returns a different account (so per_worker > 1 gets several) and
@@ -165,7 +369,13 @@ class AccountAllocator:
         exhausted account is never re-picked because it remains assigned. Freed in
         bulk by :meth:`release_worker`.
         """
-        claim = await self.reserve(worker_id, group, agent_type=agent_type)
+        claim = await self.reserve(
+            worker_id,
+            group,
+            account_id=account_id,
+            agent_type=agent_type,
+            model=model,
+        )
         return claim.account if claim else None
 
     async def get_claim(self, claim_id: str) -> AccountClaim | None:
@@ -635,6 +845,296 @@ class LoginCoordinator:
             success=bool(data.get("success")),
             account_id=account.id,
             account_email=account.email,
+            config_dir=config_dir,
+            error=data.get("error"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent API configuration (AGENT_API_CONFIGURE → correlated result)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PendingAgentApiConfigure:
+    account_id: str
+    provider: str
+    agent_type: str
+    config_dir: str
+    future: asyncio.Future
+
+
+class AgentApiCoordinator:
+    """Install a write-only API key projection on one exact Worker.
+
+    Unlike OAuth login this has no browser or OTP state. The Worker atomically
+    writes a private key/helper and returns the actual CLI home, while the
+    Manager keeps correlation and disconnect handling identical to login.
+    """
+
+    def __init__(
+        self,
+        connection_manager,
+        event_bus,
+        store,
+        *,
+        timeout: float = 60.0,
+        agent_api_admission: Callable[[], bool] | None = None,
+    ) -> None:
+        self._conn = connection_manager
+        self._store = store
+        self._timeout = timeout
+        self._agent_api_admission = agent_api_admission or (lambda: True)
+        self._pending: dict[
+            tuple[str, str], _PendingAgentApiConfigure
+        ] = {}
+        event_bus.subscribe(
+            "AGENT_API_CONFIGURE_RESULT", self._on_result
+        )
+        event_bus.subscribe("WORKER_DISCONNECTED", self._on_worker_disconnected)
+
+    async def _on_result(
+        self, event_type: str, worker_id: str, data: dict,
+    ) -> None:
+        request_id = str(data.get("request_id") or "")
+        pending = self._pending.get((worker_id, request_id))
+        if pending is None:
+            logger.warning(
+                "Ignoring stale Agent API result from %s request %s",
+                worker_id,
+                request_id or "<missing>",
+            )
+            return
+        if (
+            data.get("account_id") != pending.account_id
+            or data.get("provider") != pending.provider
+            or data.get("agent_type") != pending.agent_type
+        ):
+            logger.error(
+                "Ignoring mismatched Agent API result from %s request %s",
+                worker_id,
+                request_id,
+            )
+            return
+        if data.get("success") and not self._result_home_matches(
+            str(data.get("config_dir") or ""),
+            pending=pending,
+        ):
+            logger.error(
+                "Ignoring Agent API result with mismatched home from %s "
+                "request %s",
+                worker_id,
+                request_id,
+            )
+            return
+        if not pending.future.done():
+            pending.future.set_result(data)
+
+    @staticmethod
+    def _result_home_matches(
+        value: str,
+        *,
+        pending: _PendingAgentApiConfigure,
+    ) -> bool:
+        returned = Path(value)
+        if (
+            not value
+            or not returned.is_absolute()
+            or ".." in returned.parts
+        ):
+            return False
+        suffix = Path(
+            ".elastic-agent-api",
+            pending.provider,
+            pending.account_id,
+            pending.agent_type,
+        )
+        if pending.config_dir:
+            expected = Path(os.path.abspath(pending.config_dir)) / suffix
+            return returned == expected
+        return returned.parts[-len(suffix.parts):] == suffix.parts
+
+    async def _on_worker_disconnected(
+        self, event_type: str, worker_id: str, data: dict,
+    ) -> None:
+        for (pending_worker, request_id), pending in list(
+            self._pending.items()
+        ):
+            if pending_worker != worker_id or pending.future.done():
+                continue
+            pending.future.set_result({
+                "request_id": request_id,
+                "account_id": pending.account_id,
+                "provider": pending.provider,
+                "agent_type": pending.agent_type,
+                "success": False,
+                "error": "worker disconnected during Agent API configuration",
+                "config_dir": "",
+            })
+
+    async def configure(
+        self,
+        worker_id: str,
+        account: Any,
+        *,
+        agent_type: str,
+        config_dir: str,
+        model: str = "",
+    ) -> LoginOutcome:
+        from elastic_agent.core.protocols.messages import AgentApiConfigureMessage
+
+        provider = str(getattr(account, "api_provider", "") or "")
+        supports = getattr(account, "supports_agent_type", None)
+        if provider != "cloudrouter" or not callable(supports):
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error="unsupported Agent API account",
+            )
+        if not supports(agent_type):
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error=(
+                    f"Agent API account {account.id!r} does not support "
+                    f"{agent_type}"
+                ),
+            )
+        supports_model = getattr(account, "supports_model", None)
+        if (
+            model
+            and callable(supports_model)
+            and not supports_model(agent_type, model)
+        ):
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error=(
+                    f"Agent API account {account.id!r} does not support "
+                    f"{agent_type} model {model!r}"
+                ),
+            )
+
+        # A known exhausted/invalid key is fail-closed before it crosses the
+        # network. A transient usage read remains unknown and follows the
+        # Store's last-known-dead semantics.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                usage = await self._store.fetch_usage(account.id)
+        except TimeoutError:
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error="Agent API configuration timed out",
+            )
+        availability = self._store.availability_decision(account.id)
+        if availability.get("available") is False:
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error=(
+                    "Agent API account is unavailable: "
+                    f"{availability.get('reason') or usage.get('state') or 'quota'}"
+                ),
+            )
+
+        # Re-check immediately before the secret read.  The usage request above
+        # is an await point where live resource recovery can become incomplete
+        # after the login hook's earlier allocation check.
+        try:
+            admitted = bool(self._agent_api_admission())
+        except Exception:  # noqa: BLE001
+            logger.exception("Agent API admission callback failed")
+            admitted = False
+        if not admitted:
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error=(
+                    "Agent API configuration is blocked while resource "
+                    "recovery is incomplete"
+                ),
+            )
+
+        request_id = f"agent-api-{uuid.uuid4().hex}"
+        future: asyncio.Future = loop.create_future()
+        key = (worker_id, request_id)
+        self._pending[key] = _PendingAgentApiConfigure(
+            account_id=account.id,
+            provider=provider,
+            agent_type=agent_type,
+            config_dir=config_dir,
+            future=future,
+        )
+        try:
+            # Read only after transport policy, allocation, model and quota
+            # admission have all succeeded. The key is never persisted in a
+            # JobSpec, command, environment, or coordinator state.
+            # The provider probe and Worker round trip share one absolute
+            # deadline. A drip-fed HTTP response cannot consume a fresh timeout
+            # and then leave an already-provisioned instance waiting for
+            # another full interval.
+            async with asyncio.timeout_at(deadline):
+                api_key = self._store.read_api_key(account.id)
+                await self._conn.send_command(
+                    worker_id,
+                    AgentApiConfigureMessage(
+                        request_id=request_id,
+                        account_id=account.id,
+                        provider=provider,
+                        agent_type=agent_type,
+                        config_dir=config_dir,
+                        api_key=api_key,
+                        models=dict(account.models),
+                    ),
+                )
+                data = await future
+        except TimeoutError:
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error="Agent API configuration timed out",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Agent API configuration transport failed for %s (%s)",
+                account.id,
+                type(exc).__name__,
+            )
+            return LoginOutcome(
+                success=False,
+                account_id=account.id,
+                account_email=getattr(account, "email", ""),
+                auth_kind="agent_api",
+                error="Agent API configuration transport failed",
+            )
+        finally:
+            self._pending.pop(key, None)
+
+        return LoginOutcome(
+            success=bool(data.get("success")),
+            account_id=account.id,
+            account_email=getattr(account, "email", ""),
+            config_dir=str(data.get("config_dir") or ""),
+            auth_kind="agent_api",
             error=data.get("error"),
         )
 
@@ -746,7 +1246,8 @@ def make_provision_hook(
             logger.error("provision: %s never became SSH-ready", worker_id)
             return False
 
-        # EIP and Codex jobs require this Manager's worker protocol and identity
+        # EIP, Codex, and Agent-API jobs require this Manager's worker protocol
+        # and identity
         # checks.  An older PyPI worker neither understands Codex password/OTP
         # fields nor verifies the selected Codex identity, and could interpret
         # the message as a legacy Claude login.  Always deliver the currently
@@ -756,9 +1257,34 @@ def make_provision_hook(
         # still opt into a full source tree.
         framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
         framework_target = "/opt/elastic-agent/framework/src"
+        api_accounts: list[Any] = []
+        api_store = getattr(manager, "agent_api_store", None)
+        if api_store is not None and spec.account.mode != "none":
+            api_accounts = await api_store.list()
+        selected_ids = set(spec.account.ids)
+        uses_agent_api = any(
+            account.enabled
+            and account.supports_agent_type(spec.account.agent_type)
+            and account.supports_model(
+                spec.account.agent_type,
+                spec.account.model,
+            )
+            and (
+                account.id in selected_ids
+                if selected_ids
+                else account.group == spec.account.group
+            )
+            for account in api_accounts
+        )
+        agent_api_possible = (
+            api_store is not None
+            and spec.account.mode != "none"
+            and (not selected_ids or uses_agent_api)
+        )
         protocol_pinned = (
             spec.account.binding == "eip"
             or spec.account.agent_type == "codex"
+            or agent_api_possible
         )
         if protocol_pinned:
             framework_src = str(Path(__file__).resolve().parents[1])
@@ -907,7 +1433,12 @@ def make_provision_hook(
     return provision
 
 
-def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoordinator):
+def make_login_hook(
+    manager,
+    allocator: AccountAllocator,
+    coordinator: LoginCoordinator,
+    agent_api_coordinator: AgentApiCoordinator | None = None,
+):
     async def login(
         worker_id: str, spec: JobSpec, config_dir: str,
         account_id: str = "", claim_id: str = "",
@@ -940,13 +1471,43 @@ def make_login_hook(manager, allocator: AccountAllocator, coordinator: LoginCoor
             acct = await allocator.allocate(
                 worker_id,
                 spec.account.group,
+                account_id=account_id,
                 agent_type=spec.account.agent_type,
+                model=spec.account.model,
             )
             if acct is None:
                 return LoginOutcome(
                     success=False,
                     error=f"no available account in group '{spec.account.group}'",
                 )
+
+        if getattr(acct, "auth_kind", "oauth") == "agent_api":
+            if not getattr(manager, "binding_recovery_ready", True):
+                return LoginOutcome(
+                    success=False,
+                    account_id=acct.id,
+                    account_email=getattr(acct, "email", ""),
+                    auth_kind="agent_api",
+                    error=(
+                        "Agent API allocation is blocked while startup "
+                        "resource recovery is incomplete"
+                    ),
+                )
+            if agent_api_coordinator is None:
+                return LoginOutcome(
+                    success=False,
+                    account_id=acct.id,
+                    account_email=getattr(acct, "email", ""),
+                    auth_kind="agent_api",
+                    error="Agent API coordinator is not configured",
+                )
+            return await agent_api_coordinator.configure(
+                worker_id,
+                acct,
+                agent_type=spec.account.agent_type,
+                config_dir=config_dir or spec.account.config_dir,
+                model=spec.account.model,
+            )
 
         # Snapshot display context before waiting for the browser. In ordinary
         # (non-EIP) jobs the WorkerRun does not receive its account identity
@@ -1032,6 +1593,7 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 account_id=account_id,
                 excluded_account_ids=attempted,
                 agent_type=spec.account.agent_type,
+                model=spec.account.model,
             )
             if claim is None:
                 selector = f"account '{account_id}'" if account_id else (
@@ -1364,7 +1926,13 @@ def wire_batch(
     allocator = getattr(manager, "account_allocator", None)
     if allocator is None:
         # Lightweight test/deployment Managers predating the shared property.
-        allocator = AccountAllocator(manager.account_store)
+        allocator = AccountAllocator(
+            manager.account_store,
+            getattr(manager, "agent_api_store", None),
+            agent_api_admission=lambda: getattr(
+                manager, "binding_recovery_ready", True
+            ),
+        )
     coordinator = LoginCoordinator(
         manager.connection_manager,
         manager.event_bus,
@@ -1372,11 +1940,26 @@ def wire_batch(
         quarantine_account=allocator.quarantine,
     )
     manager._account_login_coordinator = coordinator
+    agent_api_coordinator = None
+    if getattr(manager, "agent_api_store", None) is not None:
+        agent_api_coordinator = AgentApiCoordinator(
+            manager.connection_manager,
+            manager.event_bus,
+            manager.agent_api_store,
+            agent_api_admission=lambda: getattr(
+                manager, "binding_recovery_ready", True
+            ),
+        )
     bound_reserve, bound_attach, bound_release = make_bound_hooks(manager, allocator)
     driver = ManagerFleetDriver(
         manager,
         provision_hook=make_provision_hook(manager, include_pty=include_pty),
-        login_hook=make_login_hook(manager, allocator, coordinator),
+        login_hook=make_login_hook(
+            manager,
+            allocator,
+            coordinator,
+            agent_api_coordinator,
+        ),
         bound_reserve_hook=bound_reserve,
         bound_attach_hook=bound_attach,
         bound_release_hook=bound_release,
@@ -1388,11 +1971,54 @@ def wire_batch(
         job_state_hook=getattr(manager, "_update_batch_job_state", None),
     )
 
+    async def _bench_runtime_rejected_api_key(
+        worker_id: str,
+        *,
+        task_id: str | None,
+        reason: str,
+        sticky: bool,
+    ) -> None:
+        api_store = getattr(manager, "agent_api_store", None)
+        account = orch.runtime_account_for_task(
+            worker_id,
+            task_id=task_id,
+        )
+        if (
+            api_store is None
+            or account is None
+            or account[1] != "agent_api"
+        ):
+            return
+        if sticky:
+            await api_store.mark_runtime_unavailable(
+                account[0],
+                reason,
+            )
+        else:
+            await api_store.mark_runtime_quota_unavailable(
+                account[0],
+                reason,
+            )
+
     async def _on_exhausted(event_type, worker_id, data):
         # Claim ROTATING synchronously, then return so the connection layer can
         # ACK this durable event and resume the worker's sole WS receive loop.
         # A dynamic rotation's ACCOUNT_LOGIN_RESULT arrives on that same loop;
         # awaiting the login here would deadlock it until the 3600s timeout.
+        if data.get("reason") == "agent_api_auth_failure":
+            await _bench_runtime_rejected_api_key(
+                worker_id,
+                task_id=data.get("task_id"),
+                reason="runtime_invalid_api_key",
+                sticky=True,
+            )
+        elif data.get("reason") == "agent_api_rate_limited":
+            await _bench_runtime_rejected_api_key(
+                worker_id,
+                task_id=data.get("task_id"),
+                reason="runtime_rate_limited",
+                sticky=False,
+            )
         orch.defer_exhausted(
             worker_id,
             task_id=data.get("task_id"),
@@ -1402,6 +2028,20 @@ def wire_batch(
         # Only route batch-owned workers; ignore other PROCESS_EXITs.
         job_id = orch.job_id_for_worker(worker_id)
         if job_id is not None:
+            if data.get("error_type") == "agent_api_auth_failure":
+                await _bench_runtime_rejected_api_key(
+                    worker_id,
+                    task_id=data.get("task_id"),
+                    reason="runtime_invalid_api_key",
+                    sticky=True,
+                )
+            elif data.get("error_type") == "agent_api_rate_limited":
+                await _bench_runtime_rejected_api_key(
+                    worker_id,
+                    task_id=data.get("task_id"),
+                    reason="runtime_rate_limited",
+                    sticky=False,
+                )
             task_id = data.get("task_id")
             archive_fenced = orch.begin_exit_archive(
                 worker_id,

@@ -6,11 +6,129 @@ import pytest
 
 from elastic_agent.core.rate_limit import (
     is_auth_failure,
+    is_cloudrouter_auth_failure,
+    is_cloudrouter_hard_limit,
+    is_cloudrouter_transient,
     is_rate_limited,
     is_transient_overload,
     rate_limit_event_is_actionable,
     transient_retry_delay,
 )
+
+
+class TestCloudRouterClassification:
+    @pytest.mark.parametrize("text", [
+        "HTTP 401 Unauthorized: invalid API key",
+        '{"type":"error","error":{"type":"authentication_error"}}',
+        (
+            '{"type":"assistant","isApiErrorMessage":true,'
+            '"message":{"content":[{"type":"text","text":'
+            '"API Error: HTTP 401 Unauthorized: invalid API key"}]}}'
+        ),
+        (
+            '{"type":"assistant","isApiErrorMessage":true,'
+            '"error":"authentication_error"}'
+        ),
+        (
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"api_error_status":401,"result":"API request failed"}'
+        ),
+        (
+            '{"type":"error","message":"Reconnecting... '
+            '(unexpected status 401 Unauthorized: Invalid API key, '
+            'url: https://console.cloudrouter.online/v1/responses)"}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '401 Unauthorized: Invalid API key, url: '
+            'https://console.cloudrouter.online/v1/responses"}}'
+        ),
+    ])
+    def test_auth_failure(self, text):
+        assert is_cloudrouter_auth_failure(text)
+
+    @pytest.mark.parametrize("text", [
+        "API Error: HTTP 502 upstream error",
+        (
+            '{"type":"turn.failed","error":{"type":"upstream_error",'
+            '"message":"CloudRouter upstream failed"}}'
+        ),
+        (
+            '{"type":"result","is_error":true,'
+            '"api_error_status":502,"result":"API request failed"}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '502 Bad Gateway: upstream_error"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '500 Internal Server Error"}}'
+        ),
+    ])
+    def test_gateway_transient(self, text):
+        assert is_cloudrouter_transient(text)
+
+    @pytest.mark.parametrize("text", [
+        "API Error: HTTP 429 too many requests",
+        "status code 403 forbidden",
+        (
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"api_error_status":429,"result":"API request failed"}'
+        ),
+        (
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"api_error_status":403,"result":"API request failed"}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"code":'
+            '"API_KEY_RATE_5H_EXCEEDED","message":"quota exhausted"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"exceeded retry '
+            'limit, last status: 429 Too Many Requests"}}'
+        ),
+    ])
+    def test_gateway_hard_limit(self, text):
+        assert is_cloudrouter_hard_limit(text)
+        assert not is_cloudrouter_transient(text)
+
+    def test_narrow_negative_cases(self):
+        assert not is_cloudrouter_auth_failure("application returned 401 rows")
+        assert not is_cloudrouter_transient("processed 429 records")
+        assert not is_cloudrouter_auth_failure(
+            "The operation is forbidden by policy."
+        )
+        assert not is_cloudrouter_auth_failure(
+            "authentication_error is an API error type we document."
+        )
+        assert not is_cloudrouter_transient(
+            "Experiment notes: HTTP 429 errors should be retried."
+        )
+        assert not is_cloudrouter_auth_failure(
+            '{"type":"assistant","message":{"content":[{"type":"text",'
+            '"text":"API Error: HTTP 401 Unauthorized: invalid API key"}]}}'
+        )
+        assert not is_cloudrouter_transient(
+            '{"type":"result","result":"API Error: HTTP 429 too many requests"}'
+        )
+        # CloudRouter's documented retryable platform statuses are 500/502.
+        # Do not silently widen that contract to an undocumented 503.
+        assert not is_cloudrouter_transient(
+            '{"type":"turn.failed","error":{"message":'
+            '"unexpected status 503 Service Unavailable"}}'
+        )
+
+    def test_pathological_json_is_not_a_provider_signal(self):
+        text = (
+            '{"type":"turn.failed","error":{"code":'
+            + ("9" * 5000)
+            + "}}"
+        )
+
+        assert not is_cloudrouter_auth_failure(text)
+        assert not is_cloudrouter_hard_limit(text)
+        assert not is_cloudrouter_transient(text)
 
 
 class TestIsRateLimited:

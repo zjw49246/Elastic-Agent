@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
 def _utcnow() -> datetime:
@@ -192,6 +192,26 @@ class AccountLoginCancelMessage(Message):
     reason: Literal["manager_timeout", "manager_cancelled"]
 
 
+class AgentApiConfigureMessage(Message):
+    """Manager -> Worker: install one managed Agent API credential.
+
+    The API key is transported only for this correlated setup request.  It is
+    excluded from model representations, and validation errors hide their
+    inputs so malformed payloads cannot echo the credential into logs.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    type: Literal["AGENT_API_CONFIGURE"] = "AGENT_API_CONFIGURE"
+    request_id: str
+    account_id: str
+    provider: Literal["cloudrouter"] = "cloudrouter"
+    agent_type: Literal["claude", "codex"]
+    config_dir: str
+    api_key: str = Field(repr=False, min_length=1)
+    models: dict[str, list[str]] = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Worker -> Manager (Events)
 # ---------------------------------------------------------------------------
@@ -336,6 +356,19 @@ class AccountLoginCancelledMessage(Message):
     cleanup_complete: bool = True
 
 
+class AgentApiConfigureResultMessage(Message):
+    """Worker -> Manager: correlated Agent API setup result."""
+
+    type: Literal["AGENT_API_CONFIGURE_RESULT"] = "AGENT_API_CONFIGURE_RESULT"
+    request_id: str
+    account_id: str
+    provider: Literal["cloudrouter"] = "cloudrouter"
+    agent_type: Literal["claude", "codex"]
+    success: bool
+    error: str | None = None
+    config_dir: str
+
+
 class CredentialExhaustedMessage(Message):
     type: Literal["CREDENTIAL_EXHAUSTED"] = "CREDENTIAL_EXHAUSTED"
     worker_id: str
@@ -401,6 +434,7 @@ ManagerToWorkerMessage = Annotated[
         AccountLoginMessage,
         AccountLoginOtpMessage,
         AccountLoginCancelMessage,
+        AgentApiConfigureMessage,
         AuthResultMessage,
     ],
     Field(discriminator="type"),
@@ -422,6 +456,7 @@ WorkerToManagerMessage = Annotated[
         AccountLoginResultMessage,
         AccountLoginOtpRequiredMessage,
         AccountLoginCancelledMessage,
+        AgentApiConfigureResultMessage,
         CredentialExhaustedMessage,
         RunExhaustedMessage,
         AuthMessage,
@@ -448,6 +483,7 @@ AnyMessage = Annotated[
         AccountLoginMessage,
         AccountLoginOtpMessage,
         AccountLoginCancelMessage,
+        AgentApiConfigureMessage,
         AuthResultMessage,
         LogMessage,
         ProcessExitMessage,
@@ -463,6 +499,7 @@ AnyMessage = Annotated[
         AccountLoginResultMessage,
         AccountLoginOtpRequiredMessage,
         AccountLoginCancelledMessage,
+        AgentApiConfigureResultMessage,
         CredentialExhaustedMessage,
         RunExhaustedMessage,
         AuthMessage,
@@ -476,7 +513,10 @@ AnyMessage = Annotated[
 # ---------------------------------------------------------------------------
 
 
-_any_adapter = TypeAdapter(AnyMessage)
+_any_adapter = TypeAdapter(
+    AnyMessage,
+    config=ConfigDict(hide_input_in_errors=True),
+)
 
 
 def parse_message(data: str | bytes | dict) -> Message:

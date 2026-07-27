@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from elastic_agent.core.config import ElasticAgentConfig
+from elastic_agent.core.providers.base import InstanceNotFoundError
 from elastic_agent.core.registry import NodeRecord, NodeStatus
 from elastic_agent.manager.manager import ElasticAgentManager
 
@@ -15,6 +16,12 @@ from elastic_agent.manager.manager import ElasticAgentManager
 def mock_provider():
     provider = AsyncMock()
     provider.terminate_instance = AsyncMock()
+    # Successful termination is not complete until the Manager observes a
+    # terminal cloud readback. Model the provider's canonical NotFound signal
+    # instead of leaving AsyncMock to fabricate a forever-pending instance.
+    provider.get_instance = AsyncMock(
+        side_effect=InstanceNotFoundError("instance is terminated")
+    )
     return provider
 
 

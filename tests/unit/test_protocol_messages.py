@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from elastic_agent.core.protocols.messages import (
     AccountLoginCancelledMessage,
     AccountLoginCancelMessage,
@@ -11,6 +14,8 @@ from elastic_agent.core.protocols.messages import (
     AccountLoginOtpMessage,
     AccountLoginOtpRequiredMessage,
     AccountLoginResultMessage,
+    AgentApiConfigureMessage,
+    AgentApiConfigureResultMessage,
     AuthMessage,
     AuthResultMessage,
     CredentialExhaustedMessage,
@@ -234,6 +239,70 @@ class TestManagerToWorkerMessages:
         assert restored.code == "123456"
         assert "123456" not in repr(msg)
 
+    def test_agent_api_configure_roundtrip_redacts_api_key_from_repr(self):
+        msg = AgentApiConfigureMessage(
+            request_id="api-config-1",
+            account_id="cloudrouter-1",
+            provider="cloudrouter",
+            agent_type="claude",
+            config_dir="/home/ubuntu/.claude-cloudrouter-1",
+            api_key="cloudrouter-secret-key",
+            models={
+                "anthropic": ["claude-sonnet-4-20250514"],
+                "openai": ["gpt-5.2-codex"],
+            },
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AgentApiConfigureMessage)
+        assert restored.request_id == "api-config-1"
+        assert restored.account_id == "cloudrouter-1"
+        assert restored.provider == "cloudrouter"
+        assert restored.agent_type == "claude"
+        assert restored.config_dir == "/home/ubuntu/.claude-cloudrouter-1"
+        assert restored.api_key == "cloudrouter-secret-key"
+        assert restored.models == {
+            "anthropic": ["claude-sonnet-4-20250514"],
+            "openai": ["gpt-5.2-codex"],
+        }
+        assert "cloudrouter-secret-key" not in repr(msg)
+        assert "cloudrouter-secret-key" not in repr(restored)
+
+    def test_agent_api_configure_validation_error_does_not_leak_api_key(self):
+        api_key = "cloudrouter-key-must-not-leak"
+
+        with pytest.raises(ValidationError) as exc_info:
+            AgentApiConfigureMessage(
+                request_id="api-config-1",
+                account_id="cloudrouter-1",
+                provider="apex",
+                agent_type="claude",
+                config_dir="/home/ubuntu/.claude-cloudrouter-1",
+                api_key=api_key,
+                models={"anthropic": ["claude-sonnet-4-20250514"]},
+            )
+
+        assert api_key not in str(exc_info.value)
+        assert api_key not in repr(exc_info.value)
+
+    def test_union_parser_validation_error_does_not_leak_nested_api_key(self):
+        api_key = "nested-cloudrouter-key-must-not-leak"
+
+        with pytest.raises(ValidationError) as exc_info:
+            parse_message({
+                "type": "AGENT_API_CONFIGURE",
+                "request_id": "api-config-1",
+                "account_id": "cloudrouter-1",
+                "provider": "cloudrouter",
+                "agent_type": "claude",
+                "config_dir": "/home/ubuntu/.claude-cloudrouter-1",
+                "api_key": {"nested": api_key},
+            })
+
+        assert api_key not in str(exc_info.value)
+        assert api_key not in repr(exc_info.value)
+
     def test_auth_result_roundtrip(self):
         msg = AuthResultMessage(success=True, worker_id="w-1")
         restored = parse_message(msg.model_dump_json())
@@ -249,6 +318,27 @@ class TestManagerToWorkerMessages:
 
 
 class TestWorkerToManagerMessages:
+    def test_agent_api_configure_result_roundtrip(self):
+        msg = AgentApiConfigureResultMessage(
+            request_id="api-config-1",
+            account_id="cloudrouter-1",
+            provider="cloudrouter",
+            agent_type="codex",
+            success=True,
+            config_dir="/home/ubuntu/.codex-cloudrouter-1",
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AgentApiConfigureResultMessage)
+        assert restored.request_id == "api-config-1"
+        assert restored.account_id == "cloudrouter-1"
+        assert restored.provider == "cloudrouter"
+        assert restored.agent_type == "codex"
+        assert restored.success is True
+        assert restored.error is None
+        assert restored.config_dir == "/home/ubuntu/.codex-cloudrouter-1"
+
     def test_log_roundtrip(self):
         msg = LogMessage(
             task_id="t-1",
@@ -545,6 +635,19 @@ class TestParseMessageFromDict:
             ({"type": "ACCOUNT_LOGIN_OTP", "account_id": "a", "code": "123456"}, AccountLoginOtpMessage),
             (
                 {
+                    "type": "AGENT_API_CONFIGURE",
+                    "request_id": "r",
+                    "account_id": "a",
+                    "provider": "cloudrouter",
+                    "agent_type": "claude",
+                    "config_dir": "/c",
+                    "api_key": "secret",
+                    "models": {"anthropic": ["claude-sonnet-4-20250514"]},
+                },
+                AgentApiConfigureMessage,
+            ),
+            (
+                {
                     "type": "ACCOUNT_LOGIN_CANCEL",
                     "login_request_id": "r",
                     "account_id": "a",
@@ -573,6 +676,18 @@ class TestParseMessageFromDict:
                 AccountLoginCancelledMessage,
             ),
             ({"type": "ACCOUNT_LOGIN_OTP_REQUIRED", "account_id": "a"}, AccountLoginOtpRequiredMessage),
+            (
+                {
+                    "type": "AGENT_API_CONFIGURE_RESULT",
+                    "request_id": "r",
+                    "account_id": "a",
+                    "provider": "cloudrouter",
+                    "agent_type": "claude",
+                    "success": True,
+                    "config_dir": "/c",
+                },
+                AgentApiConfigureResultMessage,
+            ),
             ({"type": "CREDENTIAL_EXHAUSTED", "worker_id": "w", "slot_index": 0, "account_id": "a", "reason": "r"}, CredentialExhaustedMessage),
             ({"type": "AUTH", "token": "t"}, AuthMessage),
         ]

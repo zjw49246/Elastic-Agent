@@ -47,6 +47,14 @@ MAX_JOB_RUNTIME_SECONDS = 2_592_000
 DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
 MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ROUTING_PROXY_ENV_KEYS = frozenset({
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "all_proxy",
+})
 _S3_URI_RE = re.compile(
     r"s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/(?P<key>.*))?"
 )
@@ -495,6 +503,10 @@ class AccountSpec(StrictSpecModel):
     # environment used by the later run.  Keep Claude as the compatibility
     # default for existing JobSpec payloads.
     agent_type: Literal["claude", "codex"] = "claude"
+    # Optional exact model admission for Agent API accounts. OAuth identities
+    # have no locally discoverable catalog, so this is an API-provider routing
+    # constraint rather than a CLI model override.
+    model: str = ""
 
     # worker_local_login: worker runs the login flow locally (P3 ACCOUNT_LOGIN),
     #   after the Manager sends the selected email + write-only mailbox token;
@@ -522,6 +534,22 @@ class AccountSpec(StrictSpecModel):
     # default (~/.claude or ~/.codex). An absolute path is required when
     # per_worker > 1 (distinct dirs per account).
     config_dir: str = ""
+
+    @field_validator("model")
+    @classmethod
+    def normalize_model(cls, model: str) -> str:
+        value = model.strip()
+        if (
+            len(value) > 200
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise ValueError(
+                "account.model must be empty or at most 200 printable characters"
+            )
+        return value
 
     @field_validator("config_dir")
     @classmethod
@@ -555,9 +583,11 @@ class RotationSpec(StrictSpecModel):
     """Coarse-grained (Mode-B) account rotation policy.
 
     ``on_exhaust_restart_resume`` (strategy "a"): when the run command's stdout
-    trips the rate-limit detectors, interrupt it, log a fresh account into the
-    same config_dir, and restart the command with ``resume_args`` appended so the
-    harness skips already-completed work.
+    proves account auth/quota exhaustion, interrupt it, advance to another
+    pre-logged credential slot or log a fresh account into a sibling config
+    directory, and restart the command with ``resume_args`` appended so the
+    harness skips already-completed work. Provider-transient 500/502 failures do
+    not replay an arbitrary outer command.
     """
 
     strategy: Literal["none", "on_exhaust_restart_resume"] = "none"
@@ -717,6 +747,13 @@ class JobSpec(StrictSpecModel):
     def validate_eip_account_binding(self) -> JobSpec:
         """Enforce the one-account/one-EIP/one-ephemeral-worker MVP."""
         if self.account.binding != "eip":
+            if self.account.ids:
+                required = self.fanout.workers * self.account.per_worker
+                if len(self.account.ids) != required:
+                    raise ValueError(
+                        "account.ids must contain exactly "
+                        f"{required} unique account(s), one per worker slot"
+                    )
             return self
         if self.account.per_worker != 1:
             raise ValueError("account.per_worker must be 1 when account.binding is 'eip'")
@@ -749,6 +786,15 @@ class JobSpec(StrictSpecModel):
                 "account.binding 'eip' does not allow run.env/run.secret_env to override "
                 + ", ".join(sorted(unsafe_identity_env))
                 + "; the run must use the same credential home verified at login"
+            )
+        routing_proxy_env = _ROUTING_PROXY_ENV_KEYS.intersection(
+            {*self.run.env, *self.run.secret_env}
+        )
+        if routing_proxy_env:
+            raise ValueError(
+                "account.binding 'eip' requires direct EIP egress and does not "
+                "allow run.env/run.secret_env proxy variables: "
+                + ", ".join(sorted(routing_proxy_env))
             )
         return self
 
@@ -814,10 +860,7 @@ class JobSpec(StrictSpecModel):
             )
             if (
                 self.account.binding == "eip"
-                or (
-                    self.account.agent_type == "codex"
-                    and self.account.mode == "worker_local_login"
-                )
+                or self.account.mode == "worker_local_login"
             ):
                 # The selected account was authenticated and exact-email
                 # verified in this directory.  Letting user env redirect the

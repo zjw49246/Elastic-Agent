@@ -13,10 +13,11 @@ command before dispatch, so the same JobSpec produces correctly-sharded runs.
 
 Mode-B rotation (strategy "a", `on_exhaust_restart_resume`): when a worker's run
 command trips the rate-limit detectors, the worker interrupts it and signals the
-Manager; :meth:`on_worker_exhausted` allocates+logs in a fresh account (into the
-same config_dir) and restarts the command with ``rotation.resume_args`` so the
-harness resumes instead of redoing completed work. Credentials are always minted
-on the worker — the Manager only supplies account identities.
+Manager; :meth:`on_worker_exhausted` advances to a pre-logged credential slot or
+logs in a fresh account under a new sibling config directory, then restarts the
+command with ``rotation.resume_args`` so the harness resumes instead of redoing
+completed work. Credentials are always minted on the worker — the Manager only
+supplies account identities.
 
 The orchestrator is decoupled from the concrete Manager via :class:`FleetDriver`,
 so it unit-tests against a fake and plugs the real Manager in for production.
@@ -32,6 +33,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Protocol
 
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
@@ -72,6 +74,11 @@ class LoginOutcome:
     success: bool
     account_id: str = ""
     account_email: str = ""
+    # OAuth login writes directly to the requested slot. Agent-API
+    # provisioning keeps the key outside the CLI home and therefore returns
+    # the exact CLAUDE_CONFIG_DIR/CODEX_HOME that must drive the run.
+    config_dir: str = ""
+    auth_kind: str = "oauth"
     error: str | None = None
 
 
@@ -120,9 +127,15 @@ class WorkerRun:
     ctx: WorkerContext
     phase: WorkerPhase = WorkerPhase.PENDING
     task_id: str = ""
+    # Immutable identity snapshot for ``task_id``.  ``active_slot`` can advance
+    # before the interrupted process emits its reliable exit, so runtime
+    # feedback must never infer the failed account from the mutable slot.
+    task_account_id: str = ""
+    task_auth_kind: str = ""
     config_dirs: list[str] = field(default_factory=list)
     account_ids: list[str] = field(default_factory=list)
     account_emails: list[str] = field(default_factory=list)
+    account_auth_kinds: list[str] = field(default_factory=list)
     active_slot: int = 0
     rotations: int = 0
     error: str | None = None
@@ -491,6 +504,28 @@ class BatchOrchestrator:
     def job_id_for_worker(self, worker_id: str) -> str | None:
         return self._worker_index.get(worker_id)
 
+    def runtime_account_for_task(
+        self,
+        worker_id: str,
+        *,
+        task_id: str | None,
+    ) -> tuple[str, str] | None:
+        """Return the exact account snapshot owned by one current dispatch."""
+
+        if not task_id:
+            return None
+        job_id = self._worker_index.get(worker_id)
+        job = self._jobs.get(job_id) if job_id is not None else None
+        run = job.runs.get(worker_id) if job is not None else None
+        if (
+            run is None
+            or not run.task_id
+            or task_id != run.task_id
+            or not run.task_account_id
+        ):
+            return None
+        return run.task_account_id, run.task_auth_kind
+
     async def _record_job_state(
         self,
         job: BatchJob,
@@ -692,7 +727,15 @@ class BatchOrchestrator:
             spec=spec,
             harness=harness,
             release_workers_on_complete=(
-                self._scale_in_on_complete and not self._is_eip_bound(spec)
+                not self._is_eip_bound(spec)
+                and (
+                    self._scale_in_on_complete
+                    # Without a correlated scrub ACK, any managed login may
+                    # have delegated credentials before failing. Retaining
+                    # such a Worker while releasing its account claim is
+                    # unsafe, so authenticated Jobs are always ephemeral.
+                    or spec.account.mode != "none"
+                )
             ),
         )
 
@@ -1447,16 +1490,33 @@ class BatchOrchestrator:
                         return self._fail(run, "bound login returned a different account")
                     if outcome.account_email:
                         run.account_emails[0] = outcome.account_email
+                    if run.account_auth_kinds:
+                        run.account_auth_kinds[0] = outcome.auth_kind
+                    else:
+                        run.account_auth_kinds.append(outcome.auth_kind)
+                    if outcome.config_dir:
+                        run.config_dirs[0] = outcome.config_dir
                 else:
                     # Log in one account per credential slot (per_worker accounts,
                     # each into its own config_dir) so rotation can switch locally.
-                    for slot in self._slot_dirs(job):
-                        outcome = await self._driver.login(worker_id, spec, slot)
+                    for slot_index, slot in enumerate(self._slot_dirs(job)):
+                        requested_account_id = self._explicit_account_for_slot(
+                            run, spec, slot_index,
+                        )
+                        outcome = await self._driver.login(
+                            worker_id,
+                            spec,
+                            slot,
+                            account_id=requested_account_id,
+                        )
+                        if outcome.auth_kind == "agent_api":
+                            job.release_workers_on_complete = True
                         if not outcome.success:
                             return self._fail(run, outcome.error or "login failed")
-                        run.config_dirs.append(slot)
+                        run.config_dirs.append(outcome.config_dir or slot)
                         run.account_ids.append(outcome.account_id)
                         run.account_emails.append(outcome.account_email)
+                        run.account_auth_kinds.append(outcome.auth_kind)
                     run.active_slot = 0
 
             if self._shutting_down:
@@ -1494,6 +1554,29 @@ class BatchOrchestrator:
         return slots or [job.spec.account.config_dir]
 
     @staticmethod
+    def _explicit_account_for_slot(
+        run: WorkerRun,
+        spec: JobSpec,
+        slot_index: int,
+    ) -> str:
+        """Map explicit account ids deterministically across workers and slots.
+
+        Historically non-EIP ``account.ids`` passed preflight but were ignored
+        during allocation. Flattening ``worker × per_worker`` in shard order
+        makes an explicit plan mean the same thing at execution time.
+        """
+
+        account_ids = list(spec.account.ids)
+        if not account_ids:
+            return ""
+        flat_index = run.ctx.shard_index * spec.account.per_worker + slot_index
+        if flat_index >= len(account_ids):
+            raise RuntimeError(
+                "explicit account assignment does not cover every worker slot"
+            )
+        return account_ids[flat_index]
+
+    @staticmethod
     def _is_eip_bound(spec: JobSpec) -> bool:
         return getattr(spec.account, "binding", "none") == "eip"
 
@@ -1510,6 +1593,16 @@ class BatchOrchestrator:
             spec.run.secret_env,
         )
         ex["env"].update(resolved_secrets)
+        if run.config_dir and spec.account.mode != "none":
+            credential_env = (
+                "CODEX_HOME"
+                if spec.account.agent_type == "codex"
+                else "CLAUDE_CONFIG_DIR"
+            )
+            # Secret resolution is intentionally last for ordinary variables,
+            # but it must never redirect the identity selected and configured
+            # by the Manager.
+            ex["env"][credential_env] = run.config_dir
         if job.cancel_requested:
             run.phase = (
                 WorkerPhase.FAILED
@@ -1519,6 +1612,12 @@ class BatchOrchestrator:
             run.error = job.cancel_reason or "job cancelled"
             return
         run.task_id = f"{job.job_id}:{run.worker_id}:{uuid.uuid4().hex[:6]}"
+        run.task_account_id = run.account_id
+        run.task_auth_kind = (
+            run.account_auth_kinds[run.active_slot]
+            if run.active_slot < len(run.account_auth_kinds)
+            else ""
+        )
         run.exit_event = asyncio.Event()
         run.exit_archive_event = asyncio.Event()
         run.exit_archive_pending = False
@@ -1680,9 +1779,12 @@ class BatchOrchestrator:
                     await self._finalize_terminal_run(job, run)
                     await self._maybe_finish(job)
                     return False
-                run.config_dirs.append(new_dir)
+                run.config_dirs.append(outcome.config_dir or new_dir)
                 run.account_ids.append(outcome.account_id)
                 run.account_emails.append(outcome.account_email)
+                run.account_auth_kinds.append(outcome.auth_kind)
+                if outcome.auth_kind == "agent_api":
+                    job.release_workers_on_complete = True
                 run.active_slot = len(run.config_dirs) - 1
 
             try:
@@ -1720,7 +1822,29 @@ class BatchOrchestrator:
     @staticmethod
     def _extra_dir(job: BatchJob, run: WorkerRun) -> str:
         """A fresh config_dir for a rotation beyond the pre-logged pool."""
-        base = run.config_dirs[0] or job.spec.account.config_dir
+        spec = job.spec
+        base = spec.account.config_dir
+        if not base:
+            first_home = run.config_dirs[0] if run.config_dirs else ""
+            first_auth_kind = (
+                run.account_auth_kinds[0]
+                if getattr(run, "account_auth_kinds", None)
+                else ""
+            )
+            if first_auth_kind == "agent_api":
+                first_account_id = (
+                    run.account_ids[0]
+                    if getattr(run, "account_ids", None)
+                    else ""
+                )
+                base = BatchOrchestrator._agent_api_slot_from_home(
+                    first_home,
+                    provider="cloudrouter",
+                    account_id=first_account_id,
+                    agent_type=spec.account.agent_type,
+                )
+            else:
+                base = first_home
         if not base and job.spec.account.agent_type == "codex":
             # JobSpec rejects this configuration for managed rotation. Keep the
             # runtime guard for custom Harness implementations rather than
@@ -1729,7 +1853,59 @@ class BatchOrchestrator:
                 "Codex rotation requires an explicit worker-writable config_dir"
             )
         base = base or "/root/.claude"
+        base_path = PurePosixPath(base)
+        if (
+            not base_path.is_absolute()
+            or ".." in base_path.parts
+            or str(base_path) != base
+            or str(base_path) == "/"
+            or ".elastic-agent-api" in base_path.parts
+        ):
+            raise RuntimeError(
+                "rotation requires a safe credential slot outside the "
+                "Agent API projection namespace"
+            )
         return f"{base}-rot-{run.rotations}"
+
+    @staticmethod
+    def _agent_api_slot_from_home(
+        home: str,
+        *,
+        provider: str,
+        account_id: str,
+        agent_type: str,
+    ) -> str:
+        """Reverse the validated Worker projection suffix to its source slot."""
+
+        path = PurePosixPath(home)
+        expected_suffix = (
+            ".elastic-agent-api",
+            provider,
+            account_id,
+            agent_type,
+        )
+        if (
+            not home
+            or not path.is_absolute()
+            or ".." in path.parts
+            or str(path) != home
+            or not account_id
+            or tuple(path.parts[-len(expected_suffix):]) != expected_suffix
+        ):
+            raise RuntimeError(
+                "cannot derive rotation slot from Agent API projection home"
+            )
+        slot_parts = path.parts[:-len(expected_suffix)]
+        slot = PurePosixPath(*slot_parts)
+        if (
+            not slot.is_absolute()
+            or str(slot) == "/"
+            or ".elastic-agent-api" in slot.parts
+        ):
+            raise RuntimeError(
+                "Agent API projection home does not contain a safe source slot"
+            )
+        return str(slot)
 
     @_tracked_lifecycle
     async def on_worker_exit(
@@ -2150,6 +2326,31 @@ class BatchOrchestrator:
             ):
                 return
 
+            # Ordinary API-account projections retain a delegated key on the
+            # Worker. Do not return that identity to the shared pool until the
+            # instance is confirmed torn down; otherwise a teardown failure
+            # could let two live Workers use the same account/EIP identity.
+            if (
+                not self._is_eip_bound(job.spec)
+                and job.release_workers_on_complete
+                and not job.resources_released
+            ):
+                try:
+                    await self._driver.scale_in(list(job.runs))
+                except Exception as exc:  # noqa: BLE001
+                    job.error = job.error or (
+                        "worker teardown failed: "
+                        f"{str(exc) or type(exc).__name__}"
+                    )
+                    logger.exception(
+                        "ordinary worker teardown failed for job %s", job.job_id
+                    )
+                    self._schedule_unbound_cleanup(job)
+                    return
+                job.resources_released = True
+                for worker_id in job.runs:
+                    self._worker_index.pop(worker_id, None)
+
             if not job.accounts_released:
                 allocator = getattr(self, "_allocator", None)
                 if allocator is not None:
@@ -2175,22 +2376,6 @@ class BatchOrchestrator:
                     not run.cleaned_up for run in job.runs.values()
                 ):
                     return
-            elif job.release_workers_on_complete and not job.resources_released:
-                try:
-                    await self._driver.scale_in(list(job.runs))
-                except Exception as exc:  # noqa: BLE001
-                    job.error = job.error or (
-                        "worker teardown failed: "
-                        f"{str(exc) or type(exc).__name__}"
-                    )
-                    logger.exception(
-                        "ordinary worker teardown failed for job %s", job.job_id
-                    )
-                    self._schedule_unbound_cleanup(job)
-                    return
-                job.resources_released = True
-                for worker_id in job.runs:
-                    self._worker_index.pop(worker_id, None)
 
             if job.completed_at is None:
                 job.completed_at = datetime.now(timezone.utc)

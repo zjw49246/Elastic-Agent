@@ -479,6 +479,11 @@ class BindingManager:
             f"instance {instance_id!r} did not reach terminated state"
         )
 
+    async def wait_instance_terminated(self, instance_id: str) -> None:
+        """Public teardown fence used before releasing non-EIP credentials."""
+
+        await self._wait_instance_terminated(instance_id)
+
     async def _wait_eip_released(self, allocation_id: str) -> None:
         missing_scans = 0
         for attempt in range(TEARDOWN_CONFIRM_ATTEMPTS):

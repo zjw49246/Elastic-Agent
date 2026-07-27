@@ -464,6 +464,25 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
         )
 
     accounts = await mgr.account_store.list()
+    agent_api_store = getattr(mgr, "agent_api_store", None)
+    if agent_api_store is not None:
+        # Local metadata only: Job plan is a pure read and must not make an
+        # upstream CloudRouter request or claim an identity.
+        accounts = [*(await agent_api_store.list()), *accounts]
+
+    def supports_agent(account, agent_type: str, model: str = "") -> bool:
+        check = getattr(account, "supports_agent_type", None)
+        if callable(check):
+            supported = bool(check(agent_type))
+        else:
+            supported = account.agent_type == agent_type
+        model_check = getattr(account, "supports_model", None)
+        return supported and (
+            not model
+            or not callable(model_check)
+            or bool(model_check(agent_type, model))
+        )
+
     if spec.account.mode != "none":
         by_id = {account.id: account for account in accounts}
         for account_id in spec.account.ids:
@@ -472,18 +491,56 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 raise HTTPException(422, f"selected account {account_id!r} does not exist")
             if not account.enabled:
                 raise HTTPException(422, f"selected account {account_id!r} is disabled")
-            if account.agent_type != spec.account.agent_type:
+            if (
+                getattr(account, "auth_kind", "oauth") == "agent_api"
+                and agent_api_store.availability_decision(account.id).get(
+                    "available"
+                )
+                is False
+            ):
+                decision = agent_api_store.availability_decision(account.id)
                 raise HTTPException(
                     422,
-                    f"selected account {account_id!r} is {account.agent_type}, "
-                    f"not {spec.account.agent_type}",
+                    f"selected account {account_id!r} is unavailable: "
+                    f"{decision.get('reason') or 'quota'}",
+                )
+            if not supports_agent(
+                account,
+                spec.account.agent_type,
+                spec.account.model,
+            ):
+                available_types = getattr(
+                    account, "supported_agent_types",
+                    [getattr(account, "agent_type", "claude")],
+                )
+                model_suffix = (
+                    f" model {spec.account.model!r}"
+                    if spec.account.model
+                    else ""
+                )
+                raise HTTPException(
+                    422,
+                    f"selected account {account_id!r} supports "
+                    f"{', '.join(available_types)}, not "
+                    f"{spec.account.agent_type}{model_suffix}",
                 )
         if not spec.account.ids:
             eligible = [
                 account for account in accounts
                 if account.enabled
                 and account.group == spec.account.group
-                and account.agent_type == spec.account.agent_type
+                and supports_agent(
+                    account,
+                    spec.account.agent_type,
+                    spec.account.model,
+                )
+                and (
+                    getattr(account, "auth_kind", "oauth") != "agent_api"
+                    or agent_api_store.availability_decision(account.id).get(
+                        "available"
+                    )
+                    is not False
+                )
             ]
             required = spec.fanout.workers * spec.account.per_worker
             if len(eligible) < required:
