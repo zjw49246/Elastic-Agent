@@ -339,8 +339,8 @@ class TestAccountsAPI:
             "name": "Malformed",
             "api_key": {"secret": key},
         })
-        apex = await client.post("/api/agent-api/accounts", json={
-            "provider": "apex",
+        unknown = await client.post("/api/agent-api/accounts", json={
+            "provider": "unregistered",
             "name": "Not implemented",
             "api_key": key,
         })
@@ -348,10 +348,122 @@ class TestAccountsAPI:
         assert rejected.status_code == 422
         assert rejected.json()["detail"] == "CloudRouter rejected the API key"
         assert malformed.status_code == 422
-        assert apex.status_code == 422
+        assert unknown.status_code == 422
         assert key not in rejected.text
         assert key not in malformed.text
-        assert key not in apex.text
+        assert key not in unknown.text
+        assert await manager.agent_api_store.list() == []
+
+    @pytest.mark.asyncio
+    async def test_apex_agent_api_account_is_codex_only_and_write_only(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("apex")
+        key = "apex-key-that-must-never-echo"
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={
+                "claude": [],
+                "codex": ["gpt-5.4"],
+            }),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "apex-1",
+                "state": "active",
+                "status": "active",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "mode": "fixed_windows",
+                "key_used": "3",
+                "windows": [],
+            }),
+        )
+
+        providers = await client.get("/api/agent-api/providers")
+        assert providers.status_code == 200
+        assert providers.json()["providers"] == ["cloudrouter", "apex"]
+
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "apex",
+            "name": "Apex Codex",
+            "group": "research",
+            "api_key": key,
+        })
+
+        assert created.status_code == 201
+        body = created.json()
+        assert body["id"] == "apex-1"
+        assert body["api_provider"] == "apex"
+        assert body["auth_kind"] == "agent_api"
+        assert body["supported_agent_types"] == ["codex"]
+        assert body["models"] == {"claude": [], "codex": ["gpt-5.4"]}
+        assert body["has_api_key"] is True
+        assert "api_key" not in body
+        assert key not in created.text
+
+        codex_plan = await client.post("/api/jobs/plan", json={
+            "name": "apex-codex",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "ids": ["apex-1"],
+                "binding": "none",
+            },
+        })
+        claude_plan = await client.post("/api/jobs/plan", json={
+            "name": "apex-claude",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "claude",
+                "ids": ["apex-1"],
+                "binding": "none",
+            },
+        })
+        assert codex_plan.status_code == 200
+        assert claude_plan.status_code == 422
+        assert "supports codex, not claude" in claude_plan.json()["detail"]
+
+        provider_accounts = await client.get("/api/agent-api/accounts")
+        assert provider_accounts.status_code == 200
+        assert key not in provider_accounts.text
+        key_file = (
+            Path(manager.config.registry.path).with_name("agent-api-accounts")
+            / "apex-1"
+            / "api.key"
+        )
+        assert key_file.read_text() == key
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+    @pytest.mark.asyncio
+    async def test_apex_invalid_key_error_is_provider_specific_and_sanitized(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.agent_api import AgentApiUpstreamError
+
+        adapter = manager.agent_api_store.registry.require("apex")
+        key = "rejected-apex-key-that-must-not-echo"
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(
+                side_effect=AgentApiUpstreamError("invalid_api_key", 401)
+            ),
+        )
+
+        rejected = await client.post("/api/agent-api/accounts", json={
+            "provider": "apex",
+            "name": "Rejected Apex",
+            "api_key": key,
+        })
+
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == "ApexRouter rejected the API key"
+        assert key not in rejected.text
         assert await manager.agent_api_store.list() == []
 
     @pytest.mark.asyncio

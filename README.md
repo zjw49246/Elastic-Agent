@@ -205,16 +205,16 @@ Select the implementation with `account.agent_type` (`"claude"` by default):
 ```python
 "account": {
     "agent_type": "codex",
-    "model": "gpt-5.4",  # optional CloudRouter model admission
+    "model": "gpt-5.4",  # optional Agent API model admission
     "mode": "worker_local_login",
     "group": "standard",
     "config_dir": "",  # Codex uses the runtime user's ~/.codex
 }
 ```
 
-The same account pool can also contain CloudRouter Agent API identities. Add
-one from the Batch Console's **CloudRouter Agent API** form or through the
-authenticated management API:
+The same account pool can also contain CloudRouter and ApexRouter Agent API
+identities. Add one from the Batch Console's **Agent API accounts** form or
+through the authenticated management API:
 
 ```bash
 curl -fsS -X POST "$EA_URL/api/agent-api/accounts" \
@@ -223,18 +223,21 @@ curl -fsS -X POST "$EA_URL/api/agent-api/accounts" \
   -d '{"provider":"cloudrouter","name":"research-router","group":"standard","api_key":"<write-only-key>"}'
 ```
 
-The Manager validates the key with CloudRouter's fixed `/v1/models` endpoint
-and projects it into Claude, Codex, or both according to the returned model
-IDs. Fresh allocation prefers a compatible, available API identity and falls
-back to OAuth; `account.ids` can select the generated ID such as
-`cloudrouter-1` explicitly. Set optional `account.model` to require an exact
-advertised model (Claude stable aliases also match their dated variants);
-without it, admission checks only the selected Agent family for backward
-compatibility. This field validates routing but does not rewrite the opaque run
-command's own model arguments. Jobs do not need a separate API mode and API
-identities support the same persistent EIP binding flow.
+Use `"provider":"apex"` for ApexRouter. CloudRouter validates against its fixed
+`/v1/models` endpoint and may project the key into Claude, Codex, or both.
+ApexRouter is Codex-only: it queries
+`https://35-75-22-186.sslip.io/v1/models` with the pinned Codex CLI version and
+configures the `apexrouter` Responses API provider. Fresh allocation prefers a
+compatible, available API identity and falls back to OAuth; `account.ids` can
+select a generated ID such as `cloudrouter-1` or `apex-1` explicitly. Set
+optional `account.model` to require an exact advertised model (Claude stable
+aliases also match their dated variants); without it, admission checks only
+the selected Agent family for backward compatibility. This field validates
+routing but does not rewrite the opaque run command's own model arguments.
+Jobs do not need a separate API mode and API identities support the same
+persistent EIP binding flow.
 
-Provider waits have nested wall-clock bounds: each CloudRouter HTTP request is
+Provider waits have nested wall-clock bounds: each Agent API HTTP request is
 limited to 15 seconds; automatic pool selection refreshes at most 16 keys
 concurrently for 30 seconds total, excludes unfinished keys for that attempt,
 and can fall back to OAuth. An explicit native/OAuth ID skips unrelated API
@@ -247,17 +250,17 @@ Agent-API-to-OAuth fallback is then needed, the OAuth login goes to a sibling
 writes OAuth state into a delegated-key projection and fails closed if the
 source slot cannot be derived safely.
 
-CloudRouter keys live in a mode-`0700` Manager account directory with
-mode-`0600` files. They are never returned by REST and never enter JobSpec,
-CLI configuration, process environment, or command arguments. After the same
-WSS transport check used for login secrets, a correlated setup message writes
-the key once to the selected Worker. Claude and Codex read it through a private
-helper; their endpoints are fixed to `console.cloudrouter.online`, inherited
-official auth/base overrides are removed, and a structured provider failure is
+Agent API keys live in a mode-`0700` Manager account directory with
+mode-`0600` files. They are never returned by REST and never enter JobSpec, CLI
+configuration, process environment, or command arguments. After the same WSS
+transport check used for login secrets, a correlated setup message writes the
+key once to the selected Worker. Claude and Codex read it through a private
+helper; routing is fixed to the selected provider, inherited official and
+gateway auth/base overrides are removed, and a structured provider failure is
 reported as a failed Job even when the CLI process exits `0`. Managed Claude
-loads only its Worker-owned user settings; project/local settings, hooks, and
-MCP configuration are excluded so Job files cannot redirect the provider or
-credential helper.
+is available only through CloudRouter and loads only its Worker-owned user
+settings; project/local settings, hooks, and MCP configuration are excluded so
+Job files cannot redirect the provider or credential helper.
 
 During Manager startup recovery, Agent API allocation stays closed until every
 previous Worker has a confirmed terminal cloud readback. OAuth allocation can
@@ -280,8 +283,8 @@ through the root-owned Node binary and exact npm entrypoint, bypassing its
 Managed Agent API traffic uses direct Worker egress. EIP Job preflight rejects
 `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (including lowercase variants) in
 `run.env` or `run.secret_env`; the supported container consumer independently
-rejects ambient or adapter-supplied routing proxies. This prevents CloudRouter
-from observing a proxy's public IP instead of the account's bound EIP. Ordinary
+rejects ambient or adapter-supplied routing proxies. This prevents the selected
+provider from observing a proxy's public IP instead of the account's bound EIP. Ordinary
 non-managed CLI Jobs retain their existing proxy support. Elastic-Agent
 deliberately does not intercept arbitrary `docker`, Compose, or SDK calls.
 
@@ -298,8 +301,14 @@ and nested display fields are bounded and allowlisted, and deterministic
 model-refresh failures bench the stale catalog. Deletion is intentionally
 disabled until every delegated Worker can be durably fenced; terminate Jobs and
 retire the upstream key when necessary.
-The provider adapter is ready for a future Apex implementation, but Apex is not
-registered or accepted in this release.
+
+ApexRouter `/usage` reports per-key `used` values but shared-group
+`remaining`, `limits`, and `concurrency`; Elastic keeps those scopes separate
+and excludes the key when any shared limit is exhausted. ApexRouter does not
+currently supply an expiry time. At runtime, Apex authentication failures and
+explicit quota exhaustion rotate credentials, while ordinary HTTP `429` and
+`500`/`502` failures are treated as transient provider errors rather than proof
+that the individual key is exhausted.
 
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent

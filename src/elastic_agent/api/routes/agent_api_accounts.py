@@ -1,8 +1,7 @@
 """Provider-neutral Agent API account endpoints.
 
-CloudRouter is the only registered provider in this release. API keys are
-write-only and are validated against the provider's fixed models endpoint
-before a private account directory is published.
+API keys are write-only and are validated against each provider's fixed models
+endpoint before a private account directory is published.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def _mgr():
 class AgentApiAccountRequest(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
-    provider: Literal["cloudrouter"] = "cloudrouter"
+    provider: Literal["cloudrouter", "apex"] = "cloudrouter"
     name: str
     api_key: SecretStr = Field(repr=False)
     group: str = "standard"
@@ -67,22 +66,32 @@ class AgentApiProvidersResponse(BaseModel):
     providers: list[str]
 
 
-def _safe_upstream_error(exc: AgentApiUpstreamError) -> HTTPException:
+def _provider_label(provider: str) -> str:
+    return {
+        "cloudrouter": "CloudRouter",
+        "apex": "ApexRouter",
+    }.get(str(provider or "").strip().lower(), "Agent API provider")
+
+
+def _safe_upstream_error(
+    exc: AgentApiUpstreamError,
+    *,
+    provider: str,
+) -> HTTPException:
+    label = _provider_label(provider)
     safe_messages = {
-        "invalid_api_key": "CloudRouter rejected the API key",
-        "forbidden": "CloudRouter denied access for this API key",
-        "no_supported_models": (
-            "CloudRouter returned no supported Claude or Codex models"
-        ),
-        "invalid_models_response": "CloudRouter returned an invalid model list",
-        "unexpected_redirect": "CloudRouter returned an unexpected redirect",
-        "response_too_large": "CloudRouter returned an oversized response",
-        "rate_limited": "CloudRouter temporarily rate limited the request",
-        "timeout": "CloudRouter request timed out",
-        "network_error": "CloudRouter could not be reached",
-        "upstream_unavailable": "CloudRouter is temporarily unavailable",
-        "upstream_rejected": "CloudRouter rejected the request",
-        "invalid_json": "CloudRouter returned an invalid response",
+        "invalid_api_key": f"{label} rejected the API key",
+        "forbidden": f"{label} denied access for this API key",
+        "no_supported_models": f"{label} returned no supported agent models",
+        "invalid_models_response": f"{label} returned an invalid model list",
+        "unexpected_redirect": f"{label} returned an unexpected redirect",
+        "response_too_large": f"{label} returned an oversized response",
+        "rate_limited": f"{label} temporarily rate limited the request",
+        "timeout": f"{label} request timed out",
+        "network_error": f"{label} could not be reached",
+        "upstream_unavailable": f"{label} is temporarily unavailable",
+        "upstream_rejected": f"{label} rejected the request",
+        "invalid_json": f"{label} returned an invalid response",
     }
     client_error = exc.status_code in {400, 401, 403, 404}
     return HTTPException(
@@ -90,7 +99,7 @@ def _safe_upstream_error(exc: AgentApiUpstreamError) -> HTTPException:
             "no_supported_models",
             "invalid_models_response",
         } else 502,
-        safe_messages.get(exc.code, "CloudRouter request failed"),
+        safe_messages.get(exc.code, f"{label} request failed"),
     )
 
 
@@ -163,11 +172,11 @@ async def add_agent_api_account(
         usage = await store.fetch_usage(account.id, force=True)
         return _public_account(account, api_usage=usage)
     except AgentApiUpstreamError as exc:
-        raise _safe_upstream_error(exc) from exc
+        raise _safe_upstream_error(exc, provider=req.provider) from exc
     except AgentApiDuplicateKeyError as exc:
         raise HTTPException(
             409,
-            "CloudRouter API key is already registered",
+            f"{_provider_label(req.provider)} API key is already registered",
         ) from exc
     except (ValueError, AgentApiUnsupportedProviderError) as exc:
         raise HTTPException(422, "invalid Agent API account") from exc
@@ -181,8 +190,15 @@ async def add_agent_api_account(
 )
 async def refresh_agent_api_account(account_id: str) -> AccountResponse:
     manager = _mgr()
+    provider = ""
     try:
         async with manager.account_allocator.mutation_guard(account_id):
+            current = await manager.agent_api_store.get(account_id)
+            if current is None:
+                raise AgentApiAccountNotFoundError(
+                    f"Agent API account {account_id!r} not found"
+                )
+            provider = current.api_provider
             account = await manager.agent_api_store.refresh(account_id)
             # Keep claims fenced until the successful forced usage probe has
             # atomically cleared any runtime-auth tombstone. A model-only
@@ -196,7 +212,7 @@ async def refresh_agent_api_account(account_id: str) -> AccountResponse:
     except AgentApiAccountNotFoundError as exc:
         raise HTTPException(404, f"Agent API account {account_id!r} not found") from exc
     except AgentApiUpstreamError as exc:
-        raise _safe_upstream_error(exc) from exc
+        raise _safe_upstream_error(exc, provider=provider) from exc
     except AgentApiStorageError as exc:
         raise HTTPException(500, "Agent API credential storage failed") from exc
     except AccountClaimConflictError as exc:

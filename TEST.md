@@ -169,8 +169,10 @@ The focused suite covers:
   the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
-- CloudRouter Agent API provider registration (Apex rejected until implemented),
-  15-second wall-clock-bounded no-redirect Bearer model/usage requests,
+- CloudRouter and Codex-only ApexRouter Agent API provider registration,
+  fixed-endpoint 15-second wall-clock-bounded no-redirect Bearer model/usage
+  requests, Apex's pinned-Codex-version native model catalog and distinct
+  per-key usage/shared-group quota normalization,
   30-second/concurrency-16 automatic pool refresh with unfinished-key OAuth
   fallback, one shared 60-second usage→key-delivery→Worker-ACK deadline,
   Claude/Codex model projection,
@@ -193,8 +195,9 @@ The focused suite covers:
   `task_id/account_id/auth_kind` dispatch snapshot so stale exhaustion/exit
   replay cannot bench a newly rotated account;
 - Mode-B POSIX process-group teardown for STOP, timeout, exhaustion, and
-  parent-before-child exit; terminal CloudRouter 500/502 fails without emitting
-  `RUN_EXHAUSTED` or triggering `rotation.resume_args`; PTY hard limits terminate
+  parent-before-child exit; terminal provider-transient failures (CloudRouter
+  500/502 and ApexRouter 429/500/502) fail without emitting `RUN_EXHAUSTED` or
+  triggering `rotation.resume_args`; PTY hard limits terminate
   without claiming an automatic cross-account resume; PTY launch/STOP/shutdown
   cancellation and teardown exceptions still converge on one reliable terminal
   handoff;
@@ -204,9 +207,10 @@ The focused suite covers:
   the key in environment variables or Docker arguments; EIP JobSpec rejects
   HTTP(S)/ALL proxy variables from both plain and secret env so managed traffic
   cannot bypass the account's stable public egress;
-- Agent API REST/UI write-only behavior, CloudRouter add/refresh/usage controls,
-  one identity selectable for both supported Agent types, quota/model display,
-  no browser-persisted Key, and sanitized validation/upstream errors.
+- Agent API REST/UI write-only behavior, CloudRouter/ApexRouter
+  add/refresh/usage controls, provider-aware Agent support (ApexRouter is
+  Codex-only), quota/model display, no browser-persisted Key, and sanitized
+  validation/upstream errors.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   suppress live actions after teardown, keep read-only system logs until release,

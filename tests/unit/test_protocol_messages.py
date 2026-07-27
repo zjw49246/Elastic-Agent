@@ -276,7 +276,7 @@ class TestManagerToWorkerMessages:
             AgentApiConfigureMessage(
                 request_id="api-config-1",
                 account_id="cloudrouter-1",
-                provider="apex",
+                provider="unregistered",
                 agent_type="claude",
                 config_dir="/home/ubuntu/.claude-cloudrouter-1",
                 api_key=api_key,
@@ -285,6 +285,26 @@ class TestManagerToWorkerMessages:
 
         assert api_key not in str(exc_info.value)
         assert api_key not in repr(exc_info.value)
+
+    def test_apex_agent_api_configure_roundtrip(self):
+        msg = AgentApiConfigureMessage(
+            request_id="api-config-apex-1",
+            account_id="apex-1",
+            provider="apex",
+            agent_type="codex",
+            config_dir="/home/ubuntu/.codex-apex-1",
+            api_key="apex-secret-key",
+            models={"codex": ["gpt-5.4"]},
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AgentApiConfigureMessage)
+        assert restored.provider == "apex"
+        assert restored.agent_type == "codex"
+        assert restored.models == {"codex": ["gpt-5.4"]}
+        assert "apex-secret-key" not in repr(msg)
+        assert "apex-secret-key" not in repr(restored)
 
     def test_union_parser_validation_error_does_not_leak_nested_api_key(self):
         api_key = "nested-cloudrouter-key-must-not-leak"
@@ -338,6 +358,22 @@ class TestWorkerToManagerMessages:
         assert restored.success is True
         assert restored.error is None
         assert restored.config_dir == "/home/ubuntu/.codex-cloudrouter-1"
+
+    def test_apex_agent_api_configure_result_roundtrip(self):
+        msg = AgentApiConfigureResultMessage(
+            request_id="api-config-apex-1",
+            account_id="apex-1",
+            provider="apex",
+            agent_type="codex",
+            success=True,
+            config_dir="/home/ubuntu/.codex-apex-1",
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AgentApiConfigureResultMessage)
+        assert restored.provider == "apex"
+        assert restored.account_id == "apex-1"
 
     def test_log_roundtrip(self):
         msg = LogMessage(

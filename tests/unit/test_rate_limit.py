@@ -5,6 +5,9 @@ from __future__ import annotations
 import pytest
 
 from elastic_agent.core.rate_limit import (
+    is_apexrouter_auth_failure,
+    is_apexrouter_hard_limit,
+    is_apexrouter_transient,
     is_auth_failure,
     is_cloudrouter_auth_failure,
     is_cloudrouter_hard_limit,
@@ -14,6 +17,102 @@ from elastic_agent.core.rate_limit import (
     rate_limit_event_is_actionable,
     transient_retry_delay,
 )
+
+
+class TestApexRouterClassification:
+    @pytest.mark.parametrize("text", [
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '401 Unauthorized: Invalid API key"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"status":403,'
+            '"message":"Forbidden"}}'
+        ),
+        (
+            '{"type":"error","error":{"type":"authentication_error",'
+            '"message":"credentials rejected"}}'
+        ),
+    ])
+    def test_auth_failure(self, text):
+        assert is_apexrouter_auth_failure(text)
+        assert not is_apexrouter_hard_limit(text)
+        assert not is_apexrouter_transient(text)
+
+    @pytest.mark.parametrize("text", [
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '429 Too Many Requests"}}'
+        ),
+        (
+            '{"type":"error","error":{"type":"rate_limit_error",'
+            '"message":"request rate limited"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"status":500,'
+            '"message":"Internal Server Error"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"unexpected status '
+            '502 Bad Gateway: upstream_error"}}'
+        ),
+    ])
+    def test_shared_gateway_conditions_are_transient(self, text):
+        assert is_apexrouter_transient(text)
+        assert not is_apexrouter_auth_failure(text)
+        assert not is_apexrouter_hard_limit(text)
+
+    @pytest.mark.parametrize("text", [
+        (
+            '{"type":"turn.failed","error":{"code":"insufficient_quota",'
+            '"message":"account quota exhausted"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":'
+            '"ApexRouter API key is out of credits"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":'
+            '"monthly spend limit reached"}}'
+        ),
+    ])
+    def test_explicit_key_quota_is_hard(self, text):
+        assert is_apexrouter_hard_limit(text)
+        assert not is_apexrouter_auth_failure(text)
+        assert not is_apexrouter_transient(text)
+
+    def test_narrow_negative_cases(self):
+        assert not is_apexrouter_auth_failure("application returned 403 rows")
+        assert not is_apexrouter_auth_failure(
+            "HTTP 403 from unrelated dataset endpoint"
+        )
+        assert not is_apexrouter_auth_failure(
+            "Error: processed 403 records"
+        )
+        assert not is_apexrouter_transient("processed 429 records")
+        assert not is_apexrouter_transient(
+            "HTTP Error: 429 from unrelated telemetry service"
+        )
+        assert not is_apexrouter_hard_limit(
+            "The documentation describes insufficient_quota errors."
+        )
+        assert not is_apexrouter_auth_failure(
+            '{"type":"turn.completed","result":"HTTP 401 Unauthorized"}'
+        )
+        assert not is_apexrouter_transient(
+            '{"type":"turn.completed","result":"HTTP 429 Too Many Requests"}'
+        )
+
+    def test_plain_fallback_requires_apex_identity(self):
+        assert is_apexrouter_auth_failure(
+            "ApexRouter API: HTTP 403 Forbidden"
+        )
+        assert is_apexrouter_transient(
+            "Apex gateway: HTTP 429 Too Many Requests"
+        )
+        assert is_apexrouter_hard_limit(
+            "ApexRouter API key is out of credits"
+        )
 
 
 class TestCloudRouterClassification:

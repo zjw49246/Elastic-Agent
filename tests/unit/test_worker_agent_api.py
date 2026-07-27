@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from elastic_agent.worker.agent_api import (
+    AGENT_API_CODEX_AUTH_ENV_KEYS,
+    APEX_CODEX_BASE_URL,
     CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS,
     CLOUDROUTER_CLAUDE_BASE_URL,
     CLOUDROUTER_CLAUDE_BINARY_ENV,
@@ -113,7 +115,7 @@ def test_claude_wrapper_fixes_route_clears_auth_and_sets_private_umask(tmp_path)
         agent_type="claude",
         config_dir=tmp_path / "slot",
         api_key="cr-private",
-        account_id="api-one",
+        account_id="cloudrouter-api-one",
     )
     fake_claude = tmp_path / "fake-claude"
     fake_claude.write_text(
@@ -151,7 +153,7 @@ def test_claude_wrapper_clears_provider_routes_at_final_exec(tmp_path):
         agent_type="claude",
         config_dir=tmp_path / "slot",
         api_key="cr-private",
-        account_id="api-provider-routes",
+        account_id="cloudrouter-api-provider-routes",
     )
     fake_claude = tmp_path / "fake-claude"
     observed_keys = sorted(CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS | CLOUDROUTER_CLAUDE_PROVIDER_ENV_KEYS)
@@ -206,7 +208,7 @@ def test_claude_wrapper_rejects_caller_settings_overrides(tmp_path, override):
         agent_type="claude",
         config_dir=tmp_path / "slot",
         api_key="cr-private",
-        account_id="api-settings-override",
+        account_id="cloudrouter-api-settings-override",
     )
     fake_claude = tmp_path / "fake-claude"
     fake_claude.write_text("#!/bin/sh\nexit 99\n")
@@ -345,7 +347,7 @@ def test_real_claude_wrapper_ignores_project_and_local_hooks_and_mcp(tmp_path):
         agent_type="claude",
         config_dir=tmp_path / "slot",
         api_key="cr-private",
-        account_id="api-real-settings-boundary",
+        account_id="cloudrouter-api-real-settings-boundary",
     )
     blocked_proxy = "http://127.0.0.1:1"
     managed_events, managed_init = run_until_init(
@@ -425,6 +427,81 @@ def test_configure_cloudrouter_codex_writes_responses_provider_without_key(tmp_p
     assert "refresh_interval_ms = 0" in config
     assert "cr-codex-private" not in config
     assert "\nmodel =" not in config
+
+
+def test_configure_apex_codex_is_private_fixed_and_codex_only(tmp_path):
+    home = Path(
+        configure_agent_api(
+            provider="apex",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="lck-apex-private",
+            account_id="apex-3",
+            models={"codex": ["gpt-5.4"]},
+        )
+    )
+    projection = validate_agent_api_home(home)
+    config = (home / "config.toml").read_text()
+    marker = json.loads((projection.root / "projection.json").read_text())
+
+    assert home == (
+        tmp_path
+        / "slot"
+        / ".elastic-agent-api"
+        / "apex"
+        / "apex-3"
+        / "codex"
+    )
+    assert projection.provider == "apex"
+    assert projection.agent_type == "codex"
+    assert marker["endpoints"] == {
+        "claude_base_url": None,
+        "codex_base_url": APEX_CODEX_BASE_URL,
+    }
+    assert 'model_provider = "apexrouter"' in config
+    assert "[model_providers.apexrouter]" in config
+    assert 'name = "ApexRouter"' in config
+    assert f'base_url = "{APEX_CODEX_BASE_URL}"' in config
+    assert 'wire_api = "responses"' in config
+    assert "supports_websockets = false" in config
+    assert "[model_providers.apexrouter.auth]" in config
+    assert "lck-apex-private" not in config
+    assert "lck-apex-private" not in json.dumps(marker)
+
+    with pytest.raises(AgentAPIConfigurationError, match="does not support"):
+        configure_agent_api(
+            provider="apex",
+            agent_type="claude",
+            config_dir=tmp_path / "claude-slot",
+            api_key="lck-apex-private",
+            account_id="apex-4",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "account_id"),
+    [
+        ("apex", "cloudrouter-1"),
+        ("cloudrouter", "apex-1"),
+    ],
+)
+def test_projection_rejects_cross_provider_account_id(
+    tmp_path,
+    provider,
+    account_id,
+):
+    with pytest.raises(
+        AgentAPIConfigurationError,
+        match="account id",
+    ):
+        configure_agent_api(
+            provider=provider,
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="provider-private",
+            account_id=account_id,
+        )
 
 
 def test_key_helper_launcher_ignores_task_writable_path(tmp_path):
@@ -508,7 +585,7 @@ def test_existing_slot_permissions_are_not_rewritten(tmp_path):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"provider": "apex"}, "Unsupported Agent API provider"),
+        ({"provider": "unregistered"}, "Unsupported Agent API provider"),
         ({"agent_type": "gemini"}, "Unsupported agent type"),
         ({"account_id": "../escape"}, "Invalid Agent API account id"),
         ({"api_key": ""}, "Invalid API key"),
@@ -764,11 +841,24 @@ def test_auth_env_scrub_removes_cloudrouter_claude_provider_overrides():
     }
 
 
+def test_auth_env_scrub_rejects_apex_claude():
+    with pytest.raises(AgentAPIConfigurationError, match="does not support"):
+        scrub_agent_api_env(
+            {},
+            provider="apex",
+            agent_type="claude",
+        )
+
+
 def test_codex_auth_env_scrub_removes_all_key_and_base_overrides():
     env = {
         "OPENAI_API_KEY": "official",
         "CODEX_API_KEY": "codex",
         "CLOUDROUTER_API_KEY": "cloudrouter",
+        "APEX_CODEX_GATEWAY_KEY": "legacy-apex",
+        "APEX_CODEX_API_KEY": "apex",
+        "APEXROUTER_API_KEY": "apexrouter",
+        "APEXROUTER_CODEX_API_KEY": "apexrouter-codex",
         "OPENAI_BASE_URL": "https://attacker.invalid",
         "CODEX_BASE_URL": "https://attacker.invalid",
         ELASTIC_AGENT_API_PROJECTION_ROOT_ENV: "/attacker-controlled",
@@ -782,6 +872,7 @@ def test_codex_auth_env_scrub_removes_all_key_and_base_overrides():
     )
 
     assert result is env
+    assert AGENT_API_CODEX_AUTH_ENV_KEYS.isdisjoint(env)
     assert env == {"SAFE": "keep"}
 
 

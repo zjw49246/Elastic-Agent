@@ -3,8 +3,8 @@
 Agent API accounts are deliberately separate from browser/OAuth identities.
 The Manager persists an opaque provider key, the models discovered through the
 provider adapter, and non-secret routing metadata.  Provider-specific HTTP
-behavior lives behind :class:`AgentApiProviderAdapter`, which is also the
-extension point for a future Apex implementation.
+behavior lives behind :class:`AgentApiProviderAdapter`; CloudRouter and
+ApexRouter are registered explicitly by the default registry.
 """
 
 from __future__ import annotations
@@ -82,14 +82,14 @@ class AgentApiUpstreamError(AgentApiError):
 
 @runtime_checkable
 class AgentApiProviderAdapter(Protocol):
-    """Provider contract; CloudRouter is registered now, Apex can implement it."""
+    """Provider contract for explicitly registered Agent API gateways."""
 
     @property
     def provider(self) -> str:
         """Stable storage/API identifier for the provider."""
 
     @property
-    def endpoints(self) -> Mapping[str, str]:
+    def endpoints(self) -> Mapping[str, str | None]:
         """Fixed, non-secret endpoints shown in public account metadata."""
 
     async def probe_models(self, api_key: str) -> dict[str, list[str]]:
@@ -106,9 +106,9 @@ class AgentApiProviderAdapter(Protocol):
 class AgentApiProviderRegistry:
     """Explicit provider registry.
 
-    The default registry intentionally contains CloudRouter only.  Merely
-    implementing the protocol does not make another provider (notably Apex)
-    selectable until it is explicitly registered.
+    Merely implementing the protocol does not make a provider selectable until
+    it is explicitly registered. Registration order is also allocation order,
+    preserving the established CloudRouter preference when Apex is enabled.
     """
 
     def __init__(
@@ -121,9 +121,10 @@ class AgentApiProviderRegistry:
 
     @classmethod
     def default(cls) -> AgentApiProviderRegistry:
+        from elastic_agent.core.apexrouter import ApexRouterAdapter
         from elastic_agent.core.cloudrouter import CloudRouterAdapter
 
-        return cls((CloudRouterAdapter(),))
+        return cls((CloudRouterAdapter(), ApexRouterAdapter()))
 
     def register(self, adapter: AgentApiProviderAdapter) -> None:
         provider = str(adapter.provider or "").strip().lower()
@@ -135,7 +136,7 @@ class AgentApiProviderRegistry:
 
     @property
     def providers(self) -> tuple[str, ...]:
-        return tuple(sorted(self._adapters))
+        return tuple(self._adapters)
 
     def require(self, provider: str) -> AgentApiProviderAdapter:
         normalized = str(provider or "").strip().lower()
@@ -167,7 +168,7 @@ class AgentApiAccount:
     models: dict[str, list[str]]
     key_fingerprint: str
     root: Path
-    endpoints: dict[str, str]
+    endpoints: dict[str, str | None]
 
     @property
     def email(self) -> str:
@@ -1236,10 +1237,14 @@ class AgentApiAccountStore:
     async def list(self) -> list[AgentApiAccount]:
         async with self._lock:
             self._reload_sync()
+            provider_order = {
+                provider: index
+                for index, provider in enumerate(self.registry.providers)
+            }
             return sorted(
                 self._accounts.values(),
                 key=lambda account: (
-                    account.api_provider,
+                    provider_order[account.api_provider],
                     int(ACCOUNT_ID_RE.fullmatch(account.id).group("number")),  # type: ignore[union-attr]
                 ),
             )

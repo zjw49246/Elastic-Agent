@@ -67,6 +67,9 @@ from elastic_agent.core.protocols.messages import (
     parse_message,
 )
 from elastic_agent.core.rate_limit import (
+    is_apexrouter_auth_failure,
+    is_apexrouter_hard_limit,
+    is_apexrouter_transient,
     is_auth_failure,
     is_cloudrouter_auth_failure,
     is_cloudrouter_hard_limit,
@@ -87,6 +90,50 @@ _AGENT_API_ERROR_PRIORITY = {
     "agent_api_rate_limited": 3,
     "agent_api_auth_failure": 4,
 }
+_AGENT_API_PROVIDER_LABELS = {
+    "cloudrouter": "CloudRouter",
+    "apex": "ApexRouter",
+}
+
+
+def _classify_agent_api_provider_error(
+    provider: str,
+    line: str,
+) -> tuple[str, str] | None:
+    """Classify a structured failure with provider-specific retry semantics."""
+
+    if provider == "cloudrouter":
+        auth_failure = is_cloudrouter_auth_failure(line)
+        hard_limit = is_cloudrouter_hard_limit(line)
+        transient = is_cloudrouter_transient(line)
+    elif provider == "apex":
+        auth_failure = is_apexrouter_auth_failure(line)
+        hard_limit = is_apexrouter_hard_limit(line)
+        transient = is_apexrouter_transient(line)
+    else:
+        return None
+
+    label = _AGENT_API_PROVIDER_LABELS[provider]
+    if auth_failure:
+        return (
+            "agent_api_auth_failure",
+            f"{label} rejected the delegated API key",
+        )
+    if hard_limit:
+        suffix = (
+            "key quota or rate limit was reached"
+            if provider == "cloudrouter"
+            else "key quota or credit limit was reached"
+        )
+        return ("agent_api_rate_limited", f"{label} {suffix}")
+    if transient:
+        suffix = (
+            "temporarily rate limited the request"
+            if provider == "cloudrouter"
+            else "request failed transiently"
+        )
+        return ("agent_api_transient_error", f"{label} {suffix}")
+    return None
 
 
 def _utcnow() -> datetime:
@@ -535,12 +582,13 @@ class WorkerRuntime:
             projection = self._agent_api_projection_for_execute(msg)
             if projection is not None:
                 from elastic_agent.worker.agent_api import (
+                    AGENT_API_CODEX_AUTH_ENV_KEYS,
                     CLOUDROUTER_CLAUDE_BASE_URL,
                     CLOUDROUTER_CLAUDE_BINARY_ENV,
-                    CLOUDROUTER_CODEX_BASE_URL,
                     apply_agent_api_runtime_env,
                     claude_shim_directory_for_home,
                     claude_wrapper_for_home,
+                    codex_base_url_for_provider,
                 )
 
                 apply_agent_api_runtime_env(env, projection)
@@ -568,10 +616,16 @@ class WorkerRuntime:
                     and Path(command[0]).name in {"bash", "sh", "zsh"}
                     and command[1] in {"-c", "-lc", "-cl"}
                 ):
+                    auth_and_route_keys = {
+                        "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY",
+                        "CLAUDE_CODE_OAUTH_TOKEN",
+                        "OPENAI_BASE_URL",
+                        "CODEX_BASE_URL",
+                        *AGENT_API_CODEX_AUTH_ENV_KEYS,
+                    }
                     exports = [
-                        "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY "
-                        "CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY "
-                        "CLOUDROUTER_API_KEY OPENAI_BASE_URL CODEX_BASE_URL"
+                        "unset " + " ".join(sorted(auth_and_route_keys))
                     ]
                     credential_name = (
                         "CLAUDE_CONFIG_DIR"
@@ -603,7 +657,7 @@ class WorkerRuntime:
                     else:
                         exports.append(
                             "export OPENAI_BASE_URL="
-                            f"{shlex.quote(CLOUDROUTER_CODEX_BASE_URL)}"
+                            f"{shlex.quote(codex_base_url_for_provider(projection.provider))}"
                         )
                     command[2] = "; ".join([*exports, command[2]])
         except Exception as exc:  # noqa: BLE001
@@ -961,6 +1015,7 @@ class WorkerRuntime:
             ))
 
             projection = self._agent_api_tasks.get(task_id)
+            provider_error = None
             if projection is not None:
                 if self._agent_api_terminal_success(line):
                     previous = self._agent_api_task_errors.get(task_id)
@@ -973,32 +1028,15 @@ class WorkerRuntime:
                         "agent_api_transient_error",
                     }:
                         self._agent_api_task_errors.pop(task_id, None)
-                if (
-                    projection.provider == "cloudrouter"
-                    and is_cloudrouter_auth_failure(line)
-                ):
-                    semantic_error = (
-                        "agent_api_auth_failure",
-                        "CloudRouter rejected the delegated API key",
-                    )
-                elif (
-                    projection.provider == "cloudrouter"
-                    and is_cloudrouter_hard_limit(line)
-                ):
-                    semantic_error = (
-                        "agent_api_rate_limited",
-                        "CloudRouter key quota or rate limit was reached",
-                    )
-                elif (
-                    projection.provider == "cloudrouter"
-                    and is_cloudrouter_transient(line)
-                ):
-                    semantic_error = (
-                        "agent_api_transient_error",
-                        "CloudRouter temporarily rate limited the request",
-                    )
-                else:
-                    semantic_error = self._agent_api_fatal_error(line)
+                provider_error = _classify_agent_api_provider_error(
+                    projection.provider,
+                    line,
+                )
+                semantic_error = provider_error or self._agent_api_fatal_error(
+                    line,
+                    provider=projection.provider,
+                    agent_type=projection.agent_type,
+                )
                 if semantic_error is not None:
                     previous = self._agent_api_task_errors.get(task_id)
                     if (
@@ -1018,18 +1056,22 @@ class WorkerRuntime:
                 and task_id not in self._exhaustion_fired
             ):
                 if (
-                    projection is not None
-                    and projection.provider == "cloudrouter"
-                    and is_cloudrouter_auth_failure(line)
+                    provider_error is not None
+                    and provider_error[0] == "agent_api_auth_failure"
                 ):
                     exhaustion_reason = "agent_api_auth_failure"
                 elif (
-                    projection is not None
-                    and projection.provider == "cloudrouter"
-                    and is_cloudrouter_hard_limit(line)
+                    provider_error is not None
+                    and provider_error[0] == "agent_api_rate_limited"
                 ):
                     exhaustion_reason = "agent_api_rate_limited"
-                elif is_rate_limited(line) or is_auth_failure(line):
+                elif (
+                    provider_error is None
+                    and (
+                        is_rate_limited(line)
+                        or is_auth_failure(line)
+                    )
+                ):
                     exhaustion_reason = "rate_limit"
             if exhaustion_reason is not None:
                 await self._signal_exhaustion(
@@ -1098,7 +1140,12 @@ class WorkerRuntime:
         return None
 
     @staticmethod
-    def _agent_api_fatal_error(line: str) -> tuple[str, str] | None:
+    def _agent_api_fatal_error(
+        line: str,
+        *,
+        provider: str = "cloudrouter",
+        agent_type: str | None = None,
+    ) -> tuple[str, str] | None:
         """Recognize terminal provider failures without matching tool errors."""
 
         try:
@@ -1108,6 +1155,10 @@ class WorkerRuntime:
         if not isinstance(event, dict):
             return None
         event_type = str(event.get("type") or "")
+        provider_label = _AGENT_API_PROVIDER_LABELS.get(
+            provider,
+            "Agent API provider",
+        )
         if event.get("isApiErrorMessage") and event_type in {
             "assistant",
             "message",
@@ -1115,12 +1166,12 @@ class WorkerRuntime:
         }:
             return (
                 "agent_api_error",
-                "CloudRouter Claude API request failed",
+                f"{provider_label} Claude API request failed",
             )
         if event_type == "turn.failed":
             return (
                 "agent_api_error",
-                "CloudRouter Codex turn failed",
+                f"{provider_label} Codex turn failed",
             )
         if event_type == "result" and (
             event.get("is_error")
@@ -1131,12 +1182,12 @@ class WorkerRuntime:
         ):
             return (
                 "agent_api_error",
-                "CloudRouter Claude turn failed",
+                f"{provider_label} {(agent_type or 'Claude').title()} turn failed",
             )
         if event_type == "session_crashed":
             return (
                 "agent_api_error",
-                "CloudRouter agent turn failed",
+                f"{provider_label} agent turn failed",
             )
         return None
 

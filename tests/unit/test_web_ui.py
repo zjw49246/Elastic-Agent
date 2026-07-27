@@ -81,20 +81,26 @@ class TestDashboardEndpoint:
         assert "accounts/bindings" in html
 
     @pytest.mark.asyncio
-    async def test_batch_console_exposes_cloudrouter_agent_api_accounts(
+    async def test_batch_console_exposes_selectable_agent_api_providers(
         self, ui_client
     ):
         client, _ = ui_client
         html = (await client.get("/batch")).text
 
-        assert "CloudRouter Agent API" in html
+        assert "Agent API accounts" in html
         assert 'id="apiAcctProvider"' in html
         assert 'value="cloudrouter"' in html
+        assert 'value="apex"' in html
+        assert 'id="apiAcctProvider" onchange="updateAgentApiProviderUI()"' in html
         assert 'id="apiAcctName"' in html
         assert 'id="apiAcctGroup"' in html
         assert 'id="apiAcctKey" type="password"' in html
-        assert "async function addCloudRouterAccount()" in html
-        assert "provider: 'cloudrouter'" in html
+        assert "function agentApiProviderMeta(provider)" in html
+        assert "function updateAgentApiProviderUI()" in html
+        assert "async function addAgentApiAccount()" in html
+        assert "provider: provider" in html
+        assert "ApexRouter" in html
+        assert "仅支持 Codex" in html
         assert "api('POST', '/agent-api/accounts'" in html
         assert "document.getElementById('apiAcctKey').value = ''" in html
         assert "sessionStorage.setItem('apiAcctKey'" not in html
@@ -112,6 +118,8 @@ class TestDashboardEndpoint:
         assert "a.supported_models" in html
         assert "a.api_usage" in html
         assert "CloudRouter · API" in html
+        assert "ApexRouter · API" in html
+        assert "agentApiProviderLabel(a.api_provider)" in html
         assert "function accountSupportedAgentTypes(a)" in html
         assert "option.dataset.agentTypes = supported.join(',')" in html
         assert "option.dataset.agentTypes.split(',').includes(agentType)" in html

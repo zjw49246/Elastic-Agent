@@ -985,7 +985,11 @@ class AgentApiCoordinator:
 
         provider = str(getattr(account, "api_provider", "") or "")
         supports = getattr(account, "supports_agent_type", None)
-        if provider != "cloudrouter" or not callable(supports):
+        try:
+            registered_providers = tuple(self._store.registry.providers)
+        except (AttributeError, TypeError):
+            registered_providers = ()
+        if provider not in registered_providers or not callable(supports):
             return LoginOutcome(
                 success=False,
                 account_id=account.id,

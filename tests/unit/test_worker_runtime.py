@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import sys
 from pathlib import Path
@@ -475,6 +476,126 @@ class TestProcessExecution:
         assert exits[0]["error_message"] == "CloudRouter Codex turn failed"
         assert runtime._agent_api_tasks == {}
         assert runtime._agent_api_task_errors == {}
+
+    @pytest.mark.asyncio
+    async def test_apex_codex_shell_uses_fixed_route_and_retries_429_on_same_key(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import (
+            AGENT_API_CODEX_AUTH_ENV_KEYS,
+            APEX_CODEX_BASE_URL,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="apex",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="apex-private",
+            account_id="apex-3",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        auth_keys = sorted(AGENT_API_CODEX_AUTH_ENV_KEYS)
+        script = (
+            "import json,os;"
+            f"print(json.dumps({{'auth':{{key:os.getenv(key) for key in "
+            f"{auth_keys!r}}},'openai_base':os.getenv('OPENAI_BASE_URL'),"
+            "'codex_base':os.getenv('CODEX_BASE_URL')}));"
+            "print(json.dumps({'type':'error','error':"
+            "{'type':'rate_limit_error','message':"
+            "'unexpected status 429: usage limit reached'}}));"
+            "print(json.dumps({'type':'turn.completed','usage':{}}))"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="apex-codex-transient",
+            command=["bash", "-c", f"{sys.executable} -c {shlex.quote(script)}"],
+            cwd=str(tmp_path),
+            env={
+                "CODEX_HOME": home,
+                **{key: f"secret-{index}" for index, key in enumerate(auth_keys)},
+                "OPENAI_BASE_URL": "https://attacker.invalid",
+                "CODEX_BASE_URL": "https://attacker.invalid",
+            },
+            job_id="job-apex-transient",
+            watch_exhaustion=True,
+        ))
+        await runtime._process_tasks["apex-codex-transient"]
+
+        payload = next(
+            json.loads(message["data"])
+            for message in sent
+            if message["type"] == "LOG" and '"auth"' in message["data"]
+        )
+        assert set(payload["auth"].values()) == {None}
+        assert payload["openai_base"] == APEX_CODEX_BASE_URL
+        assert payload["codex_base"] is None
+        assert not [
+            message for message in sent
+            if message["type"] == "RUN_EXHAUSTED"
+        ]
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 0
+        assert exit_event["error_type"] is None
+
+    @pytest.mark.asyncio
+    async def test_apex_403_is_auth_failure_not_shared_rate_limit(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="apex",
+            agent_type="codex",
+            config_dir=tmp_path / "slot",
+            api_key="apex-private",
+            account_id="apex-4",
+            models={"codex": ["gpt-5.4"]},
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        frame = {
+            "type": "turn.failed",
+            "error": {
+                "status": 403,
+                "message": "Forbidden",
+            },
+        }
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="apex-codex-auth",
+            command=[
+                sys.executable,
+                "-c",
+                f"import json;print(json.dumps({frame!r}))",
+            ],
+            cwd=str(tmp_path),
+            env={"CODEX_HOME": home},
+        ))
+        await runtime._process_tasks["apex-codex-auth"]
+
+        exit_event = next(
+            message for message in sent
+            if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 1
+        assert exit_event["error_type"] == "agent_api_auth_failure"
+        assert exit_event["error_message"] == (
+            "ApexRouter rejected the delegated API key"
+        )
 
     @pytest.mark.asyncio
     async def test_managed_output_documenting_provider_errors_stays_successful(

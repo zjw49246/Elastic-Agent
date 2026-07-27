@@ -66,13 +66,14 @@ async def _add(
     return store, account
 
 
-def test_default_registry_exposes_only_cloudrouter():
+def test_default_registry_exposes_cloudrouter_then_apex():
     registry = AgentApiProviderRegistry.default()
 
-    assert registry.providers == ("cloudrouter",)
+    assert registry.providers == ("cloudrouter", "apex")
     assert registry.require("cloudrouter").provider == "cloudrouter"
+    assert registry.require("apex").provider == "apex"
     with pytest.raises(AgentApiUnsupportedProviderError):
-        registry.require("apex")
+        registry.require("apexrouter")
 
 
 @pytest.mark.asyncio

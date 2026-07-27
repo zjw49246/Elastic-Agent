@@ -137,6 +137,98 @@ _CLOUDROUTER_HARD_LIMIT_ERROR_TYPES = frozenset(
     }
 )
 
+# ApexRouter's 429 is a group-shared concurrency/request condition, so changing
+# keys cannot repair it.  Only an explicit per-key quota/credit message is a
+# hard limit.  Its 401 and 403 responses both mean the delegated key was
+# rejected and must take auth precedence over quota/transient handling.
+_APEXROUTER_AUTH_ERROR_TYPES = frozenset(
+    {
+        "authentication_error",
+        "authentication_failed",
+        "authentication_failure",
+        "forbidden",
+        "invalid_api_key",
+        "permission_error",
+        "unauthorized",
+    }
+)
+_APEXROUTER_TRANSIENT_ERROR_TYPES = frozenset(
+    {
+        "internal_server_error",
+        "overloaded_error",
+        "rate_limit_error",
+        "rate_limited",
+        "server_error",
+        "too_many_requests",
+        "upstream_error",
+    }
+)
+_APEXROUTER_HARD_LIMIT_ERROR_TYPES = frozenset(
+    {
+        "billing_hard_limit_reached",
+        "credits_exhausted",
+        "insufficient_credits",
+        "insufficient_quota",
+        "out_of_credits",
+        "quota_exhausted",
+        "quota_exceeded",
+        "spend_limit_reached",
+    }
+)
+_APEXROUTER_AUTH_MESSAGE_RE = re.compile(
+    r"\b(?:401|403)\b"
+    r"|unauthori[sz]ed"
+    r"|forbidden"
+    r"|invalid[ _-]?api[ _-]?key",
+    re.IGNORECASE,
+)
+_APEXROUTER_TRANSIENT_MESSAGE_RE = re.compile(
+    r"\b(?:429|500|502)\b"
+    r"|too many requests"
+    r"|rate[ _-]?limit(?:ed|_error)?"
+    r"|internal[ _-]?server[ _-]?error"
+    r"|overloaded[ _-]?error"
+    r"|upstream[ _-]?error",
+    re.IGNORECASE,
+)
+_APEXROUTER_HARD_LIMIT_MESSAGE_RE = re.compile(
+    r"\binsufficient[ _-]?(?:quota|credits?)\b"
+    r"|\bquota[ _-]?(?:exhausted|exceeded)\b"
+    r"|\bout of credits?\b"
+    r"|\bcredits?[ _-]?exhausted\b"
+    r"|\b(?:billing[ _-]?hard|monthly[ _-]?spend|spend)[ _-]?limit"
+    r"(?:[ _-]?(?:reached|exceeded))?\b",
+    re.IGNORECASE,
+)
+_APEXROUTER_FALLBACK_PREFIX = (
+    r"^\s*[^\n]{0,80}"
+    r"(?:ApexRouter(?:\s+(?:API|gateway))?"
+    r"|Apex\s+(?:API|gateway)"
+    r"|35-75-22-186\.sslip\.io)"
+    r"[^\n]{0,240}"
+)
+_APEXROUTER_AUTH_FALLBACK_RE = re.compile(
+    _APEXROUTER_FALLBACK_PREFIX
+    + r"(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|"
+    r"invalid[ _-]?api[ _-]?key)",
+    re.IGNORECASE,
+)
+_APEXROUTER_TRANSIENT_FALLBACK_RE = re.compile(
+    _APEXROUTER_FALLBACK_PREFIX
+    + r"(?:\b429\b|\b500\b|\b502\b|too many requests|"
+    r"rate[ _-]?limit|internal[ _-]?server[ _-]?error|"
+    r"overloaded[ _-]?error|upstream[ _-]?error)",
+    re.IGNORECASE,
+)
+_APEXROUTER_HARD_LIMIT_FALLBACK_RE = re.compile(
+    _APEXROUTER_FALLBACK_PREFIX
+    + r"(?:insufficient[ _-]?(?:quota|credits?)|"
+    r"quota[ _-]?(?:exhausted|exceeded)|out of credits?|"
+    r"credits?[ _-]?exhausted|"
+    r"(?:billing[ _-]?hard|monthly[ _-]?spend|spend)[ _-]?limit)",
+    re.IGNORECASE,
+)
+
 
 def _normalise_error_type(value: object) -> str:
     if isinstance(value, bool) or value is None:
@@ -298,6 +390,62 @@ def is_cloudrouter_hard_limit(text: str | None) -> bool:
             or bool(_CLOUDROUTER_HARD_LIMIT_RE.search(message))
         )
     return bool(_CLOUDROUTER_HARD_LIMIT_FALLBACK_RE.search(text))
+
+
+def is_apexrouter_auth_failure(text: str | None) -> bool:
+    """ApexRouter key rejection (both HTTP 401 and 403)."""
+
+    if not text:
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _APEXROUTER_AUTH_ERROR_TYPES)
+            or bool(error_types & {"401", "403"})
+            or bool(_APEXROUTER_AUTH_MESSAGE_RE.search(message))
+        )
+    return bool(_APEXROUTER_AUTH_FALLBACK_RE.search(text))
+
+
+def is_apexrouter_hard_limit(text: str | None) -> bool:
+    """Explicit per-key ApexRouter quota/credit exhaustion.
+
+    A bare 429 is deliberately excluded because ApexRouter reports shared
+    group request/concurrency pressure with that status; rotating keys would
+    only amplify load against the same group.
+    """
+
+    if not text or is_apexrouter_auth_failure(text):
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _APEXROUTER_HARD_LIMIT_ERROR_TYPES)
+            or bool(_APEXROUTER_HARD_LIMIT_MESSAGE_RE.search(message))
+        )
+    return bool(_APEXROUTER_HARD_LIMIT_FALLBACK_RE.search(text))
+
+
+def is_apexrouter_transient(text: str | None) -> bool:
+    """Shared ApexRouter 429 or retryable 500/502; keep the same key."""
+
+    if (
+        not text
+        or is_apexrouter_auth_failure(text)
+        or is_apexrouter_hard_limit(text)
+    ):
+        return False
+    structured = _cloudrouter_structured_error(text)
+    if structured is not None:
+        error_types, message = structured
+        return (
+            bool(error_types & _APEXROUTER_TRANSIENT_ERROR_TYPES)
+            or bool(error_types & {"429", "500", "502"})
+            or bool(_APEXROUTER_TRANSIENT_MESSAGE_RE.search(message))
+        )
+    return bool(_APEXROUTER_TRANSIENT_FALLBACK_RE.search(text))
 
 
 def is_rate_limited(text: str | None) -> bool:

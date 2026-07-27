@@ -1299,6 +1299,33 @@ class TestMultiAccountPerWorker:
         with pytest.raises(RuntimeError, match="cannot derive rotation slot"):
             BatchOrchestrator._extra_dir(job, run)
 
+    async def test_apex_agent_api_rotation_derives_provider_from_account_id(
+        self,
+    ):
+        from types import SimpleNamespace
+
+        job = SimpleNamespace(
+            spec=SimpleNamespace(
+                account=SimpleNamespace(
+                    agent_type="codex",
+                    config_dir="",
+                ),
+            ),
+        )
+        run = SimpleNamespace(
+            config_dirs=[
+                "/safe/codex-slot/.elastic-agent-api/apex/apex-3/codex"
+            ],
+            account_ids=["apex-3"],
+            account_auth_kinds=["agent_api"],
+            rotations=2,
+        )
+
+        assert (
+            BatchOrchestrator._extra_dir(job, run)
+            == "/safe/codex-slot-rot-2"
+        )
+
 
 class TestCompletion:
     async def test_status_reconciliation_finalizes_missing_running_task(self):

@@ -677,14 +677,12 @@ _BATCH_HTML = """\
     <button class="btn" onclick="addAccount()">Add Account</button>
 
     <div style="border-top:1px solid var(--border);margin-top:18px;padding-top:16px">
-      <h3 style="font-size:.95rem;margin-bottom:6px">CloudRouter Agent API</h3>
-      <p class="hint">
-        一把 CloudRouter API Key 会按可用模型自动加入 Claude、Codex 或两者的账号池；
-        不需要浏览器登录，也不会触发验证码。Key 只写入 Manager 的私有账号文件，提交后不回显。
-      </p>
+      <h3 style="font-size:.95rem;margin-bottom:6px">Agent API accounts</h3>
+      <p class="hint" id="apiAcctHint"></p>
       <div class="grid3" style="margin-top:8px">
-        <div><label>Provider</label><select id="apiAcctProvider" disabled>
+        <div><label>Provider</label><select id="apiAcctProvider" onchange="updateAgentApiProviderUI()">
           <option value="cloudrouter">CloudRouter</option>
+          <option value="apex">ApexRouter</option>
         </select></div>
         <div><label>Name</label><input id="apiAcctName" placeholder="research-router"></div>
         <div><label>Group</label><input id="apiAcctGroup" value="standard"></div>
@@ -692,7 +690,7 @@ _BATCH_HTML = """\
       <label>API Key（写入后不回显）</label>
       <input id="apiAcctKey" type="password" autocomplete="new-password"
              placeholder="CloudRouter API Key">
-      <button class="btn" onclick="addCloudRouterAccount()">Add CloudRouter API</button>
+      <button class="btn" id="apiAcctAdd" onclick="addAgentApiAccount()">Add CloudRouter API</button>
     </div>
   </div>
 
@@ -795,7 +793,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       </select></div>
       <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
     </div>
-    <div><label>Agent model（可选；CloudRouter 账号按 /v1/models 精确校验）</label>
+    <div><label>Agent model（可选；Agent API 账号按 provider 模型列表精确校验）</label>
       <input id="jAgentModel" placeholder="如 gpt-5.4 或 claude-opus-4-8"></div>
     <div class="grid3">
       <div><label>config_dir（空 = Agent 默认目录）</label>
@@ -963,6 +961,36 @@ function esc(value) {
 function jsArg(value) { return esc(JSON.stringify(String(value ?? ''))); }
 
 // ---- Accounts ----
+function agentApiProviderMeta(provider) {
+  if (String(provider || '').toLowerCase() === 'apex') {
+    return {
+      id: 'apex',
+      label: 'ApexRouter',
+      accountLabel: 'ApexRouter · API',
+      pickerLabel: 'ApexRouter API',
+      hint: 'ApexRouter API Key 仅支持 Codex；模型来自固定 /models 接口。'
+        + ' 不需要浏览器登录，也不会触发验证码。Key 只写入 Manager 私有账号文件，提交后不回显。',
+    };
+  }
+  return {
+    id: 'cloudrouter',
+    label: 'CloudRouter',
+    accountLabel: 'CloudRouter · API',
+    pickerLabel: 'CloudRouter API',
+    hint: 'CloudRouter API Key 会按可用模型自动加入 Claude、Codex 或两者的账号池；'
+      + ' 不需要浏览器登录，也不会触发验证码。Key 只写入 Manager 私有账号文件，提交后不回显。',
+  };
+}
+function agentApiProviderLabel(provider) {
+  return agentApiProviderMeta(provider).accountLabel;
+}
+function updateAgentApiProviderUI() {
+  const provider = document.getElementById('apiAcctProvider').value;
+  const meta = agentApiProviderMeta(provider);
+  document.getElementById('apiAcctHint').textContent = meta.hint;
+  document.getElementById('apiAcctKey').placeholder = `${meta.label} API Key`;
+  document.getElementById('apiAcctAdd').textContent = `Add ${meta.label} API`;
+}
 function accountSupportedAgentTypes(a) {
   const declared = Array.isArray(a.supported_agent_types)
     ? a.supported_agent_types
@@ -1051,9 +1079,7 @@ async function refreshAccounts() {
         : (`${a.has_password ? 'password' : ''}`
           + `${a.has_password && a.has_email_token ? ' + ' : ''}`
           + `${a.has_email_token ? 'mail token' : ''}` || '—');
-      const providerLabel = a.api_provider === 'cloudrouter'
-        ? 'CloudRouter · API'
-        : `${a.api_provider || 'Agent'} · API`;
+      const providerLabel = agentApiProviderLabel(a.api_provider);
       const accountType = isAgentApi
         ? `<b>${esc(providerLabel)}</b><br>${esc(supported.join(' / ') || '—')}`
           + `<br><span class="muted">${esc(formatAgentApiModels(a))}</span>`
@@ -1090,7 +1116,7 @@ async function refreshAccounts() {
         ? ` · EIP ${durable.eip_ip || durable.eip_allocation_id || durable.state}`
         : '';
       const typeLabel = isAgentApi
-        ? `CloudRouter API · ${supported.join('/')}`
+        ? `${agentApiProviderMeta(a.api_provider).pickerLabel} · ${supported.join('/')}`
         : supported.join('/');
       option.textContent = `${typeLabel} · ${a.name || a.email || a.id}`
         + ` · ${a.group || 'standard'} (${a.id})${eipLabel}`;
@@ -1124,25 +1150,27 @@ async function addAccount() {
     toast('Account added'); refreshAccounts();
   } catch(e) { toast(e.message, 'error'); }
 }
-async function addCloudRouterAccount() {
+async function addAgentApiAccount() {
+  const provider = document.getElementById('apiAcctProvider').value;
+  const meta = agentApiProviderMeta(provider);
   const name = document.getElementById('apiAcctName').value.trim();
   const group = document.getElementById('apiAcctGroup').value.trim() || 'standard';
   const apiKey = document.getElementById('apiAcctKey').value.trim();
   if (!name || !apiKey) return toast('name + API key required', 'error');
   try {
     await api('POST', '/agent-api/accounts', {
-      provider: 'cloudrouter', name: name, group: group, api_key: apiKey
+      provider: provider, name: name, group: group, api_key: apiKey
     });
     document.getElementById('apiAcctKey').value = '';
     document.getElementById('apiAcctName').value = '';
-    toast('CloudRouter API account added');
+    toast(`${meta.label} API account added`);
     await refreshAccounts();
   } catch(e) { toast(e.message, 'error'); }
 }
 async function refreshAgentApiAccount(id) {
   try {
     await api('POST', '/agent-api/accounts/' + encodeURIComponent(id) + '/refresh');
-    toast('CloudRouter models and quota refreshed');
+    toast('Agent API models and quota refreshed');
     await refreshAccounts();
   } catch(e) { toast(e.message, 'error'); }
 }
@@ -2517,7 +2545,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 updateThemeLabel();
-updateEipBindingUI(); updateAgentUI();
+updateEipBindingUI(); updateAgentUI(); updateAgentApiProviderUI();
 providerDefaultsReady = initializeProviderDefaults();
 refreshAccounts(); refreshResults(); runDashboardPoll();
 </script>

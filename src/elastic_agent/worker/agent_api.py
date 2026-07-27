@@ -3,11 +3,8 @@
 An Agent API key is never placed in a CLI configuration file, environment
 variable, command line, or projection marker.  Instead, each projection owns a
 private key file and an executable credential helper.  The generated Claude
-and Codex homes only contain a fixed CloudRouter endpoint plus the helper path.
-
-Only CloudRouter is supported today.  The provider argument and marker schema
-are deliberately explicit so another provider (for example Apex) can be added
-without weakening CloudRouter's fixed-routing checks.
+and Codex homes contain only the selected provider's fixed endpoint plus the
+helper path. CloudRouter supports Claude and Codex; ApexRouter is Codex-only.
 """
 
 from __future__ import annotations
@@ -26,6 +23,7 @@ from typing import Any
 
 CLOUDROUTER_CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CLOUDROUTER_CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
+APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
 CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = frozenset(
     {
         "ANTHROPIC_AUTH_TOKEN",
@@ -67,22 +65,57 @@ CLOUDROUTER_CLAUDE_PROVIDER_ENV_KEYS = frozenset(
         "AWS_BEARER_TOKEN_BEDROCK",
     }
 )
-CLOUDROUTER_CODEX_AUTH_ENV_KEYS = frozenset(
+AGENT_API_CODEX_AUTH_ENV_KEYS = frozenset(
     {
         "OPENAI_API_KEY",
         "CODEX_API_KEY",
         "CLOUDROUTER_API_KEY",
+        "APEX_CODEX_GATEWAY_KEY",
+        "APEX_CODEX_API_KEY",
+        "APEXROUTER_API_KEY",
+        "APEXROUTER_CODEX_API_KEY",
     }
 )
+# Compatibility name retained for callers that imported the CloudRouter-only
+# set before multiple Codex Agent API providers were supported.
+CLOUDROUTER_CODEX_AUTH_ENV_KEYS = AGENT_API_CODEX_AUTH_ENV_KEYS
 CLOUDROUTER_CLAUDE_BINARY_ENV = "ELASTIC_AGENT_CLOUDROUTER_CLAUDE_BINARY"
 # Non-secret hand-off understood by container owners such as AI4Sci.  The
 # consumer still has to validate projection.json before bind-mounting this
 # directory; arbitrary Docker invocation is intentionally not intercepted.
 ELASTIC_AGENT_API_PROJECTION_ROOT_ENV = "ELASTIC_AGENT_API_PROJECTION_ROOT"
 
-_SUPPORTED_PROVIDERS = frozenset({"cloudrouter"})
+@dataclass(frozen=True)
+class _ProviderSpec:
+    agent_types: frozenset[str]
+    claude_base_url: str | None
+    codex_base_url: str
+    codex_provider_id: str
+    codex_provider_name: str
+
+
+_PROVIDER_SPECS = {
+    "cloudrouter": _ProviderSpec(
+        agent_types=frozenset({"claude", "codex"}),
+        claude_base_url=CLOUDROUTER_CLAUDE_BASE_URL,
+        codex_base_url=CLOUDROUTER_CODEX_BASE_URL,
+        codex_provider_id="cloudrouter",
+        codex_provider_name="CloudRouter",
+    ),
+    "apex": _ProviderSpec(
+        agent_types=frozenset({"codex"}),
+        claude_base_url=None,
+        codex_base_url=APEX_CODEX_BASE_URL,
+        codex_provider_id="apexrouter",
+        codex_provider_name="ApexRouter",
+    ),
+}
+_SUPPORTED_PROVIDERS = frozenset(_PROVIDER_SPECS)
 _SUPPORTED_AGENT_TYPES = frozenset({"claude", "codex"})
-_ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ACCOUNT_ID_RE = re.compile(
+    r"^(?P<provider>cloudrouter|apex)-"
+    r"(?P<suffix>[A-Za-z0-9][A-Za-z0-9._-]*)$"
+)
 _MAX_KEY_BYTES = 16 * 1024
 _MAX_MANAGED_FILE_BYTES = 256 * 1024
 _PROJECTION_VERSION = 2
@@ -185,15 +218,37 @@ class AgentAPIProjection:
     wrapper: Path | None
 
 
-def _fixed_endpoints(provider: str) -> dict[str, str]:
-    if provider != "cloudrouter":
+def _provider_spec(provider: str) -> _ProviderSpec:
+    spec = _PROVIDER_SPECS.get(provider)
+    if spec is None:
         raise AgentAPIConfigurationError(
             f"Unsupported Agent API provider: {provider!r}",
         )
+    return spec
+
+
+def _fixed_endpoints(provider: str) -> dict[str, str | None]:
+    spec = _provider_spec(provider)
     return {
-        "claude_base_url": CLOUDROUTER_CLAUDE_BASE_URL,
-        "codex_base_url": CLOUDROUTER_CODEX_BASE_URL,
+        "claude_base_url": spec.claude_base_url,
+        "codex_base_url": spec.codex_base_url,
     }
+
+
+def codex_base_url_for_provider(provider: str) -> str:
+    """Return the immutable Codex route for an enabled Agent API provider."""
+
+    return _provider_spec(provider).codex_base_url
+
+
+def _account_id_matches_provider(provider: Any, account_id: Any) -> bool:
+    if not isinstance(account_id, str) or len(account_id) > 128:
+        return False
+    match = _ACCOUNT_ID_RE.fullmatch(account_id)
+    return bool(
+        match is not None
+        and match.group("provider") == provider
+    )
 
 
 def _validate_request(
@@ -202,15 +257,17 @@ def _validate_request(
     account_id: str,
     api_key: str,
 ) -> bytes:
-    if provider not in _SUPPORTED_PROVIDERS:
-        raise AgentAPIConfigurationError(
-            f"Unsupported Agent API provider: {provider!r}",
-        )
+    spec = _provider_spec(provider)
     if agent_type not in _SUPPORTED_AGENT_TYPES:
         raise AgentAPIConfigurationError(
             f"Unsupported agent type: {agent_type!r}",
         )
-    if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
+    if agent_type not in spec.agent_types:
+        raise AgentAPIConfigurationError(
+            f"Agent API provider {provider!r} does not support "
+            f"{agent_type!r}",
+        )
+    if not _account_id_matches_provider(provider, account_id):
         raise AgentAPIConfigurationError("Invalid Agent API account id")
     if not isinstance(api_key, str):
         raise AgentAPIConfigurationError("Invalid API key")
@@ -456,16 +513,18 @@ def _helper_command(root: Path) -> str:
     return shlex.quote(str(root / "key-helper-launcher"))
 
 
-def _codex_config(root: Path) -> str:
+def _codex_config(root: Path, provider: str) -> str:
+    spec = _provider_spec(provider)
+    provider_id = spec.codex_provider_id
     helper = json.dumps(str(root / "key-helper-launcher"))
     return (
-        'model_provider = "cloudrouter"\n\n'
-        "[model_providers.cloudrouter]\n"
-        'name = "CloudRouter"\n'
-        f"base_url = {json.dumps(CLOUDROUTER_CODEX_BASE_URL)}\n"
+        f"model_provider = {json.dumps(provider_id)}\n\n"
+        f"[model_providers.{provider_id}]\n"
+        f"name = {json.dumps(spec.codex_provider_name)}\n"
+        f"base_url = {json.dumps(spec.codex_base_url)}\n"
         'wire_api = "responses"\n'
         "supports_websockets = false\n\n"
-        "[model_providers.cloudrouter.auth]\n"
+        f"[model_providers.{provider_id}.auth]\n"
         f"command = {helper}\n"
         "timeout_ms = 5000\n"
         "refresh_interval_ms = 0\n"
@@ -553,8 +612,13 @@ def _load_marker(
         or provider not in _SUPPORTED_PROVIDERS
         or not isinstance(agent_type, str)
         or agent_type not in _SUPPORTED_AGENT_TYPES
-        or not isinstance(account_id, str)
-        or not _ACCOUNT_ID_RE.fullmatch(account_id)
+        or (
+            isinstance(provider, str)
+            and provider in _PROVIDER_SPECS
+            and isinstance(agent_type, str)
+            and agent_type not in _PROVIDER_SPECS[provider].agent_types
+        )
+        or not _account_id_matches_provider(provider, account_id)
         or not isinstance(models, list)
         or data.get("endpoints") != _fixed_endpoints(provider)
     ):
@@ -682,7 +746,10 @@ def _validate_runtime(projection: AgentAPIProjection) -> None:
             raise UnsafeAgentAPIPathError("Modified Claude API routing")
         return
 
-    expected = _codex_config(projection.root).encode("utf-8")
+    expected = _codex_config(
+        projection.root,
+        projection.provider,
+    ).encode("utf-8")
     config = _read_owned_regular(
         projection.home / "config.toml",
         expected_mode=0o600,
@@ -825,7 +892,10 @@ def configure_agent_api(
             else:
                 _atomic_private_write(
                     home / "config.toml",
-                    _codex_config(projection_root).encode("utf-8"),
+                    _codex_config(
+                        projection_root,
+                        provider,
+                    ).encode("utf-8"),
                 )
 
         # Write the key just before the marker.  Initial projections are not
@@ -926,15 +996,22 @@ def scrub_agent_api_env(
 ) -> MutableMapping[str, str]:
     """Remove inherited official credentials that override helper auth."""
 
-    _fixed_endpoints(provider)
-    if agent_type == "claude":
-        keys = CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS | CLOUDROUTER_CLAUDE_PROVIDER_ENV_KEYS
-    elif agent_type == "codex":
-        keys = CLOUDROUTER_CODEX_AUTH_ENV_KEYS
-    else:
+    spec = _provider_spec(provider)
+    if agent_type not in _SUPPORTED_AGENT_TYPES:
         raise AgentAPIConfigurationError(
             f"Unsupported agent type: {agent_type!r}",
         )
+    if agent_type not in spec.agent_types:
+        raise AgentAPIConfigurationError(
+            f"Agent API provider {provider!r} does not support "
+            f"{agent_type!r}",
+        )
+    keys = (
+        CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS
+        | CLOUDROUTER_CLAUDE_PROVIDER_ENV_KEYS
+        if agent_type == "claude"
+        else AGENT_API_CODEX_AUTH_ENV_KEYS
+    )
     env.pop(ELASTIC_AGENT_API_PROJECTION_ROOT_ENV, None)
     for key in keys:
         env.pop(key, None)
@@ -1039,6 +1116,8 @@ __all__ = [
     "AgentAPIConfigurationError",
     "AgentAPIError",
     "AgentAPIProjection",
+    "AGENT_API_CODEX_AUTH_ENV_KEYS",
+    "APEX_CODEX_BASE_URL",
     "CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS",
     "CLOUDROUTER_CLAUDE_BASE_URL",
     "CLOUDROUTER_CLAUDE_BINARY_ENV",
@@ -1051,6 +1130,7 @@ __all__ = [
     "apply_agent_api_runtime_env",
     "claude_wrapper_for_home",
     "claude_shim_directory_for_home",
+    "codex_base_url_for_provider",
     "configure_agent_api",
     "is_managed_agent_api_home",
     "scrub_agent_api_env",

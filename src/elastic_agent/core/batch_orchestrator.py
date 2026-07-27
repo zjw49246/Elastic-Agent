@@ -1837,9 +1837,16 @@ class BatchOrchestrator:
                     if getattr(run, "account_ids", None)
                     else ""
                 )
+                from elastic_agent.core.agent_api import ACCOUNT_ID_RE
+
+                account_match = ACCOUNT_ID_RE.fullmatch(first_account_id)
+                if account_match is None:
+                    raise RuntimeError(
+                        "cannot derive Agent API provider from account id"
+                    )
                 base = BatchOrchestrator._agent_api_slot_from_home(
                     first_home,
-                    provider="cloudrouter",
+                    provider=account_match.group("provider"),
                     account_id=first_account_id,
                     agent_type=spec.account.agent_type,
                 )

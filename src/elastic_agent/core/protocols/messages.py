@@ -205,7 +205,7 @@ class AgentApiConfigureMessage(Message):
     type: Literal["AGENT_API_CONFIGURE"] = "AGENT_API_CONFIGURE"
     request_id: str
     account_id: str
-    provider: Literal["cloudrouter"] = "cloudrouter"
+    provider: Literal["cloudrouter", "apex"] = "cloudrouter"
     agent_type: Literal["claude", "codex"]
     config_dir: str
     api_key: str = Field(repr=False, min_length=1)
@@ -362,7 +362,7 @@ class AgentApiConfigureResultMessage(Message):
     type: Literal["AGENT_API_CONFIGURE_RESULT"] = "AGENT_API_CONFIGURE_RESULT"
     request_id: str
     account_id: str
-    provider: Literal["cloudrouter"] = "cloudrouter"
+    provider: Literal["cloudrouter", "apex"] = "cloudrouter"
     agent_type: Literal["claude", "codex"]
     success: bool
     error: str | None = None

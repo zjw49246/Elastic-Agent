@@ -998,8 +998,9 @@ class TestLoginCoordinator:
 
 
 class _FakeAgentApiStore:
-    def __init__(self, account):
+    def __init__(self, account, *, providers=("cloudrouter", "apex")):
         self.account = account
+        self.registry = SimpleNamespace(providers=tuple(providers))
         self.api_key = "cloudrouter-manager-secret"
         self.usage = {
             "state": "active",
@@ -1067,7 +1068,90 @@ def _api_acct():
     )
 
 
+def _apex_api_acct():
+    return SimpleNamespace(
+        id="apex-3",
+        email="Shared ApexRouter",
+        name="Shared ApexRouter",
+        group="standard",
+        enabled=True,
+        auth_kind="agent_api",
+        api_provider="apex",
+        models={"claude": [], "codex": ["gpt-5.4"]},
+        supported_agent_types=["codex"],
+        supports_agent_type=lambda agent_type: agent_type == "codex",
+        supports_model=lambda agent_type, model: (
+            agent_type == "codex"
+            and (not model or model == "gpt-5.4")
+        ),
+    )
+
+
 class TestAgentApiCoordinator:
+    async def test_registered_apex_codex_configures_provider_specific_home(
+        self,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _apex_api_acct()
+        store = _FakeAgentApiStore(account)
+        store.api_key = "apex-manager-secret"
+        coordinator = AgentApiCoordinator(conn, bus, store, timeout=5)
+
+        pending = asyncio.create_task(coordinator.configure(
+            "worker-apex",
+            account,
+            agent_type="codex",
+            config_dir="/home/ubuntu/.codex-apex",
+            model="gpt-5.4",
+        ))
+        await asyncio.sleep(0)
+        worker_id, message = conn.sent[0]
+        assert worker_id == "worker-apex"
+        assert message.provider == "apex"
+        assert message.account_id == "apex-3"
+        assert message.agent_type == "codex"
+        assert message.api_key == store.api_key
+
+        actual_home = (
+            "/home/ubuntu/.codex-apex/.elastic-agent-api/"
+            "apex/apex-3/codex"
+        )
+        await bus.emit("AGENT_API_CONFIGURE_RESULT", "worker-apex", {
+            "request_id": message.request_id,
+            "account_id": account.id,
+            "provider": "apex",
+            "agent_type": "codex",
+            "success": True,
+            "error": None,
+            "config_dir": actual_home,
+        })
+
+        outcome = await pending
+        assert outcome.success is True
+        assert outcome.auth_kind == "agent_api"
+        assert outcome.config_dir == actual_home
+
+    async def test_provider_must_be_registered_before_key_is_read(self):
+        bus = EventBus()
+        conn = FakeConn()
+        account = _apex_api_acct()
+        store = _FakeAgentApiStore(account, providers=("cloudrouter",))
+        coordinator = AgentApiCoordinator(conn, bus, store, timeout=5)
+
+        outcome = await coordinator.configure(
+            "worker-apex",
+            account,
+            agent_type="codex",
+            config_dir="/home/ubuntu/.codex-apex",
+        )
+
+        assert outcome.success is False
+        assert outcome.error == "unsupported Agent API account"
+        assert store.fetch_calls == 0
+        assert store.read_calls == 0
+        assert conn.sent == []
+
     @pytest.mark.parametrize("probe_kind", ["never", "drip"])
     async def test_configure_absolute_deadline_covers_usage_probe(
         self,
