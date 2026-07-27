@@ -448,3 +448,12 @@
 **验证**：先以红测试锁定持久化失败 Job 的归档访问和新的结果状态契约；最终完整套件 **2097 passed / 12 skipped / 0 failed**，Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。Chrome 149 真实复现新结果先返回、旧空结果后返回，修复后文件数保持非空且按钮不消失；下载中 Job 卡被轮询替换仍保持单请求状态；失败归档请求 5000 行、显示退出摘要/stderr，并在终态停止轮询。独立日志、结果和 UI 测试审查无 blocker。
 
 **生产发布（runtime `4348521`）**：发布前后均确认活跃 Job、Node、账号占用、OTP challenge、非终态 managed EC2 和已挂载 EIP 全为 0。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-4348521`，旧 `f6d510b` 由 rollback symlink 保留；域名 health、运行时路径和新 Invocation 均正常，ERROR pattern 为 0。Chrome 149 通过线上失败 Job `job-c4827c3f4bcc992fb6dbea99a925ad29` 验证“查看失败日志”显示退出码 1、101 行归档及 instance-generation 根因，3.5 秒后仍只有一次日志请求；结果操作稳定显示 607 个文件且可下载。此次复用已有失败历史做无副作用验收，没有创建收费 EC2 canary。
+## 2026-07-27 大结果流式下载与运行中快照说明（commit `a737c39`）
+
+**问题**：生产 Job `job-c187753c3be7e4393981786b7fe06e3d` 的结果包含 5,184 个 S3 对象、约 754 MiB，其中多数是小文件。旧下载端点会在 Manager 串行 GET 全部对象并完整压缩到临时文件后才返回响应头，前端又等待整个 `Blob` 进入内存后才触发保存；两次请求在数分钟无任何可见进度后被客户端取消。页面只显示“正在打包”，也没有取消操作。与此同时，界面没有充分说明中间结果并非自动出现：`collect.interval_seconds=0` 是终态收集，只有显式设为正数才会在运行中周期上传。
+
+**解决**：保留原来可在响应头前返回 503 的严格预构建端点，另为 Batch UI 增加 S3 流式 tar 路由；使用有界 OS pipe、事件循环原生读端、gzip level 1 和独立四线程 producer 池，首批对象到达即可响应，客户端断开会关闭当前 S3 body 并停止 producer。UI 通过 `ReadableStream` 显示已接收字节与耗时、支持点击取消，并在安全桌面 Chromium 中用 File System Access API 直接写盘；无直接落盘能力时仅允许小于 256 MiB 的内存 fallback，S3 源大小和 Manager 本地 `Content-Length` 都纳入阈值。进度只原位更新两个下载按钮，不再重建 Job 卡或结果列表；磁盘、浏览器和网络异常都会显式 abort controller、cancel reader。运行中按钮明确标记为最近一次已上传的中间快照，文档说明正间隔、首轮等待和“下载不触发即时 Worker 同步”的边界。
+
+**以后避免**：面向多对象存储的下载不能把“完整预构建 + 整包浏览器 Blob”当作普通小文件路径；要同时核算对象 RTT、首字节时间、Manager 磁盘、浏览器内存、代理空闲超时和取消后的服务端资源。高频进度不能进入整卡渲染签名。任何内存 fallback 的上限必须覆盖所有后端响应元数据，而不只覆盖主存储路径。运行中结果的 UI 也必须区分“Worker 当前文件”与“最近一次已完成收集快照”。
+
+**验证**：新增归档有效性、后续对象阻塞时提前产出、active body close 异常下取消清理，以及 UI 流读取、直接落盘、大文件保护、原位进度和运行中快照测试。API/UI 聚焦测试 **101 passed**；完整套件 **2101 passed / 12 skipped / 0 failed**；变更模块 Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。后端与浏览器侧独立复核最终均无 blocker/high。
