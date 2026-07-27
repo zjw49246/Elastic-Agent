@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import hashlib
 import heapq
 import json
@@ -19,11 +20,14 @@ import re
 import stat
 import tarfile
 import tempfile
+import threading
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -55,6 +59,15 @@ RESULT_SCORE_MAX_ATTEMPTS = 500
 RESULT_SCORE_MAX_BYTES = 2_000_000
 JOB_LOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 JOB_LOG_LINE_MAX_BYTES = 64 * 1024
+RESULT_ARCHIVE_STREAM_WORKERS = 4
+
+# Archive producers perform long-lived blocking S3 reads. Keep them off
+# asyncio's shared default executor so concurrent downloads cannot starve
+# unrelated lifecycle, log, and collection work that also uses ``to_thread``.
+_RESULT_ARCHIVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=RESULT_ARCHIVE_STREAM_WORKERS,
+    thread_name_prefix="result-archive",
+)
 
 # ``ETag`` is retained from ListObjectsV2 so GET can use ``IfMatch``.  The
 # fourth item may be ``None`` only for an S3-compatible backend that omitted an
@@ -1499,6 +1512,196 @@ def _build_s3_archive(
     return destination
 
 
+class _ArchiveStreamCancelledError(Exception):
+    """Internal signal used to stop a live archive after client disconnect."""
+
+
+class _S3ArchiveStreamControl:
+    """Coordinate cancellation with the blocking S3/tar producer thread."""
+
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._body = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise _ArchiveStreamCancelledError
+
+    def bind_body(self, body) -> None:
+        with self._lock:
+            if self._cancelled.is_set():
+                close_now = True
+            else:
+                self._body = body
+                close_now = False
+        if close_now:
+            _close_s3_body(body)
+            raise _ArchiveStreamCancelledError
+
+    def release_body(self, body) -> None:
+        with self._lock:
+            if self._body is body:
+                self._body = None
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            body = self._body
+            self._body = None
+        if body is not None:
+            try:
+                _close_s3_body(body)
+            except Exception:  # noqa: BLE001
+                # Cancellation cleanup must not mask the disconnect or skip
+                # closing the pipe transport. The producer also observes the
+                # cancellation event and owns its final body close.
+                logger.warning(
+                    "Failed to close an active S3 result body during "
+                    "archive cancellation",
+                    exc_info=True,
+                )
+
+
+def _write_s3_archive_stream(
+    job_id: str,
+    objs: list[S3ResultObject],
+    write_fd: int,
+    control: _S3ArchiveStreamControl,
+) -> None:
+    """Write a gzip tar stream to a bounded OS pipe.
+
+    The pipe applies backpressure when the browser is slow, while mode
+    ``w|gz`` lets the response send bytes before every S3 object has been read.
+    """
+
+    bucket = _s3_bucket()
+    try:
+        with os.fdopen(write_fd, "wb", buffering=0) as sink:
+            control.check()
+            s3 = _s3_client()
+            with tarfile.open(
+                fileobj=sink, mode="w|gz", compresslevel=1,
+            ) as archive:
+                for obj in objs:
+                    control.check()
+                    rel, size, key, _etag = obj
+                    try:
+                        body = _get_s3_result_body(s3, bucket, obj)
+                    except Exception as exc:  # noqa: BLE001
+                        if control.cancelled:
+                            raise _ArchiveStreamCancelledError from exc
+                        if isinstance(exc, S3ResultsUnavailable):
+                            raise
+                        raise S3ResultsUnavailable(
+                            f"cannot read s3://{bucket}/{key}: "
+                            f"{exc or type(exc).__name__}"
+                        ) from exc
+                    control.bind_body(body)
+                    try:
+                        info = tarfile.TarInfo(name=f"{job_id}/{rel}")
+                        info.size = size
+                        info.mode = 0o600
+                        archive.addfile(info, body)
+                        extra = body.read(1)
+                        if not isinstance(extra, (bytes, bytearray)):
+                            raise S3ResultsUnavailable(
+                                f"S3 result body for {key!r} returned non-bytes data"
+                            )
+                        if extra:
+                            raise S3ResultsUnavailable(
+                                f"S3 result object {key!r} became larger "
+                                "while being archived"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        if control.cancelled:
+                            raise _ArchiveStreamCancelledError from exc
+                        if isinstance(exc, S3ResultsUnavailable):
+                            raise
+                        raise S3ResultsUnavailable(
+                            f"cannot archive s3://{bucket}/{key}: "
+                            f"{exc or type(exc).__name__}"
+                        ) from exc
+                    finally:
+                        control.release_body(body)
+                        _close_s3_body(body)
+    except _ArchiveStreamCancelledError:
+        return
+    except (BrokenPipeError, ConnectionError, OSError) as exc:
+        if control.cancelled or (
+            isinstance(exc, OSError) and exc.errno == errno.EPIPE
+        ):
+            return
+        raise
+
+
+def _consume_archive_producer(task: asyncio.Future) -> None:
+    """Retrieve a detached producer exception so asyncio does not warn."""
+
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:  # task result is diagnostic-only during disconnect
+        return
+
+
+async def _stream_s3_archive(
+    job_id: str,
+    objs: list[S3ResultObject],
+) -> AsyncIterator[bytes]:
+    """Yield a gzip tar while a blocking producer reads S3 into an OS pipe."""
+
+    read_fd, write_fd = os.pipe()
+    control = _S3ArchiveStreamControl()
+    loop = asyncio.get_running_loop()
+    read_pipe = os.fdopen(read_fd, "rb", buffering=0)
+    reader = asyncio.StreamReader(limit=256 * 1024)
+    protocol = asyncio.StreamReaderProtocol(reader)
+    try:
+        transport, _ = await loop.connect_read_pipe(lambda: protocol, read_pipe)
+    except BaseException:
+        read_pipe.close()
+        os.close(write_fd)
+        raise
+    try:
+        producer = loop.run_in_executor(
+            _RESULT_ARCHIVE_EXECUTOR,
+            _write_s3_archive_stream,
+            job_id,
+            objs,
+            write_fd,
+            control,
+        )
+    except BaseException:
+        transport.close()
+        os.close(write_fd)
+        raise
+    producer_observed = False
+    try:
+        while True:
+            chunk = await reader.read(256 * 1024)
+            if not chunk:
+                break
+            yield chunk
+        await producer
+        producer_observed = True
+    finally:
+        try:
+            control.cancel()
+        finally:
+            transport.close()
+            if producer.done():
+                if not producer_observed:
+                    _consume_archive_producer(producer)
+            else:
+                producer.add_done_callback(_consume_archive_producer)
+
+
 def _build_local_archive(job_id: str, base: Path) -> Path:
     regular = _local_regular_files(
         base,
@@ -1585,6 +1788,52 @@ async def job_results_download(job_id: str) -> FileResponse:
         media_type="application/gzip",
         filename=f"{job_id}-results.tar.gz",
         background=BackgroundTask(_remove_temp_archive, archive),
+    )
+
+
+@router.get("/jobs/{job_id}/results/download/stream")
+async def job_results_download_stream(job_id: str) -> Response:
+    """Stream an S3 result archive immediately for the interactive web UI.
+
+    The original ``/download`` endpoint deliberately builds the full archive
+    before returning so an object error can still become an HTTP 503.  This
+    live variant trades that late-error status for bounded, cancellable
+    streaming: a mid-stream S3 consistency failure aborts the response rather
+    than silently producing a complete-looking archive.
+    """
+
+    job_id = _validate_job_id(job_id)
+    try:
+        objs = await asyncio.to_thread(
+            _s3_list_job,
+            job_id,
+            max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
+            max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
+        )
+    except ResultsLimitExceeded as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except S3ResultsUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    if not objs:
+        # Manager-local archives are normally small and do not incur thousands
+        # of remote object round trips, so retain the strict prebuilt behavior.
+        return await job_results_download(job_id)
+
+    source_bytes = sum(obj[1] for obj in objs)
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": (
+            f'attachment; filename="{job_id}-results.tar.gz"'
+        ),
+        "X-Content-Type-Options": "nosniff",
+        "X-Accel-Buffering": "no",
+        "X-Elastic-Agent-Object-Count": str(len(objs)),
+        "X-Elastic-Agent-Source-Bytes": str(source_bytes),
+    }
+    return StreamingResponse(
+        _stream_s3_archive(job_id, objs),
+        media_type="application/gzip",
+        headers=headers,
     )
 
 

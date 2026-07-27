@@ -410,6 +410,12 @@ Workers cannot overwrite each other. Every slot includes
 `_elastic_agent/collection.json` with its Job, Worker, shard, paths, collection
 time, and transfer mode. `collect.interval_seconds > 0` uploads snapshots while
 the command runs; success and failure both perform an awaited final collection.
+The first running snapshot is collected after one full interval. A value of
+`0` (the schema and Batch Console default) means final collection only, so set a
+positive interval such as `120` for a long Job whose intermediate files must be
+visible in S3 and downloadable before the command exits. A running download is
+the latest completed snapshot; it does not trigger an immediate sync from the
+Worker.
 
 S3 upload is automatic only when `ELASTIC_AGENT_RESULTS_S3_BUCKET` is set. On
 AWS Workers with `worker_instance_profile`, each Worker pushes directly with its
@@ -493,7 +499,18 @@ actions disappear at execution terminal state. Each Job keeps a stable result
 action while metadata loads. Per-Job request versions reject stale responses,
 known non-empty results never regress to empty on a transient or out-of-order
 refresh, terminal empty results retry with bounded backoff, and duplicate
-archive downloads are suppressed. API keys are accepted only in
+archive downloads are suppressed. S3 result archives use the UI's cancellable
+streaming endpoint, which starts returning the tarball while objects are read
+instead of waiting for a complete Manager-side temporary archive. The action
+shows received bytes and elapsed time; secure desktop Chromium writes chunks
+directly to the selected file, while browsers without the File System Access
+API use a memory-backed fallback only below 256 MiB of source data and reject
+larger snapshots with a desktop-Chrome instruction instead of risking a tab
+crash. Running Jobs label the action as a download of the latest uploaded
+intermediate snapshot.
+The original strict download endpoint remains available to API clients that
+prefer a prebuilt archive and an HTTP error before response headers. API keys
+are accepted only in
 the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
 `sessionStorage` and strips legacy query-string credentials. REST includes `/api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and

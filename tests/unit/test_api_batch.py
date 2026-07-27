@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -1645,6 +1646,160 @@ class TestJobResults:
         assert body.full_reads == 0
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
             assert archive.extractfile("job-stream/output.txt").read() == b"streamed-result"
+
+    @pytest.mark.asyncio
+    async def test_s3_live_download_returns_stream_metadata_and_valid_archive(
+        self, client, monkeypatch,
+    ):
+        class OneObjectPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-live/output.txt",
+                    "Size": len(b"live-result"),
+                    "ETag": '"live-etag"',
+                }]}]
+
+        class StreamingS3:
+            def get_paginator(self, name):
+                return OneObjectPaginator()
+
+            def get_object(self, **kwargs):
+                assert kwargs["IfMatch"] == '"live-etag"'
+                return {
+                    "Body": io.BytesIO(b"live-result"),
+                    "ContentLength": len(b"live-result"),
+                    "ETag": '"live-etag"',
+                }
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client", lambda: StreamingS3(),
+        )
+
+        response = await client.get(
+            "/api/jobs/job-live/results/download/stream"
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/gzip"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-elastic-agent-object-count"] == "1"
+        assert response.headers["x-elastic-agent-source-bytes"] == str(
+            len(b"live-result")
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(response.content), mode="r:gz"
+        ) as archive:
+            assert archive.extractfile("job-live/output.txt").read() == b"live-result"
+
+    @pytest.mark.asyncio
+    async def test_s3_live_archive_yields_before_later_object_finishes(
+        self, monkeypatch,
+    ):
+        import threading
+
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        second_started = threading.Event()
+        allow_second = threading.Event()
+        first_payload = os.urandom(32 * 1_024)
+
+        class SequencedS3:
+            def get_object(self, **kwargs):
+                if kwargs["Key"].endswith("/second.txt"):
+                    second_started.set()
+                    assert allow_second.wait(timeout=5)
+                    payload = b"second"
+                else:
+                    payload = first_payload
+                return {"Body": io.BytesIO(payload), "ContentLength": len(payload)}
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: SequencedS3())
+        objects = [
+            (
+                "first.txt",
+                len(first_payload),
+                "jobs/job-early/first.txt",
+                None,
+            ),
+            ("second.txt", 6, "jobs/job-early/second.txt", None),
+        ]
+        stream = jobs_route._stream_s3_archive("job-early", objects)
+
+        try:
+            first_chunk_task = asyncio.create_task(anext(stream))
+            assert await asyncio.to_thread(second_started.wait, 1)
+            first_chunk = await asyncio.wait_for(first_chunk_task, timeout=1)
+            assert first_chunk
+            allow_second.set()
+            remaining = [chunk async for chunk in stream]
+        finally:
+            allow_second.set()
+            await stream.aclose()
+
+        payload = first_chunk + b"".join(remaining)
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            assert (
+                archive.extractfile("job-early/first.txt").read()
+                == first_payload
+            )
+            assert archive.extractfile("job-early/second.txt").read() == b"second"
+
+    @pytest.mark.asyncio
+    async def test_s3_live_archive_cancel_survives_active_body_close_failure(
+        self, monkeypatch,
+    ):
+        import threading
+
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        read_started = threading.Event()
+        body_closed = threading.Event()
+        release_read = threading.Event()
+        first_payload = os.urandom(32 * 1_024)
+
+        class BlockingBody:
+            def read(self, size=-1):
+                read_started.set()
+                release_read.wait(timeout=5)
+                return b""
+
+            def close(self):
+                body_closed.set()
+                release_read.set()
+                raise OSError("simulated close failure")
+
+        class SequencedS3:
+            def get_object(self, **kwargs):
+                if kwargs["Key"].endswith("/blocked.txt"):
+                    return {"Body": BlockingBody(), "ContentLength": 1}
+                return {
+                    "Body": io.BytesIO(first_payload),
+                    "ContentLength": len(first_payload),
+                }
+
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: SequencedS3())
+        objects = [
+            (
+                "first.txt",
+                len(first_payload),
+                "jobs/job-cancel/first.txt",
+                None,
+            ),
+            ("blocked.txt", 1, "jobs/job-cancel/blocked.txt", None),
+        ]
+        stream = jobs_route._stream_s3_archive("job-cancel", objects)
+
+        try:
+            first_chunk = await asyncio.wait_for(anext(stream), timeout=1)
+            assert first_chunk
+            assert await asyncio.to_thread(read_started.wait, 1)
+        finally:
+            await stream.aclose()
+
+        assert await asyncio.to_thread(body_closed.wait, 1)
 
     @pytest.mark.asyncio
     async def test_s3_score_reads_are_bounded_and_attempt_limited(

@@ -898,7 +898,7 @@ let dashboardPollRunning = false;
 let dashboardPollTimer = null;
 const jobResultsCache = new Map();
 const jobResultsRequestVersions = new Map();
-const resultDownloadsInFlight = new Set();
+const resultDownloadsInFlight = new Map();
 let latestLoginAttempts = [];
 const otpCardsByKey = new Map();
 const openedOtpChallenges = new Set();
@@ -1531,25 +1531,183 @@ function workerActionsHtml(worker, jobId) {
       onclick="terminateWorker(${jsArg(worker.worker_id)})">终止</button>`;
   return `${taskLog}${systemLog}${terminate}`;
 }
-async function downloadResults(jobId) {
+function formatDownloadBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B','KiB','MiB','GiB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024; unit += 1;
+  }
+  const digits = unit === 0 || amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+function formatDownloadElapsed(startedAt) {
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  if (seconds < 60) return `${seconds}秒`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}分${String(seconds % 60).padStart(2,'0')}秒`;
+}
+function formatResultDownloadLabel(state) {
+  const elapsed = formatDownloadElapsed(state.startedAt);
+  if (state.phase === 'choosing') return '选择保存位置…';
+  if (state.phase === 'preparing') {
+    return `服务器准备中 · ${elapsed}（点此取消）`;
+  }
+  if (state.phase === 'cancelling') return '正在取消…';
+  if (state.phase === 'saving') return '正在保存…';
+  if (state.total > 0) {
+    const percent = Math.min(100, Math.floor(state.received * 100 / state.total));
+    return `下载 ${percent}% · ${formatDownloadBytes(state.received)}（点此取消）`;
+  }
+  return `已接收 ${formatDownloadBytes(state.received)} · ${elapsed}（点此取消）`;
+}
+function resultDownloadCancellable(state) {
+  return !['choosing','saving','cancelling'].includes(state.phase);
+}
+function repaintResultDownload(jobId, state, force=false) {
+  if (resultDownloadsInFlight.get(jobId) !== state) return;
+  const now = Date.now();
+  if (!force && now - (state.lastPaint || 0) < 500) return;
+  state.lastPaint = now;
+  const label = formatResultDownloadLabel(state);
+  const cancellable = resultDownloadCancellable(state);
+  document.querySelectorAll('[data-result-download-job]').forEach(button => {
+    if (button.dataset.resultDownloadJob !== jobId) return;
+    button.textContent = label;
+    button.title = cancellable
+      ? '正在生成并下载当前结果快照；点击可取消'
+      : '正在完成浏览器操作';
+    button.dataset.resultAction = 'downloading';
+    button.classList.add('btn-danger');
+    button.disabled = !cancellable;
+    if (cancellable) {
+      button.removeAttribute('aria-disabled');
+      button.onclick = () => cancelResultDownload(jobId);
+    } else {
+      button.setAttribute('aria-disabled', 'true');
+      button.onclick = null;
+    }
+  });
+}
+function cancelResultDownload(rawJobId) {
+  const jobId = String(rawJobId);
+  const state = resultDownloadsInFlight.get(jobId);
+  if (!state || !resultDownloadCancellable(state)) return;
+  state.phase = 'cancelling';
+  state.cancelled = true;
+  state.controller.abort();
+  repaintResultDownload(jobId, state, true);
+}
+async function downloadResults(rawJobId) {
+  const jobId = String(rawJobId);
   if (resultDownloadsInFlight.has(jobId)) return;
-  resultDownloadsInFlight.add(jobId);
-  reconcileJobCards(visibleJobs(latestJobs));
-  refreshResults();
+  const state = {
+    phase:'choosing', startedAt:Date.now(), received:0, total:0,
+    sourceBytes:0, objectCount:0, lastPaint:0, cancelled:false,
+    controller:new AbortController(), reader:null, writable:null, timer:null,
+  };
+  resultDownloadsInFlight.set(jobId, state);
+  state.timer = setInterval(
+    () => repaintResultDownload(jobId, state, true), 1_000,
+  );
+  repaintResultDownload(jobId, state, true);
+  let fileHandle = null;
+  let chunks = null;
+  let streamComplete = false;
   try {
-    const resp = await fetch(
-      '/api/jobs/' + encodeURIComponent(jobId) + '/results/download',
-      {headers: {...headers}}
+    if (window.isSecureContext && typeof window.showSaveFilePicker === 'function') {
+      try {
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName: jobId + '-results.tar.gz',
+        });
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        // Older Chromium variants may expose the API but reject its options.
+        // Fall back to the ordinary in-memory browser download below.
+        fileHandle = null;
+      }
+    }
+    state.phase = 'preparing';
+    repaintResultDownload(jobId, state, true);
+    toast('正在准备结果压缩包；按钮会显示传输量，点击可取消。');
+    const response = await fetch(
+      '/api/jobs/' + encodeURIComponent(jobId) + '/results/download/stream',
+      {headers: {...headers}, signal: state.controller.signal}
     );
-    if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url; link.download = jobId + '-results.tar.gz';
-    document.body.appendChild(link); link.click(); link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch(e) { toast('下载失败：' + e.message, 'error'); }
+    if (!response.ok) {
+      throw new Error(`${response.status}: ${await response.text()}`);
+    }
+    state.total = Number(response.headers.get('content-length')) || 0;
+    state.sourceBytes = Number(
+      response.headers.get('x-elastic-agent-source-bytes')
+    ) || 0;
+    state.objectCount = Number(
+      response.headers.get('x-elastic-agent-object-count')
+    ) || 0;
+    state.phase = 'transferring';
+    repaintResultDownload(jobId, state, true);
+
+    if (!response.body) throw new Error('浏览器没有提供可读取的响应流');
+    state.reader = response.body.getReader();
+    if (fileHandle) {
+      state.writable = await fileHandle.createWritable();
+    } else {
+      const fallbackBytes = Math.max(state.sourceBytes, state.total);
+      if (fallbackBytes >= 256 * 1024 * 1024) {
+        const sizeKind = state.sourceBytes > 0 ? '源文件' : '压缩包';
+        throw new Error(
+          `结果${sizeKind}约 ${formatDownloadBytes(fallbackBytes)}，当前浏览器`
+          + '不能安全地直接写入磁盘；请使用 HTTPS 下的桌面版 Chrome 重试。'
+        );
+      }
+      chunks = [];
+    }
+    while (true) {
+      const {done, value} = await state.reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        throw new Error('下载响应包含无效数据');
+      }
+      state.received += value.byteLength;
+      if (state.writable) await state.writable.write(value);
+      else chunks.push(value);
+      repaintResultDownload(jobId, state);
+    }
+    streamComplete = true;
+
+    state.phase = 'saving';
+    repaintResultDownload(jobId, state, true);
+    if (state.writable) {
+      await state.writable.close();
+      state.writable = null;
+    } else {
+      const blob = new Blob(chunks, {type:'application/gzip'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = jobId + '-results.tar.gz';
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    }
+    toast(`下载完成：${formatDownloadBytes(state.received)}`);
+  } catch(e) {
+    if (state.writable) {
+      try { await state.writable.abort(); } catch (_) { /* best effort */ }
+      state.writable = null;
+    }
+    if (state.cancelled || e?.name === 'AbortError') toast('下载已取消');
+    else toast('下载失败：' + e.message, 'error');
+  }
   finally {
+    if (!streamComplete) {
+      state.controller.abort();
+      if (state.reader) {
+        try { await state.reader.cancel(); } catch (_) { /* best effort */ }
+      }
+    }
+    state.reader = null;
+    clearInterval(state.timer);
     resultDownloadsInFlight.delete(jobId);
     reconcileJobCards(visibleJobs(latestJobs));
     refreshResults();
@@ -1625,17 +1783,20 @@ function jobResultActionHtml(job, result) {
   const jobId = String(job.job_id);
   const cached = jobResultsCache.get(jobId);
   const fileCount = resultFileCount(result);
-  const downloading = resultDownloadsInFlight.has(jobId);
+  const downloadState = resultDownloadsInFlight.get(jobId);
   let state = 'empty';
   let label = '暂无结果';
   let enabled = false;
   let title = '当前尚未发现已收集文件';
-  if (downloading) {
-    state = 'downloading'; label = '正在打包下载…';
-    title = '正在生成并下载结果压缩包';
+  if (downloadState) {
+    state = 'downloading'; label = formatResultDownloadLabel(downloadState);
+    title = resultDownloadCancellable(downloadState)
+      ? '正在生成并下载当前结果快照；点击可取消'
+      : '正在完成浏览器操作';
+    enabled = true;
   } else if (fileCount > 0) {
     state = 'available'; label = `⬇ 下载结果 (${fileCount})`;
-    title = '下载已经收集的结果';
+    title = job.done ? '下载最终收集结果' : '下载当前已上传的中间结果快照';
     enabled = true;
   } else if (cached?.error) {
     const missing = Number(cached.errorStatus) === 404;
@@ -1651,9 +1812,18 @@ function jobResultActionHtml(job, result) {
     state = 'checking'; label = '⏳ 检查结果…';
     title = '正在检查结果是否已经可用';
   }
-  return `<button class="btn btn-ghost" data-job-focus="job-results"
+  const action = downloadState
+    ? resultDownloadCancellable(downloadState)
+      ? `onclick="cancelResultDownload(${jsArg(jobId)})"`
+      : 'disabled aria-disabled="true"'
+    : enabled
+    ? `onclick="downloadResults(${jsArg(jobId)})"`
+    : 'disabled aria-disabled="true"';
+  return `<button class="${downloadState ? 'btn btn-danger' : 'btn btn-ghost'}"
+    data-job-focus="job-results"
+    data-result-download-job="${esc(jobId)}"
     data-result-action="${state}" title="${esc(title)}"
-    ${enabled ? `onclick="downloadResults(${jsArg(jobId)})"` : 'disabled aria-disabled="true"'}>${label}</button>`;
+    ${action}>${label}</button>`;
 }
 function jobRowHtml(j, r) {
   const wd = j.workers_detail || [];
@@ -2147,23 +2317,35 @@ function refreshResults() {
   if (list.dataset.signature === signature) return;
   list.dataset.signature = signature;
   if (!jobs.length) {
-    list.innerHTML = '<p class="muted">暂无已收集结果；Job 完成后会在这里显示。</p>';
+    list.innerHTML = '<p class="muted">暂无已收集结果；启用周期收集后运行中也会显示，否则会在 Job 结束后显示。</p>';
     return;
   }
   list.innerHTML = jobs.map(result => {
     const scoreStr = (result.scores && result.scores.length)
       ? result.scores.map(score => `${esc(score.task_id)} ${esc(score.prompt_level)}: <b>${Number(score.final_score||0).toFixed(1)}</b>`).join(' · ')
       : '';
-    const downloading = resultDownloadsInFlight.has(String(result.job_id));
+    const jobId = String(result.job_id);
+    const downloadState = resultDownloadsInFlight.get(jobId);
+    const matchingJob = latestJobs.find(job => String(job.job_id) === jobId);
+    const snapshotLabel = matchingJob && !matchingJob.done
+      ? '<div class="muted" style="font-size:.72rem">当前为运行中已上传的中间结果快照</div>'
+      : '';
+    const downloadLabel = downloadState
+      ? formatResultDownloadLabel(downloadState) : '⬇ 下载全部';
+    const action = downloadState
+      ? resultDownloadCancellable(downloadState)
+        ? `onclick="cancelResultDownload(${jsArg(jobId)})"`
+        : 'disabled aria-disabled="true"'
+      : `onclick="downloadResults(${jsArg(jobId)})"`;
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;
         border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
       <div><b>${esc(result.job_id)}</b> <span class="muted">(${Number(result.file_count)||0} 文件)</span>
         ${scoreStr ? '<div class="muted" style="margin-top:2px">📊 '+scoreStr+'</div>' : ''}
-        ${result.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(result.s3_uri)+'</div>' : ''}</div>
-      <button class="btn" style="margin:0" ${downloading
-        ? 'disabled aria-disabled="true"'
-        : `onclick="downloadResults(${jsArg(result.job_id)})"`}>${downloading
-          ? '正在打包下载…' : '⬇ 下载全部'}</button>
+        ${result.s3_uri ? '<div class="muted" style="font-size:.72rem">S3: '+esc(result.s3_uri)+'</div>' : ''}
+        ${snapshotLabel}</div>
+      <button class="${downloadState ? 'btn btn-danger' : 'btn'}"
+        data-result-download-job="${esc(jobId)}"
+        style="margin:0" ${action}>${downloadLabel}</button>
     </div>`;
   }).join('');
 }

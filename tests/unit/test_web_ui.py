@@ -170,6 +170,34 @@ class TestDashboardEndpoint:
         assert "formatTaskExitSummary(data.tasks || [])" in html
 
     @pytest.mark.asyncio
+    async def test_batch_console_streams_large_downloads_with_progress_and_cancel(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "/results/download/stream" in html
+        assert "new AbortController()" in html
+        assert "response.body.getReader()" in html
+        assert "showSaveFilePicker" in html
+        assert "cancelResultDownload" in html
+        assert "formatResultDownloadLabel" in html
+        assert "已接收" in html
+        assert "点此取消" in html
+        assert "当前为运行中已上传的中间结果快照" in html
+        assert "Math.max(state.sourceBytes, state.total)" in html
+        assert "请使用 HTTPS 下的桌面版 Chrome 重试" in html
+        assert "await state.reader.cancel()" in html
+        assert "data-result-download-job" in html
+
+        repaint = html[
+            html.index("function repaintResultDownload"):
+            html.index("function cancelResultDownload")
+        ]
+        assert "reconcileJobCards" not in repaint
+        assert "refreshResults" not in repaint
+
+    @pytest.mark.asyncio
     async def test_batch_console_jobs_start_collapsed_and_keep_user_choice(
         self, ui_client
     ):

@@ -140,7 +140,8 @@ The focused suite covers:
   credential warm-up;
 - per-shard Worker result namespaces and collection manifests, direct/fallback
   S3 prefix parity, content-hash change detection, bounded/consistent result
-  reads and downloads, awaited Manager-side upload, explicit S3 failures, and
+  reads and downloads, running snapshot visibility for positive collection
+  intervals, awaited Manager-side upload, explicit S3 failures, and
   force-termination plus Node-record removal (not registry-only draining) after
   ordinary Job completion;
 - mode-0600 bounded Job command-log snapshots, ownership/path/symlink guards,
@@ -150,7 +151,9 @@ The focused suite covers:
   archived failed-task access after the in-memory Job is gone;
 - stable failed-Job log/result controls, 5,000-line terminal log requests with
   exit summaries, per-Job result request versions, non-empty monotonic cache
-  protection, finite terminal-empty retry, and duplicate-download suppression;
+  protection, finite terminal-empty retry, duplicate-download suppression, and
+  cancellable S3 archive streaming that yields before later objects finish,
+  closes the active S3 body on cancellation, and produces a valid tarball;
 - ordered durable lifecycle-event replay, single-handler in-flight replay with
   failure/cancellation takeover, reconnect-on-handler-failure, stale-socket ACK
   suppression with deduplicated reconnect ACK, active-socket send-error
