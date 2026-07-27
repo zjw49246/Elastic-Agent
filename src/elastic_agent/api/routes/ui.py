@@ -1609,6 +1609,11 @@ async function downloadResults(rawJobId) {
     controller:new AbortController(), reader:null, writable:null, timer:null,
   };
   resultDownloadsInFlight.set(jobId, state);
+  // Record the one-time idle → active signature transition. Progress paints
+  // after this update only mutate the matching buttons in place; on completion
+  // the active → idle transition then reliably restores the ordinary action.
+  reconcileJobCards(visibleJobs(latestJobs));
+  refreshResults();
   state.timer = setInterval(
     () => repaintResultDownload(jobId, state, true), 1_000,
   );

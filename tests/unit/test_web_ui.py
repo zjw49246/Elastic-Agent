@@ -190,6 +190,13 @@ class TestDashboardEndpoint:
         assert "await state.reader.cancel()" in html
         assert "data-result-download-job" in html
 
+        start_transition = html[
+            html.index("resultDownloadsInFlight.set(jobId, state)"):
+            html.index("state.timer = setInterval")
+        ]
+        assert "reconcileJobCards(visibleJobs(latestJobs))" in start_transition
+        assert "refreshResults()" in start_transition
+
         repaint = html[
             html.index("function repaintResultDownload"):
             html.index("function cancelResultDownload")
