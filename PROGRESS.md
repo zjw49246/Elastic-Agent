@@ -1,5 +1,28 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-28 全量代码审计基线
+
+**范围**：以最新 `origin/main` `8dc4228` 为基线（包含审计期间新增的 per-worker
+S3 dataset 增量），对账号/API Key、Batch/EIP 生命周期、Worker 协议与登录、PTY、
+结果下载、API/UI 和持久化恢复做只读审查。完整套件
+`2356 passed / 12 skipped`，近期高风险模块专项 `375 passed`、新增分片数据集专项
+`303 passed`，`compileall` 通过；同时用故障注入复现 ENOSPC、登录取消、超长输出、
+下载断连和路径穿越。
+未创建真实云资源、调用用户 Key、部署或重启服务。
+
+**结果**：确认 26 项开放问题，其中 14 项高严重度、11 项中严重度、1 项低严重度。最高优先级是
+LocalBackend 路径穿越、Claude 凭据 `0644` 与登录秘密进入 journal、Claude
+取消登录的错误清理确认、可靠终态/tombstone 写失败阻断实例回收、超长输出停止
+pipe 排水、Agent API Key 不能多 Worker 共享、结果下载/解析的资源耗尽路径，以及空
+hostname 把单对象 S3 dataset 退化为整桶同步。
+完整证据、最小复现、影响和建议见
+[`docs/audits/code-audit-2026-07-28.md`](docs/audits/code-audit-2026-07-28.md)。
+
+**以后避免**：完整测试全绿不能替代失败路径审查；取消、断线、ENOSPC、LIST→OPEN
+替换和多 Worker 并发必须作为一等测试维度。任何秘密写入都要在 API、传输、日志和
+文件 mode 四层分别验证；任何可靠终态的辅助状态写入都不能阻止更重要的收集和云资源
+销毁。API Key 共享必须与 OAuth/EIP 独占模型显式分层，不能仅移除一个候选过滤条件。
+
 ## 2026-07-28 同步 CloudRouter unrestricted 准入语义
 
 **问题**：CCM `387834d` 明确了 CloudRouter 无消费上限账号会返回
