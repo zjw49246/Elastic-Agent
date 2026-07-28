@@ -191,7 +191,9 @@ class WorkerContext:
     job_name: str = ""
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        values = asdict(self)
+        values["shard_id"] = f"{self.shard_index:05d}"
+        return values
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +232,8 @@ class S3Dataset(StrictSpecModel):
 
     The worker downloads ``uri`` with its EC2 instance profile; static AWS
     credentials are never placed in a JobSpec. ``uri`` may be a single object
-    or a prefix (trailing ``/`` → recursive sync)."""
+    or a prefix (trailing ``/`` → recursive sync). Both fields support
+    per-worker template variables such as ``{{shard_id}}``."""
 
     uri: str                      # s3://bucket/key or s3://bucket/prefix/
     dest: str                     # absolute path on the worker
@@ -318,8 +321,8 @@ class SetupSpec(StrictSpecModel):
     # is in the docker group). Required for jobs whose run uses Docker, e.g.
     # ai4sci-bench `--sandbox os`.
     needs_docker: bool = False
-    # Datasets staged from S3 onto each worker before the run (Manager-side pull
-    # → rsync; workers need no S3 creds).
+    # Datasets staged from S3 onto each worker before the run using the worker's
+    # instance profile.
     s3_datasets: list[S3Dataset] = Field(default_factory=list)
 
     @field_validator("repo")
@@ -703,6 +706,14 @@ class JobSpec(StrictSpecModel):
         return self
 
     @model_validator(mode="after")
+    def dataset_templates_are_renderable(self) -> JobSpec:
+        try:
+            self.render_s3_datasets(self.worker_contexts()[0])
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"invalid S3 dataset template: {exc}") from exc
+        return self
+
+    @model_validator(mode="after")
     def validate_agent_account_mode(self) -> JobSpec:
         if (
             self.account.agent_type == "codex"
@@ -823,6 +834,17 @@ class JobSpec(StrictSpecModel):
         return [
             WorkerContext(shard_index=i, num_shards=n, job_name=self.name)
             for i in range(n)
+        ]
+
+    def render_s3_datasets(self, ctx: WorkerContext) -> list[S3Dataset]:
+        """Render and revalidate per-worker S3 object locations."""
+        values = ctx.as_dict()
+        return [
+            S3Dataset(
+                uri=render_template(dataset.uri, values),
+                dest=render_template(dataset.dest, values),
+            )
+            for dataset in self.setup.s3_datasets
         ]
 
     def render_command(self, ctx: WorkerContext) -> list[str]:

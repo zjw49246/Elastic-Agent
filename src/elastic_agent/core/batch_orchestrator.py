@@ -504,6 +504,12 @@ class BatchOrchestrator:
     def job_id_for_worker(self, worker_id: str) -> str | None:
         return self._worker_index.get(worker_id)
 
+    def worker_context_for(self, worker_id: str) -> WorkerContext | None:
+        job_id = self._worker_index.get(worker_id)
+        job = self._jobs.get(job_id) if job_id is not None else None
+        run = job.runs.get(worker_id) if job is not None else None
+        return run.ctx if run is not None else None
+
     def runtime_account_for_task(
         self,
         worker_id: str,

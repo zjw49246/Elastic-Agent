@@ -46,6 +46,9 @@ class TestWorkerContexts:
         ctxs = spec.worker_contexts()
         assert len(ctxs) == 4
         assert [c.shard_index for c in ctxs] == [0, 1, 2, 3]
+        assert [c.as_dict()["shard_id"] for c in ctxs] == [
+            "00000", "00001", "00002", "00003",
+        ]
         assert all(c.num_shards == 4 for c in ctxs)
         assert all(c.job_name == "j" for c in ctxs)
 
@@ -247,6 +250,46 @@ class TestRenderCommand:
         cmd = spec.render_command(spec.worker_contexts()[0])
         assert cmd[0:2] == ["bash", "-lc"]
         assert "$(hostname -s)" in cmd[2]
+
+
+class TestRenderS3Datasets:
+    def test_renders_one_object_for_each_worker(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            fanout={"workers": 3, "shard_by": "shard_index"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/run/shard-{{shard_id}}.jsonl",
+                    "dest": "/srv/replay/shard-{{shard_id}}.jsonl",
+                }],
+            },
+        )
+
+        rendered = [
+            spec.render_s3_datasets(ctx)[0]
+            for ctx in spec.worker_contexts()
+        ]
+
+        assert [dataset.uri for dataset in rendered] == [
+            "s3://private-data/run/shard-00000.jsonl",
+            "s3://private-data/run/shard-00001.jsonl",
+            "s3://private-data/run/shard-00002.jsonl",
+        ]
+        assert rendered[2].dest == "/srv/replay/shard-00002.jsonl"
+
+    def test_unknown_dataset_template_variable_fails(self):
+        with pytest.raises(ValidationError, match="unknown template variable"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="bench"),
+                setup={
+                    "s3_datasets": [{
+                        "uri": "s3://private-data/{{unknown}}.jsonl",
+                        "dest": "/srv/replay/input.jsonl",
+                    }],
+                },
+            )
 
 
 class TestRenderResumeCommand:

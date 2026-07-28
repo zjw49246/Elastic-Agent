@@ -1553,6 +1553,10 @@ class TestJobsAPI:
                     "env": {"PRIVATE_VALUE": "supersecret"},
                     "timeout": 1000, "retries": 1,
                 }],
+                "s3_datasets": [{
+                    "uri": "s3://private-data/run/shard-{{shard_id}}.jsonl",
+                    "dest": "/srv/replay/shard-{{shard_id}}.jsonl",
+                }],
             },
             "run": {
                 "command": "bench --token $TOKEN",
@@ -1577,6 +1581,10 @@ class TestJobsAPI:
         assert "another-secret" not in response.text
         assert plan["run"]["secret_env_keys"] == ["DB_PASSWORD"]
         assert "aws-ssm" not in response.text
+        assert plan["datasets"] == [{
+            "uri": "s3://private-data/run/shard-00000.jsonl",
+            "dest": "/srv/replay/shard-00000.jsonl",
+        }]
         assert plan["fanout"]["worst_case_worker_hours"] == 144
         assert plan["fanout"]["instance_type_allowlist"] == [
             manager.config.provider.aws.default_instance_type

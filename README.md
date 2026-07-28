@@ -144,8 +144,17 @@ spec = JobSpec.model_validate({
 job = await manager.batch.launch(spec)   # scale → bootstrap → login → run, per worker
 ```
 
-Template `{{shard_index}}` / `{{num_shards}}` / `{{hostname}}` are rendered by the
-Manager; shell constructs like `$(hostname -s)` are evaluated on the worker.
+Template `{{shard_index}}` / `{{shard_id}}` / `{{num_shards}}` /
+`{{hostname}}` are rendered by the Manager; `shard_id` is the zero-padded
+five-digit shard index. Shell constructs like `$(hostname -s)` are evaluated on
+the worker. The same templates work in `setup.s3_datasets[].uri` and `dest`, so
+a fanout Job can stage one exact S3 object per worker instead of copying a whole
+prefix to every worker:
+
+```json
+{"uri": "s3://private-data/run/shard-{{shard_id}}.jsonl",
+ "dest": "/srv/replay/shard-{{shard_id}}.jsonl"}
+```
 
 `environment.profile` selects a versioned common platform definition maintained
 by the framework. Jobs add only their repository, setup steps, datasets, run
@@ -158,8 +167,9 @@ Legacy `setup.commands: ["..."]` remains accepted and runs as one shell. New
 `setup.steps` entries have independent `name`, `command`, `env`, `cwd`,
 `timeout`, and `retries`; every Job-owned setup operation runs as the same
 non-root Job/runtime user that later executes `run.command`. Use `setup.ref` for
-a branch/tag and provide the full `setup.resolved_commit` when replay must fail
-unless the checkout is byte-for-byte the expected Git revision.
+a branch/tag and provide the full `setup.resolved_commit` for an immutable
+checkout. Manager delivery fetches that commit directly, so a mutable branch
+advancing after Job creation does not change or invalidate the selected source.
 
 JobSpec sections reject unknown fields instead of silently ignoring typos.
 Missing, `null`, or legacy-zero `run.timeout` is normalized to 24 hours;

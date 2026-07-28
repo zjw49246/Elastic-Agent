@@ -118,7 +118,8 @@ The focused suite covers:
 - durable mode-0600 JobSpec persistence before direct/API launch side effects,
   crash recovery collection, and whole-fanout capacity rejection before any EIP;
 - strict unknown-field rejection, immutable environment-profile selection,
-  finite run/Job TTL defaults and bounds, exact Git manifest validation, and
+  finite run/Job TTL defaults and bounds, direct immutable Git commit checkout,
+  per-worker `shard_id` S3 object rendering with unknown-template rejection, and
   backward-compatible legacy plus structured per-step setup executed as the Job
   user with isolated env/cwd/timeout/retry policy;
 - side-effect-free `/api/jobs/plan` previews with secret values omitted, plus

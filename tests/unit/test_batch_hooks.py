@@ -2240,6 +2240,60 @@ class TestProvisionHook:
         ) is True
         assert captured["host"] == "10.0.0.1"
 
+    async def test_s3_dataset_is_rendered_for_the_worker_shard(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec, WorkerContext
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        mgr._batch = SimpleNamespace(
+            worker_context_for=lambda worker_id: (
+                WorkerContext(shard_index=7, num_shards=10)
+                if worker_id == "w1"
+                else None
+            ),
+        )
+        commands = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                assert kwargs["use_sudo"] is False
+
+            async def execute(self, command, timeout=None, **kwargs):
+                commands.append(command)
+                return 0, "", ""
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            fanout={"workers": 10, "shard_by": "shard_index"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/run/shard-{{shard_id}}.jsonl",
+                    "dest": "/srv/replay/shard-{{shard_id}}.jsonl",
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("w1", None, spec) is True
+        assert any(
+            "aws s3 cp" in command
+            and "s3://private-data/run/shard-00007.jsonl" in command
+            and "/srv/replay/shard-00007.jsonl" in command
+            for command in commands
+        )
+        assert all("aws s3 sync" not in command for command in commands)
+
     async def test_bootstrap_failure(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
         mgr = FakeManager(tmp_path, await _store(tmp_path, []))
@@ -2398,7 +2452,10 @@ class TestProvisionHook:
 
         class FakeSync:
             def __init__(self, *a, **k): ...
-            async def ensure_clone(self, repo, branch): return "/local/clone"
+            async def ensure_clone(
+                self, repo, branch, *, resolved_commit="",
+            ):
+                return "/local/clone"
             async def deliver(self, local, host, target): return True
 
         captured = {"calls": []}
@@ -2447,7 +2504,10 @@ class TestProvisionHook:
 
         class FakeSync:
             def __init__(self, *args, **kwargs): ...
-            async def ensure_clone(self, repo, branch): return "/local/clone"
+            async def ensure_clone(
+                self, repo, branch, *, resolved_commit="",
+            ):
+                return "/local/clone"
             async def deliver(self, local, host, target): return True
 
         calls = []

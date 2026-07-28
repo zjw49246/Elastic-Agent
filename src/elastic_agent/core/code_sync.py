@@ -326,11 +326,21 @@ class ManagerCodeSync:
                 f"code payload contains prohibited secret/special paths: {visible}{suffix}"
             )
 
-    async def ensure_clone(self, repo: str, branch: str = "main") -> str:
+    async def ensure_clone(
+        self,
+        repo: str,
+        branch: str = "main",
+        *,
+        resolved_commit: str = "",
+    ) -> str:
         """Return a checkout keyed by canonical repository URL + resolved commit."""
 
         canonical_repo = self._canonical_repo(repo)
         ref = self._validate_ref(branch)
+        expected_commit = resolved_commit.strip().lower()
+        if expected_commit and _GIT_COMMIT.fullmatch(expected_commit) is None:
+            raise ValueError("resolved_commit must be a full Git commit id")
+        fetch_ref = expected_commit or ref
         repo_key = hashlib.sha256(canonical_repo.encode()).hexdigest()
         secure_state_directory(self._cache)
 
@@ -370,7 +380,7 @@ class ManagerCodeSync:
                     "git", "--git-dir", str(active_mirror), "fetch",
                     "--no-write-fetch-head", "--force", "--depth", "1", "--",
                     self._auth_url(canonical_repo),
-                    f"{ref}:refs/elastic-agent/resolved",
+                    f"{fetch_ref}:refs/elastic-agent/resolved",
                 )
                 resolved = (
                     await self._checked(
@@ -381,6 +391,10 @@ class ManagerCodeSync:
                 ).strip().splitlines()[0]
                 if _GIT_COMMIT.fullmatch(resolved) is None:
                     raise RuntimeError("manager git resolve returned an invalid commit id")
+                if expected_commit and resolved.casefold() != expected_commit:
+                    raise RuntimeError(
+                        "manager git resolve did not return resolved_commit"
+                    )
 
                 if temp_mirror is not None:
                     os.replace(temp_mirror, mirror)

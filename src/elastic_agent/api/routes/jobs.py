@@ -597,6 +597,7 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
 
     ctx = spec.worker_contexts()[0]
     command_preview = spec.render_command(ctx)
+    dataset_preview = spec.render_s3_datasets(ctx)
     return {
         "valid": True,
         "side_effects": False,
@@ -618,6 +619,10 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 "env_keys": sorted(step.env),
             }
             for step in spec.setup.normalized_steps()
+        ],
+        "datasets": [
+            {"uri": dataset.uri, "dest": dataset.dest}
+            for dataset in dataset_preview
         ],
         "run": {
             "command": command_preview,

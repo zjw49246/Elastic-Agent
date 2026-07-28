@@ -51,6 +51,25 @@ async def test_clone_uses_token_then_scrubs_it(tmp_path):
     assert "checkouts" in path
 
 
+async def test_resolved_commit_is_the_fetch_target(tmp_path):
+    r = FakeRunner()
+    expected = "b" * 40
+    r.commit = expected
+    sync = ManagerCodeSync(str(tmp_path / "cache"), runner=r)
+
+    path = await sync.ensure_clone(
+        "https://github.com/org/private.git",
+        "main",
+        resolved_commit=expected,
+    )
+
+    assert path.endswith("/" + expected)
+    assert any(
+        f"{expected}:refs/elastic-agent/resolved" in command
+        for command in r.joined()
+    )
+
+
 async def test_deliver_excludes_git_and_carries_no_token(tmp_path):
     r = FakeRunner()
     sync = ManagerCodeSync(str(tmp_path), git_token="ghp_secret", ssh_key="/k.pem",
@@ -251,6 +270,48 @@ async def test_content_addressed_checkout_rejects_local_mutation(tmp_path):
 
     with pytest.raises(RuntimeError, match="modified or untracked"):
         await sync.ensure_clone(str(source), "main")
+
+
+async def test_resolved_commit_survives_mutable_branch_advance(tmp_path):
+    source = tmp_path / "source"
+    subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", str(source)],
+        check=True,
+    )
+    for message in ("first", "second"):
+        subprocess.run(
+            [
+                "git", "-C", str(source),
+                "-c", "user.name=Elastic Agent Test",
+                "-c", "user.email=test@example.invalid",
+                "commit", "--quiet", "--allow-empty", "-m", message,
+            ],
+            check=True,
+        )
+        if message == "first":
+            first = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+    sync = ManagerCodeSync(str(tmp_path / "cache"))
+    checkout = await sync.ensure_clone(
+        str(source),
+        "main",
+        resolved_commit=first,
+    )
+
+    actual = subprocess.run(
+        ["git", "-C", checkout, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual == first
+
+
 @pytest.mark.parametrize(
     "key",
     ["data/../../secret", "data/../secret", "data/bad\\name", "data//empty"],

@@ -1316,7 +1316,9 @@ def make_provision_hook(
         # worker (no token) → run setup commands on the worker.
         if need_manager_rsync:
             local = await _sync.ensure_clone(
-                spec.setup.repo, spec.setup.checkout_ref,
+                spec.setup.repo,
+                spec.setup.checkout_ref,
+                resolved_commit=spec.setup.resolved_commit,
             )
             if spec.setup.resolved_commit:
                 proc = await asyncio.create_subprocess_exec(
@@ -1418,7 +1420,16 @@ def make_provision_hook(
             if rc != 0:
                 logger.error("awscli install failed on %s: %s", worker_id, _e[:200])
                 return False
-            for ds in spec.setup.s3_datasets:
+            batch = getattr(manager, "_batch", None)
+            worker_ctx = (
+                batch.worker_context_for(worker_id)
+                if batch is not None
+                and callable(getattr(batch, "worker_context_for", None))
+                else None
+            )
+            if worker_ctx is None:
+                worker_ctx = spec.worker_contexts()[0]
+            for ds in spec.render_s3_datasets(worker_ctx):
                 uri = ds.uri.strip()
                 # trailing '/' → prefix (recursive sync); otherwise a single object.
                 if uri.endswith("/"):
