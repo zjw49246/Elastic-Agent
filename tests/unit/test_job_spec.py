@@ -253,6 +253,25 @@ class TestRenderCommand:
 
 
 class TestRenderS3Datasets:
+    def test_uri_template_whitespace_is_canonicalized_and_rendered(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/shard-{{ shard_id }}.jsonl",
+                    "dest": "/srv/replay/input.jsonl",
+                }],
+            },
+        )
+
+        assert spec.setup.s3_datasets[0].uri == (
+            "s3://private-data/shard-{{shard_id}}.jsonl"
+        )
+        assert spec.render_s3_datasets(
+            WorkerContext(shard_index=7)
+        )[0].uri == "s3://private-data/shard-00007.jsonl"
+
     def test_renders_one_object_for_each_worker(self):
         spec = JobSpec(
             name="j",
@@ -290,6 +309,25 @@ class TestRenderS3Datasets:
                     }],
                 },
             )
+
+    def test_dataset_template_value_cannot_render_empty(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/{{hostname}}",
+                    "dest": "/srv/replay/input.jsonl",
+                }],
+            },
+        )
+
+        # Submission validation uses a throwaway synthetic hostname; real
+        # worker contexts remain unmodified and must still fail closed until
+        # discovery supplies a concrete hostname.
+        assert spec.worker_contexts()[0].hostname == ""
+        with pytest.raises(ValueError, match="hostname.*empty"):
+            spec.render_s3_datasets(WorkerContext(hostname=""))
 
 
 class TestRenderResumeCommand:
@@ -602,12 +640,33 @@ class TestJobSpecDefaults:
                 },
             )
 
+    def test_claude_also_rejects_unimplemented_manager_distribution(self):
+        with pytest.raises(ValidationError, match="not implemented"):
+            JobSpec(
+                name="j",
+                run=RunSpec(command="claude -p task"),
+                account={
+                    "agent_type": "claude",
+                    "mode": "manager_distribute",
+                },
+            )
+
 
 class TestEipAccountBinding:
-    def test_account_ids_are_trimmed_and_deduplicated_in_order(self):
+    def test_account_ids_are_trimmed_without_losing_slot_positions(self):
         account = AccountSpec(ids=[" acct-2 ", "acct-1", "acct-2", "", "acct-1"])
 
-        assert account.ids == ["acct-2", "acct-1"]
+        assert account.ids == ["acct-2", "acct-1", "acct-2", "acct-1"]
+
+    def test_unbound_explicit_ids_preserve_agent_api_references(self):
+        spec = JobSpec(
+            name="shared-api",
+            run=RunSpec(command="bench"),
+            account={"ids": ["cloudrouter-1", "cloudrouter-1"]},
+            fanout={"workers": 2},
+        )
+
+        assert spec.account.ids == ["cloudrouter-1", "cloudrouter-1"]
 
     def test_eip_binding_accepts_one_explicit_account_per_worker(self):
         spec = JobSpec(

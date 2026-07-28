@@ -7,17 +7,32 @@ OAuth tokens are minted on the worker at login time and never enter this API.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 from elastic_agent.api.auth import require_api_key
 from elastic_agent.core.account_binding import AccountBinding, LeaseConflictError
 from elastic_agent.core.batch_hooks import AccountClaimConflictError
-from elastic_agent.core.credential_pool import AccountDefinition
+from elastic_agent.core.credential_pool import (
+    MAX_ACCOUNT_EMAIL_LENGTH,
+    MAX_ACCOUNT_GROUP_LENGTH,
+    AccountDefinition,
+    normalize_account_id,
+    normalize_account_text,
+    validate_account_secret,
+)
 
 router = APIRouter(tags=["accounts"], dependencies=[Depends(require_api_key)])
+_TERMINAL_ALLOCATION_PHASES = frozenset({"done", "failed", "cancelled"})
 
 
 def _mgr():
@@ -39,7 +54,22 @@ def _account_allocator():
     return _mgr().account_allocator
 
 
+async def _await_owned_account_mutation(task: asyncio.Task):
+    """Settle an irreversible account mutation despite request cancellation."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done() and task.cancelled():
+                raise
+            continue
+    return task.result()
+
+
 class AccountRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: str
     email: str
     agent_type: Literal["claude", "codex"] = "claude"
@@ -50,13 +80,36 @@ class AccountRequest(BaseModel):
     group: str = "standard"
     enabled: bool = True
 
-    @field_validator("id", "email", "group")
+    @field_validator("id")
     @classmethod
-    def require_identity_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("account id, email, and group must be non-empty")
-        return normalized
+    def safe_id(cls, value: str) -> str:
+        return normalize_account_id(value)
+
+    @field_validator("email")
+    @classmethod
+    def safe_email(cls, value: str) -> str:
+        return normalize_account_text(
+            value, field="email", maximum=MAX_ACCOUNT_EMAIL_LENGTH,
+        )
+
+    @field_validator("group")
+    @classmethod
+    def safe_group(cls, value: str) -> str:
+        return normalize_account_text(
+            value, field="group", maximum=MAX_ACCOUNT_GROUP_LENGTH,
+        )
+
+    @field_validator("email_token")
+    @classmethod
+    def safe_email_token(cls, value: str) -> str:
+        return validate_account_secret(
+            value, field="email_token", strip=True,
+        )
+
+    @field_validator("password")
+    @classmethod
+    def safe_password(cls, value: str) -> str:
+        return validate_account_secret(value, field="password")
 
 
 class AccountListResponse(BaseModel):
@@ -146,6 +199,9 @@ class DecommissionAccountBindingRequest(BaseModel):
 
     release_eip: Literal[True]
     confirm_account_id: str
+    # Batch UI uses this to close the decommission→identity-delete claim race.
+    # API clients may keep the original infrastructure-only behavior.
+    delete_identity: bool = False
 
 
 @router.get("/accounts", response_model=AccountListResponse)
@@ -186,8 +242,14 @@ async def account_allocations() -> dict:
     out: dict[str, list[dict]] = {}
     try:
         jobs = mgr.batch.list_jobs()
-    except Exception:
-        jobs = []
+    except Exception as exc:
+        # Returning an empty map here makes the management UI claim every
+        # identity is idle even though the allocator snapshot is unavailable.
+        # Fail closed at the observation boundary; mutation_guard remains the
+        # authoritative safety fence for actual CRUD/allocation.
+        raise HTTPException(
+            503, "Account allocation state is temporarily unavailable"
+        ) from exc
     live_by_lease: dict[str, tuple[object, str, object]] = {}
     for job in jobs:
         for wid, run in getattr(job, "runs", {}).items():
@@ -198,7 +260,12 @@ async def account_allocations() -> dict:
             emails = getattr(run, "account_emails", []) or []
             active = getattr(run, "active_slot", 0)
             phase = run.phase.value if hasattr(run.phase, "value") else str(run.phase)
-            if phase in {"done", "failed"}:
+            terminal = phase in _TERMINAL_ALLOCATION_PHASES
+            account_release_proven = (
+                bool(getattr(run, "cleaned_up", False))
+                or bool(getattr(job, "accounts_released", False))
+            )
+            if terminal and account_release_proven:
                 continue
             for i, aid in enumerate(ids):
                 if not aid:
@@ -209,7 +276,8 @@ async def account_allocations() -> dict:
                     "worker_id": wid,
                     "phase": phase,
                     "email": emails[i] if i < len(emails) else "",
-                    "active": (i == active),
+                    "active": not terminal and i == active,
+                    "cleanup_pending": terminal,
                 })
 
     # Durable leases are the source of truth for EIP accounts.  They survive a
@@ -217,15 +285,19 @@ async def account_allocations() -> dict:
     # not leave completed historical jobs looking permanently allocated.
     try:
         leases = await _binding_manager().list_leases(active_only=True)
-    except Exception:
-        leases = []
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            503, "Durable account allocation state is temporarily unavailable"
+        ) from exc
     for lease in leases:
         live = live_by_lease.get(lease.lease_id)
         if live is not None:
             job, wid, run = live
             phase = run.phase.value if hasattr(run.phase, "value") else str(run.phase)
             job_name = getattr(job.spec, "name", "")
-            active = phase not in {"done", "failed"}
+            active = phase not in _TERMINAL_ALLOCATION_PHASES
             cleanup_pending = not getattr(run, "cleaned_up", False)
         else:
             wid = lease.worker_id
@@ -315,34 +387,94 @@ async def decommission_account_binding(
     account_id: str,
     req: DecommissionAccountBindingRequest,
 ) -> dict:
-    """Permanently release an account's EIP after an explicit double-confirm.
-
-    This is deliberately separate from deleting the account identity. It is
-    the only account API that releases the billable public IPv4 allocation.
-    """
+    """Release an EIP, optionally retiring its identity under the same fence."""
     if req.confirm_account_id != account_id:
         raise HTTPException(400, "confirm_account_id must exactly match account_id")
 
+    identity_removed = False
     try:
         # Reject a live claim and prevent a new claim entering the gap before
-        # its durable lease is written. decommission() owns the binding account
-        # lock itself, so account_transaction must not be nested here.
+        # its durable lease is written. When requested, identity removal remains
+        # under this same mutation guard, closing the old two-request window in
+        # which a new Job could claim the account after EIP release but before
+        # DELETE. decommission() owns the binding account lock itself, so
+        # account_transaction must not be nested here.
         async with _account_allocator().mutation_guard(account_id):
-            service = _binding_manager()
-            active_leases = await service.list_leases(
-                account_id=account_id, active_only=True,
-            )
-            if active_leases:
-                raise HTTPException(
-                    409,
-                    f"Account {account_id} has {len(active_leases)} active lease(s); "
-                    "finish the owning Job before decommissioning",
+            async def retire_under_guard() -> tuple[bool, bool]:
+                identity = None
+                if req.delete_identity:
+                    identity = await _get_account_identity(account_id)
+                    if identity is None:
+                        raise HTTPException(
+                            404, f"Account {account_id} not found"
+                        )
+                    if (
+                        getattr(identity, "auth_kind", "oauth") == "agent_api"
+                        and not getattr(
+                            _mgr(), "binding_recovery_ready", True
+                        )
+                    ):
+                        raise HTTPException(
+                            409,
+                            "Agent API identity retirement is blocked while "
+                            "startup resource recovery is incomplete",
+                        )
+                service = _binding_manager()
+                active_leases = await service.list_leases(
+                    account_id=account_id, active_only=True,
                 )
-            # This authenticated, double-confirmed endpoint is the only caller
-            # allowed to acknowledge a stably missing EIP. Startup recovery
-            # keeps confirm_absent=False.
-            removed = await service.decommission(
-                account_id, confirm_absent=True
+                if active_leases:
+                    raise HTTPException(
+                        409,
+                        f"Account {account_id} has "
+                        f"{len(active_leases)} active lease(s); finish the "
+                        "owning Job before decommissioning",
+                    )
+                # This authenticated, double-confirmed endpoint is the only
+                # caller allowed to acknowledge a stably missing EIP. Startup
+                # recovery keeps confirm_absent=False.
+                decommissioned = await service.decommission(
+                    account_id, confirm_absent=True
+                )
+                retired = False
+                if decommissioned and identity is not None:
+                    try:
+                        if (
+                            getattr(identity, "auth_kind", "oauth")
+                            == "agent_api"
+                        ):
+                            retired = await _mgr().agent_api_store.remove(
+                                account_id
+                            )
+                        else:
+                            retired = await _mgr().account_store.remove(
+                                account_id
+                            )
+                    except BaseException as exc:  # noqa: BLE001
+                        # EIP release is irreversible. Keep a failed identity
+                        # retirement unavailable in this process and report the
+                        # partial state instead of allowing immediate reuse.
+                        await _account_allocator().quarantine(account_id)
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        raise HTTPException(
+                            500,
+                            "EIP was decommissioned but identity removal "
+                            "failed; the account remains quarantined",
+                        ) from exc
+                    if not retired:
+                        await _account_allocator().quarantine(account_id)
+                        raise HTTPException(
+                            500,
+                            "EIP was decommissioned but identity removal was "
+                            "not confirmed; the account remains quarantined",
+                        )
+                    await _account_allocator().clear_quarantine(account_id)
+                return decommissioned, retired
+
+            mutation = asyncio.create_task(retire_under_guard())
+            removed, identity_removed = await _await_owned_account_mutation(
+                mutation
             )
     except (AccountClaimConflictError, LeaseConflictError) as exc:
         # Active leases make a decommission unsafe; BindingManager rejects it.
@@ -351,8 +483,13 @@ async def decommission_account_binding(
         raise HTTPException(404, f"Account {account_id} has no EIP binding")
     return {
         "account_id": account_id,
-        "status": "decommissioned",
+        "status": (
+            "decommissioned_and_removed"
+            if identity_removed
+            else "decommissioned"
+        ),
         "eip_released": True,
+        "identity_removed": identity_removed,
     }
 
 
@@ -465,6 +602,8 @@ async def remove_account(account_id: str) -> dict:
                         "finish its Job and decommission it first",
                     )
                 ok = await manager.account_store.remove(account_id)
+                if ok:
+                    await _account_allocator().clear_quarantine(account_id)
     except AccountClaimConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
     if not ok:

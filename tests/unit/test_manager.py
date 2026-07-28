@@ -130,6 +130,18 @@ def manager(tmp_config, provider):
     return ElasticAgentManager(tmp_config, provider)
 
 
+def _rewrite_persisted_account_mode(
+    registry_path: str,
+    job_id: str,
+    mode: str,
+) -> None:
+    """Model a Job journal written by an older Manager release."""
+    spec_path = Path(registry_path).with_name("specs") / f"{job_id}.json"
+    payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    payload["spec"]["account"]["mode"] = mode
+    spec_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 # ------------------------------------------------------------------
 # Tests: lifecycle
 # ------------------------------------------------------------------
@@ -200,6 +212,78 @@ class TestManagerLifecycle:
             )
             assert journal["submission_state"] == "failed"
             assert journal["terminal_summary"]["done"] is True
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_collects_legacy_manager_distribute_unbound_job(
+        self, tmp_config, provider, monkeypatch
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = "job-legacy-manager-distribute"
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        await previous._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "legacy-manager-distribute",
+                "setup": {"target_dir": "/srv/legacy-job"},
+                "run": {"command": "must-never-be-replayed"},
+                "account": {"mode": "worker_local_login"},
+                "collect": {"paths": ["results"]},
+            }),
+        )
+        await previous._update_batch_job_state(job_id, "running")
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentJob": job_id,
+            },
+        ))
+        await previous.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.READY,
+            public_ip=instance.public_ip,
+            private_ip=instance.private_ip,
+            metadata={"job_id": job_id},
+        ))
+        await previous.stop()
+        _rewrite_persisted_account_mode(
+            tmp_config.registry.path,
+            job_id,
+            "manager_distribute",
+        )
+
+        collected: list[tuple[str, str]] = []
+
+        async def record_collect(_driver, worker_id, recovery_spec, recovered_job_id):
+            assert recovered_job_id == job_id
+            assert recovery_spec.name == "legacy-manager-distribute"
+            assert recovery_spec.setup.target_dir == "/srv/legacy-job"
+            assert recovery_spec.collect.paths == ["results"]
+            # Recovery compatibility exposes no executable/login fields.
+            assert not hasattr(recovery_spec, "run")
+            assert not hasattr(recovery_spec, "account")
+            collected.append((worker_id, recovered_job_id))
+
+        monkeypatch.setattr(ManagerFleetDriver, "collect", record_collect)
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            assert collected == [(instance.instance_id, job_id)]
+            assert provider._instances == {}
+            recovered = await restarted.registry.get(instance.instance_id)
+            assert recovered.status == NodeStatus.TERMINATED
         finally:
             await restarted.stop()
 
@@ -519,6 +603,98 @@ class TestManagerLifecycle:
             assert (await provider.describe_eip(allocation_id)).instance_id is None
             assert len(provider.get_operations("release_eip")) == 0
             assert restarted.binding_recovery_ready is True
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_collects_legacy_manager_distribute_eip_job(
+        self, tmp_config, monkeypatch
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = "legacy-manager-distribute-eip"
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        await previous._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "legacy-manager-distribute-eip",
+                "setup": {"target_dir": "/srv/legacy-eip-job"},
+                "run": {"command": "must-never-be-replayed"},
+                "account": {
+                    "mode": "worker_local_login",
+                    "binding": "eip",
+                },
+                "collect": {"paths": ["results"]},
+            }),
+        )
+        await previous._update_batch_job_state(job_id, "running")
+        lease = await previous.binding_manager.reserve(
+            "acct-legacy",
+            job_id=job_id,
+            region="dryrun-region",
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": "acct-legacy",
+                "ElasticAgentLease": lease.lease_id,
+                "ElasticAgentJob": job_id,
+            },
+        ))
+        await previous.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.READY,
+            public_ip=instance.public_ip,
+            private_ip=instance.private_ip,
+            metadata={"job_id": job_id, "lease_id": lease.lease_id},
+        ))
+        await previous.binding_manager.attach_instance(
+            lease.lease_id,
+            instance.instance_id,
+            worker_id=instance.instance_id,
+        )
+        await previous.stop()
+        _rewrite_persisted_account_mode(
+            tmp_config.registry.path,
+            job_id,
+            "manager_distribute",
+        )
+
+        collected: list[tuple[str, str]] = []
+
+        async def record_collect(_driver, worker_id, recovery_spec, recovered_job_id):
+            assert recovered_job_id == job_id
+            assert recovery_spec.name == "legacy-manager-distribute-eip"
+            assert recovery_spec.setup.target_dir == "/srv/legacy-eip-job"
+            assert recovery_spec.collect.paths == ["results"]
+            assert not hasattr(recovery_spec, "run")
+            assert not hasattr(recovery_spec, "account")
+            collected.append((worker_id, recovered_job_id))
+
+        monkeypatch.setattr(ManagerFleetDriver, "collect", record_collect)
+        restarted = ElasticAgentManager(tmp_config, provider)
+        await restarted.start()
+        try:
+            recovered = await restarted.binding_manager.get_lease(lease.lease_id)
+            assert collected == [(instance.instance_id, job_id)]
+            assert recovered.recovery_collection_attempted is True
+            assert recovered.recovery_collected is True
+            assert recovered.recovery_collection_error is None
+            assert recovered.state == LeaseState.RELEASED
+            assert provider.instances[instance.instance_id].state == (
+                InstanceState.TERMINATED
+            )
         finally:
             await restarted.stop()
 

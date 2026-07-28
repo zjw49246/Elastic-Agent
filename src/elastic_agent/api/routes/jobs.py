@@ -10,35 +10,61 @@ from __future__ import annotations
 import asyncio
 import copy
 import errno
+import functools
 import hashlib
 import heapq
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import stat
 import tarfile
 import tempfile
 import threading
-from collections.abc import AsyncIterator
+import time
+from collections import Counter
+from collections.abc import AsyncIterator, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
-from starlette.background import BackgroundTask
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
 
 from elastic_agent.api.auth import require_api_key
+from elastic_agent.api.body_limit import (
+    JOB_SUBMIT_MAX_BODY_BYTES,
+    REQUEST_BODY_LIMIT_STATE_KEY,
+)
 from elastic_agent.core.batch_orchestrator import (
     TERMINAL_WORKER_PHASES,
     JobSpecPersistenceError,
 )
 from elastic_agent.core.job_spec import JobSpec
-from elastic_agent.core.job_spec_store import job_specs_dir
-from elastic_agent.core.secure_store import atomic_write_private, secure_state_directory
+from elastic_agent.core.job_spec_store import (
+    JOB_REQUEST_FINGERPRINT_ALGORITHM,
+    JOB_REQUEST_FINGERPRINT_SCHEMA,
+)
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    fsync_directory,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 router = APIRouter(tags=["jobs"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
@@ -53,13 +79,45 @@ _TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 # directory contains unexpectedly many files.  Listing has a higher ceiling;
 # downloads additionally cap the uncompressed payload size.
 RESULT_LIST_MAX_OBJECTS = 100_000
+RESULT_LIST_MAX_METADATA_BYTES = 64 * 1024 * 1024
+RESULT_LIST_MAX_SCANNED_ENTRIES = 200_000
+RESULT_LIST_MAX_S3_PAGES = 10_000
+RESULT_FILE_LIST_MAX_ENTRIES = 500
+RESULT_FILE_LIST_MAX_PATH_BYTES = 8 * 1024 * 1024
+RESULT_FILE_LIST_MAX_JSON_BYTES = 10 * 1024 * 1024
 RESULT_ARCHIVE_MAX_OBJECTS = 10_000
 RESULT_ARCHIVE_MAX_BYTES = 10 * 1024 * 1024 * 1024
 RESULT_SCORE_MAX_ATTEMPTS = 500
 RESULT_SCORE_MAX_BYTES = 2_000_000
+RESULT_SCORE_TOTAL_READ_BYTES = 16 * 1024 * 1024
+RESULT_SCORE_MAX_ENTRIES = 500
+RESULT_SCORE_TEXT_MAX_CHARS = 512
+RESULT_SCORE_ABS_MAX = 1_000_000_000_000
 JOB_LOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 JOB_LOG_LINE_MAX_BYTES = 64 * 1024
+JOB_JOURNAL_MAX_BYTES = 32 * 1024 * 1024
+JOB_HISTORY_WORKERS = 2
+JOB_LOG_READ_WORKERS = 4
+JOB_LIST_HISTORY_MAX_SCANNED_ENTRIES = 10_000
+JOB_LIST_HISTORY_MAX_NAME_BYTES = 2 * 1024 * 1024
+JOB_LIST_HISTORY_MAX_CANDIDATES = 1_000
+JOB_LIST_HISTORY_MAX_RETURNED = 500
+JOB_LIST_HISTORY_MAX_READ_BYTES = 64 * 1024 * 1024
+JOB_LIST_HISTORY_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+JOB_LIST_HISTORY_MAX_LEASES = 10_000
 RESULT_ARCHIVE_STREAM_WORKERS = 4
+RESULT_ARCHIVE_BUILD_WORKERS = 2
+RESULT_READ_WORKERS = 4
+RESULT_SUMMARY_MAX_JOBS = 1_000
+RESULT_SUMMARY_MAX_OBJECTS = 100_000
+RESULT_SUMMARY_MAX_METADATA_BYTES = 16 * 1024 * 1024
+RESULT_SUMMARY_MAX_DIRECTORY_ENTRIES = 5_000
+RESULT_SUMMARY_MAX_S3_ROOT_ENTRIES = 10_000
+RESULT_SUMMARY_MAX_S3_PAGES = 2_000
+RESULT_ARCHIVE_SPOOL_MAX_BYTES = 20 * 1024 * 1024 * 1024
+RESULT_ARCHIVE_DISK_SAFETY_BYTES = 512 * 1024 * 1024
+RESULT_ARCHIVE_STALE_SECONDS = 24 * 60 * 60
+HARNESS_UPLOAD_MAX_BYTES = 1024 * 1024
 
 # Archive producers perform long-lived blocking S3 reads. Keep them off
 # asyncio's shared default executor so concurrent downloads cannot starve
@@ -68,11 +126,95 @@ _RESULT_ARCHIVE_EXECUTOR = ThreadPoolExecutor(
     max_workers=RESULT_ARCHIVE_STREAM_WORKERS,
     thread_name_prefix="result-archive",
 )
+_RESULT_ARCHIVE_BUILD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=RESULT_ARCHIVE_BUILD_WORKERS,
+    thread_name_prefix="result-archive-build",
+)
+_RESULT_ARCHIVE_CLEANUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=RESULT_ARCHIVE_STREAM_WORKERS,
+    thread_name_prefix="result-archive-close",
+)
+_RESULT_ARCHIVE_FILE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=RESULT_ARCHIVE_STREAM_WORKERS,
+    thread_name_prefix="result-archive-file",
+)
+_RESULT_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=RESULT_READ_WORKERS,
+    thread_name_prefix="result-read",
+)
+_JOB_HISTORY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=JOB_HISTORY_WORKERS,
+    thread_name_prefix="job-history",
+)
+_JOB_LOG_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=JOB_LOG_READ_WORKERS,
+    thread_name_prefix="job-log-read",
+)
 
-# ``ETag`` is retained from ListObjectsV2 so GET can use ``IfMatch``.  The
-# fourth item may be ``None`` only for an S3-compatible backend that omitted an
-# ETag; exact byte-count validation still prevents truncation/over-read there.
-S3ResultObject = tuple[str, int, str, str | None]
+
+class _ResultOperationPermit:
+    """Exactly-once token for one fail-fast results operation."""
+
+    def __init__(self, admission: _ResultOperationAdmission) -> None:
+        self._admission = admission
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._admission._release()
+
+
+class _ResultOperationAdmission:
+    """Bound active work without accumulating coroutine waiter queues."""
+
+    def __init__(self, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("result operation limit must be positive")
+        self._limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> _ResultOperationPermit | None:
+        with self._lock:
+            if self._active >= self._limit:
+                return None
+            self._active += 1
+        return _ResultOperationPermit(self)
+
+    def _release(self) -> None:
+        with self._lock:
+            if self._active <= 0:
+                raise RuntimeError("result operation admission underflow")
+            self._active -= 1
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
+
+_RESULT_ARCHIVE_STREAM_ADMISSION = _ResultOperationAdmission(
+    RESULT_ARCHIVE_STREAM_WORKERS
+)
+_RESULT_ARCHIVE_BUILD_ADMISSION = _ResultOperationAdmission(
+    RESULT_ARCHIVE_BUILD_WORKERS
+)
+_RESULT_READ_ADMISSION = _ResultOperationAdmission(RESULT_READ_WORKERS)
+_JOB_HISTORY_ADMISSION = _ResultOperationAdmission(JOB_HISTORY_WORKERS)
+_JOB_LOG_READ_ADMISSION = _ResultOperationAdmission(JOB_LOG_READ_WORKERS)
+_RESULT_ARCHIVE_SPOOL_LOCK = threading.Lock()
+_RESULT_ARCHIVE_SPOOL_RESERVED = 0
+_RESULT_ARCHIVE_TEMP_RESERVATIONS: dict[Path, int] = {}
+_RESULT_ARCHIVE_STALE_CLEANED = False
+
+# ``ETag`` is retained from ListObjectsV2 so every later GET can use
+# ``IfMatch``. A backend that cannot provide immutable object identity is not a
+# safe source for an archive assembled after LIST and therefore fails closed.
+S3ResultObject = tuple[str, int, str, str]
 
 
 class S3ResultsUnavailable(RuntimeError):  # noqa: N818
@@ -87,6 +229,63 @@ class LocalResultsUnavailable(RuntimeError):  # noqa: N818
     """Manager-local result files changed or became unreadable while archiving."""
 
 
+class ResultsSpoolUnavailable(RuntimeError):  # noqa: N818
+    """The Manager cannot safely reserve temporary archive disk space."""
+
+
+def _acquire_result_operation(
+    admission: _ResultOperationAdmission,
+    *,
+    operation: str,
+) -> _ResultOperationPermit:
+    permit = admission.try_acquire()
+    if permit is None:
+        raise HTTPException(
+            503,
+            f"{operation} capacity is currently exhausted",
+            headers={"Retry-After": "1"},
+        )
+    return permit
+
+
+async def _run_owned_executor(executor, function, *args, **kwargs):
+    """Wait for real thread completion before propagating caller cancellation."""
+
+    future = asyncio.get_running_loop().run_in_executor(
+        executor,
+        functools.partial(function, *args, **kwargs),
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise
+            # A running thread cannot be cancelled. Keep the route's admission
+            # token until the callable really exits, then propagate the
+            # original request cancellation.
+            cancellation = exc
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        del result
+        raise cancellation
+    return result
+
+
+async def _run_result_read(function, *args, **kwargs):
+    return await _run_owned_executor(
+        _RESULT_READ_EXECUTOR,
+        function,
+        *args,
+        **kwargs,
+    )
+
+
 def _mgr():
     from elastic_agent.api.app import get_manager
     return get_manager()
@@ -94,8 +293,15 @@ def _mgr():
 
 def _specs_dir(mgr) -> Path:
     """Where submitted JobSpecs are persisted so they survive a Manager restart
-    (the orchestrator's job records are in-memory and lost on restart)."""
-    return job_specs_dir(mgr.config.registry.path)
+    (the orchestrator's job records are in-memory and lost on restart).
+
+    Do not repair every historical file on each API request: that old helper
+    used an unbounded glob. Exact files are tightened immediately before their
+    bounded read instead.
+    """
+    return secure_state_directory(
+        Path(mgr.config.registry.path).expanduser().with_name("specs")
+    )
 
 
 def _validate_job_id(job_id: str) -> str:
@@ -109,21 +315,188 @@ def _job_spec_path(mgr, job_id: str) -> Path:
     return _specs_dir(mgr) / f"{_validate_job_id(job_id)}.json"
 
 
-def _read_json_file(path: Path) -> dict:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _read_bounded_json_file(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[dict, int]:
+    """Read one private regular JSON file without following a replacement link."""
+
+    if max_bytes <= 0:
+        raise ValueError("JSON read budget is exhausted")
+    tighten_state_file(path)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > max_bytes
+        ):
+            raise ValueError(
+                f"JSON file {path.name!r} exceeds its read boundary"
+            )
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - bytes_read),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        if bytes_read > max_bytes:
+            raise ValueError(
+                f"JSON file {path.name!r} exceeds its read boundary"
+            )
+    finally:
+        os.close(descriptor)
+    payload = json.loads(b"".join(chunks).decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"invalid JSON object in {path.name}")
-    return payload
+    return payload, bytes_read
 
 
-def _read_job_journal(path: Path, expected_job_id: str) -> dict:
-    payload = _read_json_file(path)
+def _read_job_journal_sized(
+    path: Path,
+    expected_job_id: str,
+    *,
+    max_bytes: int = JOB_JOURNAL_MAX_BYTES,
+) -> tuple[dict, int]:
+    payload, bytes_read = _read_bounded_json_file(
+        path,
+        max_bytes=max_bytes,
+    )
     if (
         payload.get("job_id") != expected_job_id
         or not isinstance(payload.get("spec"), dict)
     ):
         raise ValueError(f"invalid JobSpec journal for {expected_job_id!r}")
-    return payload
+    return payload, bytes_read
+
+
+def _read_job_journal(path: Path, expected_job_id: str) -> dict:
+    return _read_job_journal_sized(path, expected_job_id)[0]
+
+
+def _load_historical_job_journals(
+    directory: Path,
+    live_ids: frozenset[str],
+) -> dict:
+    """Scandir and parse a bounded newest-first historical Job snapshot."""
+
+    candidates: list[tuple[int, str, int]] = []
+    scanned = 0
+    name_bytes = 0
+    truncated = False
+    candidate_limit = max(
+        JOB_LIST_HISTORY_MAX_CANDIDATES,
+        JOB_LIST_HISTORY_MAX_RETURNED,
+    )
+    try:
+        entries = os.scandir(directory)
+    except FileNotFoundError:
+        return {
+            "entries": [],
+            "scanned": 0,
+            "read_bytes": 0,
+            "truncated": False,
+        }
+    with entries:
+        for entry in entries:
+            if scanned >= JOB_LIST_HISTORY_MAX_SCANNED_ENTRIES:
+                truncated = True
+                break
+            scanned += 1
+            try:
+                name_bytes += len(entry.name.encode("utf-8"))
+            except UnicodeEncodeError:
+                truncated = True
+                continue
+            if name_bytes > JOB_LIST_HISTORY_MAX_NAME_BYTES:
+                truncated = True
+                break
+            if not entry.name.endswith(".json"):
+                continue
+            job_id = entry.name[:-5]
+            if (
+                _SAFE_JOB_ID.fullmatch(job_id) is None
+                or job_id in live_ids
+            ):
+                continue
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size < 1
+                or metadata.st_size > JOB_JOURNAL_MAX_BYTES
+            ):
+                continue
+            candidate = (
+                int(metadata.st_mtime_ns),
+                entry.name,
+                int(metadata.st_size),
+            )
+            if len(candidates) < candidate_limit:
+                heapq.heappush(candidates, candidate)
+            elif candidate > candidates[0]:
+                heapq.heapreplace(candidates, candidate)
+                truncated = True
+            else:
+                truncated = True
+
+    ordered = sorted(candidates, reverse=True)
+    parsed: list[tuple[str, dict]] = []
+    read_bytes = 0
+    for index, (_mtime_ns, name, listed_size) in enumerate(ordered):
+        if len(parsed) >= JOB_LIST_HISTORY_MAX_RETURNED:
+            truncated = True
+            break
+        remaining = JOB_LIST_HISTORY_MAX_READ_BYTES - read_bytes
+        if remaining <= 0:
+            truncated = True
+            break
+        if listed_size > remaining:
+            truncated = True
+            continue
+        job_id = name[:-5]
+        try:
+            payload, consumed = _read_job_journal_sized(
+                directory / name,
+                job_id,
+                max_bytes=min(JOB_JOURNAL_MAX_BYTES, remaining),
+            )
+        except (
+            json.JSONDecodeError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
+            continue
+        read_bytes += consumed
+        parsed.append((job_id, payload))
+        if (
+            len(parsed) >= JOB_LIST_HISTORY_MAX_RETURNED
+            and index + 1 < len(ordered)
+        ):
+            truncated = True
+
+    return {
+        "entries": parsed,
+        "scanned": scanned,
+        "read_bytes": read_bytes,
+        "truncated": truncated,
+    }
 
 
 def _journal_state(payload: dict) -> str:
@@ -285,12 +658,226 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
 def _canonical_spec(spec: object) -> object:
     """Normalize legacy persisted specs before idempotency comparison."""
 
+    candidate = copy.deepcopy(spec)
+    legacy_manager_distribution = False
+    if isinstance(candidate, dict):
+        account = candidate.get("account")
+        if (
+            isinstance(account, dict)
+            and account.get("mode") == "manager_distribute"
+        ):
+            # ``manager_distribute`` existed in an older schema. Preserve its
+            # identity marker while borrowing the current model only to fill
+            # defaults and normalize the rest of an otherwise compatible
+            # legacy request.
+            account["mode"] = "worker_local_login"
+            legacy_manager_distribution = True
     try:
-        return JobSpec.model_validate(spec).model_dump(mode="json")
+        normalized = JobSpec.model_validate(candidate).model_dump(mode="json")
     except (TypeError, ValueError):
         # An invalid/different journal must remain a mismatch. The caller
         # reports the same 409 as before without exposing validation details.
         return spec
+    if legacy_manager_distribution:
+        normalized["account"]["mode"] = "manager_distribute"
+    return normalized
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    """Reject NaN/Infinity, which are not JSON and lack stable semantics."""
+
+    raise ValueError(f"invalid JSON constant {value!r}")
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Reject ambiguous JSON objects instead of fingerprinting last-key-wins."""
+
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+async def _read_bounded_job_request(request: Request) -> dict[str, object]:
+    """Read one POST /jobs payload before applying the current JobSpec model."""
+
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid Content-Length") from exc
+        if content_length < 0:
+            raise HTTPException(400, "invalid Content-Length")
+        if content_length > JOB_SUBMIT_MAX_BODY_BYTES:
+            raise HTTPException(
+                413,
+                "Job request body exceeds the "
+                f"{JOB_SUBMIT_MAX_BODY_BYTES}-byte limit",
+            )
+
+    request_state = request.scope.get("state")
+    middleware_limit = (
+        request_state.get(REQUEST_BODY_LIMIT_STATE_KEY)
+        if isinstance(request_state, dict)
+        else None
+    )
+    if (
+        isinstance(middleware_limit, int)
+        and 0 < middleware_limit <= JOB_SUBMIT_MAX_BODY_BYTES
+    ):
+        body: bytes | bytearray = await request.body()
+        if len(body) > JOB_SUBMIT_MAX_BODY_BYTES:
+            raise HTTPException(
+                413,
+                "Job request body exceeds the "
+                f"{JOB_SUBMIT_MAX_BODY_BYTES}-byte limit",
+            )
+    else:
+        # Routers embedded without the production application middleware keep
+        # the same independent hard ceiling, including for chunked bodies.
+        incremental = bytearray()
+        async for chunk in request.stream():
+            if len(incremental) + len(chunk) > JOB_SUBMIT_MAX_BODY_BYTES:
+                raise HTTPException(
+                    413,
+                    "Job request body exceeds the "
+                    f"{JOB_SUBMIT_MAX_BODY_BYTES}-byte limit",
+                )
+            incremental.extend(chunk)
+        body = incremental
+    if not body:
+        raise HTTPException(422, "Job request body must be a JSON object")
+    try:
+        payload = json.loads(
+            body,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(422, "invalid Job JSON request body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Job request body must be a JSON object")
+    return payload
+
+
+def _request_fingerprint(payload: object) -> str:
+    """Return a stable digest of one parsed, standards-compliant JSON value."""
+
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validated_job_spec(payload: dict[str, object]) -> JobSpec:
+    """Apply the current schema while retaining FastAPI's safe 422 handling."""
+
+    try:
+        return JobSpec.model_validate(payload)
+    except ValidationError as exc:
+        errors = exc.errors(
+            include_url=True,
+            include_context=False,
+            include_input=False,
+        )
+        for error in errors:
+            error["loc"] = ("body", *error.get("loc", ()))
+        raise RequestValidationError(errors) from exc
+
+
+def _journal_request_match(
+    payload: dict,
+    raw_request: dict[str, object],
+    request_fingerprint: str,
+) -> tuple[bool, bool]:
+    """Return ``(matches, is_legacy)`` for a persisted idempotent request.
+
+    New journals compare the canonical raw-request digest. Old journals can
+    replay only when their stored spec is byte-semantically identical JSON or
+    both sides normalize identically under a known compatible legacy schema.
+    """
+
+    stored = payload.get("request_fingerprint")
+    if stored is not None:
+        if (
+            not isinstance(stored, dict)
+            or set(stored) != {"schema", "algorithm", "digest"}
+            or stored.get("schema") != JOB_REQUEST_FINGERPRINT_SCHEMA
+            or stored.get("algorithm") != JOB_REQUEST_FINGERPRINT_ALGORITHM
+            or not isinstance(stored.get("digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", stored["digest"]) is None
+        ):
+            raise ValueError("invalid persisted Job request fingerprint")
+        if hmac.compare_digest(stored["digest"], request_fingerprint):
+            return True, False
+        # Canonical raw JSON intentionally distinguishes omitted defaults from
+        # explicitly serialized defaults. Preserve the prior semantic
+        # idempotency contract when *both* requests still validate under the
+        # current schema and normalize to the same JobSpec. Cross-version
+        # historical requests that no longer validate get only the strict raw
+        # fingerprint path above.
+        try:
+            persisted_current = JobSpec.model_validate(
+                payload.get("spec")
+            ).model_dump(mode="json")
+            request_current = JobSpec.model_validate(
+                raw_request
+            ).model_dump(mode="json")
+            return (
+                hmac.compare_digest(
+                    _request_fingerprint(persisted_current),
+                    _request_fingerprint(request_current),
+                ),
+                False,
+            )
+        except (TypeError, ValueError, RecursionError):
+            return False, False
+
+    persisted_spec = payload.get("spec")
+    try:
+        if hmac.compare_digest(
+            _request_fingerprint(persisted_spec),
+            request_fingerprint,
+        ):
+            return True, True
+        persisted_normalized = _canonical_spec(persisted_spec)
+        request_normalized = _canonical_spec(raw_request)
+        return (
+            hmac.compare_digest(
+                _request_fingerprint(persisted_normalized),
+                _request_fingerprint(request_normalized),
+            ),
+            True,
+        )
+    except (TypeError, ValueError, RecursionError):
+        return False, True
+
+
+def _idempotency_conflict(*, legacy: bool) -> HTTPException:
+    if legacy:
+        return HTTPException(
+            409,
+            "Idempotency-Key belongs to a legacy Job journal without a "
+            "request fingerprint; exact request equivalence cannot be proven",
+        )
+    return HTTPException(
+        409,
+        "Idempotency-Key was already used for another Job request",
+    )
 
 
 def _job_detail(job) -> dict:
@@ -335,7 +922,15 @@ def _job_detail(job) -> dict:
                 # for API clients instead of asking them to infer it from a
                 # terminal process phase.
                 "worker_released": (
-                    r.cleaned_up if is_eip_bound else job.resources_released
+                    r.cleaned_up
+                    if is_eip_bound
+                    else (
+                        job.resources_released
+                        or (
+                            job.release_workers_on_complete
+                            and r.cleaned_up
+                        )
+                    )
                 ),
                 "worker_release_expected": worker_release_expected,
             }
@@ -469,6 +1064,18 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
         # Local metadata only: Job plan is a pure read and must not make an
         # upstream CloudRouter request or claim an identity.
         accounts = [*(await agent_api_store.list()), *accounts]
+    binding_manager = getattr(mgr, "binding_manager", None)
+    durable_binding_ids = {
+        binding.account_id
+        for binding in (
+            await binding_manager.list_bindings()
+            if (
+                binding_manager is not None
+                and spec.account.mode != "none"
+            )
+            else []
+        )
+    }
 
     def supports_agent(account, agent_type: str, model: str = "") -> bool:
         check = getattr(account, "supports_agent_type", None)
@@ -483,6 +1090,16 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             or bool(model_check(agent_type, model))
         )
 
+    def agent_api_decision(account) -> dict:
+        if getattr(account, "auth_kind", "oauth") != "agent_api":
+            return {"available": True}
+        if agent_api_store is None:
+            return {
+                "available": False,
+                "reason": "Agent API store is not configured",
+            }
+        return agent_api_store.availability_decision(account.id)
+
     if spec.account.mode != "none":
         by_id = {account.id: account for account in accounts}
         for account_id in spec.account.ids:
@@ -492,13 +1109,17 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             if not account.enabled:
                 raise HTTPException(422, f"selected account {account_id!r} is disabled")
             if (
-                getattr(account, "auth_kind", "oauth") == "agent_api"
-                and agent_api_store.availability_decision(account.id).get(
-                    "available"
-                )
-                is False
+                spec.account.binding == "none"
+                and account_id in durable_binding_ids
             ):
-                decision = agent_api_store.availability_decision(account.id)
+                raise HTTPException(
+                    422,
+                    f"selected account {account_id!r} has a durable EIP binding; "
+                    "use account.binding='eip' or explicitly decommission the "
+                    "binding first",
+                )
+            decision = agent_api_decision(account)
+            if decision.get("available") is False:
                 raise HTTPException(
                     422,
                     f"selected account {account_id!r} is unavailable: "
@@ -524,30 +1145,64 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                     f"{', '.join(available_types)}, not "
                     f"{spec.account.agent_type}{model_suffix}",
                 )
+        duplicate_ids = {
+            account_id for account_id, count
+            in Counter(spec.account.ids).items()
+            if count > 1
+        }
+        for account_id in duplicate_ids:
+            account = by_id[account_id]
+            if (
+                spec.account.binding != "none"
+                or getattr(account, "auth_kind", "oauth") != "agent_api"
+            ):
+                raise HTTPException(
+                    422,
+                    f"selected OAuth/EIP account {account_id!r} cannot be "
+                    "shared across worker slots",
+                )
         if not spec.account.ids:
             eligible = [
                 account for account in accounts
                 if account.enabled
                 and account.group == spec.account.group
+                and (
+                    spec.account.binding != "none"
+                    or account.id not in durable_binding_ids
+                )
                 and supports_agent(
                     account,
                     spec.account.agent_type,
                     spec.account.model,
                 )
-                and (
-                    getattr(account, "auth_kind", "oauth") != "agent_api"
-                    or agent_api_store.availability_decision(account.id).get(
-                        "available"
-                    )
-                    is not False
-                )
+                and agent_api_decision(account).get("available") is not False
             ]
             required = spec.fanout.workers * spec.account.per_worker
-            if len(eligible) < required:
+            eligible_api = [
+                account for account in eligible
+                if getattr(account, "auth_kind", "oauth") == "agent_api"
+            ]
+            eligible_oauth = [
+                account for account in eligible
+                if getattr(account, "auth_kind", "oauth") != "agent_api"
+            ]
+            if spec.account.binding == "none" and eligible_api:
+                # Automatic allocation may reuse each API account once per
+                # worker, but never twice among that worker's pre-login slots.
+                # Explicit ids are a separate, administrator-chosen mapping
+                # and may repeat one API id deliberately.
+                available_slots = (
+                    len(eligible_oauth)
+                    + len(eligible_api) * spec.fanout.workers
+                )
+            else:
+                available_slots = len(eligible_oauth) + len(eligible_api)
+            if available_slots < required:
                 raise HTTPException(
                     422,
                     f"account group {spec.account.group!r} has "
-                    f"{len(eligible)} eligible {spec.account.agent_type} account(s); "
+                    f"{len(eligible_oauth)} eligible OAuth account(s) and "
+                    f"{len(eligible_api)} eligible Agent API account(s); "
                     f"this Job requires {required}",
                 )
 
@@ -578,8 +1233,9 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
         and spec.account.binding == "none"
     ):
         warnings.append(
-            "account.binding='none' uses a temporary public IP and bypasses "
-            "the account's durable EIP; use binding='eip' for stable login identity"
+            "account.binding='none' uses a temporary public IP and excludes "
+            "identities with durable EIP bindings; use binding='eip' for "
+            "stable login identity"
         )
 
     results_bucket = _s3_bucket()
@@ -596,6 +1252,10 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             )
 
     ctx = spec.worker_contexts()[0]
+    # A plan has no real worker yet, but hostname is a valid render variable.
+    # Use a conspicuous stable preview value rather than passing an empty
+    # hostname into the runtime fail-closed dataset renderer.
+    ctx.hostname = "plan-worker-00000"
     command_preview = spec.render_command(ctx)
     dataset_preview = spec.render_s3_datasets(ctx)
     return {
@@ -661,22 +1321,49 @@ async def plan_job(spec: JobSpec) -> dict:
     return await _preflight_job(_mgr(), spec)
 
 
-@router.post("/jobs", status_code=201)
+@router.post(
+    "/jobs",
+    status_code=201,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/JobSpec"},
+                },
+            },
+        },
+    },
+)
 async def submit_job(
-    spec: JobSpec,
+    request: Request,
     idempotency_key: str | None = Header(
         default=None, alias="Idempotency-Key"
     ),
 ) -> dict:
-    """Validate + launch a batch job. Returns the job summary."""
+    """Replay history or validate + launch a new batch Job."""
+
+    raw_request = await _read_bounded_job_request(request)
+    try:
+        fingerprint = _request_fingerprint(raw_request)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise HTTPException(422, "invalid Job JSON request body") from exc
+
     mgr = _mgr()
-    await _preflight_job(mgr, spec)
     if idempotency_key is not None:
         idempotency_key = idempotency_key.strip()
         if not idempotency_key or len(idempotency_key) > 200 or any(
             ord(char) < 0x20 for char in idempotency_key
         ):
             raise HTTPException(400, "invalid Idempotency-Key")
+
+    # Unkeyed submissions have no shared identity to serialize. Keep their
+    # potentially slow account/model/capacity probes outside the idempotency
+    # lock so one provider cannot stall unrelated submitters.
+    spec: JobSpec | None = None
+    if not idempotency_key:
+        spec = _validated_job_spec(raw_request)
+        await _preflight_job(mgr, spec)
 
     async with _submit_lock:
         deterministic_id = None
@@ -685,17 +1372,8 @@ async def submit_job(
             deterministic_id = "job-" + hashlib.sha256(
                 idempotency_key.encode("utf-8")
             ).hexdigest()[:32]
-            live = mgr.batch.get_job(deterministic_id)
-            if live is not None:
-                if live.spec.model_dump(mode="json") != spec.model_dump(mode="json"):
-                    raise HTTPException(
-                        409, "Idempotency-Key was already used for another JobSpec"
-                    )
-                detail = _job_detail(live)
-                detail["idempotent_replay"] = True
-                return detail
-
             persisted = _job_spec_path(mgr, deterministic_id)
+            live = mgr.batch.get_job(deterministic_id)
             if persisted.is_file():
                 try:
                     payload = await asyncio.to_thread(
@@ -705,10 +1383,29 @@ async def submit_job(
                     raise HTTPException(
                         500, f"cannot read persisted Job {deterministic_id}"
                     ) from exc
-                if _canonical_spec(payload.get("spec")) != spec.model_dump(mode="json"):
-                    raise HTTPException(
-                        409, "Idempotency-Key was already used for another JobSpec"
+                try:
+                    matches, legacy_journal = _journal_request_match(
+                        payload,
+                        raw_request,
+                        fingerprint,
                     )
+                except ValueError as exc:
+                    raise HTTPException(
+                        500,
+                        f"invalid request fingerprint for persisted Job "
+                        f"{deterministic_id}",
+                    ) from exc
+                if not matches:
+                    raise _idempotency_conflict(legacy=legacy_journal)
+
+                # The journal is authoritative for request identity, while a
+                # live record proves scheduling already crossed the launch
+                # boundary even if its durable state is momentarily prepared.
+                if live is not None:
+                    detail = _job_detail(live)
+                    detail["idempotent_replay"] = True
+                    return detail
+
                 submission_state = _journal_state(payload)
                 if submission_state == "prepared":
                     # The durable write won, but scheduling did not.  Reusing
@@ -725,16 +1422,39 @@ async def submit_job(
                     )
                     detail["idempotent_replay"] = True
                     return detail
+            elif live is not None:
+                # Compatibility only for an in-memory Job created by an older
+                # integration that did not install the persistence hook.
+                # Without a raw fingerprint, require strict legacy-normalized
+                # equality and otherwise fail closed.
+                matches, _legacy = _journal_request_match(
+                    {"spec": live.spec.model_dump(mode="json")},
+                    raw_request,
+                    fingerprint,
+                )
+                if not matches:
+                    raise _idempotency_conflict(legacy=True)
+                detail = _job_detail(live)
+                detail["idempotent_replay"] = True
+                return detail
+
+        # Exact replays of a live or durable Job above are historical reads:
+        # the current schema and policy must not invalidate a Job that already
+        # launched. New submissions and recovery of a merely prepared journal
+        # do require current validation and the complete preflight.
+        if spec is None:
+            spec = _validated_job_spec(raw_request)
+            await _preflight_job(mgr, spec)
 
         try:
-            # Prepare first so an idempotency key can own a deterministic Job
-            # id before the durable spec and any cloud side effect are created.
+            # The raw request fingerprint is carried into the very first
+            # atomic prepared journal, before registration, account claims, or
+            # cloud calls. This applies to keyed and unkeyed submissions.
+            job = mgr.batch.prepare(spec)
+            job.request_fingerprint = fingerprint
             if deterministic_id:
-                job = mgr.batch.prepare(spec)
                 job.job_id = deterministic_id
-                await mgr.batch.submit_prepared(job)
-            else:
-                job = await mgr.batch.submit(spec)
+            await mgr.batch.submit_prepared(job)
         except JobSpecPersistenceError as exc:
             raise HTTPException(500, str(exc)) from exc
         except NotImplementedError as exc:
@@ -792,29 +1512,94 @@ async def list_jobs() -> dict:
     # per job — that per-job fan-out floods the Manager and, once many jobs pile
     # up, makes the jobs panel silently fail to render ("No jobs yet").
     out = [_job_list_item(j) for j in live]
-    # Persisted specs whose jobs are no longer in memory (restarted) — surface
-    # them so they can be reviewed / resubmitted.
-    leases = await mgr.account_binding_store.list_leases()
-    leases_by_job: dict[str, list] = {}
-    for lease in leases:
-        leases_by_job.setdefault(lease.job_id, []).append(lease)
-    spec_files = await asyncio.to_thread(
-        lambda: sorted(_specs_dir(mgr).glob("*.json"))
+    # Persisted specs whose jobs are no longer in memory (restarted) are
+    # useful history, but this directory grows for the lifetime of the
+    # Manager. Scan and parse it under explicit aggregate budgets in a
+    # dedicated executor; fail fast instead of queuing unlimited UI polls.
+    permit = _acquire_result_operation(
+        _JOB_HISTORY_ADMISSION,
+        operation="Job history read",
     )
-    for f in spec_files:
-        if _SAFE_JOB_ID.fullmatch(f.stem) is None:
-            continue
-        if f.stem in live_ids:
-            continue
-        try:
-            data = await asyncio.to_thread(_read_job_journal, f, f.stem)
-        except Exception:
-            continue
-        recovered = leases_by_job.get(f.stem, [])
-        out.append(_persisted_job_view(
-            f.stem, data, recovered, include_spec=False,
-        ))
-    return {"jobs": out, "total": len(out)}
+    try:
+        history = await _run_owned_executor(
+            _JOB_HISTORY_EXECUTOR,
+            _load_historical_job_journals,
+            _specs_dir(mgr),
+            frozenset(live_ids),
+        )
+        history_ids = {
+            job_id for job_id, _payload in history["entries"]
+        }
+        leases_by_job: dict[str, list] = {}
+        leases_truncated = False
+        if history_ids:
+            # The binding store already owns a bounded durable state file.
+            # Group only leases relevant to the bounded history snapshot so
+            # the response cannot include unrelated lease metadata.
+            relevant_leases = await mgr.account_binding_store.list_leases(
+                job_ids=history_ids,
+                limit=JOB_LIST_HISTORY_MAX_LEASES + 1,
+            )
+            if len(relevant_leases) > JOB_LIST_HISTORY_MAX_LEASES:
+                leases_truncated = True
+                relevant_leases = relevant_leases[
+                    :JOB_LIST_HISTORY_MAX_LEASES
+                ]
+            for lease in relevant_leases:
+                leases_by_job.setdefault(lease.job_id, []).append(lease)
+
+        response_bytes = 2  # JSON array brackets
+        history_returned = 0
+        response_truncated = False
+        for job_id, data in history["entries"]:
+            try:
+                view = _persisted_job_view(
+                    job_id,
+                    data,
+                    leases_by_job.get(job_id, []),
+                    include_spec=False,
+                )
+                encoded = json.dumps(
+                    view,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            except (
+                RecursionError,
+                TypeError,
+                UnicodeEncodeError,
+                ValueError,
+            ):
+                logger.warning(
+                    "Ignoring invalid historical Job view %s",
+                    job_id,
+                )
+                continue
+            next_size = response_bytes + len(encoded) + bool(history_returned)
+            if next_size > JOB_LIST_HISTORY_MAX_RESPONSE_BYTES:
+                response_truncated = True
+                continue
+            response_bytes = next_size
+            out.append(view)
+            history_returned += 1
+
+        truncated = bool(
+            history["truncated"]
+            or response_truncated
+            or leases_truncated
+        )
+        return {
+            "jobs": out,
+            # Preserve the existing UI/API meaning: number of returned rows.
+            "total": len(out),
+            "truncated": truncated,
+            "history_scanned": history["scanned"],
+            "history_returned": history_returned,
+        }
+    finally:
+        permit.release()
 
 
 @router.get("/jobs/{job_id}")
@@ -860,13 +1645,24 @@ async def job_logs(
         raise HTTPException(404, "task output not found for this Job")
 
     response.headers["Cache-Control"] = "no-store"
-    archived = await asyncio.to_thread(
-        mgr.job_log_store.read_job_tail,
-        job_id,
-        lines=lines,
-        worker_id=worker_id,
-        task_id=task_id,
+    permit = _acquire_result_operation(
+        _JOB_LOG_READ_ADMISSION,
+        operation="Job log read",
     )
+    try:
+        archived = await _run_owned_executor(
+            _JOB_LOG_READ_EXECUTOR,
+            mgr.job_log_store.read_job_tail,
+            job_id,
+            lines=lines,
+            worker_id=worker_id,
+            task_id=task_id,
+        )
+    finally:
+        # `_run_owned_executor` shields a running thread through request
+        # cancellation, so this token cannot be returned while the disk scan
+        # still occupies its dedicated worker.
+        permit.release()
     archived_by_task = {
         str(snapshot["task_id"]): snapshot
         for snapshot in archived["tasks"]
@@ -1098,51 +1894,101 @@ def _local_regular_files(
     *,
     max_objects: int,
     max_total_bytes: int | None = None,
+    max_metadata_bytes: int = RESULT_LIST_MAX_METADATA_BYTES,
+    max_scanned_entries: int = RESULT_LIST_MAX_SCANNED_ENTRIES,
+    scan_usage: dict[str, int] | None = None,
 ) -> list[tuple[Path, str, os.stat_result]]:
     """Enumerate only regular files below ``base`` without following links."""
     if not _is_real_directory(base):
         return []
     files: list[tuple[Path, str, os.stat_result]] = []
     total_bytes = 0
-    for dirpath, dirnames, filenames in os.walk(base, topdown=True, followlinks=False):
-        directory = Path(dirpath)
-        real_dirs: list[str] = []
-        for name in sorted(dirnames):
-            child = directory / name
-            try:
-                child_stat = child.lstat()
-            except OSError:
-                continue
-            if stat.S_ISDIR(child_stat.st_mode):
-                real_dirs.append(name)
-        dirnames[:] = real_dirs
-        for name in sorted(filenames):
-            path = directory / name
-            try:
-                file_stat = path.lstat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(file_stat.st_mode):
-                continue
-            rel = path.relative_to(base).as_posix()
-            if not _is_safe_result_relative_path(rel):
-                raise LocalResultsUnavailable(
-                    f"local results contain an unsafe relative path: {rel!r}"
-                )
-            files.append((path, rel, file_stat))
-            total_bytes += file_stat.st_size
-            if len(files) > max_objects:
-                raise ResultsLimitExceeded(
-                    f"results contain more than {max_objects} regular files"
-                )
-            if max_total_bytes is not None and total_bytes > max_total_bytes:
-                raise ResultsLimitExceeded(
-                    f"results exceed the {max_total_bytes}-byte archive limit"
-                )
+    metadata_bytes = 0
+    scanned_entries = 0
+    pending_directories = [base]
+    while pending_directories:
+        directory = pending_directories.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                scanned_entries += 1
+                if scanned_entries > max_scanned_entries:
+                    raise ResultsLimitExceeded(
+                        "local results contain more than "
+                        f"{max_scanned_entries} filesystem entries"
+                    )
+                path = Path(entry.path)
+                try:
+                    rel = path.relative_to(base).as_posix()
+                    encoded_path_bytes = len(rel.encode("utf-8"))
+                except (UnicodeEncodeError, ValueError) as exc:
+                    raise LocalResultsUnavailable(
+                        "local results contain a path that is not valid UTF-8"
+                    ) from exc
+                metadata_bytes += encoded_path_bytes
+                if metadata_bytes > max_metadata_bytes:
+                    raise ResultsLimitExceeded(
+                        "local result path metadata exceeds the "
+                        f"{max_metadata_bytes}-byte limit"
+                    )
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending_directories.append(path)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    file_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(file_stat.st_mode):
+                    continue
+                if not _is_safe_result_relative_path(rel):
+                    raise LocalResultsUnavailable(
+                        "local results contain an unsafe relative path: "
+                        f"{rel!r}"
+                    )
+                files.append((path, rel, file_stat))
+                total_bytes += file_stat.st_size
+                if len(files) > max_objects:
+                    raise ResultsLimitExceeded(
+                        f"results contain more than {max_objects} regular files"
+                    )
+                if (
+                    max_total_bytes is not None
+                    and total_bytes > max_total_bytes
+                ):
+                    raise ResultsLimitExceeded(
+                        "results exceed the "
+                        f"{max_total_bytes}-byte archive limit"
+                    )
+    files.sort(key=lambda item: item[1])
+    if scan_usage is not None:
+        scan_usage["entries"] = scanned_entries
+        scan_usage["metadata_bytes"] = metadata_bytes
     return files
 
 
-def _read_small_regular_file(path: Path, *, max_bytes: int) -> bytes | None:
+def _same_file_snapshot(
+    current: os.stat_result,
+    expected: os.stat_result,
+) -> bool:
+    return (
+        current.st_dev == expected.st_dev
+        and current.st_ino == expected.st_ino
+        and current.st_size == expected.st_size
+        and current.st_mtime_ns == expected.st_mtime_ns
+    )
+
+
+def _read_small_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    expected_stat: os.stat_result | None = None,
+) -> bytes | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -1150,41 +1996,186 @@ def _read_small_regular_file(path: Path, *, max_bytes: int) -> bytes | None:
         return None
     try:
         file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_size > max_bytes
+            or (
+                expected_stat is not None
+                and not _same_file_snapshot(file_stat, expected_stat)
+            )
+        ):
             return None
         with os.fdopen(fd, "rb", closefd=False) as stream:
-            return stream.read(max_bytes + 1)
+            payload = stream.read(file_stat.st_size + 1)
+        if len(payload) != file_stat.st_size:
+            return None
+        final_stat = os.fstat(fd)
+        if not _same_file_snapshot(final_stat, file_stat):
+            return None
+        return payload
     except OSError:
         return None
     finally:
         os.close(fd)
 
 
-def _results_for(mgr, job_id: str, base: Path) -> dict:
+def _bounded_score(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+
+    values: dict[str, str | None] = {}
+    for field in ("task_id", "prompt_level", "status"):
+        value = raw.get(field)
+        if value is None:
+            # Preserve compatibility with historical benchmark summaries that
+            # only emitted ``final_score`` while still bounding present text.
+            values[field] = None
+            continue
+        if (
+            not isinstance(value, str)
+            or len(value) > RESULT_SCORE_TEXT_MAX_CHARS
+            or not value.isprintable()
+        ):
+            return None
+        values[field] = value
+
+    score = raw.get("final_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    if isinstance(score, float) and not math.isfinite(score):
+        return None
+    try:
+        if abs(score) > RESULT_SCORE_ABS_MAX:
+            return None
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return {**values, "final_score": score}
+
+
+def _bounded_result_files(
+    rows: Iterable[tuple[str, int]],
+    *,
+    file_count: int,
+) -> list[dict]:
+    """Build an explicitly bounded result-file response.
+
+    ``file_count`` comes from the complete authoritative local/S3 listing.
+    Callers expose ``files_returned`` and ``files_truncated`` so the fixed-size
+    preview can never be mistaken for a complete list. Path and exact compact
+    JSON byte budgets additionally protect unusual but valid long filenames.
+    """
+
+    files: list[dict] = []
+    path_bytes = 0
+    # JSON array brackets. Each entry below includes its exact compact JSON
+    # representation plus the separating comma used by the response.
+    serialized_bytes = 2
+    for rel, size in islice(rows, RESULT_FILE_LIST_MAX_ENTRIES):
+        try:
+            path_bytes += len(rel.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ResultsLimitExceeded(
+                f"result listing has {file_count} files but contains a path "
+                "that is not valid UTF-8"
+            ) from exc
+        if path_bytes > RESULT_FILE_LIST_MAX_PATH_BYTES:
+            raise ResultsLimitExceeded(
+                f"result listing has {file_count} files but UTF-8 path "
+                f"metadata exceeds {RESULT_FILE_LIST_MAX_PATH_BYTES} bytes"
+            )
+        item = {"path": rel, "size": size}
+        encoded_item = json.dumps(
+            item,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        serialized_bytes += len(encoded_item) + bool(files)
+        if serialized_bytes > RESULT_FILE_LIST_MAX_JSON_BYTES:
+            raise ResultsLimitExceeded(
+                f"result listing has {file_count} files but serialized file "
+                f"metadata exceeds {RESULT_FILE_LIST_MAX_JSON_BYTES} bytes"
+            )
+        files.append(item)
+    return files
+
+
+def _results_for(
+    mgr,
+    job_id: str,
+    base: Path,
+    *,
+    parse_scores: bool = True,
+    include_files: bool = True,
+    max_objects: int = RESULT_LIST_MAX_OBJECTS,
+    max_metadata_bytes: int = RESULT_LIST_MAX_METADATA_BYTES,
+    include_scan_usage: bool = False,
+) -> dict:
+    scan_usage: dict[str, int] | None = {} if include_scan_usage else None
     regular = _local_regular_files(
-        base, max_objects=RESULT_LIST_MAX_OBJECTS,
+        base,
+        max_objects=max_objects,
+        max_metadata_bytes=max_metadata_bytes,
+        scan_usage=scan_usage,
     )
-    files = [{"path": rel, "size": item_stat.st_size}
-             for _, rel, item_stat in regular]
-    scores = []
-    for path, rel, _ in regular:
+    file_count = len(regular)
+    files = (
+        _bounded_result_files(
+            (
+                (rel, item_stat.st_size)
+                for _, rel, item_stat in regular
+            ),
+            file_count=file_count,
+        )
+        if include_files
+        else []
+    )
+    scores: list[dict] = []
+    attempted = 0
+    total_read_bytes = 0
+    for path, rel, listed_stat in regular if parse_scores else ():
         parts = PurePosixPath(rel).parts
         if not rel.endswith(".json") or "instances" in parts:
             continue
-        payload = _read_small_regular_file(path, max_bytes=2_000_000)
+        if listed_stat.st_size > RESULT_SCORE_MAX_BYTES:
+            continue
+        if (
+            attempted >= RESULT_SCORE_MAX_ATTEMPTS
+            or len(scores) >= RESULT_SCORE_MAX_ENTRIES
+            or total_read_bytes + listed_stat.st_size
+            > RESULT_SCORE_TOTAL_READ_BYTES
+        ):
+            break
+        attempted += 1
+        total_read_bytes += listed_stat.st_size
+        payload = _read_small_regular_file(
+            path,
+            max_bytes=RESULT_SCORE_MAX_BYTES,
+            expected_stat=listed_stat,
+        )
         if payload is None:
             continue
         try:
             d = json.loads(payload)
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        except (RecursionError, UnicodeDecodeError, TypeError, ValueError):
             continue
-        if isinstance(d, dict) and "final_score" in d:
-            scores.append({
-                "task_id": d.get("task_id"), "prompt_level": d.get("prompt_level"),
-                "status": d.get("status"), "final_score": d.get("final_score"),
-            })
+        score = _bounded_score(d)
+        if score is not None:
+            scores.append(score)
     s3_uri = mgr._s3_uploader.s3_uri(job_id) if getattr(mgr, "_s3_uploader", None) else None
-    return {"job_id": job_id, "file_count": len(files), "scores": scores, "s3_uri": s3_uri, "files": files}
+    result = {
+        "job_id": job_id,
+        "file_count": file_count,
+        "files_returned": len(files),
+        "files_truncated": include_files and len(files) < file_count,
+        "scores": scores,
+        "s3_uri": s3_uri,
+        "files": files,
+    }
+    if include_scan_usage:
+        assert scan_usage is not None
+        result["_scan_metadata_bytes"] = scan_usage["metadata_bytes"]
+    return result
 
 
 # --- S3-backed results (worker-direct push lands only in S3, not the Manager's
@@ -1221,6 +2212,7 @@ def _s3_list_job(
     *,
     max_objects: int | None = None,
     max_total_bytes: int | None = None,
+    max_metadata_bytes: int = RESULT_LIST_MAX_METADATA_BYTES,
 ) -> list[S3ResultObject]:
     """Objects under s3://<bucket>/jobs/<job_id>/ → result metadata tuples.
     Empty when no bucket is configured or nothing is there."""
@@ -1232,11 +2224,35 @@ def _s3_list_job(
     prefix = _s3_job_prefix(job_id)
     out: list[S3ResultObject] = []
     total_bytes = 0
+    metadata_bytes = 0
+    scanned_entries = 0
+    scanned_pages = 0
     try:
         s3 = _s3_client()
         for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
+            scanned_pages += 1
+            if scanned_pages > RESULT_LIST_MAX_S3_PAGES:
+                raise ResultsLimitExceeded(
+                    "S3 result listing contains more than "
+                    f"{RESULT_LIST_MAX_S3_PAGES} pages"
+                )
+            contents = page.get("Contents", [])
+            if not isinstance(contents, list):
+                raise S3ResultsUnavailable(
+                    "S3 returned an invalid result object listing"
+                )
+            for obj in contents:
+                scanned_entries += 1
+                if scanned_entries > RESULT_LIST_MAX_SCANNED_ENTRIES:
+                    raise ResultsLimitExceeded(
+                        "S3 results contain more than "
+                        f"{RESULT_LIST_MAX_SCANNED_ENTRIES} listed entries"
+                    )
+                if not isinstance(obj, dict):
+                    raise S3ResultsUnavailable(
+                        "S3 returned an invalid result object"
+                    )
+                key = obj.get("Key")
                 if not isinstance(key, str) or not key.startswith(prefix):
                     raise S3ResultsUnavailable(
                         "S3 results contain an object outside the requested prefix"
@@ -1244,15 +2260,28 @@ def _s3_list_job(
                 rel = key[len(prefix):]
                 if rel:
                     rel = _safe_s3_relative_key(rel)
-                    size = obj["Size"]
+                    size = obj.get("Size")
                     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                         raise S3ResultsUnavailable(
                             f"S3 result object {key!r} has an invalid size"
                         )
                     etag = obj.get("ETag")
-                    if etag is not None and not isinstance(etag, str):
+                    if not isinstance(etag, str) or not etag:
                         raise S3ResultsUnavailable(
-                            f"S3 result object {key!r} has an invalid ETag"
+                            f"S3 result object {key!r} has no immutable ETag"
+                        )
+                    try:
+                        metadata_bytes += len(rel.encode("utf-8"))
+                        metadata_bytes += len(key.encode("utf-8"))
+                        metadata_bytes += len(etag.encode("utf-8"))
+                    except UnicodeEncodeError as exc:
+                        raise S3ResultsUnavailable(
+                            "S3 results contain metadata that is not valid UTF-8"
+                        ) from exc
+                    if metadata_bytes > max_metadata_bytes:
+                        raise ResultsLimitExceeded(
+                            "S3 result metadata exceeds the "
+                            f"{max_metadata_bytes}-byte limit"
                         )
                     out.append((rel, size, key, etag))
                     total_bytes += size
@@ -1289,9 +2318,11 @@ def _get_s3_result_body(s3, bucket: str, obj: S3ResultObject):
     """
 
     _rel, expected_size, key, listed_etag = obj
-    request = {"Bucket": bucket, "Key": key}
-    if listed_etag:
-        request["IfMatch"] = listed_etag
+    if not isinstance(listed_etag, str) or not listed_etag:
+        raise S3ResultsUnavailable(
+            f"S3 result object {key!r} has no immutable ETag"
+        )
+    request = {"Bucket": bucket, "Key": key, "IfMatch": listed_etag}
     response = s3.get_object(**request)
     body = response["Body"]
     try:
@@ -1308,7 +2339,7 @@ def _get_s3_result_body(s3, bucket: str, obj: S3ResultObject):
                 f"S3 result object {key!r} changed size while being read"
             )
         response_etag = response.get("ETag")
-        if listed_etag and response_etag != listed_etag:
+        if response_etag != listed_etag:
             raise S3ResultsUnavailable(
                 f"S3 result object {key!r} changed while being read"
             )
@@ -1346,24 +2377,44 @@ def _read_s3_body_exact(body, expected_size: int, *, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _results_from_s3(job_id: str, objs: list[S3ResultObject], *, parse_scores: bool) -> dict:
+def _results_from_s3(
+    job_id: str,
+    objs: list[S3ResultObject],
+    *,
+    parse_scores: bool,
+    include_files: bool = True,
+) -> dict:
     bucket = _s3_bucket()
-    files = [{"path": rel, "size": size} for rel, size, _, _ in objs]
+    file_count = len(objs)
+    files = (
+        _bounded_result_files(
+            ((rel, size) for rel, size, _, _ in objs),
+            file_count=file_count,
+        )
+        if include_files
+        else []
+    )
     scores: list[dict] = []
     if parse_scores:
         s3 = _s3_client()
         attempted = 0
+        total_read_bytes = 0
         for obj in objs:
             rel, size, key, _etag = obj
             if not rel.endswith(".json") or "instances" in rel.split("/"):
                 continue
             if size > RESULT_SCORE_MAX_BYTES:  # agent stdout dumps etc.
                 continue
-            if attempted >= RESULT_SCORE_MAX_ATTEMPTS:
+            if (
+                attempted >= RESULT_SCORE_MAX_ATTEMPTS
+                or len(scores) >= RESULT_SCORE_MAX_ENTRIES
+                or total_read_bytes + size > RESULT_SCORE_TOTAL_READ_BYTES
+            ):
                 break
             # Count attempts, not successful JSON parses: an attacker must not
             # turn 100k invalid .json objects into 100k bounded-but-costly GETs.
             attempted += 1
+            total_read_bytes += size
             try:
                 body = _get_s3_result_body(s3, bucket, obj)
                 try:
@@ -1381,41 +2432,143 @@ def _results_from_s3(job_id: str, objs: list[S3ResultObject], *, parse_scores: b
                 ) from exc
             try:
                 d = json.loads(payload)
-            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            except (RecursionError, UnicodeDecodeError, TypeError, ValueError):
                 continue
-            if isinstance(d, dict) and "final_score" in d:
-                scores.append({
-                    "task_id": d.get("task_id"), "prompt_level": d.get("prompt_level"),
-                    "status": d.get("status"), "final_score": d.get("final_score"),
-                })
-    return {"job_id": job_id, "file_count": len(files), "scores": scores,
-            "s3_uri": f"s3://{bucket}/{_s3_job_prefix(job_id)}", "files": files}
+            score = _bounded_score(d)
+            if score is not None:
+                scores.append(score)
+    return {
+        "job_id": job_id,
+        "file_count": file_count,
+        "files_returned": len(files),
+        "files_truncated": include_files and len(files) < file_count,
+        "scores": scores,
+        "s3_uri": f"s3://{bucket}/{_s3_job_prefix(job_id)}",
+        "files": files,
+    }
 
 
-def _s3_result_summaries() -> list[dict]:
+def _s3_result_summaries(
+    *,
+    max_jobs: int,
+    max_objects: int,
+    max_metadata_bytes: int,
+) -> tuple[list[dict], set[str], int, int, bool]:
     bucket = _s3_bucket()
     if not bucket:
-        return []
+        return [], set(), 0, 0, False
     root_prefix = f"{_s3_prefix()}/" if _s3_prefix() else ""
     jobs: list[dict] = []
     seen: set[str] = set()
+    object_count = 0
+    metadata_bytes = 0
+    truncated = False
+    scanned_entries = 0
+    scanned_pages = 0
     try:
         s3 = _s3_client()
         for page in s3.get_paginator("list_objects_v2").paginate(
             Bucket=bucket, Prefix=root_prefix, Delimiter="/",
         ):
-            for common_prefix in page.get("CommonPrefixes", []):
+            scanned_pages += 1
+            if scanned_pages > RESULT_SUMMARY_MAX_S3_PAGES:
+                return jobs, seen, object_count, metadata_bytes, True
+            direct_objects = page.get("Contents", [])
+            common_prefixes = page.get("CommonPrefixes", [])
+            if (
+                not isinstance(direct_objects, list)
+                or not isinstance(common_prefixes, list)
+            ):
+                raise S3ResultsUnavailable(
+                    "S3 returned an invalid root result listing"
+                )
+            for direct_object in direct_objects:
+                scanned_entries += 1
+                if scanned_entries > RESULT_SUMMARY_MAX_S3_ROOT_ENTRIES:
+                    return jobs, seen, object_count, metadata_bytes, True
+                if not isinstance(direct_object, dict):
+                    raise S3ResultsUnavailable(
+                        "S3 returned an invalid root result object"
+                    )
+                direct_key = direct_object.get("Key")
+                if not isinstance(direct_key, str):
+                    raise S3ResultsUnavailable(
+                        "S3 returned an invalid root result object key"
+                    )
+                try:
+                    metadata_bytes += len(direct_key.encode("utf-8"))
+                except UnicodeEncodeError as exc:
+                    raise S3ResultsUnavailable(
+                        "S3 returned root metadata that is not valid UTF-8"
+                    ) from exc
+                if metadata_bytes > max_metadata_bytes:
+                    return jobs, seen, object_count, metadata_bytes, True
+            for common_prefix in common_prefixes:
+                scanned_entries += 1
+                if scanned_entries > RESULT_SUMMARY_MAX_S3_ROOT_ENTRIES:
+                    return jobs, seen, object_count, metadata_bytes, True
+                if not isinstance(common_prefix, dict):
+                    raise S3ResultsUnavailable(
+                        "S3 returned an invalid result prefix"
+                    )
                 raw_prefix = common_prefix.get("Prefix")
                 if not isinstance(raw_prefix, str) or not raw_prefix.startswith(root_prefix):
                     raise S3ResultsUnavailable("S3 returned an invalid result prefix")
+                try:
+                    prefix_bytes = len(raw_prefix.encode("utf-8"))
+                except UnicodeEncodeError as exc:
+                    raise S3ResultsUnavailable(
+                        "S3 returned a result prefix that is not valid UTF-8"
+                    ) from exc
+                metadata_bytes += prefix_bytes
+                if metadata_bytes > max_metadata_bytes:
+                    return jobs, seen, object_count, metadata_bytes, True
                 job_id = raw_prefix[len(root_prefix):].strip("/")
                 if _SAFE_JOB_ID.fullmatch(job_id) is None:
                     raise S3ResultsUnavailable("S3 returned an unsafe result job id")
                 if job_id in seen:
                     continue
+                if len(jobs) >= max_jobs or object_count >= max_objects:
+                    truncated = True
+                    return (
+                        jobs,
+                        seen,
+                        object_count,
+                        metadata_bytes,
+                        truncated,
+                    )
                 seen.add(job_id)
+                try:
+                    objects = _s3_list_job(
+                        job_id,
+                        max_objects=max_objects - object_count,
+                        max_metadata_bytes=(
+                            max_metadata_bytes
+                            - metadata_bytes
+                        ),
+                    )
+                except ResultsLimitExceeded:
+                    truncated = True
+                    return (
+                        jobs,
+                        seen,
+                        object_count,
+                        metadata_bytes,
+                        truncated,
+                    )
+                object_metadata = sum(
+                    len(rel.encode("utf-8"))
+                    + len(key.encode("utf-8"))
+                    + (len(etag.encode("utf-8")) if etag else 0)
+                    for rel, _size, key, etag in objects
+                )
+                object_count += len(objects)
+                metadata_bytes += object_metadata
                 result = _results_from_s3(
-                    job_id, _s3_list_job(job_id), parse_scores=False,
+                    job_id,
+                    objects,
+                    parse_scores=False,
+                    include_files=False,
                 )
                 jobs.append({
                     key: result[key]
@@ -1428,106 +2581,506 @@ def _s3_result_summaries() -> list[dict]:
             "cannot list configured S3 results backend: "
             f"{exc or type(exc).__name__}"
         ) from exc
-    return jobs
+    return jobs, seen, object_count, metadata_bytes, truncated
 
 
-def _local_result_summaries(mgr, seen: set[str]) -> list[dict]:
+def _local_result_summaries(
+    mgr,
+    seen: set[str],
+    *,
+    max_jobs: int,
+    max_objects: int,
+    max_metadata_bytes: int,
+) -> tuple[list[dict], int, int, bool]:
     root = Path(mgr.collected_root)
     if not _is_real_directory(root):
-        return []
+        return [], 0, 0, False
     jobs: list[dict] = []
-    for directory in sorted(root.iterdir()):
-        if (
-            directory.name in seen
-            or _SAFE_JOB_ID.fullmatch(directory.name) is None
-            or not _is_real_directory(directory)
-        ):
-            continue
-        result = _results_for(mgr, directory.name, directory)
-        jobs.append({
-            key: result[key]
-            for key in ("job_id", "file_count", "scores", "s3_uri")
-        })
-    return jobs
+    object_count = 0
+    metadata_bytes = 0
+    scanned_entries = 0
+    truncated = False
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                scanned_entries += 1
+                if scanned_entries > RESULT_SUMMARY_MAX_DIRECTORY_ENTRIES:
+                    truncated = True
+                    break
+                name = entry.name
+                if name in seen or _SAFE_JOB_ID.fullmatch(name) is None:
+                    continue
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not is_directory:
+                    continue
+                if len(jobs) >= max_jobs or object_count >= max_objects:
+                    truncated = True
+                    break
+                try:
+                    name_bytes = len(name.encode("utf-8"))
+                except UnicodeEncodeError:
+                    continue
+                if metadata_bytes + name_bytes > max_metadata_bytes:
+                    truncated = True
+                    break
+                directory = Path(entry.path)
+                try:
+                    result = _results_for(
+                        mgr,
+                        name,
+                        directory,
+                        parse_scores=False,
+                        include_files=False,
+                        max_objects=max_objects - object_count,
+                        max_metadata_bytes=(
+                            max_metadata_bytes
+                            - metadata_bytes
+                            - name_bytes
+                        ),
+                        include_scan_usage=True,
+                    )
+                except ResultsLimitExceeded:
+                    truncated = True
+                    break
+                object_count += result["file_count"]
+                metadata_bytes += (
+                    name_bytes + result["_scan_metadata_bytes"]
+                )
+                jobs.append({
+                    key: result[key]
+                    for key in ("job_id", "file_count", "scores", "s3_uri")
+                })
+    except OSError as exc:
+        raise LocalResultsUnavailable(
+            "cannot enumerate local result summaries"
+        ) from exc
+    jobs.sort(key=lambda item: item["job_id"])
+    return jobs, object_count, metadata_bytes, truncated
 
 
 @router.get("/results")
 async def list_all_results() -> dict:
     """List every job's results — from S3 (authoritative once uploaded) with a
     local collected/ fallback for non-S3 deployments."""
+    permit = _acquire_result_operation(
+        _RESULT_READ_ADMISSION,
+        operation="result listing",
+    )
     mgr = _mgr()
-    jobs, seen = [], set()
-    bucket = _s3_bucket()
-    if bucket:  # list job prefixes cheaply (no per-file score parsing here)
-        try:
-            jobs.extend(await asyncio.to_thread(_s3_result_summaries))
-            seen.update(item["job_id"] for item in jobs)
-        except ResultsLimitExceeded as exc:
-            raise HTTPException(413, str(exc)) from exc
-        except S3ResultsUnavailable as exc:
-            logger.exception("Configured S3 results backend is unavailable")
-            raise HTTPException(503, str(exc)) from exc
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    object_count = 0
+    metadata_bytes = 0
+    truncated = False
     try:
-        jobs.extend(await asyncio.to_thread(_local_result_summaries, mgr, seen))
-    except ResultsLimitExceeded as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except LocalResultsUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    return {"jobs": jobs, "total": len(jobs)}
+        bucket = _s3_bucket()
+        if bucket:
+            try:
+                (
+                    s3_jobs,
+                    s3_seen,
+                    s3_objects,
+                    s3_metadata,
+                    s3_truncated,
+                ) = await _run_result_read(
+                    _s3_result_summaries,
+                    max_jobs=RESULT_SUMMARY_MAX_JOBS,
+                    max_objects=RESULT_SUMMARY_MAX_OBJECTS,
+                    max_metadata_bytes=RESULT_SUMMARY_MAX_METADATA_BYTES,
+                )
+                jobs.extend(s3_jobs)
+                seen.update(s3_seen)
+                object_count += s3_objects
+                metadata_bytes += s3_metadata
+                truncated = s3_truncated
+            except S3ResultsUnavailable as exc:
+                logger.exception(
+                    "Configured S3 results backend is unavailable"
+                )
+                raise HTTPException(503, str(exc)) from exc
+        if not truncated:
+            try:
+                (
+                    local_jobs,
+                    _local_objects,
+                    _local_metadata,
+                    local_truncated,
+                ) = await _run_result_read(
+                    _local_result_summaries,
+                    mgr,
+                    seen,
+                    max_jobs=RESULT_SUMMARY_MAX_JOBS - len(jobs),
+                    max_objects=RESULT_SUMMARY_MAX_OBJECTS - object_count,
+                    max_metadata_bytes=(
+                        RESULT_SUMMARY_MAX_METADATA_BYTES - metadata_bytes
+                    ),
+                )
+                jobs.extend(local_jobs)
+                truncated = local_truncated
+            except LocalResultsUnavailable as exc:
+                raise HTTPException(503, str(exc)) from exc
+    finally:
+        permit.release()
+    jobs.sort(key=lambda item: item["job_id"])
+    return {
+        "jobs": jobs,
+        "total": len(jobs),
+        "truncated": truncated,
+    }
 
 
 @router.get("/jobs/{job_id}/results")
 async def job_results(job_id: str) -> dict:
     """List a job's result files + benchmark scores (S3 first, local fallback)."""
     job_id = _validate_job_id(job_id)
+    permit = _acquire_result_operation(
+        _RESULT_READ_ADMISSION,
+        operation="result read",
+    )
     try:
-        objs = await asyncio.to_thread(_s3_list_job, job_id)
-    except ResultsLimitExceeded as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except S3ResultsUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    if objs:
         try:
-            r = await asyncio.to_thread(
-                _results_from_s3, job_id, objs, parse_scores=True,
-            )
+            objs = await _run_result_read(_s3_list_job, job_id)
+        except ResultsLimitExceeded as exc:
+            raise HTTPException(413, str(exc)) from exc
         except S3ResultsUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
-        r["files"] = r["files"][:500]
-        return r
-    base = _collected_dir(_mgr(), job_id)
-    if not _is_real_directory(base):
-        raise HTTPException(404, f"no results for job {job_id}")
-    try:
-        r = await asyncio.to_thread(_results_for, _mgr(), job_id, base)
-    except ResultsLimitExceeded as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except LocalResultsUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    r["files"] = r["files"][:500]
-    return r
-
-
-def _new_temp_archive() -> Path:
-    fd, raw_path = tempfile.mkstemp(prefix="elastic-agent-results-", suffix=".tar.gz")
-    try:
-        os.fchmod(fd, 0o600)
+        if objs:
+            try:
+                return await _run_result_read(
+                    _results_from_s3, job_id, objs, parse_scores=True,
+                )
+            except ResultsLimitExceeded as exc:
+                raise HTTPException(413, str(exc)) from exc
+            except S3ResultsUnavailable as exc:
+                raise HTTPException(503, str(exc)) from exc
+        base = _collected_dir(_mgr(), job_id)
+        if not _is_real_directory(base):
+            raise HTTPException(404, f"no results for job {job_id}")
+        try:
+            return await _run_result_read(
+                _results_for,
+                _mgr(),
+                job_id,
+                base,
+            )
+        except ResultsLimitExceeded as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except LocalResultsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
     finally:
-        os.close(fd)
-    return Path(raw_path)
+        permit.release()
+
+
+def _archive_spool_reservation(
+    job_id: str,
+    members: Iterable[tuple[str, int]],
+) -> int:
+    """Return a conservative upper bound for one ``tar.gz`` tempfile.
+
+    Python's default PAX tar format can add substantially more than one KiB of
+    metadata for a long/non-ASCII path. Account for every member's padded data,
+    ordinary header, a worst-case PAX header and its path/size/mtime records.
+    The final one-percent-plus-one-MiB margin dominates zlib's default DEFLATE
+    bound and includes the gzip wrapper, so aggregate reservations bound actual
+    spool usage rather than merely the source payload.
+    """
+
+    tar_bytes = 0
+    for relative, size in members:
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ResultsLimitExceeded(
+                "result archive contains an invalid member size"
+            )
+        try:
+            archive_name_bytes = len(
+                f"{job_id}/{relative}".encode("utf-8", "strict")
+            )
+        except UnicodeEncodeError as exc:
+            raise ResultsLimitExceeded(
+                "result archive contains a path that is not valid UTF-8"
+            ) from exc
+
+        padded_payload = ((size + 511) // 512) * 512
+        # PAX records contain the UTF-8 path plus short bounded size/mtime
+        # records and decimal length prefixes. 256 bytes is a conservative
+        # bound for all non-path record data; round the payload to a tar block
+        # and include both its extension header and the member's own header.
+        pax_payload = archive_name_bytes + 256
+        padded_pax_payload = ((pax_payload + 511) // 512) * 512
+        tar_bytes += 512 + padded_payload + 512 + padded_pax_payload
+
+    # TarFile.close writes two zero blocks and pads the complete stream to its
+    # 10 KiB record size.
+    tar_bytes += 1024
+    tar_bytes = ((tar_bytes + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE) * (
+        tarfile.RECORDSIZE
+    )
+    return max(
+        1024 * 1024,
+        tar_bytes + tar_bytes // 100 + 1024 * 1024,
+    )
+
+
+def _cleanup_stale_temp_archives() -> None:
+    global _RESULT_ARCHIVE_SPOOL_RESERVED, _RESULT_ARCHIVE_STALE_CLEANED
+    with _RESULT_ARCHIVE_SPOOL_LOCK:
+        if _RESULT_ARCHIVE_STALE_CLEANED:
+            return
+        cutoff = time.time() - RESULT_ARCHIVE_STALE_SECONDS
+        temp_root = Path(tempfile.gettempdir())
+        try:
+            candidates = list(
+                temp_root.glob("elastic-agent-results-*.tar.gz")
+            )
+        except OSError:
+            candidates = []
+        retained_bytes = 0
+        for candidate in candidates:
+            try:
+                item_stat = candidate.lstat()
+                if item_stat.st_mtime < cutoff:
+                    candidate.unlink(missing_ok=True)
+                elif stat.S_ISREG(item_stat.st_mode):
+                    # A recent file can belong to an overlapping old Manager
+                    # during a rolling replacement. Do not unlink it, but
+                    # charge its actual bytes to this process's global budget.
+                    retained_bytes += item_stat.st_size
+            except OSError:
+                logger.warning(
+                    "Failed to inspect/remove stale results archive %s",
+                    candidate,
+                )
+        _RESULT_ARCHIVE_SPOOL_RESERVED += retained_bytes
+        _RESULT_ARCHIVE_STALE_CLEANED = True
+
+
+_cleanup_stale_temp_archives()
+
+
+def _new_temp_archive(*, reserve_bytes: int) -> Path:
+    global _RESULT_ARCHIVE_SPOOL_RESERVED
+    _cleanup_stale_temp_archives()
+    if reserve_bytes <= 0:
+        raise ValueError("archive spool reservation must be positive")
+    with _RESULT_ARCHIVE_SPOOL_LOCK:
+        if (
+            reserve_bytes > RESULT_ARCHIVE_SPOOL_MAX_BYTES
+            or _RESULT_ARCHIVE_SPOOL_RESERVED + reserve_bytes
+            > RESULT_ARCHIVE_SPOOL_MAX_BYTES
+        ):
+            raise ResultsSpoolUnavailable(
+                "temporary results archive disk budget is exhausted"
+            )
+        # Logical reservations alone do not protect a small/full Manager root
+        # filesystem. Charge every tracked archive's not-yet-written portion
+        # against current free bytes, and always preserve a fixed emergency
+        # margin for journals, logs, package state and OS operation.
+        outstanding_reserved = 0
+        for path, reserved in _RESULT_ARCHIVE_TEMP_RESERVATIONS.items():
+            try:
+                actual = min(reserved, path.stat().st_size)
+            except OSError:
+                actual = 0
+            outstanding_reserved += reserved - actual
+        try:
+            free_bytes = shutil.disk_usage(tempfile.gettempdir()).free
+        except OSError as exc:
+            raise ResultsSpoolUnavailable(
+                "cannot verify temporary results archive disk capacity"
+            ) from exc
+        required_free = (
+            RESULT_ARCHIVE_DISK_SAFETY_BYTES
+            + outstanding_reserved
+            + reserve_bytes
+        )
+        if free_bytes < required_free:
+            raise ResultsSpoolUnavailable(
+                "temporary results archive would consume the Manager disk "
+                "safety margin"
+            )
+        _RESULT_ARCHIVE_SPOOL_RESERVED += reserve_bytes
+        try:
+            fd, raw_path = tempfile.mkstemp(
+                prefix="elastic-agent-results-",
+                suffix=".tar.gz",
+            )
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            path = Path(raw_path)
+            _RESULT_ARCHIVE_TEMP_RESERVATIONS[path] = reserve_bytes
+        except BaseException:
+            _RESULT_ARCHIVE_SPOOL_RESERVED -= reserve_bytes
+            try:
+                Path(raw_path).unlink(missing_ok=True)
+            except (NameError, OSError):
+                pass
+            raise
+    return path
 
 
 def _remove_temp_archive(path: Path) -> None:
+    global _RESULT_ARCHIVE_SPOOL_RESERVED
+    removed = False
     try:
         path.unlink(missing_ok=True)
+        removed = True
     except OSError:
         logger.warning("Failed to remove temporary results archive %s", path)
+    if removed:
+        with _RESULT_ARCHIVE_SPOOL_LOCK:
+            reserved = _RESULT_ARCHIVE_TEMP_RESERVATIONS.pop(path, 0)
+            _RESULT_ARCHIVE_SPOOL_RESERVED = max(
+                0, _RESULT_ARCHIVE_SPOOL_RESERVED - reserved,
+            )
+
+
+async def _prepare_temp_archive(
+    builder,
+    *args,
+    permit: _ResultOperationPermit | None = None,
+) -> Path:
+    """Run a bounded archive build and clean an abandoned result.
+
+    ``asyncio.to_thread`` keeps running after its waiter is cancelled. A done
+    callback therefore owns cleanup when a client disconnects during the
+    prebuild phase, so neither the tempfile nor its disk reservation leaks.
+    """
+
+    if permit is None:
+        permit = _acquire_result_operation(
+            _RESULT_ARCHIVE_BUILD_ADMISSION,
+            operation="result archive build",
+        )
+    try:
+        task = asyncio.ensure_future(
+            asyncio.get_running_loop().run_in_executor(
+                _RESULT_ARCHIVE_BUILD_EXECUTOR,
+                functools.partial(builder, *args),
+            )
+        )
+    except BaseException:
+        permit.release()
+        raise
+    state = {"abandoned": False}
+
+    def build_done(completed: asyncio.Task) -> None:
+        permit.release()
+        if not state["abandoned"]:
+            return
+        try:
+            archive = completed.result()
+        except BaseException:
+            return
+        _remove_temp_archive(archive)
+
+    task.add_done_callback(build_done)
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        state["abandoned"] = True
+        if task.done():
+            try:
+                archive = task.result()
+            except BaseException:
+                pass
+            else:
+                _remove_temp_archive(archive)
+        raise
+
+
+async def _stream_temp_archive(
+    path: Path,
+    *,
+    permit: _ResultOperationPermit | None = None,
+) -> AsyncIterator[bytes]:
+    """Stream one private tempfile and unlink it on every exit path."""
+
+    try:
+        with path.open("rb") as stream:
+            while True:
+                read_future = asyncio.get_running_loop().run_in_executor(
+                    _RESULT_ARCHIVE_FILE_EXECUTOR,
+                    stream.read,
+                    256 * 1024,
+                )
+                cancellation: asyncio.CancelledError | None = None
+                while True:
+                    try:
+                        chunk = await asyncio.shield(read_future)
+                        break
+                    except asyncio.CancelledError as exc:
+                        if read_future.cancelled():
+                            raise
+                        # Executor work cannot be cancelled safely. Do not
+                        # close/unlink the file or return admission while a
+                        # real read still owns the file object.
+                        cancellation = exc
+                    except BaseException as exc:
+                        if cancellation is not None:
+                            raise cancellation from exc
+                        raise
+                if cancellation is not None:
+                    del chunk
+                    raise cancellation
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        _remove_temp_archive(path)
+        if permit is not None:
+            permit.release()
+
+
+class _TemporaryArchiveResponse(StreamingResponse):
+    """A prebuilt archive response whose tempfile has response-level ownership."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        job_id: str,
+        permit: _ResultOperationPermit | None = None,
+    ) -> None:
+        self._archive_path = path
+        self._permit = permit
+        super().__init__(
+            _stream_temp_archive(path, permit=permit),
+            media_type="application/gzip",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": (
+                    f'attachment; filename="{job_id}-results.tar.gz"'
+                ),
+                "Content-Length": str(path.stat().st_size),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # StreamingResponse does not promise to enter/close its iterator
+            # when response-start or the first body send is cancelled.
+            _remove_temp_archive(self._archive_path)
+            if self._permit is not None:
+                self._permit.release()
 
 
 def _build_s3_archive(
     job_id: str, objs: list[S3ResultObject],
 ) -> Path:
-    destination = _new_temp_archive()
+    destination = _new_temp_archive(
+        reserve_bytes=_archive_spool_reservation(
+            job_id,
+            ((rel, size) for rel, size, _key, _etag in objs),
+        )
+    )
     bucket = _s3_bucket()
     try:
         s3 = _s3_client()
@@ -1605,28 +3158,21 @@ class _S3ArchiveStreamControl:
             _close_s3_body(body)
             raise _ArchiveStreamCancelledError
 
-    def release_body(self, body) -> None:
+    def release_body(self, body) -> bool:
         with self._lock:
             if self._body is body:
                 self._body = None
+                return True
+            return False
 
-    def cancel(self) -> None:
+    def cancel(self):
+        """Signal cancellation and transfer any live body to the caller."""
+
         self._cancelled.set()
         with self._lock:
             body = self._body
             self._body = None
-        if body is not None:
-            try:
-                _close_s3_body(body)
-            except Exception:  # noqa: BLE001
-                # Cancellation cleanup must not mask the disconnect or skip
-                # closing the pipe transport. The producer also observes the
-                # cancellation event and owns its final body close.
-                logger.warning(
-                    "Failed to close an active S3 result body during "
-                    "archive cancellation",
-                    exc_info=True,
-                )
+        return body
 
 
 def _write_s3_archive_stream(
@@ -1689,8 +3235,8 @@ def _write_s3_archive_stream(
                             f"{exc or type(exc).__name__}"
                         ) from exc
                     finally:
-                        control.release_body(body)
-                        _close_s3_body(body)
+                        if control.release_body(body):
+                            _close_s3_body(body)
     except _ArchiveStreamCancelledError:
         return
     except (BrokenPipeError, ConnectionError, OSError) as exc:
@@ -1712,13 +3258,50 @@ def _consume_archive_producer(task: asyncio.Future) -> None:
         return
 
 
+def _consume_archive_cleanup(task: asyncio.Future) -> None:
+    """Retrieve and report a detached blocking-body close failure."""
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:  # noqa: BLE001
+        logger.warning(
+            "Failed to close an active S3 result body during "
+            "archive cancellation",
+            exc_info=True,
+        )
+
+
+class _LiveArchivePermitOwner:
+    """Tell response cleanup whether its archive iterator ever took ownership."""
+
+    def __init__(self, permit: _ResultOperationPermit) -> None:
+        self.permit = permit
+        self.started = False
+
+
 async def _stream_s3_archive(
     job_id: str,
     objs: list[S3ResultObject],
+    *,
+    permit: _ResultOperationPermit | None = None,
+    owner: _LiveArchivePermitOwner | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield a gzip tar while a blocking producer reads S3 into an OS pipe."""
 
-    read_fd, write_fd = os.pipe()
+    if permit is None:
+        permit = _acquire_result_operation(
+            _RESULT_ARCHIVE_STREAM_ADMISSION,
+            operation="live result archive",
+        )
+    if owner is not None:
+        owner.started = True
+    try:
+        read_fd, write_fd = os.pipe()
+    except BaseException:
+        permit.release()
+        raise
     control = _S3ArchiveStreamControl()
     loop = asyncio.get_running_loop()
     read_pipe = os.fdopen(read_fd, "rb", buffering=0)
@@ -1729,6 +3312,7 @@ async def _stream_s3_archive(
     except BaseException:
         read_pipe.close()
         os.close(write_fd)
+        permit.release()
         raise
     try:
         producer = loop.run_in_executor(
@@ -1742,8 +3326,8 @@ async def _stream_s3_archive(
     except BaseException:
         transport.close()
         os.close(write_fd)
+        permit.release()
         raise
-    producer_observed = False
     try:
         while True:
             chunk = await reader.read(256 * 1024)
@@ -1751,17 +3335,98 @@ async def _stream_s3_archive(
                 break
             yield chunk
         await producer
-        producer_observed = True
     finally:
+        close_future = None
         try:
-            control.cancel()
+            body = control.cancel()
+            if body is not None:
+                # ``StreamingBody.close`` is an SDK call and may block. Never
+                # invoke it on the Manager event loop; a separate cleanup pool
+                # can interrupt the producer's blocking read even when every
+                # archive-producer worker is occupied.
+                close_future = loop.run_in_executor(
+                    _RESULT_ARCHIVE_CLEANUP_EXECUTOR,
+                    _close_s3_body,
+                    body,
+                )
         finally:
             transport.close()
-            if producer.done():
-                if not producer_observed:
-                    _consume_archive_producer(producer)
-            else:
-                producer.add_done_callback(_consume_archive_producer)
+            # A cancelled response may finish before either the blocking
+            # producer or a detached SDK-body close unwinds. Keep admission
+            # until *both* operations have really exited so replacement work
+            # cannot accumulate behind hung threads or retained raw FDs.
+            completions: list[
+                tuple[asyncio.Future, object]
+            ] = [(producer, _consume_archive_producer)]
+            if close_future is not None:
+                completions.append(
+                    (close_future, _consume_archive_cleanup)
+                )
+            completion_lock = threading.Lock()
+            remaining_completions = len(completions)
+
+            def operation_done(
+                completed: asyncio.Future,
+                consumer,
+            ) -> None:
+                nonlocal remaining_completions
+                consumer(completed)
+                with completion_lock:
+                    remaining_completions -= 1
+                    is_last = remaining_completions == 0
+                if is_last:
+                    permit.release()
+
+            for completion, consumer in completions:
+                completion.add_done_callback(
+                    functools.partial(
+                        operation_done,
+                        consumer=consumer,
+                    )
+                )
+
+
+class _LiveArchiveResponse(StreamingResponse):
+    """Own a pre-admitted live stream even if response start is cancelled."""
+
+    def __init__(
+        self,
+        iterator: AsyncIterator[bytes],
+        *,
+        owner: _LiveArchivePermitOwner,
+        headers: dict[str, str],
+    ) -> None:
+        self._archive_iterator = iterator
+        self._owner = owner
+        super().__init__(
+            iterator,
+            media_type="application/gzip",
+            headers=headers,
+        )
+
+    @staticmethod
+    def _consume_close(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:  # noqa: BLE001
+            logger.warning(
+                "Failed to finalize cancelled live result archive",
+                exc_info=True,
+            )
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            cleanup = asyncio.create_task(self._archive_iterator.aclose())
+            cleanup.add_done_callback(self._consume_close)
+            try:
+                await asyncio.shield(cleanup)
+            finally:
+                if not self._owner.started:
+                    self._owner.permit.release()
 
 
 def _build_local_archive(job_id: str, base: Path) -> Path:
@@ -1770,11 +3435,19 @@ def _build_local_archive(job_id: str, base: Path) -> Path:
         max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
         max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
     )
-    destination = _new_temp_archive()
+    destination = _new_temp_archive(
+        reserve_bytes=_archive_spool_reservation(
+            job_id,
+            (
+                (rel, item_stat.st_size)
+                for _, rel, item_stat in regular
+            ),
+        )
+    )
     total_bytes = 0
     try:
         with tarfile.open(destination, mode="w:gz") as archive:
-            for path, rel, _ in regular:
+            for path, rel, listed_stat in regular:
                 try:
                     resolved = path.resolve(strict=True)
                     resolved.relative_to(base)
@@ -1789,9 +3462,12 @@ def _build_local_archive(job_id: str, base: Path) -> Path:
                     ) from exc
                 try:
                     file_stat = os.fstat(fd)
-                    if not stat.S_ISREG(file_stat.st_mode):
+                    if (
+                        not stat.S_ISREG(file_stat.st_mode)
+                        or not _same_file_snapshot(file_stat, listed_stat)
+                    ):
                         raise LocalResultsUnavailable(
-                            f"local result {rel!r} is not a regular file"
+                            f"local result {rel!r} changed during archive creation"
                         )
                     total_bytes += file_stat.st_size
                     if total_bytes > RESULT_ARCHIVE_MAX_BYTES:
@@ -1807,6 +3483,14 @@ def _build_local_archive(job_id: str, base: Path) -> Path:
                     info.mtime = int(file_stat.st_mtime)
                     with os.fdopen(fd, "rb", closefd=False) as stream:
                         archive.addfile(info, stream)
+                        if stream.read(1):
+                            raise LocalResultsUnavailable(
+                                f"local result {rel!r} grew during archive creation"
+                            )
+                    if not _same_file_snapshot(os.fstat(fd), file_stat):
+                        raise LocalResultsUnavailable(
+                            f"local result {rel!r} changed during archive creation"
+                        )
                 finally:
                     os.close(fd)
     except Exception:
@@ -1816,41 +3500,100 @@ def _build_local_archive(job_id: str, base: Path) -> Path:
 
 
 @router.get("/jobs/{job_id}/results/download")
-async def job_results_download(job_id: str) -> FileResponse:
+async def job_results_download(job_id: str) -> Response:
     """Download a job's results as a .tar.gz (S3 first, local fallback)."""
     job_id = _validate_job_id(job_id)
+    build_permit = _acquire_result_operation(
+        _RESULT_ARCHIVE_BUILD_ADMISSION,
+        operation="result archive build",
+    )
     try:
-        objs = await asyncio.to_thread(
-            _s3_list_job,
-            job_id,
-            max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
-            max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
+        stream_permit = _acquire_result_operation(
+            _RESULT_ARCHIVE_STREAM_ADMISSION,
+            operation="result archive download",
         )
-    except ResultsLimitExceeded as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except S3ResultsUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    if objs:
+    except BaseException:
+        build_permit.release()
+        raise
+    try:
+        read_permit = _acquire_result_operation(
+            _RESULT_READ_ADMISSION,
+            operation="result listing",
+        )
+    except BaseException:
+        stream_permit.release()
+        build_permit.release()
+        raise
+    archive: Path | None = None
+    build_owned: _ResultOperationPermit | None = build_permit
+    stream_owned: _ResultOperationPermit | None = stream_permit
+    try:
         try:
-            archive = await asyncio.to_thread(_build_s3_archive, job_id, objs)
-        except S3ResultsUnavailable as exc:
-            raise HTTPException(503, str(exc)) from exc
-    else:
-        base = _collected_dir(_mgr(), job_id)
-        if not _is_real_directory(base):
-            raise HTTPException(404, f"no results for job {job_id}")
-        try:
-            archive = await asyncio.to_thread(_build_local_archive, job_id, base)
+            objs = await _run_result_read(
+                _s3_list_job,
+                job_id,
+                max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
+                max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
+            )
         except ResultsLimitExceeded as exc:
             raise HTTPException(413, str(exc)) from exc
-        except LocalResultsUnavailable as exc:
+        except S3ResultsUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
-    return FileResponse(
-        archive,
-        media_type="application/gzip",
-        filename=f"{job_id}-results.tar.gz",
-        background=BackgroundTask(_remove_temp_archive, archive),
-    )
+        finally:
+            read_permit.release()
+
+        owned_for_builder = build_owned
+        build_owned = None
+        if objs:
+            try:
+                archive = await _prepare_temp_archive(
+                    _build_s3_archive,
+                    job_id,
+                    objs,
+                    permit=owned_for_builder,
+                )
+            except ResultsLimitExceeded as exc:
+                raise HTTPException(413, str(exc)) from exc
+            except S3ResultsUnavailable as exc:
+                raise HTTPException(503, str(exc)) from exc
+            except ResultsSpoolUnavailable as exc:
+                raise HTTPException(507, str(exc)) from exc
+        else:
+            base = _collected_dir(_mgr(), job_id)
+            if not _is_real_directory(base):
+                # No builder took ownership in this branch.
+                if owned_for_builder is not None:
+                    owned_for_builder.release()
+                raise HTTPException(404, f"no results for job {job_id}")
+            try:
+                archive = await _prepare_temp_archive(
+                    _build_local_archive,
+                    job_id,
+                    base,
+                    permit=owned_for_builder,
+                )
+            except ResultsLimitExceeded as exc:
+                raise HTTPException(413, str(exc)) from exc
+            except LocalResultsUnavailable as exc:
+                raise HTTPException(503, str(exc)) from exc
+            except ResultsSpoolUnavailable as exc:
+                raise HTTPException(507, str(exc)) from exc
+
+        response = _TemporaryArchiveResponse(
+            archive,
+            job_id=job_id,
+            permit=stream_owned,
+        )
+        archive = None
+        stream_owned = None
+        return response
+    finally:
+        if archive is not None:
+            _remove_temp_archive(archive)
+        if build_owned is not None:
+            build_owned.release()
+        if stream_owned is not None:
+            stream_owned.release()
 
 
 @router.get("/jobs/{job_id}/results/download/stream")
@@ -1865,20 +3608,39 @@ async def job_results_download_stream(job_id: str) -> Response:
     """
 
     job_id = _validate_job_id(job_id)
+    stream_permit = _acquire_result_operation(
+        _RESULT_ARCHIVE_STREAM_ADMISSION,
+        operation="live result archive",
+    )
     try:
-        objs = await asyncio.to_thread(
-            _s3_list_job,
-            job_id,
-            max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
-            max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
+        read_permit = _acquire_result_operation(
+            _RESULT_READ_ADMISSION,
+            operation="result listing",
         )
-    except ResultsLimitExceeded as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except S3ResultsUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
+    except BaseException:
+        stream_permit.release()
+        raise
+    try:
+        try:
+            objs = await _run_result_read(
+                _s3_list_job,
+                job_id,
+                max_objects=RESULT_ARCHIVE_MAX_OBJECTS,
+                max_total_bytes=RESULT_ARCHIVE_MAX_BYTES,
+            )
+        except ResultsLimitExceeded as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except S3ResultsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+    except BaseException:
+        stream_permit.release()
+        raise
+    finally:
+        read_permit.release()
     if not objs:
         # Manager-local archives are normally small and do not incur thousands
         # of remote object round trips, so retain the strict prebuilt behavior.
+        stream_permit.release()
         return await job_results_download(job_id)
 
     source_bytes = sum(obj[1] for obj in objs)
@@ -1892,17 +3654,28 @@ async def job_results_download_stream(job_id: str) -> Response:
         "X-Elastic-Agent-Object-Count": str(len(objs)),
         "X-Elastic-Agent-Source-Bytes": str(source_bytes),
     }
-    return StreamingResponse(
-        _stream_s3_archive(job_id, objs),
-        media_type="application/gzip",
-        headers=headers,
+    owner = _LiveArchivePermitOwner(stream_permit)
+    iterator = _stream_s3_archive(
+        job_id,
+        objs,
+        permit=stream_permit,
+        owner=owner,
     )
+    try:
+        return _LiveArchiveResponse(
+            iterator,
+            owner=owner,
+            headers=headers,
+        )
+    except BaseException:
+        stream_permit.release()
+        raise
 
 
 class HarnessUploadRequest(BaseModel):
-    filename: str
-    content: str
-    class_name: str
+    filename: str = Field(min_length=4, max_length=128)
+    content: str = Field(min_length=1, max_length=HARNESS_UPLOAD_MAX_BYTES)
+    class_name: str = Field(min_length=1, max_length=128)
 
 
 class HarnessUploadResponse(BaseModel):
@@ -1928,20 +3701,60 @@ async def upload_harness(req: HarnessUploadRequest) -> HarnessUploadResponse:
         raise HTTPException(400, "filename must be a simple <name>.py")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", req.class_name):
         raise HTTPException(400, "class_name must be a valid identifier")
+    content_bytes = req.content.encode("utf-8")
+    if len(content_bytes) > HARNESS_UPLOAD_MAX_BYTES:
+        raise HTTPException(413, "Harness source exceeds the 1 MiB limit")
 
     mgr = _mgr()
     base = Path(mgr.config.registry.path).with_name("harness_plugins")
     secure_state_directory(base)
-    dest = base / req.filename
-    atomic_write_private(dest, req.content)
+    digest = hashlib.sha256(content_bytes).hexdigest()
+    logical_stem = Path(req.filename).stem
+    dest = base / f"{logical_stem}-{digest}.py"
+    fd, validation_path_raw = tempfile.mkstemp(
+        prefix=".harness-validation-",
+        suffix=".py",
+        dir=base,
+    )
+    os.close(fd)
+    validation_path = Path(validation_path_raw)
+    atomic_write_private(validation_path, req.content)
 
-    ref = f"{dest}:{req.class_name}"
-    # Fail fast if the uploaded code doesn't actually resolve to a Harness.
+    # Validate a unique private candidate first. Never overwrite or remove a
+    # previously published path: persisted JobSpecs must keep referring to
+    # byte-identical code for their entire lifetime.
     from elastic_agent.harness.generic import load_harness_class
     try:
-        load_harness_class(ref)
+        load_harness_class(f"{validation_path}:{req.class_name}")
     except Exception as exc:
-        dest.unlink(missing_ok=True)
+        validation_path.unlink(missing_ok=True)
         raise HTTPException(400, f"uploaded code is not a valid Harness: {exc}")
+    try:
+        validation_stat = validation_path.lstat()
+        if not stat.S_ISREG(validation_stat.st_mode):
+            raise OSError("validation source is no longer a regular file")
+        validated_bytes = validation_path.read_bytes()
+    except OSError as exc:
+        validation_path.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "uploaded Harness source disappeared during validation",
+        ) from exc
+    if validated_bytes != content_bytes:
+        validation_path.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "uploaded Harness modified its source during validation",
+        )
+    try:
+        try:
+            os.link(validation_path, dest)
+            fsync_directory(base)
+        except FileExistsError:
+            if dest.read_bytes() != content_bytes:
+                raise HTTPException(
+                    500, "Harness content-address collision detected",
+                )
+    finally:
+        validation_path.unlink(missing_ok=True)
 
+    ref = f"{dest}:{req.class_name}"
     return HarnessUploadResponse(harness_ref=ref, path=str(dest))

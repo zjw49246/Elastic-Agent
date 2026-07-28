@@ -208,6 +208,8 @@ async def refresh_agent_api_account(account_id: str) -> AccountResponse:
                 force=True,
                 allow_model_tombstone_clear=True,
             )
+            if usage.get("available") is True:
+                await manager.account_allocator.clear_quarantine(account_id)
         return _public_account(account, api_usage=usage)
     except AgentApiAccountNotFoundError as exc:
         raise HTTPException(404, f"Agent API account {account_id!r} not found") from exc
@@ -241,16 +243,50 @@ async def get_agent_api_usage(
 
 @router.delete("/agent-api/accounts/{account_id}")
 async def remove_agent_api_account(account_id: str) -> dict:
-    """Keep deletion disabled until every delegated Worker is durably fenced."""
+    """Retire one key only after every delegated Worker is fenced."""
 
+    manager = _mgr()
+    if not getattr(manager, "binding_recovery_ready", True):
+        raise HTTPException(
+            409,
+            "Agent API account deletion is blocked while startup resource "
+            "recovery is incomplete",
+        )
     try:
-        account = await _mgr().agent_api_store.get(account_id)
+        async with manager.account_allocator.mutation_guard(account_id):
+            # Keep the identity, durable binding, and lease snapshots stable
+            # through the same-directory tombstone rename. Lifecycle cleanup
+            # releases an allocator reference only after its ordinary Worker
+            # has been confirmed terminated, so an empty claim set proves no
+            # live unbound Worker still has delegated access.
+            async with manager.binding_manager.account_transaction(account_id):
+                account = await manager.agent_api_store.get(account_id)
+                if account is None:
+                    raise AgentApiAccountNotFoundError(
+                        f"Agent API account {account_id!r} not found"
+                    )
+                binding = await manager.binding_manager.get_binding(account_id)
+                active_leases = await manager.binding_manager.list_leases(
+                    account_id=account_id,
+                    active_only=True,
+                )
+                if binding is not None or active_leases:
+                    raise HTTPException(
+                        409,
+                        f"Agent API account {account_id} still has an EIP "
+                        "binding/lease; finish its Job and decommission it first",
+                    )
+                removed = await manager.agent_api_store.remove(account_id)
+                if removed:
+                    await manager.account_allocator.clear_quarantine(account_id)
     except AgentApiAccountNotFoundError as exc:
         raise HTTPException(404, f"Agent API account {account_id!r} not found") from exc
-    if account is None:
+    except AccountClaimConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except AgentApiStorageError as exc:
+        raise HTTPException(
+            500, "Agent API credential storage failed"
+        ) from exc
+    if not removed:
         raise HTTPException(404, f"Agent API account {account_id!r} not found")
-    raise HTTPException(
-        409,
-        "Agent API account deletion is disabled; terminate all delegated "
-        "Workers before credential retirement",
-    )
+    return {"account_id": account_id, "status": "removed"}

@@ -349,3 +349,27 @@ class TestResolveHarness:
     def test_missing_file(self):
         with pytest.raises(FileNotFoundError):
             load_harness_class("/nonexistent/harness.py:X")
+
+    def test_same_stem_in_distinct_content_paths_has_distinct_module_cache(
+        self, tmp_path,
+    ):
+        source = (
+            "from elastic_agent.harness.base import Harness\n"
+            "class Versioned(Harness):\n"
+            "    marker = {marker!r}\n"
+        )
+        first_dir = tmp_path / "digest-a"
+        second_dir = tmp_path / "digest-b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "plugin.py"
+        second = second_dir / "plugin.py"
+        first.write_text(source.format(marker="first"))
+        second.write_text(source.format(marker="second"))
+
+        first_cls = load_harness_class(f"{first}:Versioned")
+        second_cls = load_harness_class(f"{second}:Versioned")
+
+        assert first_cls.marker == "first"
+        assert second_cls.marker == "second"
+        assert first_cls.__module__ != second_cls.__module__

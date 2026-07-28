@@ -290,6 +290,28 @@ async def test_reserve_is_idempotent_for_same_job_slot(tmp_path):
     assert len(await store.list_leases()) == 1
 
 
+async def test_list_leases_filters_jobs_before_copy_and_honors_limit(tmp_path):
+    store = _store(tmp_path)
+    for index in range(4):
+        account_id = f"acc-{index}"
+        await store.upsert_binding(AccountBinding(account_id=account_id))
+        await store.reserve_lease(
+            account_id,
+            job_id="selected" if index < 3 else "unrelated",
+            slot=index,
+        )
+
+    selected = await store.list_leases(
+        job_ids={"selected"},
+        limit=2,
+    )
+
+    assert len(selected) == 2
+    assert {lease.job_id for lease in selected} == {"selected"}
+    with pytest.raises(ValueError, match="limit must be positive"):
+        await store.list_leases(limit=0)
+
+
 async def test_reserve_atomically_rejects_concurrent_jobs(tmp_path):
     store = _store(tmp_path)
     await store.upsert_binding(AccountBinding(account_id="acc-1"))

@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-import asyncio
+import io
 import json
-import os
-import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from elastic_agent.worker.file_sync import (
     FileSyncManager,
     LocalBackend,
-    SyncMappingEntry,
-    SyncManifest,
+    OSSBackend,
+    S3Backend,
+    StorageObjectMetadataError,
     SyncedFile,
+    SyncManifest,
+    SyncMappingEntry,
     _file_md5,
     _guess_role,
     _is_critical,
@@ -26,7 +27,6 @@ from elastic_agent.worker.file_sync import (
     create_storage_backend,
     load_storage_env,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helper fixtures
@@ -200,6 +200,149 @@ class TestLocalBackend:
         dest = sync_dir / "data" / "test.json"
         assert dest.exists()
         assert json.loads(dest.read_text()) == {"test": True}
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "../outside.txt",
+            "safe/../../outside.txt",
+            "/tmp/outside.txt",
+            "safe\\..\\outside.txt",
+            "safe/\x00outside.txt",
+        ],
+    )
+    async def test_all_operations_reject_unsafe_keys(
+        self, tmp_path, sync_dir, key,
+    ):
+        backend = LocalBackend(str(sync_dir))
+        source = tmp_path / "source.txt"
+        source.write_text("payload")
+
+        with pytest.raises(ValueError, match="unsafe storage key"):
+            await backend.upload_file(str(source), key)
+        with pytest.raises(ValueError, match="unsafe storage key"):
+            await backend.upload_bytes(b"payload", key)
+        with pytest.raises(ValueError, match="unsafe storage key"):
+            await backend.read_file(key)
+        with pytest.raises(ValueError, match="unsafe storage key"):
+            await backend.file_exists(key)
+
+    async def test_symlink_parent_cannot_escape_storage_root(
+        self, tmp_path, sync_dir,
+    ):
+        backend = LocalBackend(str(sync_dir))
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (sync_dir / "link").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="escapes storage root"):
+            await backend.upload_bytes(b"secret", "link/escaped.txt")
+        with pytest.raises(ValueError, match="escapes storage root"):
+            await backend.read_file("link/escaped.txt")
+        assert not (outside / "escaped.txt").exists()
+
+    async def test_open_reader_is_bounded_and_closeable(
+        self, sync_dir,
+    ):
+        backend = LocalBackend(str(sync_dir))
+        (sync_dir / "data.bin").write_bytes(b"abcdef")
+
+        reader = await backend.open_reader("data.bin")
+        assert reader.size == 6
+        assert await reader.read(2) == b"ab"
+        assert await reader.read(4) == b"cdef"
+        assert await reader.read(1) == b""
+        await reader.close()
+        await reader.close()
+
+    @pytest.mark.parametrize("key", ["line\u2028break", "zero\u200bwidth"])
+    async def test_open_reader_rejects_nonprintable_unicode_key(
+        self, sync_dir, key,
+    ):
+        backend = LocalBackend(str(sync_dir))
+        with pytest.raises(ValueError, match="unsafe storage key"):
+            await backend.open_reader(key)
+
+
+class _SdkBody(io.BytesIO):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.close_calls = 0
+        self.read_sizes: list[int] = []
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return super().read(size)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
+
+
+class TestCloudObjectReaders:
+    async def test_s3_reader_uses_get_length_and_closes_body(self):
+        body = _SdkBody(b"abcdef")
+        client = MagicMock()
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": 6,
+        }
+        backend = S3Backend("bucket")
+        backend._client = client
+
+        reader = await backend.open_reader("safe/key")
+        assert reader.size == 6
+        assert await reader.read(3) == b"abc"
+        await reader.close()
+        await reader.close()
+
+        assert body.close_calls == 1
+        client.get_object.assert_called_once_with(
+            Bucket="bucket", Key="safe/key",
+        )
+
+    async def test_s3_invalid_length_closes_body(self):
+        body = _SdkBody(b"payload")
+        client = MagicMock()
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": "7",
+        }
+        backend = S3Backend("bucket")
+        backend._client = client
+
+        with pytest.raises(StorageObjectMetadataError):
+            await backend.open_reader("safe/key")
+
+        assert body.close_calls >= 1
+
+    async def test_oss_reader_uses_content_length_and_closes_body(self):
+        body = _SdkBody(b"payload")
+        body.content_length = 7
+        bucket = MagicMock()
+        bucket.get_object.return_value = body
+        backend = OSSBackend("bucket", "endpoint", "id", "secret")
+        backend._bucket = bucket
+
+        reader = await backend.open_reader("safe/key")
+        assert reader.size == 7
+        assert await reader.read(7) == b"payload"
+        await reader.close()
+
+        assert body.close_calls == 1
+        bucket.get_object.assert_called_once_with("safe/key")
+
+    async def test_oss_missing_length_closes_body(self):
+        body = _SdkBody(b"payload")
+        bucket = MagicMock()
+        bucket.get_object.return_value = body
+        backend = OSSBackend("bucket", "endpoint", "id", "secret")
+        backend._bucket = bucket
+
+        with pytest.raises(StorageObjectMetadataError):
+            await backend.open_reader("safe/key")
+
+        assert body.close_calls >= 1
 
 
 # ---------------------------------------------------------------------------

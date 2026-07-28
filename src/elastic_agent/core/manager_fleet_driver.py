@@ -138,6 +138,19 @@ class ManagerFleetDriver:
         self._bound_reserve = bound_reserve_hook or _no_bound_reserve
         self._bound_attach = bound_attach_hook or _no_bound_attach
         self._bound_release = bound_release_hook or _no_bound_release
+        # A successful cloud termination and registry removal are one ordered
+        # transaction. Retain the exact proof in memory if registry cleanup
+        # raises so a retry does not ask Manager to rediscover an already-removed
+        # node and then mistake an empty response for success.
+        self._scale_in_state_lock = asyncio.Lock()
+        self._scale_in_locks: dict[str, asyncio.Lock] = {}
+        self._scale_in_lock_users: dict[str, int] = {}
+        self._proven_terminated_workers: set[str] = set()
+        self._proven_removed_workers: set[str] = set()
+        # A completed proof is needed only while an overlapping caller is
+        # already queued on the same per-worker lock.  The last lock user drops
+        # it, so successful Jobs do not leave an ever-growing tombstone set.
+        self._completed_scale_in_workers: set[str] = set()
 
     async def acquire_capacity(self, count: int) -> str:
         return await self._mgr.acquire_instance_capacity(count)
@@ -472,18 +485,132 @@ class ManagerFleetDriver:
                 ) from exc
 
     async def scale_in(self, worker_ids: list[str]) -> None:
-        # Batch completion owns these ephemeral workers.  A graceful drain only
-        # changes registry state and leaves the EC2 instance billable.
-        terminated = await self._mgr.scale_in(
-            node_ids=list(worker_ids), force=True,
-        )
-        # Job workers are disposable implementation details, not fleet history.
-        # Keeping a TERMINATED NodeRecord for every shard makes the dashboard and
-        # registry grow without bound across large fan-out workloads.  Cloud
-        # termination has succeeded at this point; remove the disconnected
-        # record through Manager's normal task/registry cleanup path.
-        for worker_id in terminated:
-            await self._mgr.remove_node(worker_id)
+        requested = list(dict.fromkeys(worker_ids))
+        if not requested:
+            return
+
+        async def terminate_and_remove() -> None:
+            ordered_workers = sorted(requested)
+            async with self._scale_in_state_lock:
+                worker_locks = []
+                for worker_id in ordered_workers:
+                    worker_lock = self._scale_in_locks.setdefault(
+                        worker_id, asyncio.Lock()
+                    )
+                    self._scale_in_lock_users[worker_id] = (
+                        self._scale_in_lock_users.get(worker_id, 0) + 1
+                    )
+                    worker_locks.append((worker_id, worker_lock))
+            acquired: list[asyncio.Lock] = []
+            try:
+                # Sorted acquisition prevents overlapping multi-worker cleanup
+                # calls from deadlocking, while disjoint shard terminations stay
+                # fully concurrent.
+                for _worker_id, worker_lock in worker_locks:
+                    await worker_lock.acquire()
+                    acquired.append(worker_lock)
+                async with self._scale_in_state_lock:
+                    active_requested = [
+                        worker_id
+                        for worker_id in requested
+                        if worker_id not in self._completed_scale_in_workers
+                    ]
+                if not active_requested:
+                    return
+                pending = [
+                    worker_id
+                    for worker_id in active_requested
+                    if worker_id not in self._proven_terminated_workers
+                ]
+                if pending:
+                    # Batch completion owns these ephemeral workers. A graceful
+                    # drain only changes registry state and leaves the EC2
+                    # instance billable.
+                    raw_terminated = await self._mgr.scale_in(
+                        node_ids=pending,
+                        force=True,
+                    )
+                    try:
+                        terminated = list(raw_terminated)
+                    except TypeError as exc:
+                        raise RuntimeError(
+                            "Manager returned an invalid worker termination proof"
+                        ) from exc
+                    terminated_set = set(terminated)
+                    pending_set = set(pending)
+                    missing = sorted(pending_set - terminated_set)
+                    extra = sorted(terminated_set - pending_set)
+                    duplicates = len(terminated) != len(terminated_set)
+                    if missing or extra or duplicates:
+                        details = []
+                        if missing:
+                            details.append("missing=" + ",".join(missing))
+                        if extra:
+                            details.append("extra=" + ",".join(extra))
+                        if duplicates:
+                            details.append("duplicate worker ids")
+                        raise RuntimeError(
+                            "Manager returned an incomplete or invalid worker "
+                            "termination proof (" + "; ".join(details) + ")"
+                        )
+                    self._proven_terminated_workers.update(pending)
+
+                # Job workers are disposable implementation details, not fleet
+                # history. Remove records only after every requested instance has
+                # an exact termination proof. Track each successful removal
+                # independently: if worker B's registry fsync fails after worker
+                # A was removed, the retry must not re-enter A's non-idempotent
+                # removal path.
+                for worker_id in active_requested:
+                    if worker_id in self._proven_removed_workers:
+                        continue
+                    removed = await self._mgr.remove_node(worker_id)
+                    remaining = await self._mgr.registry.get(worker_id)
+                    if remaining is not None:
+                        raise RuntimeError(
+                            "Manager did not provide registry-removal proof for "
+                            f"worker {worker_id!r} (remove_node returned "
+                            f"{removed!r})"
+                        )
+                    # Absence is the authoritative postcondition.  In a narrow
+                    # concurrent-removal race Manager may return False because
+                    # another cleanup removed the row first; the exact readback
+                    # still proves the desired state.
+                    self._proven_removed_workers.add(worker_id)
+
+                self._proven_terminated_workers.difference_update(
+                    active_requested
+                )
+                self._proven_removed_workers.difference_update(active_requested)
+                async with self._scale_in_state_lock:
+                    self._completed_scale_in_workers.update(active_requested)
+            finally:
+                for worker_lock in reversed(acquired):
+                    worker_lock.release()
+                async with self._scale_in_state_lock:
+                    for worker_id, worker_lock in worker_locks:
+                        users = self._scale_in_lock_users[worker_id] - 1
+                        if users:
+                            self._scale_in_lock_users[worker_id] = users
+                        else:
+                            self._scale_in_lock_users.pop(worker_id, None)
+                            self._completed_scale_in_workers.discard(worker_id)
+                            if self._scale_in_locks.get(worker_id) is worker_lock:
+                                self._scale_in_locks.pop(worker_id, None)
+
+        # Once Manager has begun a destructive termination transaction, caller
+        # cancellation must not strand the operation between exact cloud proof
+        # and registry cleanup. The independently owned task also absorbs
+        # repeated cancellation; a concrete child failure is still propagated.
+        transaction = asyncio.create_task(terminate_and_remove())
+        while not transaction.done():
+            try:
+                await asyncio.shield(transaction)
+            except asyncio.CancelledError:
+                if transaction.done() and transaction.cancelled():
+                    raise
+                continue
+        transaction.result()
 
 
 async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:

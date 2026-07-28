@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,7 @@ class FakeManager:
 
     async def remove_node(self, node_id):
         self.removed_nodes.append(node_id)
+        self.registry.nodes.pop(node_id, None)
         return True
 
 
@@ -274,6 +276,219 @@ async def test_scale_in_force_terminates_and_stop_command_forwards_signal(tmp_pa
     assert manager.connection_manager.stopped == [
         ("worker-a", "task-1", "SIGINT")
     ]
+
+
+@pytest.mark.parametrize(
+    "terminated",
+    [
+        ["worker-a"],
+        ["worker-a", "worker-b", "worker-extra"],
+        ["worker-a", "worker-a", "worker-b"],
+    ],
+)
+async def test_scale_in_requires_exact_termination_proof_before_node_removal(
+    tmp_path, terminated,
+):
+    manager = FakeManager(tmp_path)
+
+    async def incomplete_scale_in(*, node_ids, force):
+        manager.scale_in_calls.append((node_ids, force))
+        return list(terminated)
+
+    manager.scale_in = incomplete_scale_in
+
+    with pytest.raises(RuntimeError, match="termination proof"):
+        await ManagerFleetDriver(manager).scale_in(["worker-a", "worker-b"])
+
+    assert manager.removed_nodes == []
+
+
+async def test_scale_in_normalizes_requested_duplicates_and_accepts_reordering(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+
+    async def reordered_scale_in(*, node_ids, force):
+        manager.scale_in_calls.append((node_ids, force))
+        return list(reversed(node_ids))
+
+    manager.scale_in = reordered_scale_in
+
+    await ManagerFleetDriver(manager).scale_in([
+        "worker-a", "worker-a", "worker-b",
+    ])
+
+    assert manager.scale_in_calls == [(["worker-a", "worker-b"], True)]
+    assert manager.removed_nodes == ["worker-a", "worker-b"]
+
+
+async def test_scale_in_finishes_proven_node_cleanup_when_caller_is_cancelled(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+    removal_started = asyncio.Event()
+    allow_removal = asyncio.Event()
+
+    async def blocking_remove_node(node_id):
+        removal_started.set()
+        await allow_removal.wait()
+        manager.removed_nodes.append(node_id)
+        manager.registry.nodes.pop(node_id, None)
+        return True
+
+    manager.remove_node = blocking_remove_node
+    operation = asyncio.create_task(
+        ManagerFleetDriver(manager).scale_in(["worker-a"])
+    )
+    await removal_started.wait()
+    operation.cancel()
+    await asyncio.sleep(0)
+    operation.cancel()
+    await asyncio.sleep(0)
+    allow_removal.set()
+
+    # Once Manager returned an exact termination proof, caller cancellation
+    # must not turn the transaction into a retry against an already-removed
+    # registry record.
+    await operation
+    assert manager.removed_nodes == ["worker-a"]
+
+
+async def test_scale_in_reuses_exact_proof_after_node_cleanup_failure(tmp_path):
+    manager = FakeManager(tmp_path)
+    attempts = 0
+
+    async def fail_once_remove_node(node_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("registry fsync failed")
+        manager.removed_nodes.append(node_id)
+        manager.registry.nodes.pop(node_id, None)
+        return True
+
+    manager.remove_node = fail_once_remove_node
+    driver = ManagerFleetDriver(manager)
+
+    with pytest.raises(OSError, match="registry fsync failed"):
+        await driver.scale_in(["worker-a"])
+    await driver.scale_in(["worker-a"])
+
+    assert manager.scale_in_calls == [(["worker-a"], True)]
+    assert manager.removed_nodes == ["worker-a"]
+
+
+async def test_scale_in_retries_only_unremoved_records_after_partial_failure(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+    removal_calls: list[str] = []
+    worker_b_attempts = 0
+
+    async def partial_remove_node(node_id):
+        nonlocal worker_b_attempts
+        removal_calls.append(node_id)
+        if node_id == "worker-a":
+            if removal_calls.count(node_id) > 1:
+                raise AssertionError("worker-a removal is not idempotent")
+        else:
+            worker_b_attempts += 1
+            if worker_b_attempts == 1:
+                raise OSError("worker-b registry fsync failed")
+        manager.registry.nodes.pop(node_id, None)
+        manager.removed_nodes.append(node_id)
+        return True
+
+    manager.remove_node = partial_remove_node
+    driver = ManagerFleetDriver(manager)
+
+    with pytest.raises(OSError, match="worker-b registry fsync failed"):
+        await driver.scale_in(["worker-a", "worker-b"])
+    await driver.scale_in(["worker-a", "worker-b"])
+
+    assert manager.scale_in_calls == [(["worker-a", "worker-b"], True)]
+    assert removal_calls == ["worker-a", "worker-b", "worker-b"]
+    assert manager.removed_nodes == ["worker-a", "worker-b"]
+    assert driver._proven_terminated_workers == set()
+    assert driver._proven_removed_workers == set()
+
+
+async def test_scale_in_requires_registry_absence_after_remove_node(tmp_path):
+    manager = FakeManager(tmp_path)
+
+    async def lying_remove_node(node_id):
+        manager.removed_nodes.append(node_id)
+        return True
+
+    manager.remove_node = lying_remove_node
+    driver = ManagerFleetDriver(manager)
+
+    with pytest.raises(RuntimeError, match="registry-removal proof"):
+        await driver.scale_in(["worker-a"])
+
+    assert manager.scale_in_calls == [(["worker-a"], True)]
+    assert manager.registry.nodes["worker-a"] is not None
+
+
+async def test_scale_in_coalesces_overlapping_same_worker_cleanup(tmp_path):
+    manager = FakeManager(tmp_path)
+    cloud_entered = asyncio.Event()
+    allow_cloud_finish = asyncio.Event()
+
+    async def blocking_scale_in(*, node_ids, force):
+        manager.scale_in_calls.append((node_ids, force))
+        cloud_entered.set()
+        await allow_cloud_finish.wait()
+        return list(node_ids)
+
+    manager.scale_in = blocking_scale_in
+    driver = ManagerFleetDriver(manager)
+    first = asyncio.create_task(driver.scale_in(["worker-a"]))
+    await cloud_entered.wait()
+    second = asyncio.create_task(driver.scale_in(["worker-a"]))
+    for _ in range(100):
+        async with driver._scale_in_state_lock:
+            if driver._scale_in_lock_users.get("worker-a") == 2:
+                break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("second cleanup did not join the per-worker lock")
+
+    allow_cloud_finish.set()
+    await asyncio.gather(first, second)
+
+    assert manager.scale_in_calls == [(["worker-a"], True)]
+    assert manager.removed_nodes == ["worker-a"]
+    assert driver._scale_in_locks == {}
+    assert driver._scale_in_lock_users == {}
+    assert driver._completed_scale_in_workers == set()
+
+
+async def test_scale_in_keeps_disjoint_worker_terminations_concurrent(tmp_path):
+    manager = FakeManager(tmp_path)
+    entered: set[str] = set()
+    both_entered = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def concurrent_scale_in(*, node_ids, force):
+        assert len(node_ids) == 1
+        entered.add(node_ids[0])
+        if len(entered) == 2:
+            both_entered.set()
+        await allow_finish.wait()
+        return list(node_ids)
+
+    manager.scale_in = concurrent_scale_in
+    driver = ManagerFleetDriver(manager)
+    first = asyncio.create_task(driver.scale_in(["worker-a"]))
+    second = asyncio.create_task(driver.scale_in(["worker-b"]))
+
+    await asyncio.wait_for(both_entered.wait(), timeout=0.5)
+    allow_finish.set()
+    await asyncio.gather(first, second)
+
+    assert entered == {"worker-a", "worker-b"}
+    assert set(manager.removed_nodes) == entered
 
 
 async def test_resolve_secret_env_delegates_without_mutating_refs(

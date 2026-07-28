@@ -722,6 +722,28 @@ class TestElasticPTYBackendEvents:
         # The synthesized result carries the task's session, not the sub-agent's.
         assert obj["session_id"] == "sess-1"
 
+    @pytest.mark.asyncio
+    async def test_autonomous_result_marks_manager_accounting_scope(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        raw = json.dumps({
+            "type": "result",
+            "session_id": "subagent-session",
+            "cost_usd": 4.2,
+        })
+
+        await backend.on_event("t1", {
+            "event_type": "result",
+            "raw_json": raw,
+            "autonomous": True,
+            "session_id": "subagent-session",
+        })
+
+        sent = backend._runtime._send_event.call_args[0][0]
+        assert sent.data == raw
+        assert sent.parsed is None
+        assert "t1" not in backend._saw_result
+        assert "t1" not in backend._task_session_ids
+
 
 # ---------------------------------------------------------------------------
 # TaskRouter use_pty
@@ -942,6 +964,7 @@ class TestRecycleConfigDir:
 class TestCredentialLoginRecyclesPTY:
     @pytest.mark.asyncio
     async def test_login_triggers_recycle(self, runtime, tmp_path):
+        from elastic_agent.core.claude_oauth import read_credentials
         from elastic_agent.core.protocols.messages import CredentialLoginMessage
 
         backend = MagicMock()
@@ -960,6 +983,7 @@ class TestCredentialLoginRecyclesPTY:
         sent = runtime._send_event.call_args[0][0]
         assert sent.type == "CREDENTIAL_LOGIN_RESULT"
         assert sent.success is True
+        assert read_credentials(config_dir)["accessToken"] == "tok"
 
     @pytest.mark.asyncio
     async def test_login_without_backend_unaffected(self, runtime, tmp_path):
@@ -975,20 +999,42 @@ class TestCredentialLoginRecyclesPTY:
         assert sent.success is True
 
     @pytest.mark.asyncio
-    async def test_recycle_failure_does_not_break_login(self, runtime, tmp_path):
+    async def test_recycle_failure_rolls_back_and_fails_login(
+        self, runtime, tmp_path,
+    ):
+        from elastic_agent.core.claude_oauth import (
+            read_credentials,
+            write_credentials,
+        )
         from elastic_agent.core.protocols.messages import CredentialLoginMessage
 
         backend = MagicMock()
         backend.recycle_config_dir = AsyncMock(side_effect=RuntimeError("boom"))
         runtime._pty_backend = backend
         runtime._send_event = AsyncMock()
+        runtime._quota_checker = MagicMock()
+        config_dir = str(tmp_path / "claude-edit-1")
+        write_credentials(config_dir, {
+            "account_id": "acc-old",
+            "accessToken": "old-token",
+        })
         await runtime._handle_credential_login(CredentialLoginMessage(
             task_id="", slot_index=1,
             credentials={"account_id": "acc-2", "accessToken": "tok"},
-            config_dir=str(tmp_path / "claude-edit-1"),
+            config_dir=config_dir,
         ))
         sent = runtime._send_event.call_args[0][0]
-        assert sent.success is True
+        assert sent.success is False
+        assert sent.error == (
+            "Credential activation failed; previous credentials restored"
+        )
+        assert read_credentials(config_dir)["accessToken"] == "old-token"
+        assert Path(config_dir).stat().st_mode & 0o777 == 0o700
+        assert (
+            Path(config_dir, ".credentials.json").stat().st_mode & 0o777
+            == 0o600
+        )
+        runtime._quota_checker.add_slot.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

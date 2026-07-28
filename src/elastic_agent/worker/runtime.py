@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import signal
 import subprocess
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,6 +86,23 @@ logger = logging.getLogger(__name__)
 # giving up — a lingering child (e.g. a docker container from `--sandbox os`)
 # can hold the pipe open so it never EOFs. Bounded so the exit is always reported.
 _EXIT_DRAIN_TIMEOUT = 10.0
+# Physical stdout/stderr lines are not trusted.  StreamReader.readline() stops
+# draining after its internal 64 KiB limit; split larger records into bounded
+# frames so a child can never deadlock on a full pipe.
+_MAX_LOG_FRAME_BYTES = 64 * 1024
+# Local NDJSON remains authoritative during a slow/disconnected Manager link.
+# Bound best-effort transports by both entries and serialized wire bytes;
+# lifecycle/control messages keep their existing reliable path.
+_MAX_PENDING_CONTROL_FRAMES = 256
+_MAX_CONTROL_TRANSPORT_FRAME_BYTES = 1024 * 1024
+_MAX_PENDING_CONTROL_BYTES = 8 * 1024 * 1024
+_MAX_PENDING_LOG_FRAMES = 256
+_MAX_LOG_TRANSPORT_FRAME_BYTES = 256 * 1024
+_MAX_PENDING_LOG_BYTES = 8 * 1024 * 1024
+_MAX_PENDING_DATA_FRAMES = 64
+_MAX_DATA_TRANSPORT_FRAME_BYTES = 1024 * 1024
+_MAX_PENDING_DATA_BYTES = 8 * 1024 * 1024
+_MAX_COMPLETED_LOGIN_RECORDS = 256
 _AGENT_API_ERROR_PRIORITY = {
     "agent_api_error": 1,
     "agent_api_transient_error": 2,
@@ -94,6 +113,126 @@ _AGENT_API_PROVIDER_LABELS = {
     "cloudrouter": "CloudRouter",
     "apex": "ApexRouter",
 }
+
+
+class ReliableEventPersistenceError(RuntimeError):
+    """A terminal event could not be made durable on this worker."""
+
+
+class AccountLoginCleanupError(RuntimeError):
+    """Credential/process rollback could not be proven complete."""
+
+
+class _BoundedFrameQueue:
+    """Same-loop FIFO with strict serialized-byte and frame-count budgets."""
+
+    def __init__(
+        self,
+        *,
+        max_frames: int,
+        max_bytes: int,
+        max_frame_bytes: int,
+    ) -> None:
+        self._max_frames = max_frames
+        self._max_bytes = max_bytes
+        self._max_frame_bytes = max_frame_bytes
+        self._frames: deque[tuple[str, int]] = deque()
+        self._wire_bytes = 0
+        self._not_empty = asyncio.Event()
+
+    @property
+    def wire_bytes(self) -> int:
+        return self._wire_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def max_frame_bytes(self) -> int:
+        return self._max_frame_bytes
+
+    def qsize(self) -> int:
+        return len(self._frames)
+
+    def empty(self) -> bool:
+        return not self._frames
+
+    def put_latest(
+        self,
+        data: str,
+        *,
+        reserved_bytes: int = 0,
+        reserved_frames: int = 0,
+    ) -> tuple[bool, int, int]:
+        """Append newest data, evicting oldest queued frames within the budget.
+
+        Returns ``(accepted, dropped_frames, dropped_bytes)``.  In-flight/retry
+        reservations keep the total pending wire footprint strict even while a
+        WebSocket send is suspended or has failed.
+        """
+
+        frame_bytes = len(data.encode("utf-8"))
+        available_bytes = max(0, self._max_bytes - reserved_bytes)
+        available_frames = max(0, self._max_frames - reserved_frames)
+        if (
+            frame_bytes > self._max_frame_bytes
+            or frame_bytes > available_bytes
+            or available_frames == 0
+        ):
+            return False, 0, 0
+
+        dropped_frames = 0
+        dropped_bytes = 0
+        while self._frames and (
+            len(self._frames) >= available_frames
+            or self._wire_bytes + frame_bytes > available_bytes
+        ):
+            _, removed_bytes = self._frames.popleft()
+            self._wire_bytes -= removed_bytes
+            dropped_frames += 1
+            dropped_bytes += removed_bytes
+        if (
+            len(self._frames) >= available_frames
+            or self._wire_bytes + frame_bytes > available_bytes
+        ):
+            return False, dropped_frames, dropped_bytes
+        self._frames.append((data, frame_bytes))
+        self._wire_bytes += frame_bytes
+        self._not_empty.set()
+        return True, dropped_frames, dropped_bytes
+
+    def get_frame_nowait(self) -> tuple[str, int]:
+        if not self._frames:
+            raise asyncio.QueueEmpty
+        data, frame_bytes = self._frames.popleft()
+        self._wire_bytes -= frame_bytes
+        if not self._frames:
+            self._not_empty.clear()
+        return data, frame_bytes
+
+    def get_nowait(self) -> str:
+        data, _ = self.get_frame_nowait()
+        return data
+
+    async def put(self, data: str) -> None:
+        """Compatibility helper for internal tests and legacy producers.
+
+        Production transport code uses ``put_latest`` with retry/in-flight
+        reservations.  This helper remains strictly bounded and raises when a
+        single frame cannot fit.
+        """
+
+        accepted, _, _ = self.put_latest(data)
+        if not accepted:
+            raise asyncio.QueueFull
+
+    async def get(self) -> str:
+        while True:
+            try:
+                return self.get_nowait()
+            except asyncio.QueueEmpty:
+                await self._not_empty.wait()
 
 
 def _classify_agent_api_provider_error(
@@ -223,6 +362,10 @@ class WorkerRuntime:
         # of later STATUS/heartbeat frames across reconnects instead of putting
         # it at the tail and reordering lifecycle state.
         self._retry_send: str | None = None
+        self._retry_send_kind = "control"
+        self._retry_send_bytes = 0
+        self._inflight_send_kind: str | None = None
+        self._inflight_send_bytes = 0
 
         self._ws: Any = None
         self._authenticated = False
@@ -254,7 +397,27 @@ class WorkerRuntime:
         self._agent_api_tasks: dict[str, Any] = {}
         self._agent_api_task_errors: dict[str, tuple[str, str]] = {}
 
-        self._send_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._send_queue = _BoundedFrameQueue(
+            max_frames=_MAX_PENDING_CONTROL_FRAMES,
+            max_bytes=_MAX_PENDING_CONTROL_BYTES,
+            max_frame_bytes=_MAX_CONTROL_TRANSPORT_FRAME_BYTES,
+        )
+        self._log_send_queue = _BoundedFrameQueue(
+            max_frames=_MAX_PENDING_LOG_FRAMES,
+            max_bytes=_MAX_PENDING_LOG_BYTES,
+            max_frame_bytes=_MAX_LOG_TRANSPORT_FRAME_BYTES,
+        )
+        self._data_send_queue = _BoundedFrameQueue(
+            max_frames=_MAX_PENDING_DATA_FRAMES,
+            max_bytes=_MAX_PENDING_DATA_BYTES,
+            max_frame_bytes=_MAX_DATA_TRANSPORT_FRAME_BYTES,
+        )
+        self._send_queue_ready = asyncio.Event()
+        self._dropped_log_frames = 0
+        self._truncated_log_frames = 0
+        self._dropped_data_frames = 0
+        self._dropped_control_frames = 0
+        self._prefer_data_frame = True
         self._reconnect_event = asyncio.Event()
 
         self._file_sync_manager: Any = None
@@ -273,6 +436,14 @@ class WorkerRuntime:
         self._account_login_tasks: dict[str, asyncio.Task] = {}
         self._account_login_accounts: dict[str, str] = {}
         self._account_login_otp_readers: dict[str, _WorkerLoginOtpReader] = {}
+        # A late ACCOUNT_LOGIN_CANCEL may arrive after the task's done callback
+        # removed it.  Retain a bounded exact request/account proof that all
+        # transactional cleanup completed before acknowledging it.
+        self._account_login_cleanup_confirmed: dict[str, str] = {}
+        # A credential update whose rollback cannot be proven must never feed
+        # either a warm PTY or a subprocess. Runtime restart clears this set
+        # only after all in-memory PTY sessions have also been destroyed.
+        self._unsafe_credential_config_dirs: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -364,6 +535,7 @@ class WorkerRuntime:
         self._account_login_tasks.clear()
         self._account_login_accounts.clear()
         self._account_login_otp_readers.clear()
+        self._account_login_cleanup_confirmed.clear()
         if self._pty_backend is not None:
             for timer in self._pty_timeouts.values():
                 timer.cancel()
@@ -395,22 +567,63 @@ class WorkerRuntime:
     async def _sender_loop(self) -> None:
         while self._running and self._ws:
             data = self._retry_send
-            if data is None:
-                data = await self._send_queue.get()
-            sent = False
+            if data is not None:
+                kind = self._retry_send_kind
+                frame_bytes = self._retry_send_bytes
+                self._retry_send = None
+                self._retry_send_kind = "control"
+                self._retry_send_bytes = 0
+            else:
+                data, kind, frame_bytes = await self._next_queued_frame()
+            self._inflight_send_kind = kind
+            self._inflight_send_bytes = frame_bytes
             try:
                 await self._ws.send(data)
-                sent = True
-                if self._retry_send == data:
-                    self._retry_send = None
             except BaseException:
                 # The queue item used to be lost as soon as get() returned.  A
                 # disconnect/cancel at the send boundary must remain first;
                 # reliable terminal events are additionally replayed from the
                 # fsynced outbox and are safe to deliver more than once.
-                if not sent:
-                    self._retry_send = data
+                self._retry_send = data
+                self._retry_send_kind = kind
+                self._retry_send_bytes = frame_bytes
                 raise
+            finally:
+                self._inflight_send_kind = None
+                self._inflight_send_bytes = 0
+
+    async def _next_queued_frame(self) -> tuple[str, str, int]:
+        """Return control first, then fairly alternate bounded data and LOG."""
+
+        while True:
+            try:
+                data, frame_bytes = self._send_queue.get_frame_nowait()
+                return data, "control", frame_bytes
+            except asyncio.QueueEmpty:
+                pass
+            queues = (
+                (("data", self._data_send_queue), ("log", self._log_send_queue))
+                if self._prefer_data_frame
+                else (("log", self._log_send_queue), ("data", self._data_send_queue))
+            )
+            for kind, queue in queues:
+                try:
+                    data, frame_bytes = queue.get_frame_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+                self._prefer_data_frame = kind != "data"
+                return data, kind, frame_bytes
+
+            # Clear first, then re-check both queues to close the producer race:
+            # a producer between clear() and wait() sets the event again.
+            self._send_queue_ready.clear()
+            if (
+                not self._send_queue.empty()
+                or not self._data_send_queue.empty()
+                or not self._log_send_queue.empty()
+            ):
+                continue
+            await self._send_queue_ready.wait()
 
     async def _receiver_loop(self) -> None:
         async for raw in self._ws:
@@ -459,8 +672,10 @@ class WorkerRuntime:
                             slot_index=msg.slot_index,
                             success=False,
                             error="duplicate account login request",
+                            cleanup_complete=False,
                         ))
                         return
+                    self._account_login_cleanup_confirmed.pop(request_id, None)
                     task = asyncio.create_task(
                         self._run_account_login_task(msg)
                     )
@@ -488,8 +703,41 @@ class WorkerRuntime:
                     task.add_done_callback(_forget_login)
                     return
                 await handler(msg)
-            except Exception:
-                logger.exception("Error handling %s message", msg.type)
+            except AccountLoginCleanupError as exc:
+                # Credential/login exceptions may chain third-party messages
+                # containing tokens or browser URLs. Log only the class and
+                # return a protocol-specific, deliberately generic failure.
+                logger.error(
+                    "Cleanup could not be verified while handling %s (%s)",
+                    msg.type,
+                    type(exc).__name__,
+                )
+                if isinstance(msg, CredentialLoginMessage):
+                    await self._send_event(CredentialLoginResultMessage(
+                        account_id=msg.credentials.get(
+                            "account_id", f"slot-{msg.slot_index}"
+                        ),
+                        slot_index=msg.slot_index,
+                        success=False,
+                        error=(
+                            "Credential update failed and rollback could not "
+                            "be verified"
+                        ),
+                    ))
+                else:
+                    await self._send_event(ErrorMessage(
+                        error_type="handler_cleanup_error",
+                        message=(
+                            f"Cleanup could not be verified for {msg.type}"
+                        ),
+                        recoverable=False,
+                    ))
+            except Exception as exc:
+                logger.error(
+                    "Error handling %s message (%s)",
+                    msg.type,
+                    type(exc).__name__,
+                )
                 await self._send_event(ErrorMessage(
                     error_type="handler_error",
                     message=f"Failed to handle {msg.type}",
@@ -554,6 +802,37 @@ class WorkerRuntime:
                 error_type="duplicate_task",
                 message=f"Process already running for task {task_id}",
                 recoverable=True,
+            ))
+            return
+
+        selected_config_dir = str(
+            (msg.agent_params or {}).get("config_dir")
+            or msg.env.get("CLAUDE_CONFIG_DIR")
+            or ""
+        )
+        uses_claude_credentials = (
+            msg.agent_params is not None
+            or "CLAUDE_CONFIG_DIR" in msg.env
+            or bool(msg.command and Path(msg.command[0]).name == "claude")
+        )
+        if uses_claude_credentials:
+            from elastic_agent.core.claude_oauth import normalize_local_config_dir
+
+            selected_config_dir = normalize_local_config_dir(
+                selected_config_dir
+            )
+        if (
+            selected_config_dir
+            and selected_config_dir in self._unsafe_credential_config_dirs
+        ):
+            await self._send_process_exit(ProcessExitMessage(
+                task_id=task_id,
+                exit_code=-1,
+                error_type="credential_slot_unsafe",
+                error_message=(
+                    "Credential slot rollback could not be verified; "
+                    "worker restart or successful reconfiguration is required"
+                ),
             ))
             return
 
@@ -972,6 +1251,51 @@ class WorkerRuntime:
             error_message=error_message,
         ))
 
+    @staticmethod
+    async def _iter_stream_frames(stream: asyncio.StreamReader):
+        """Drain arbitrary-length physical lines as bounded byte frames."""
+
+        pending = bytearray()
+        while True:
+            try:
+                chunk = await stream.read(_MAX_LOG_FRAME_BYTES)
+            except Exception:
+                logger.warning("Worker output stream read failed", exc_info=True)
+                break
+            if not chunk:
+                break
+            pending.extend(chunk)
+            while pending:
+                # Search only inside the byte budget.  A short OS read followed
+                # by a second read containing a later newline must not let the
+                # newline branch emit an over-sized combined frame.
+                newline = pending.find(b"\n", 0, _MAX_LOG_FRAME_BYTES)
+                if newline >= 0:
+                    end = newline + 1
+                elif len(pending) >= _MAX_LOG_FRAME_BYTES:
+                    end = _MAX_LOG_FRAME_BYTES
+                else:
+                    break
+                yield bytes(pending[:end])
+                del pending[:end]
+        if pending:
+            yield bytes(pending)
+
+    @classmethod
+    async def _iter_stream_text_frames(cls, stream: asyncio.StreamReader):
+        """Decode bounded byte frames without corrupting split UTF-8 codepoints."""
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        async for frame in cls._iter_stream_frames(stream):
+            physical_line_end = frame.endswith(b"\n")
+            text = decoder.decode(frame, final=physical_line_end)
+            if physical_line_end:
+                decoder.reset()
+            yield text
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield tail
+
     async def _read_stream(
         self,
         task_id: str,
@@ -982,15 +1306,8 @@ class WorkerRuntime:
         if stream is None:
             return
 
-        while True:
-            try:
-                line_bytes = await stream.readline()
-            except Exception:
-                break
-            if not line_bytes:
-                break
-
-            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
+        async for text_frame in self._iter_stream_text_frames(stream):
+            line = text_frame.rstrip("\n")
             if not line:
                 continue
 
@@ -1817,13 +2134,68 @@ class WorkerRuntime:
         ))
 
     async def _handle_credential_login(self, msg: CredentialLoginMessage) -> None:
-        from elastic_agent.core.claude_oauth import write_credentials
+        from elastic_agent.core.claude_oauth import (
+            normalize_local_config_dir,
+            restore_claude_credentials,
+            snapshot_claude_credentials,
+            write_credentials,
+        )
 
-        config_dir = msg.config_dir
+        config_dir = normalize_local_config_dir(msg.config_dir)
         credentials = msg.credentials
         account_id = credentials.get("account_id", f"slot-{msg.slot_index}")
 
-        write_credentials(config_dir, credentials)
+        try:
+            credential_snapshot = snapshot_claude_credentials(config_dir)
+        except Exception as exc:
+            self._unsafe_credential_config_dirs.add(config_dir)
+            logger.error(
+                "Could not secure credential slot %s before update (%s)",
+                config_dir,
+                type(exc).__name__,
+            )
+            await self._send_event(CredentialLoginResultMessage(
+                account_id=account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error="Credential slot validation failed",
+            ))
+            return
+
+        def rollback_error() -> BaseException | None:
+            try:
+                restore_claude_credentials(credential_snapshot)
+            except BaseException as exc:
+                self._unsafe_credential_config_dirs.add(config_dir)
+                logger.error(
+                    "Credential rollback could not be verified for %s (%s)",
+                    config_dir,
+                    type(exc).__name__,
+                )
+                return exc
+            return None
+
+        try:
+            write_credentials(config_dir, credentials)
+        except BaseException as exc:
+            restore_error = rollback_error()
+            if not isinstance(exc, Exception):
+                if restore_error is not None:
+                    raise AccountLoginCleanupError(
+                        "Credential rollback could not be verified"
+                    ) from restore_error
+                raise
+            await self._send_event(CredentialLoginResultMessage(
+                account_id=account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error=(
+                    "Credential update failed and rollback could not be verified"
+                    if restore_error is not None
+                    else "Credential update failed; previous credentials restored"
+                ),
+            ))
+            return
         logger.info("Wrote credentials for %s to %s", account_id, config_dir)
 
         # Credential swap is in-place: warm PTY sessions on this config_dir
@@ -1831,11 +2203,34 @@ class WorkerRuntime:
         if self._pty_backend is not None:
             try:
                 await self._pty_backend.recycle_config_dir(config_dir)
-            except Exception:
-                logger.exception(
-                    "Failed to recycle PTY sessions for %s", config_dir
+            except BaseException as exc:
+                restore_error = rollback_error()
+                if not isinstance(exc, Exception):
+                    if restore_error is not None:
+                        raise AccountLoginCleanupError(
+                            "Credential rollback could not be verified"
+                        ) from restore_error
+                    raise
+                logger.error(
+                    "Failed to recycle PTY sessions for %s (%s)",
+                    config_dir,
+                    type(exc).__name__,
                 )
+                await self._send_event(CredentialLoginResultMessage(
+                    account_id=account_id,
+                    slot_index=msg.slot_index,
+                    success=False,
+                    error=(
+                        "Credential activation failed and rollback could not "
+                        "be verified"
+                        if restore_error is not None
+                        else "Credential activation failed; previous "
+                        "credentials restored"
+                    ),
+                ))
+                return
 
+        self._unsafe_credential_config_dirs.discard(config_dir)
         if self._quota_checker:
             self._quota_checker.add_slot(account_id, config_dir)
 
@@ -1845,13 +2240,33 @@ class WorkerRuntime:
             success=True,
         ))
 
+    def _confirm_account_login_cleanup(self, msg: AccountLoginMessage) -> None:
+        """Record exact proof that no delegated credential/process remains."""
+
+        self._account_login_cleanup_confirmed[msg.login_request_id] = msg.account_id
+        while (
+            len(self._account_login_cleanup_confirmed)
+            > _MAX_COMPLETED_LOGIN_RECORDS
+        ):
+            oldest = next(iter(self._account_login_cleanup_confirmed))
+            self._account_login_cleanup_confirmed.pop(oldest, None)
+
     async def _handle_account_login(self, msg: AccountLoginMessage) -> None:
         """Run one worker-local login while keeping OTP commands receivable."""
-        async with self._account_login_lock:
-            if msg.agent_type == "codex":
-                await self._handle_codex_account_login(msg)
-            else:
-                await self._handle_claude_account_login(msg)
+        entered_login = False
+        try:
+            async with self._account_login_lock:
+                entered_login = True
+                if msg.agent_type == "codex":
+                    await self._handle_codex_account_login(msg)
+                else:
+                    await self._handle_claude_account_login(msg)
+        except asyncio.CancelledError:
+            if not entered_login:
+                # Cancellation while waiting behind another login touched no
+                # browser, process, or credential and is therefore clean.
+                self._confirm_account_login_cleanup(msg)
+            raise
 
     async def _run_account_login_task(self, msg: AccountLoginMessage) -> None:
         """Convert every unexpected background failure into a safe result."""
@@ -1859,6 +2274,28 @@ class WorkerRuntime:
             await self._handle_account_login(msg)
         except asyncio.CancelledError:
             raise
+        except AccountLoginCleanupError as exc:
+            if msg.agent_type == "claude":
+                from elastic_agent.core.claude_oauth import (
+                    normalize_local_config_dir,
+                )
+
+                self._unsafe_credential_config_dirs.add(
+                    normalize_local_config_dir(msg.config_dir)
+                )
+            logger.error(
+                "Account login cleanup could not be verified for request %s (%s)",
+                msg.login_request_id,
+                type(exc).__name__,
+            )
+            await self._send_event(AccountLoginResultMessage(
+                login_request_id=msg.login_request_id,
+                account_id=msg.account_id,
+                slot_index=msg.slot_index,
+                success=False,
+                error="account login cleanup could not be verified",
+                cleanup_complete=False,
+            ))
         except Exception as exc:
             # Browser/subprocess exception strings may contain a URL or input
             # value. Keep both the log and correlated result deliberately
@@ -1874,6 +2311,12 @@ class WorkerRuntime:
                 slot_index=msg.slot_index,
                 success=False,
                 error="account login failed unexpectedly",
+                cleanup_complete=(
+                    self._account_login_cleanup_confirmed.get(
+                        msg.login_request_id
+                    )
+                    == msg.account_id
+                ),
             ))
 
     async def _handle_claude_account_login(
@@ -1884,9 +2327,13 @@ class WorkerRuntime:
         on this machine) and the credentials are written here, never sent up.
         """
         from elastic_agent.core.claude_oauth import (
+            ClaudeLoginCleanupError,
             ClaudeOAuthProvider,
+            LoginResult,
             OAuthConfig,
             normalize_local_config_dir,
+            restore_claude_credentials,
+            snapshot_claude_credentials,
         )
 
         provider = ClaudeOAuthProvider()
@@ -1900,54 +2347,92 @@ class WorkerRuntime:
             config_dir=config_dir,
             provider=msg.provider,
             worker_host=None,
+            login_timeout=msg.login_timeout_seconds,
         )
+        credential_snapshot = snapshot_claude_credentials(config_dir)
+        committed = False
+        cancelled_error: asyncio.CancelledError | None = None
         try:
             result = await provider.login(config)
-        except Exception as exc:
-            logger.exception("Account login failed for %s", msg.account_id)
-            await self._send_event(AccountLoginResultMessage(
-                login_request_id=msg.login_request_id,
-                account_id=msg.account_id, slot_index=msg.slot_index,
-                success=False, error=str(exc),
-            ))
-            return
-
-        if result.success:
-            logger.info("Account %s logged in on this worker (%s)",
-                        msg.account_id, config_dir)
-            identity_ok = await self._verify_config_identity(
-                config_dir, msg.email
-            )
-            if not identity_ok:
-                result.success = False
-                result.error = (
-                    "Claude credentials are valid for a different or unknown "
-                    "email than the selected account"
+            if result.success:
+                logger.info(
+                    "Account %s logged in on this worker (%s)",
+                    msg.account_id,
+                    config_dir,
                 )
-            # Warm the account so the first real PTY turn doesn't stall on
-            # GrowthBook/onboarding, and verify the credentials are usable.
-            warmup_ok = (
-                await self._warmup_config_dir(config_dir)
-                if result.success
-                else False
-            )
-            if result.success and not warmup_ok:
-                result.success = False
-                result.error = (
-                    "Claude login produced credentials, but the credential "
-                    "validation command failed"
+                identity_ok = await self._verify_config_identity(
+                    config_dir, msg.email
                 )
-            # New credentials on this config_dir: warm PTY sessions there ran
-            # under a different account and must not be hot-reused.
-            if result.success and self._pty_backend is not None:
-                try:
-                    await self._pty_backend.recycle_config_dir(config_dir)
-                except Exception:
-                    logger.exception(
-                        "Failed to recycle PTY sessions for %s", config_dir
+                if not identity_ok:
+                    result.success = False
+                    result.error = (
+                        "Claude credentials are valid for a different or unknown "
+                        "email than the selected account"
                     )
-            if result.success and self._quota_checker:
-                self._quota_checker.add_slot(msg.account_id, config_dir)
+                # Warm the account so the first real PTY turn doesn't stall on
+                # GrowthBook/onboarding, and verify the credentials are usable.
+                warmup_ok = (
+                    await self._warmup_config_dir(config_dir)
+                    if result.success
+                    else False
+                )
+                if result.success and not warmup_ok:
+                    result.success = False
+                    result.error = (
+                        "Claude login produced credentials, but the credential "
+                        "validation command failed"
+                    )
+                committed = result.success
+        except asyncio.CancelledError as exc:
+            cancelled_error = exc
+        except ClaudeLoginCleanupError as exc:
+            raise AccountLoginCleanupError(
+                "Claude login process cleanup could not be verified"
+            ) from exc
+        except Exception as exc:
+            logger.error(
+                "Claude account login failed for %s (%s)",
+                msg.account_id,
+                type(exc).__name__,
+            )
+            result = LoginResult(
+                success=False,
+                account_id=msg.account_id,
+                error="Claude login automation failed unexpectedly",
+            )
+        finally:
+            if not committed:
+                try:
+                    restore_claude_credentials(credential_snapshot)
+                except Exception as exc:
+                    raise AccountLoginCleanupError(
+                        "Claude credential rollback could not be verified"
+                    ) from exc
+
+        if cancelled_error is not None:
+            self._confirm_account_login_cleanup(msg)
+            raise cancelled_error
+
+        # New credentials on this config_dir: warm PTY sessions there ran
+        # under a different account and must not be hot-reused.
+        if result.success and self._pty_backend is not None:
+            try:
+                await self._pty_backend.recycle_config_dir(config_dir)
+            except Exception as exc:
+                # A warm PTY still carries the previous account even though the
+                # credential files now contain the newly selected account.
+                # Reporting success here would let the next task run under the
+                # wrong identity. Fail closed so an ordinary Worker/account is
+                # quarantined (or an EIP Worker is destroyed).
+                raise AccountLoginCleanupError(
+                    "Claude PTY session cleanup could not be verified"
+                ) from exc
+        if result.success and self._quota_checker:
+            self._quota_checker.add_slot(msg.account_id, config_dir)
+        if result.success:
+            self._unsafe_credential_config_dirs.discard(config_dir)
+        if not result.success:
+            self._confirm_account_login_cleanup(msg)
 
         await self._send_event(AccountLoginResultMessage(
             login_request_id=msg.login_request_id,
@@ -1955,6 +2440,7 @@ class WorkerRuntime:
             slot_index=msg.slot_index,
             success=result.success,
             error=result.error,
+            cleanup_complete=True if not result.success else None,
         ))
 
     async def _handle_codex_account_login(
@@ -1970,12 +2456,14 @@ class WorkerRuntime:
             else Path.home() / ".codex"
         )
         if not msg.password and not msg.email_token.strip():
+            self._confirm_account_login_cleanup(msg)
             await self._send_event(AccountLoginResultMessage(
                 login_request_id=msg.login_request_id,
                 account_id=msg.account_id,
                 slot_index=msg.slot_index,
                 success=False,
                 error="Codex login requires an email token or OpenAI password",
+                cleanup_complete=True,
             ))
             return
 
@@ -1993,6 +2481,9 @@ class WorkerRuntime:
                 timeout=msg.login_timeout_seconds,
             )
         except asyncio.CancelledError:
+            # codex_login only lets cancellation escape after its transactional
+            # finally has stopped the CLI/browser and restored auth.json.
+            self._confirm_account_login_cleanup(msg)
             raise
         except Exception as exc:
             logger.error(
@@ -2006,6 +2497,7 @@ class WorkerRuntime:
                 slot_index=msg.slot_index,
                 success=False,
                 error="Codex login automation failed unexpectedly",
+                cleanup_complete=False,
             ))
             return
         finally:
@@ -2018,12 +2510,15 @@ class WorkerRuntime:
                 msg.account_id,
                 codex_home,
             )
+        else:
+            self._confirm_account_login_cleanup(msg)
         await self._send_event(AccountLoginResultMessage(
             login_request_id=msg.login_request_id,
             account_id=msg.account_id,
             slot_index=msg.slot_index,
             success=success,
             error=None if success else str(result.get("error") or "Codex login failed"),
+            cleanup_complete=True if not success else None,
         ))
 
     async def _handle_account_login_otp(
@@ -2044,7 +2539,10 @@ class WorkerRuntime:
         """Cancel one login and acknowledge only after its cleanup finishes."""
         task = self._account_login_tasks.get(msg.login_request_id)
         account_id = self._account_login_accounts.get(msg.login_request_id)
-        cleanup_complete = account_id in (None, msg.account_id)
+        cleanup_complete = (
+            self._account_login_cleanup_confirmed.get(msg.login_request_id)
+            == msg.account_id
+        )
         if task is not None and not task.done() and account_id == msg.account_id:
             logger.info(
                 "Cancelling account login request %s (%s)",
@@ -2066,6 +2564,13 @@ class WorkerRuntime:
                 # A completed task has run its transactional rollback even if
                 # its handler failed. The wrapper has already redacted/logged it.
                 pass
+            cleanup_complete = (
+                task.done()
+                and self._account_login_cleanup_confirmed.get(
+                    msg.login_request_id
+                )
+                == msg.account_id
+            )
 
         await self._send_event(AccountLoginCancelledMessage(
             login_request_id=msg.login_request_id,
@@ -2311,28 +2816,213 @@ class WorkerRuntime:
         unacknowledged PROCESS_EXIT (and briefly both), never neither.
         """
         await self._mark_task_exiting(msg.task_id)
-        await self._send_event(msg)
+        try:
+            await self._send_event(msg)
+        except BaseException:
+            # The event is neither durable nor deliverable.  Do not advertise a
+            # phantom pending exit forever; reconnect STATUS must let the
+            # Manager's lost-task reconciliation take over.
+            async with self._event_outbox_lock:
+                self._exiting_task_ids.discard(msg.task_id)
+            raise
         async with self._event_outbox_lock:
             if msg.event_id in self._reliable_events:
                 self._exiting_task_ids.discard(msg.task_id)
 
     async def _handle_event_ack(self, msg: EventAckMessage) -> None:
+        persist_error: Exception | None = None
         async with self._event_outbox_lock:
-            if self._reliable_events.pop(msg.event_id, None) is None:
+            previous_events = dict(self._reliable_events)
+            removed = self._reliable_events.pop(msg.event_id, None)
+            if removed is None:
                 return
-            self._persist_reliable_events()
+            try:
+                self._persist_reliable_events()
+            except Exception as exc:
+                # The on-disk outbox still contains the event.  Restore memory
+                # to the same truth so reconnect replay remains possible.
+                self._reliable_events = previous_events
+                persist_error = exc
+        if persist_error is not None:
+            await self._force_reconnect_for_outbox_failure()
+            raise ReliableEventPersistenceError(
+                "failed to durably acknowledge terminal event"
+            ) from persist_error
+
+    def _transport_reservation(self, kind: str) -> tuple[int, int]:
+        reserved_bytes = 0
+        reserved_frames = 0
+        if self._retry_send is not None and self._retry_send_kind == kind:
+            reserved_bytes += self._retry_send_bytes
+            reserved_frames += 1
+        if self._inflight_send_kind == kind:
+            reserved_bytes += self._inflight_send_bytes
+            reserved_frames += 1
+        return reserved_bytes, reserved_frames
+
+    @staticmethod
+    def _drop_count_should_log(before: int, after: int) -> bool:
+        return before == 0 or before.bit_length() != after.bit_length()
+
+    def _record_transport_drops(self, kind: str, count: int) -> None:
+        if count <= 0:
+            return
+        if kind == "log":
+            before = self._dropped_log_frames
+            self._dropped_log_frames += count
+            after = self._dropped_log_frames
+            if self._drop_count_should_log(before, after):
+                logger.warning(
+                    "Dropped %d Worker LOG transport frames because the Manager "
+                    "link is slow or disconnected; local task logs remain intact",
+                    after,
+                )
+            return
+        if kind == "control":
+            before = self._dropped_control_frames
+            self._dropped_control_frames += count
+            after = self._dropped_control_frames
+            if self._drop_count_should_log(before, after):
+                logger.warning(
+                    "Dropped %d Worker control transport frames because the "
+                    "Manager link is slow or disconnected; durable terminal "
+                    "events remain in the worker outbox",
+                    after,
+                )
+            return
+        before = self._dropped_data_frames
+        self._dropped_data_frames += count
+        after = self._dropped_data_frames
+        if self._drop_count_should_log(before, after):
+            logger.warning(
+                "Dropped %d Worker file-data transport frames because the "
+                "Manager link is slow or disconnected",
+                after,
+            )
 
     async def _send_event(self, msg: Message) -> None:
-        try:
-            data = msg.model_dump_json()
-            event_id = getattr(msg, "event_id", "")
-            if event_id:
-                async with self._event_outbox_lock:
-                    self._reliable_events[str(event_id)] = data
+        data = msg.model_dump_json()
+        event_id = str(getattr(msg, "event_id", "") or "")
+        if event_id:
+            persist_error: Exception | None = None
+            async with self._event_outbox_lock:
+                previous = self._reliable_events.get(event_id)
+                self._reliable_events[event_id] = data
+                try:
                     self._persist_reliable_events()
-            await self._send_queue.put(data)
+                except Exception as exc:
+                    if previous is None:
+                        self._reliable_events.pop(event_id, None)
+                    else:
+                        self._reliable_events[event_id] = previous
+                    persist_error = exc
+            if persist_error is not None:
+                logger.critical(
+                    "Failed to persist reliable %s event (%s); forcing reconnect",
+                    msg.type,
+                    type(persist_error).__name__,
+                )
+                await self._force_reconnect_for_outbox_failure()
+                raise ReliableEventPersistenceError(
+                    f"failed to persist reliable {msg.type} event"
+                ) from persist_error
+
+        if isinstance(msg, LogMessage):
+            serialized_bytes = len(data.encode("utf-8"))
+            if serialized_bytes > _MAX_LOG_TRANSPORT_FRAME_BYTES:
+                # The caller has already appended the byte-exact raw event to
+                # the worker-local NDJSON.  Send only an explicit bounded marker
+                # so a giant PTY/tool frame cannot multiply across the backlog.
+                msg = LogMessage(
+                    task_id=msg.task_id,
+                    stream=msg.stream,
+                    data=(
+                        "[elastic-agent transport truncated: full raw frame is "
+                        "available in the worker-local task log]"
+                    ),
+                    parsed={
+                        "type": "elastic_transport_truncated",
+                        "original_serialized_bytes": serialized_bytes,
+                    },
+                )
+                data = msg.model_dump_json()
+                self._truncated_log_frames += 1
+                if self._truncated_log_frames & (
+                    self._truncated_log_frames - 1
+                ) == 0:
+                    logger.warning(
+                        "Truncated %d oversized Worker LOG transport frames; "
+                        "local raw task logs remain intact",
+                        self._truncated_log_frames,
+                    )
+            reserved_bytes, reserved_frames = self._transport_reservation("log")
+            accepted, dropped, _ = self._log_send_queue.put_latest(
+                data,
+                reserved_bytes=reserved_bytes,
+                reserved_frames=reserved_frames,
+            )
+            self._record_transport_drops(
+                "log",
+                dropped + (0 if accepted else 1),
+            )
+            if accepted:
+                self._send_queue_ready.set()
+            return
+
+        if isinstance(msg, (FileChangeMessage, FileContentMessage)):
+            serialized_bytes = len(data.encode("utf-8"))
+            if serialized_bytes > _MAX_DATA_TRANSPORT_FRAME_BYTES:
+                # File notifications/content are best-effort.  Do not turn
+                # every omitted payload into an unbounded control message:
+                # during a disconnected Manager link an attacker could flood
+                # oversized events and exhaust worker memory through the
+                # otherwise reliable/control queue.  The scalar drop counter
+                # and its power-of-two local warnings are the bounded signal.
+                self._record_transport_drops("data", 1)
+                return
+            reserved_bytes, reserved_frames = self._transport_reservation("data")
+            accepted, dropped, _ = self._data_send_queue.put_latest(
+                data,
+                reserved_bytes=reserved_bytes,
+                reserved_frames=reserved_frames,
+            )
+            self._record_transport_drops(
+                "data",
+                dropped + (0 if accepted else 1),
+            )
+            if accepted:
+                self._send_queue_ready.set()
+            return
+
+        reserved_bytes, reserved_frames = self._transport_reservation("control")
+        accepted, dropped, _ = self._send_queue.put_latest(
+            data,
+            reserved_bytes=reserved_bytes,
+            reserved_frames=reserved_frames,
+        )
+        self._record_transport_drops(
+            "control",
+            dropped + (0 if accepted else 1),
+        )
+        if accepted:
+            self._send_queue_ready.set()
+        if dropped or (event_id and not accepted):
+            # An evicted control frame may itself be a durable terminal event.
+            # Reconnect so the fsynced outbox is replayed before the bounded
+            # queues; best-effort control frames need no recovery.
+            await self._force_reconnect_for_outbox_failure()
+
+    async def _force_reconnect_for_outbox_failure(self) -> None:
+        """Close the active socket so Manager receives a fresh STATUS snapshot."""
+
+        self._reconnect_event.set()
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.close(code=1011, reason="worker durable outbox failure")
+        except TypeError:
+            # Minimal/fake websocket implementations may accept no close args.
+            await ws.close()
         except Exception:
-            # Critical events must never be silently discarded.  The process
-            # monitor cannot retry an exit later, so surface persistence/queue
-            # failures loudly while preserving the local process log.
-            logger.exception("Failed to queue message of type %s", msg.type)
+            logger.exception("Failed to close websocket after outbox failure")

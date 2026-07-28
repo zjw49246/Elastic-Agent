@@ -27,6 +27,7 @@ class FakeDriver:
         self.login_calls: list[tuple[str, str]] = []
         self.dispatched: list[dict] = []
         self.scaled_in: list[str] = []
+        self.scale_in_requests: list[list[str]] = []
         self.scale_in_calls = 0
         self.scale_in_failures = 0
         self.stopped: list[tuple[str, str, str]] = []
@@ -155,6 +156,7 @@ class FakeDriver:
 
     async def scale_in(self, worker_ids):
         self.scale_in_calls += 1
+        self.scale_in_requests.append(list(worker_ids))
         if self.scale_in_failures:
             self.scale_in_failures -= 1
             raise RuntimeError("scale-in transient")
@@ -1364,6 +1366,31 @@ class TestCompletion:
             await orch.on_worker_exit(job.job_id, wid, 0)
         assert set(d.scaled_in) == set(job.runs.keys())
 
+    async def test_terminal_shard_is_collected_and_terminated_immediately(
+        self,
+    ):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+        first, second = job.runs.values()
+
+        await orch.on_worker_exit(
+            job.job_id,
+            first.worker_id,
+            1,
+            task_id=first.task_id,
+        )
+
+        assert first.phase == WorkerPhase.FAILED
+        assert first.cleaned_up is True
+        assert second.phase == WorkerPhase.RUNNING
+        assert d.collected == [(first.worker_id, job.job_id)]
+        assert d.scaled_in == [first.worker_id]
+        assert allocator.released == [first.worker_id]
+        assert job.resources_released is False
+
     async def test_default_lifecycle_terminates_ephemeral_workers(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
@@ -1391,7 +1418,7 @@ class TestCompletion:
         assert job.resources_released is True
         assert d.scale_in_calls == 2
 
-    async def test_concurrent_shard_exits_scale_in_once(self):
+    async def test_concurrent_shard_exits_each_scale_in_exact_worker(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
         job = await orch.launch(_spec(fanout={"workers": 2}))
@@ -1401,7 +1428,7 @@ class TestCompletion:
             )
             for run in job.runs.values()
         ))
-        assert d.scale_in_calls == 1
+        assert d.scale_in_calls == 2
 
     async def test_cancel_job_stops_collects_and_scales_in_all_workers(self):
         d = FakeDriver()
@@ -1644,6 +1671,131 @@ class TestAccountRelease:
         assert job.resources_released is True
         assert job.accounts_released is True
         assert allocator.released == [run.worker_id]
+        assert driver.scaled_in == [run.worker_id]
+
+    async def test_bound_account_release_flag_waits_for_durable_cleanup(self):
+        driver = FakeDriver()
+        # The terminal handler and its immediate _maybe_finish pass both try
+        # release_bound. Keep both attempts failed so the pending window is
+        # observable without racing the background retry loop.
+        driver.bound_release_failures = 2
+        orch = BatchOrchestrator(driver, cleanup_retry_seconds=60)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        spec = TestEipBoundLaunch()._bound_spec(
+            workers=1,
+            ids=["acct-1"],
+        )
+        job = await orch.launch(spec)
+        run = next(iter(job.runs.values()))
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+
+        assert run.cleaned_up is False
+        assert job.accounts_released is False
+        # EIP release_bound owns the exact job:slot claim; the broad ordinary
+        # worker fallback must never run before or after that transaction.
+        assert allocator.released == []
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+
+        assert run.cleaned_up is True
+        assert job.accounts_released is True
+        assert allocator.released == []
+
+    async def test_missing_termination_proof_does_not_release_account_claim(
+        self,
+    ):
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        class MissingProofManager:
+            async def scale_in(self, *, node_ids, force):
+                return []
+
+            async def remove_node(self, worker_id):
+                raise AssertionError(
+                    "node removal requires an exact termination proof"
+                )
+
+        class MissingProofDriver(FakeDriver):
+            def __init__(self):
+                super().__init__()
+                self.teardown = ManagerFleetDriver(MissingProofManager())
+
+            async def scale_in(self, worker_ids):
+                self.scale_in_calls += 1
+                await self.teardown.scale_in(worker_ids)
+
+        driver = MissingProofDriver()
+        orch = BatchOrchestrator(driver, cleanup_retry_seconds=60)
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+
+        assert run.infrastructure_released is False
+        assert run.cleaned_up is False
+        assert job.accounts_released is False
+        assert allocator.released == []
+
+    async def test_claim_release_retry_does_not_terminate_worker_twice(self):
+        class FailOnceAllocator(_RecordingAllocator):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            async def release_worker(self, worker_id):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("allocator unavailable")
+                await super().release_worker(worker_id)
+
+        driver = FakeDriver()
+        orch = BatchOrchestrator(driver, cleanup_retry_seconds=60)
+        allocator = FailOnceAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        run = next(iter(job.runs.values()))
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+        assert run.infrastructure_released is True
+        assert run.cleaned_up is False
+        assert driver.scale_in_calls == 1
+        assert allocator.released == []
+
+        await orch.on_worker_exit(
+            job.job_id,
+            run.worker_id,
+            0,
+            task_id=run.task_id,
+        )
+
+        assert run.cleaned_up is True
+        assert driver.scale_in_calls == 1
+        assert driver.scaled_in == [run.worker_id]
+        assert allocator.released == [run.worker_id]
 
     async def test_agent_api_forces_ephemeral_teardown_when_global_scale_in_is_off(
         self,
@@ -1802,3 +1954,39 @@ class TestShutdown:
         assert driver.collected == [(run.worker_id, job.job_id)]
         assert driver.scaled_in == [run.worker_id]
         assert job.resources_released is True
+
+    async def test_shutdown_retries_only_unsettled_ordinary_shards(self):
+        driver = FakeDriver()
+        orch = BatchOrchestrator(
+            driver,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+            cleanup_retry_seconds=60,
+        )
+        allocator = _RecordingAllocator()
+        orch._allocator = allocator
+        job = await orch.launch(_spec(fanout={"workers": 2}))
+        first, second = job.runs.values()
+
+        await orch.on_worker_exit(
+            job.job_id,
+            first.worker_id,
+            0,
+            task_id=first.task_id,
+        )
+        assert first.cleaned_up is True
+        driver.scale_in_failures = 1
+
+        await orch.shutdown(timeout=0.1)
+
+        assert first.cleaned_up is True
+        assert second.cleaned_up is True
+        assert driver.scale_in_requests == [
+            [first.worker_id],
+            [second.worker_id],
+            [second.worker_id],
+        ]
+        assert driver.scaled_in == [first.worker_id, second.worker_id]
+        assert allocator.released == [first.worker_id, second.worker_id]
+        assert job.resources_released is True
+        assert job.accounts_released is True

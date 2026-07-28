@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import io
 import json
 import os
 import stat
 import tarfile
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from elastic_agent.api.app import create_app
@@ -81,7 +85,11 @@ class FakeBatch:
 
         if self.persist_spec_hook is not None:
             try:
-                await self.persist_spec_hook(job.job_id, job.spec)
+                await self.persist_spec_hook(
+                    job.job_id,
+                    job.spec,
+                    job.request_fingerprint,
+                )
             except Exception as exc:  # noqa: BLE001
                 raise JobSpecPersistenceError(
                     f"failed to persist JobSpec before launch: {exc}"
@@ -216,6 +224,82 @@ async def client(manager):
 
 class TestAccountsAPI:
     @pytest.mark.asyncio
+    async def test_cancelled_job_allocation_remains_until_release_proof(
+        self, client, manager,
+    ):
+        submitted = await client.post(
+            "/api/jobs",
+            json={
+                "name": "cancelled-allocation",
+                "run": {"command": "true"},
+                "account": {"mode": "none"},
+            },
+        )
+        assert submitted.status_code == 201
+        job = manager.batch.get_job(submitted.json()["job_id"])
+        run = next(iter(job.runs.values()))
+        run.account_ids = ["released-account"]
+        run.account_emails = ["released@example.com"]
+
+        cancelled = await client.post(f"/api/jobs/{job.job_id}/cancel")
+        pending = await client.get("/api/accounts/allocations")
+
+        assert cancelled.status_code == 200
+        assert pending.status_code == 200
+        assert pending.json()["allocations"]["released-account"] == [{
+            "job_id": job.job_id,
+            "job_name": "cancelled-allocation",
+            "worker_id": run.worker_id,
+            "phase": "cancelled",
+            "email": "released@example.com",
+            "active": False,
+            "cleanup_pending": True,
+        }]
+
+        job.accounts_released = True
+        released = await client.get("/api/accounts/allocations")
+        assert released.status_code == 200
+        assert released.json() == {
+            "allocations": {},
+            "total_accounts_bound": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_allocation_view_fails_closed_when_job_state_is_unavailable(
+        self, client, manager, monkeypatch,
+    ):
+        def fail_list_jobs():
+            raise RuntimeError("in-memory job state failed")
+
+        monkeypatch.setattr(manager.batch, "list_jobs", fail_list_jobs)
+
+        response = await client.get("/api/accounts/allocations")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Account allocation state is temporarily unavailable"
+        )
+        assert "in-memory job state failed" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_allocation_view_fails_closed_when_leases_are_unavailable(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            manager.binding_manager,
+            "list_leases",
+            AsyncMock(side_effect=RuntimeError("durable lease read failed")),
+        )
+
+        response = await client.get("/api/accounts/allocations")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Durable account allocation state is temporarily unavailable"
+        )
+        assert "durable lease read failed" not in response.text
+
+    @pytest.mark.asyncio
     async def test_cloudrouter_agent_api_account_is_write_only_and_shared(
         self, client, manager, monkeypatch,
     ):
@@ -309,9 +393,76 @@ class TestAccountsAPI:
         assert key_file.read_text() == key
         assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
 
-        assert (
-            await client.delete("/api/agent-api/accounts/cloudrouter-1")
-        ).status_code == 409
+        removed = await client.delete(
+            "/api/agent-api/accounts/cloudrouter-1"
+        )
+        assert removed.status_code == 200
+        assert removed.json() == {
+            "account_id": "cloudrouter-1",
+            "status": "removed",
+        }
+        assert not key_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_agent_api_delete_rejects_active_claim_then_succeeds(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={"claude": ["claude-opus-4-8"]}),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "windows": [],
+            }),
+        )
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Shared",
+            "api_key": "private-key",
+        })
+        assert created.status_code == 201
+        first_claim = await manager.account_allocator.reserve(
+            "job-1:w1",
+            "standard",
+            account_id="cloudrouter-1",
+            agent_type="claude",
+            allow_shared_agent_api=True,
+        )
+        second_claim = await manager.account_allocator.reserve(
+            "job-2:w2",
+            "standard",
+            account_id="cloudrouter-1",
+            agent_type="claude",
+            allow_shared_agent_api=True,
+        )
+        assert first_claim is not None
+        assert second_claim is not None
+
+        blocked = await client.delete(
+            "/api/agent-api/accounts/cloudrouter-1"
+        )
+        assert blocked.status_code == 409
+
+        await manager.account_allocator.release_claim(first_claim.claim_id)
+        still_blocked = await client.delete(
+            "/api/agent-api/accounts/cloudrouter-1"
+        )
+        assert still_blocked.status_code == 409
+
+        await manager.account_allocator.release_claim(second_claim.claim_id)
+        removed = await client.delete(
+            "/api/agent-api/accounts/cloudrouter-1"
+        )
+        assert removed.status_code == 200
 
     @pytest.mark.asyncio
     async def test_cloudrouter_invalid_key_errors_are_sanitized(
@@ -1019,12 +1170,234 @@ class TestAccountsAPI:
             "account_id": "a",
             "status": "decommissioned",
             "eip_released": True,
+            "identity_removed": False,
         }
         assert manager.binding_manager.decommissioned == ["a"]
         assert (await client.get("/api/accounts/a/binding")).status_code == 404
         # Identity CRUD stays separate and becomes available after explicit
         # infrastructure decommissioning.
         assert (await client.delete("/api/accounts/a")).status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_decommission_can_atomically_remove_identity(
+        self, client, manager,
+    ):
+        await client.post(
+            "/api/accounts",
+            json={"id": "a", "email": "one@x.com"},
+        )
+        await client.put("/api/accounts/a/binding")
+
+        retired = await client.post(
+            "/api/accounts/a/binding/decommission",
+            json={
+                "release_eip": True,
+                "confirm_account_id": "a",
+                "delete_identity": True,
+            },
+        )
+
+        assert retired.status_code == 200
+        assert retired.json() == {
+            "account_id": "a",
+            "status": "decommissioned_and_removed",
+            "eip_released": True,
+            "identity_removed": True,
+        }
+        assert await manager.account_store.get("a") is None
+        assert await manager.binding_manager.get_binding("a") is None
+
+    @pytest.mark.asyncio
+    async def test_decommission_can_atomically_remove_agent_api_identity(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={"claude": ["claude-opus-4-8"]}),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "windows": [],
+            }),
+        )
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Retired API key",
+            "api_key": "private-key",
+        })
+        account_id = created.json()["id"]
+        assert (
+            await client.put(f"/api/accounts/{account_id}/binding")
+        ).status_code == 200
+
+        retired = await client.post(
+            f"/api/accounts/{account_id}/binding/decommission",
+            json={
+                "release_eip": True,
+                "confirm_account_id": account_id,
+                "delete_identity": True,
+            },
+        )
+
+        assert retired.status_code == 200
+        assert retired.json() == {
+            "account_id": account_id,
+            "status": "decommissioned_and_removed",
+            "eip_released": True,
+            "identity_removed": True,
+        }
+        assert await manager.agent_api_store.get(account_id) is None
+        assert await manager.binding_manager.get_binding(account_id) is None
+
+    @pytest.mark.asyncio
+    async def test_agent_api_atomic_retirement_waits_for_startup_recovery(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={"claude": ["claude-opus-4-8"]}),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "windows": [],
+            }),
+        )
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Recovery fenced key",
+            "api_key": "private-key",
+        })
+        account_id = created.json()["id"]
+        assert (
+            await client.put(f"/api/accounts/{account_id}/binding")
+        ).status_code == 200
+        manager._binding_recovery_ready = False
+
+        blocked = await client.post(
+            f"/api/accounts/{account_id}/binding/decommission",
+            json={
+                "release_eip": True,
+                "confirm_account_id": account_id,
+                "delete_identity": True,
+            },
+        )
+
+        assert blocked.status_code == 409
+        assert "startup resource recovery" in blocked.json()["detail"]
+        assert await manager.agent_api_store.get(account_id) is not None
+        assert await manager.binding_manager.get_binding(account_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_atomic_retirement_closes_decommission_claim_gap(
+        self, client, manager,
+    ):
+        await client.post(
+            "/api/accounts",
+            json={"id": "a", "email": "one@x.com"},
+        )
+        await client.put("/api/accounts/a/binding")
+        decommission_entered = asyncio.Event()
+        allow_decommission = asyncio.Event()
+        original_decommission = manager.binding_manager.decommission
+
+        async def blocking_decommission(account_id, *, confirm_absent=False):
+            decommission_entered.set()
+            await allow_decommission.wait()
+            return await original_decommission(
+                account_id,
+                confirm_absent=confirm_absent,
+            )
+
+        manager.binding_manager.decommission = blocking_decommission
+        retirement = asyncio.create_task(client.post(
+            "/api/accounts/a/binding/decommission",
+            json={
+                "release_eip": True,
+                "confirm_account_id": "a",
+                "delete_identity": True,
+            },
+        ))
+        await decommission_entered.wait()
+        competing_claim = asyncio.create_task(
+            manager.account_allocator.reserve(
+                "new-job:0",
+                "standard",
+                account_id="a",
+            )
+        )
+        await asyncio.sleep(0)
+        assert competing_claim.done() is False
+
+        allow_decommission.set()
+        retired = await retirement
+        claim = await competing_claim
+
+        assert retired.status_code == 200
+        assert retired.json()["identity_removed"] is True
+        assert claim is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_retirement_settles_identity_removal_before_unfence(
+        self, client, manager,
+    ):
+        await client.post(
+            "/api/accounts",
+            json={"id": "a", "email": "one@x.com"},
+        )
+        await client.put("/api/accounts/a/binding")
+        removal_entered = asyncio.Event()
+        allow_removal = asyncio.Event()
+        original_remove = manager.account_store.remove
+
+        async def blocking_remove(account_id):
+            removal_entered.set()
+            await allow_removal.wait()
+            return await original_remove(account_id)
+
+        manager.account_store.remove = blocking_remove
+        retirement = asyncio.create_task(client.post(
+            "/api/accounts/a/binding/decommission",
+            json={
+                "release_eip": True,
+                "confirm_account_id": "a",
+                "delete_identity": True,
+            },
+        ))
+        await removal_entered.wait()
+        retirement.cancel()
+        competing_claim = asyncio.create_task(
+            manager.account_allocator.reserve(
+                "new-job:0",
+                "standard",
+                account_id="a",
+            )
+        )
+        await asyncio.sleep(0)
+        assert competing_claim.done() is False
+
+        allow_removal.set()
+        retired = await retirement
+        claim = await competing_claim
+
+        assert retired.status_code == 200
+        assert retired.json()["identity_removed"] is True
+        assert claim is None
 
     @pytest.mark.asyncio
     async def test_decommission_missing_binding_404(self, client):
@@ -1078,6 +1451,17 @@ class TestJobsAPI:
         )
 
         job = manager.batch.get_job(body["job_id"])
+        first_run = next(iter(job.runs.values()))
+        first_run.cleaned_up = True
+        partially_released = (
+            await client.get(f"/api/jobs/{body['job_id']}")
+        ).json()
+        assert [
+            worker["worker_released"]
+            for worker in partially_released["workers_detail"]
+        ] == [True, False, False]
+        first_run.cleaned_up = False
+
         job.resources_released = True
         released = (await client.get(f"/api/jobs/{body['job_id']}")).json()
         assert all(w["worker_released"] is True for w in released["workers_detail"])
@@ -1104,6 +1488,128 @@ class TestJobsAPI:
         ]
 
     @pytest.mark.asyncio
+    async def test_non_eip_agent_api_key_can_fill_multiple_worker_slots(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={"claude": ["claude-opus-4-8"]}),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "state": "active",
+                "known": True,
+                "available": True,
+                "reason": "active",
+            }),
+        )
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Shared key",
+            "group": "shared",
+            "api_key": "shared-cloudrouter-key",
+        })
+        assert created.status_code == 201
+        account_id = created.json()["id"]
+        automatic = {
+            "name": "shared-api-auto",
+            "run": {"command": "true"},
+            "fanout": {"workers": 2},
+            "account": {
+                "agent_type": "claude",
+                "group": "shared",
+                "binding": "none",
+            },
+        }
+        explicit = {
+            **automatic,
+            "name": "shared-api-explicit",
+            "account": {
+                **automatic["account"],
+                "ids": [account_id, account_id],
+            },
+        }
+
+        plan = await client.post("/api/jobs/plan", json=automatic)
+        submitted = await client.post("/api/jobs", json=explicit)
+        insufficient_distinct_slots = await client.post(
+            "/api/jobs/plan",
+            json={
+                **automatic,
+                "name": "shared-api-two-slots-one-worker",
+                "fanout": {"workers": 1},
+                "account": {
+                    **automatic["account"],
+                    "per_worker": 2,
+                },
+            },
+        )
+
+        assert plan.status_code == 200
+        assert submitted.status_code == 201
+        assert submitted.json()["workers"] == 2
+        assert insufficient_distinct_slots.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_non_eip_oauth_account_cannot_be_repeated(
+        self, client,
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "oauth-one",
+            "email": "oauth-one@example.com",
+            "agent_type": "claude",
+            "group": "shared",
+        })
+        assert created.status_code == 201
+
+        response = await client.post("/api/jobs/plan", json={
+            "name": "duplicate-oauth",
+            "run": {"command": "true"},
+            "fanout": {"workers": 2},
+            "account": {
+                "agent_type": "claude",
+                "binding": "none",
+                "ids": ["oauth-one", "oauth-one"],
+            },
+        })
+
+        assert response.status_code == 422
+        assert "cannot be shared" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_plan_renders_hostname_dataset_with_synthetic_worker(
+        self, client, manager,
+    ):
+        manager.config.provider.aws.worker_instance_profile = "worker-profile"
+        response = await client.post("/api/jobs/plan", json={
+            "name": "hostname-dataset-preview",
+            "setup": {
+                "s3_datasets": [{
+                    "uri": "s3://bucket/shard-{{hostname}}.tar",
+                    "dest": "/home/ubuntu/data/{{hostname}}",
+                }],
+            },
+            "run": {"command": "echo {{hostname}}"},
+            "account": {"mode": "none"},
+        })
+
+        assert response.status_code == 200
+        assert response.json()["datasets"] == [{
+            "uri": "s3://bucket/shard-plan-worker-00000.tar",
+            "dest": "/home/ubuntu/data/plan-worker-00000",
+        }]
+        assert response.json()["run"]["command"] == [
+            "bash",
+            "-lc",
+            "echo plan-worker-00000",
+        ]
+
+    @pytest.mark.asyncio
     async def test_submit_idempotency_key_never_launches_duplicate_fleet(
         self, client, manager
     ):
@@ -1114,6 +1620,30 @@ class TestJobsAPI:
         assert first.status_code == 201
         assert second.status_code == 201
         assert first.json()["job_id"] == second.json()["job_id"]
+        assert second.json()["idempotent_replay"] is True
+        assert manager.batch.started == [first.json()["job_id"]]
+
+    @pytest.mark.asyncio
+    async def test_new_fingerprint_replay_preserves_current_semantic_defaults(
+        self, client, manager,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+
+        key = "request-semantic-defaults"
+        headers = {"Idempotency-Key": key}
+        first = await client.post("/api/jobs", json=self._SPEC, headers=headers)
+        explicitly_defaulted = JobSpec.model_validate(
+            self._SPEC
+        ).model_dump(mode="json")
+        second = await client.post(
+            "/api/jobs",
+            json=explicitly_defaulted,
+            headers=headers,
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert second.json()["job_id"] == first.json()["job_id"]
         assert second.json()["idempotent_replay"] is True
         assert manager.batch.started == [first.json()["job_id"]]
 
@@ -1157,6 +1687,80 @@ class TestJobsAPI:
         assert manager.batch.started == [job_id]
 
     @pytest.mark.asyncio
+    async def test_terminal_legacy_manager_distribute_replays_before_current_validation(
+        self, client, manager,
+    ):
+        key = "legacy-manager-distribute-terminal"
+        job_id = self._seed_job_journal(manager, key, "succeeded")
+        journal = (
+            Path(manager.config.registry.path).with_name("specs") / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text())
+        payload["spec"]["account"]["mode"] = "manager_distribute"
+        journal.write_text(json.dumps(payload))
+
+        response = await client.post(
+            "/api/jobs",
+            json=payload["spec"],
+            headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["submission_state"] == "succeeded"
+        assert response.json()["idempotent_replay"] is True
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    async def test_terminal_legacy_journal_without_fingerprint_fails_closed_on_mismatch(
+        self, client, manager,
+    ):
+        key = "legacy-manager-distribute-mismatch"
+        job_id = self._seed_job_journal(manager, key, "succeeded")
+        journal = (
+            Path(manager.config.registry.path).with_name("specs") / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text())
+        payload["spec"]["account"]["mode"] = "manager_distribute"
+        journal.write_text(json.dumps(payload))
+        changed = copy.deepcopy(payload["spec"])
+        changed["name"] = "different"
+
+        response = await client.post(
+            "/api/jobs",
+            json=changed,
+            headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 409
+        assert "legacy Job journal" in response.json()["detail"]
+        assert "cannot be proven" in response.json()["detail"]
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    async def test_prepared_legacy_request_must_pass_current_validation_before_launch(
+        self, client, manager,
+    ):
+        key = "legacy-manager-distribute-prepared"
+        job_id = self._seed_job_journal(manager, key, "prepared")
+        journal = (
+            Path(manager.config.registry.path).with_name("specs") / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text())
+        payload["spec"]["account"]["mode"] = "manager_distribute"
+        journal.write_text(json.dumps(payload))
+
+        response = await client.post(
+            "/api/jobs",
+            json=payload["spec"],
+            headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 422
+        assert manager.batch.started == []
+        assert json.loads(journal.read_text())["submission_state"] == "prepared"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("state", ["launching", "running"])
     async def test_idempotent_retry_does_not_duplicate_interrupted_fleet(
         self, client, manager, state,
@@ -1192,6 +1796,28 @@ class TestJobsAPI:
         assert response.json()["submission_state"] == state
         assert response.json()["state"] == state
         assert response.json()["done"] is True
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    async def test_exact_terminal_replay_bypasses_current_preflight(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        key = "terminal-after-policy-change"
+        job_id = self._seed_job_journal(manager, key, "succeeded")
+
+        async def rejected_preflight(*_args, **_kwargs):
+            raise HTTPException(422, "current policy rejects new jobs")
+
+        monkeypatch.setattr(jobs_route, "_preflight_job", rejected_preflight)
+        response = await client.post(
+            "/api/jobs", json=self._SPEC, headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["job_id"] == job_id
+        assert response.json()["idempotent_replay"] is True
         assert manager.batch.started == []
 
     @pytest.mark.asyncio
@@ -1242,6 +1868,12 @@ class TestJobsAPI:
             data = json.loads(path.read_text(encoding="utf-8"))
             assert data["job_id"] == job.job_id
             assert data["spec"]["name"] == "ai4sci"
+            assert data["request_fingerprint"] == {
+                "schema": 1,
+                "algorithm": "sha256",
+                "digest": job.request_fingerprint,
+            }
+            assert len(data["request_fingerprint"]["digest"]) == 64
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
         manager.batch.before_start = assert_persisted
@@ -1273,6 +1905,35 @@ class TestJobsAPI:
         assert list(specs.iterdir()) == []
 
     @pytest.mark.asyncio
+    async def test_submit_route_has_independent_raw_body_limit(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        monkeypatch.setattr(jobs_route, "JOB_SUBMIT_MAX_BODY_BYTES", 128)
+        response = await client.post(
+            "/api/jobs",
+            content=json.dumps({
+                **self._SPEC,
+                "padding": "x" * 256,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 413
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+
+    @pytest.mark.asyncio
+    async def test_submit_openapi_retains_jobspec_request_schema(self, client):
+        document = (await client.get("/openapi.json")).json()
+        schema = document["paths"]["/api/jobs"]["post"]["requestBody"][
+            "content"
+        ]["application/json"]["schema"]
+
+        assert schema == {"$ref": "#/components/schemas/JobSpec"}
+
+    @pytest.mark.asyncio
     async def test_list_and_get(self, client):
         submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
         jid = submitted["job_id"]
@@ -1283,6 +1944,94 @@ class TestJobsAPI:
         detail = (await client.get(f"/api/jobs/{jid}")).json()
         assert detail["job_id"] == jid
         assert detail["spec"]["name"] == "ai4sci"
+
+    @pytest.mark.asyncio
+    async def test_historical_job_list_uses_scandir_and_explicit_caps(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        for index in range(6):
+            self._seed_job_journal(manager, f"bounded-history-{index}")
+        monkeypatch.setattr(
+            jobs_route,
+            "JOB_LIST_HISTORY_MAX_SCANNED_ENTRIES",
+            3,
+        )
+        monkeypatch.setattr(
+            jobs_route,
+            "JOB_LIST_HISTORY_MAX_RETURNED",
+            2,
+        )
+
+        def forbid_glob(*_args, **_kwargs):
+            raise AssertionError("historical listing must use bounded scandir")
+
+        monkeypatch.setattr(Path, "glob", forbid_glob)
+        response = await client.get("/api/jobs")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["history_scanned"] == 3
+        assert payload["history_returned"] == 2
+        assert payload["total"] == 2
+        assert len(payload["jobs"]) == 2
+        assert payload["truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_historical_job_list_caps_aggregate_read_and_response(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        for index in range(3):
+            self._seed_job_journal(manager, f"bounded-read-{index}")
+        specs = Path(manager.config.registry.path).with_name("specs")
+        one_journal = max(
+            path.stat().st_size for path in specs.glob("*.json")
+        )
+        monkeypatch.setattr(
+            jobs_route,
+            "JOB_LIST_HISTORY_MAX_READ_BYTES",
+            one_journal,
+        )
+
+        read_limited = (await client.get("/api/jobs")).json()
+        assert read_limited["history_returned"] == 1
+        assert read_limited["truncated"] is True
+
+        monkeypatch.setattr(
+            jobs_route,
+            "JOB_LIST_HISTORY_MAX_RESPONSE_BYTES",
+            1,
+        )
+        response_limited = (await client.get("/api/jobs")).json()
+        assert response_limited["history_returned"] == 0
+        assert response_limited["total"] == 0
+        assert response_limited["truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_historical_job_list_fails_fast_when_capacity_is_full(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(
+            jobs_route,
+            "_JOB_HISTORY_ADMISSION",
+            admission,
+        )
+        held = admission.try_acquire()
+        assert held is not None
+        try:
+            response = await client.get("/api/jobs")
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "1"
+            assert admission.active == 1
+        finally:
+            held.release()
+        assert admission.active == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1489,6 +2238,108 @@ class TestJobsAPI:
         assert payload["complete"] is False
 
     @pytest.mark.asyncio
+    async def test_job_logs_use_dedicated_executor_and_fail_fast_when_full(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(
+            jobs_route,
+            "_JOB_LOG_READ_ADMISSION",
+            admission,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        thread_names: list[str] = []
+
+        def blocking_tail(*_args, **_kwargs):
+            thread_names.append(threading.current_thread().name)
+            entered.set()
+            release.wait(timeout=5)
+            return {
+                "tasks": [],
+                "entries": [],
+                "total": 0,
+                "history_truncated": False,
+                "truncated": False,
+            }
+
+        monkeypatch.setattr(
+            manager.job_log_store,
+            "read_job_tail",
+            blocking_tail,
+        )
+        active = asyncio.create_task(
+            client.get(f"/api/jobs/{job_id}/logs")
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+
+        saturated = await client.get(f"/api/jobs/{job_id}/logs")
+        assert saturated.status_code == 503
+        assert saturated.headers["retry-after"] == "1"
+        assert admission.active == 1
+
+        release.set()
+        assert (await active).status_code == 200
+        assert thread_names
+        assert all(name.startswith("job-log-read") for name in thread_names)
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_job_log_read_keeps_permit_until_thread_exits(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(
+            jobs_route,
+            "_JOB_LOG_READ_ADMISSION",
+            admission,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_tail(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            return {
+                "tasks": [],
+                "entries": [],
+                "total": 0,
+                "history_truncated": False,
+                "truncated": False,
+            }
+
+        monkeypatch.setattr(
+            manager.job_log_store,
+            "read_job_tail",
+            blocking_tail,
+        )
+        cancelled = asyncio.create_task(
+            client.get(f"/api/jobs/{job_id}/logs")
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        cancelled.cancel()
+        await asyncio.sleep(0)
+
+        assert cancelled.done() is False
+        assert admission.active == 1
+        saturated = await client.get(f"/api/jobs/{job_id}/logs")
+        assert saturated.status_code == 503
+        assert admission.active == 1
+
+        release.set()
+        result = await asyncio.gather(cancelled, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
     async def test_job_logs_stop_polling_after_run_while_cleanup_is_pending(
         self, client, manager,
     ):
@@ -1624,9 +2475,79 @@ class TestJobsAPI:
 
         assert response.status_code == 200
         assert any(
-            "bypasses the account's durable EIP" in warning
+            "excludes identities with durable EIP bindings" in warning
             for warning in response.json()["warnings"]
         )
+
+    @pytest.mark.asyncio
+    async def test_durable_api_binding_is_not_available_to_unbound_jobs(
+        self, client, manager, monkeypatch,
+    ):
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter,
+            "probe_models",
+            AsyncMock(return_value={"codex": ["gpt-5.4"]}),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "windows": [],
+            }),
+        )
+        created = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Bound API",
+            "group": "bound-only",
+            "api_key": "private-bound-key",
+        })
+        assert created.status_code == 201
+        manager.binding_manager.bindings["cloudrouter-1"] = AccountBinding(
+            account_id="cloudrouter-1",
+            eip_allocation_id="eipalloc-bound-api",
+            eip_ip="198.51.100.42",
+            region="us-west-2",
+            state=BindingState.READY,
+        )
+
+        explicit_unbound = await client.post("/api/jobs/plan", json={
+            "name": "explicit-unbound-api",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "binding": "none",
+                "ids": ["cloudrouter-1"],
+            },
+        })
+        automatic_unbound = await client.post("/api/jobs/plan", json={
+            "name": "automatic-unbound-api",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "binding": "none",
+                "group": "bound-only",
+            },
+        })
+        bound = await client.post("/api/jobs/plan", json={
+            "name": "bound-api",
+            "run": {"command": "true"},
+            "account": {
+                "agent_type": "codex",
+                "binding": "eip",
+                "ids": ["cloudrouter-1"],
+            },
+        })
+
+        assert explicit_unbound.status_code == 422
+        assert "has a durable EIP binding" in explicit_unbound.json()["detail"]
+        assert automatic_unbound.status_code == 422
+        assert "requires 1" in automatic_unbound.json()["detail"]
+        assert bound.status_code == 200
 
     @pytest.mark.asyncio
     async def test_submit_preflight_rejects_unavailable_region_before_persisting(
@@ -1778,6 +2699,66 @@ class TestHarnessUpload:
         })
         assert r.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_invalid_reupload_does_not_destroy_existing_harness(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.harness.generic import load_harness_class
+
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
+        first = await client.post("/api/jobs/harness", json={
+            "filename": "stable.py",
+            "content": self._CODE,
+            "class_name": "MyHarness",
+        })
+        assert first.status_code == 201
+        first_ref = first.json()["harness_ref"]
+        first_path = Path(first.json()["path"])
+
+        invalid = await client.post("/api/jobs/harness", json={
+            "filename": "stable.py",
+            "content": "class Nope:\n    pass\n",
+            "class_name": "Nope",
+        })
+
+        assert invalid.status_code == 400
+        assert first_path.is_file()
+        assert load_harness_class(first_ref).__name__ == "MyHarness"
+
+    @pytest.mark.asyncio
+    async def test_reupload_publishes_immutable_content_addressed_version(
+        self, client, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
+        first = await client.post("/api/jobs/harness", json={
+            "filename": "versioned.py",
+            "content": self._CODE,
+            "class_name": "MyHarness",
+        })
+        changed_code = self._CODE.replace("echo c", "echo changed")
+        second = await client.post("/api/jobs/harness", json={
+            "filename": "versioned.py",
+            "content": changed_code,
+            "class_name": "MyHarness",
+        })
+
+        assert first.status_code == second.status_code == 201
+        assert first.json()["harness_ref"] != second.json()["harness_ref"]
+        assert Path(first.json()["path"]).read_text() == self._CODE
+        assert Path(second.json()["path"]).read_text() == changed_code
+
+    @pytest.mark.asyncio
+    async def test_harness_upload_has_hard_content_limit(
+        self, client, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD", "1")
+        response = await client.post("/api/jobs/harness", json={
+            "filename": "huge.py",
+            "content": "x" * (1_048_576 + 1),
+            "class_name": "Huge",
+        })
+        assert response.status_code in {413, 422}
+
 
 class TestJobResults:
     def _seed(self, manager, job_id="job-r"):
@@ -1798,9 +2779,110 @@ class TestJobResults:
         assert r.status_code == 200
         body = r.json()
         assert body["file_count"] == 2
+        assert body["files_returned"] == 2
+        assert body["files_truncated"] is False
         assert body["scores"] == [
             {"task_id": "math.foo", "prompt_level": "b1", "status": "completed", "final_score": 39.06}
         ]
+
+    @pytest.mark.asyncio
+    async def test_local_result_file_preview_is_explicitly_bounded(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        jid = "job-local-many"
+        base = (
+            Path(manager.config.registry.path).with_name("collected") / jid
+        )
+        base.mkdir(parents=True)
+        anchor = base / "anchor.txt"
+        anchor.write_text("x")
+        listed_stat = anchor.lstat()
+        regular = [
+            (anchor, f"worker/result-{index:05d}.txt", listed_stat)
+            for index in range(5_184)
+        ]
+        monkeypatch.setattr(
+            jobs_route,
+            "_local_regular_files",
+            lambda *_args, **_kwargs: regular,
+        )
+
+        response = await client.get(f"/api/jobs/{jid}/results")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["file_count"] == 5_184
+        assert body["files_returned"] == 500
+        assert body["files_truncated"] is True
+        assert len(body["files"]) == 500
+
+    @pytest.mark.asyncio
+    async def test_s3_result_file_preview_uses_the_same_bound(
+        self, client, monkeypatch,
+    ):
+        class ManyObjectPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [
+                    {
+                        "Key": (
+                            f"jobs/job-s3-many/worker/"
+                            f"result-{index:05d}.txt"
+                        ),
+                        "Size": 1,
+                        "ETag": f'"many-{index}"',
+                    }
+                    for index in range(5_184)
+                ]}]
+
+        class ManyObjectS3:
+            def get_paginator(self, name):
+                return ManyObjectPaginator()
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client",
+            lambda: ManyObjectS3(),
+        )
+
+        response = await client.get("/api/jobs/job-s3-many/results")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["file_count"] == 5_184
+        assert body["files_returned"] == 500
+        assert body["files_truncated"] is True
+        assert len(body["files"]) == 500
+
+    def test_result_file_preview_has_utf8_and_serialized_byte_budgets(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        row = ("科学-result.txt", 1)
+        monkeypatch.setattr(
+            jobs_route,
+            "RESULT_FILE_LIST_MAX_PATH_BYTES",
+            len(row[0].encode("utf-8")) - 1,
+        )
+        with pytest.raises(
+            jobs_route.ResultsLimitExceeded, match="UTF-8 path metadata",
+        ):
+            jobs_route._bounded_result_files([row], file_count=1)
+
+        monkeypatch.setattr(
+            jobs_route, "RESULT_FILE_LIST_MAX_PATH_BYTES", 1_024,
+        )
+        monkeypatch.setattr(
+            jobs_route, "RESULT_FILE_LIST_MAX_JSON_BYTES", 2,
+        )
+        with pytest.raises(
+            jobs_route.ResultsLimitExceeded, match="serialized file metadata",
+        ):
+            jobs_route._bounded_result_files([row], file_count=1)
 
     @pytest.mark.asyncio
     async def test_download_tarball(self, client, manager):
@@ -1809,6 +2891,7 @@ class TestJobResults:
         assert r.status_code == 200
         assert r.headers["content-type"] == "application/gzip"
         assert "job-dl-results.tar.gz" in r.headers["content-disposition"]
+        assert int(r.headers["content-length"]) == len(r.content)
         assert len(r.content) > 0
 
     @pytest.mark.asyncio
@@ -1883,6 +2966,684 @@ class TestJobResults:
         assert all(not path.exists() for path, _ in created)
 
     @pytest.mark.asyncio
+    async def test_local_score_attempts_and_aggregate_reads_are_bounded(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        base = (
+            Path(manager.config.registry.path).with_name("collected")
+            / "job-local-score-budget"
+        )
+        base.mkdir(parents=True)
+        for index in range(10):
+            (base / f"{index:02}.json").write_text("x" * 8)
+
+        monkeypatch.setattr(jobs_route, "RESULT_SCORE_MAX_ATTEMPTS", 3)
+        monkeypatch.setattr(jobs_route, "RESULT_SCORE_TOTAL_READ_BYTES", 16)
+        original = jobs_route._read_small_regular_file
+        reads = 0
+
+        def recording_read(*args, **kwargs):
+            nonlocal reads
+            reads += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            jobs_route, "_read_small_regular_file", recording_read,
+        )
+        response = await client.get(
+            "/api/jobs/job-local-score-budget/results"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["scores"] == []
+        assert reads == 2
+
+    @pytest.mark.asyncio
+    async def test_score_fields_are_scalar_and_bounded(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        base = (
+            Path(manager.config.registry.path).with_name("collected")
+            / "job-score-scalars"
+        )
+        base.mkdir(parents=True)
+        (base / "oversized.json").write_text(json.dumps({
+            "task_id": "x" * 2_000,
+            "prompt_level": "b1",
+            "status": "done",
+            "final_score": 1,
+        }))
+        (base / "structured.json").write_text(json.dumps({
+            "task_id": "task",
+            "prompt_level": "b1",
+            "status": "done",
+            "final_score": {"nested": "not-a-number"},
+        }))
+        (base / "huge-integer.json").write_text(
+            '{"task_id":"task","prompt_level":"b1","status":"done",'
+            f'"final_score":{"9" * 5_000}}}'
+        )
+        (base / "infinite.json").write_text(
+            '{"task_id":"task","prompt_level":"b1","status":"done",'
+            '"final_score":1e309}'
+        )
+        (base / "surrogate.json").write_text(json.dumps({
+            "task_id": "\ud800",
+            "prompt_level": "b1",
+            "status": "done",
+            "final_score": 2,
+        }))
+        (base / "c1-control.json").write_text(json.dumps({
+            "task_id": "task",
+            "prompt_level": "b1",
+            "status": "done\u0085",
+            "final_score": 2,
+        }))
+        (base / "valid.json").write_text(json.dumps({
+            "task_id": "task",
+            "prompt_level": "b1",
+            "status": "done",
+            "final_score": 3.5,
+        }))
+        monkeypatch.setattr(jobs_route, "RESULT_SCORE_TEXT_MAX_CHARS", 128)
+
+        response = await client.get("/api/jobs/job-score-scalars/results")
+
+        assert response.status_code == 200
+        assert response.json()["scores"] == [{
+            "task_id": "task",
+            "prompt_level": "b1",
+            "status": "done",
+            "final_score": 3.5,
+        }]
+
+    @pytest.mark.asyncio
+    async def test_local_score_read_rejects_replaced_snapshot(
+        self, manager,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        base = (
+            Path(manager.config.registry.path).with_name("collected")
+            / "job-replaced-score"
+        )
+        base.mkdir(parents=True)
+        score = base / "score.json"
+        score.write_text('{"final_score":1}')
+        listed = score.lstat()
+        replacement = base / "replacement.json"
+        replacement.write_text('{"final_score":9}')
+        replacement.replace(score)
+
+        assert jobs_route._read_small_regular_file(
+            score,
+            expected_stat=listed,
+            max_bytes=2_000_000,
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_temp_archive_stream_always_unlinks_on_disconnect(
+        self, tmp_path,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        archive = tmp_path / "prepared.tar.gz"
+        archive.write_bytes(b"x" * (512 * 1024))
+        stream = jobs_route._stream_temp_archive(archive)
+        assert await anext(stream)
+        await stream.aclose()
+        assert not archive.exists()
+
+    @pytest.mark.asyncio
+    async def test_temp_archive_response_unlinks_when_body_send_is_cancelled(
+        self,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        archive = jobs_route._new_temp_archive(reserve_bytes=1024)
+        archive.write_bytes(b"prepared archive")
+        response = jobs_route._TemporaryArchiveResponse(
+            archive, job_id="job-disconnect",
+        )
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.4"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/",
+                    "raw_path": b"/",
+                    "query_string": b"",
+                    "headers": [],
+                    "client": ("127.0.0.1", 1),
+                    "server": ("127.0.0.1", 80),
+                    "root_path": "",
+                },
+                receive,
+                send,
+            )
+        assert not archive.exists()
+
+    @pytest.mark.asyncio
+    async def test_temp_archive_read_cancellation_holds_permit_until_read_exits(
+        self, monkeypatch, tmp_path,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        read_started = threading.Event()
+        allow_read = threading.Event()
+        stream_closed = threading.Event()
+
+        class SlowStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                stream_closed.set()
+
+            def read(self, _size):
+                read_started.set()
+                assert allow_read.wait(timeout=5)
+                return b"x"
+
+        archive = tmp_path / "slow-prepared.tar.gz"
+        archive.write_bytes(b"placeholder")
+        original_open = jobs_route.Path.open
+
+        def slow_open(path, *args, **kwargs):
+            if path == archive:
+                return SlowStream()
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(jobs_route.Path, "open", slow_open)
+        admission = jobs_route._ResultOperationAdmission(1)
+        permit = admission.try_acquire()
+        assert permit is not None
+        stream = jobs_route._stream_temp_archive(
+            archive,
+            permit=permit,
+        )
+        pending = asyncio.create_task(anext(stream))
+        assert await asyncio.to_thread(read_started.wait, 1)
+
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+        assert admission.active == 1
+        assert admission.try_acquire() is None
+
+        allow_read.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert stream_closed.is_set()
+        assert admission.active == 0
+        assert not archive.exists()
+
+    @pytest.mark.asyncio
+    async def test_archive_build_cancellation_holds_permit_until_builder_exits(
+        self, tmp_path,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        build_started = threading.Event()
+        allow_build = threading.Event()
+        archive = tmp_path / "late-build.tar.gz"
+
+        def slow_builder() -> Path:
+            build_started.set()
+            assert allow_build.wait(timeout=5)
+            archive.write_bytes(b"archive")
+            return archive
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        permit = admission.try_acquire()
+        assert permit is not None
+        build = asyncio.create_task(
+            jobs_route._prepare_temp_archive(
+                slow_builder,
+                permit=permit,
+            )
+        )
+        assert await asyncio.to_thread(build_started.wait, 1)
+        build.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await build
+
+        assert admission.active == 1
+        assert admission.try_acquire() is None
+        allow_build.set()
+
+        async def wait_for_cleanup() -> None:
+            while admission.active or archive.exists():
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_cleanup(), timeout=1)
+        assert admission.active == 0
+        assert not archive.exists()
+
+    @pytest.mark.asyncio
+    async def test_temp_archive_response_holds_stream_permit_for_slow_client(
+        self,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        archive = jobs_route._new_temp_archive(reserve_bytes=1024)
+        archive.write_bytes(b"prepared archive")
+        admission = jobs_route._ResultOperationAdmission(1)
+        permit = admission.try_acquire()
+        assert permit is not None
+        response = jobs_route._TemporaryArchiveResponse(
+            archive,
+            job_id="job-slow-client",
+            permit=permit,
+        )
+        body_started = asyncio.Event()
+        allow_send = asyncio.Event()
+
+        async def receive():
+            await asyncio.Future()
+
+        async def send(message):
+            if (
+                message["type"] == "http.response.body"
+                and message.get("body")
+            ):
+                body_started.set()
+                await allow_send.wait()
+
+        sending = asyncio.create_task(response(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/",
+                "raw_path": b"/",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("127.0.0.1", 80),
+                "root_path": "",
+            },
+            receive,
+            send,
+        ))
+        await asyncio.wait_for(body_started.wait(), timeout=1)
+        assert admission.active == 1
+        assert admission.try_acquire() is None
+
+        allow_send.set()
+        await asyncio.wait_for(sending, timeout=1)
+        assert admission.active == 0
+        assert not archive.exists()
+
+    @pytest.mark.asyncio
+    async def test_local_archive_rejects_replace_between_list_and_open(
+        self, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        base = (
+            Path(manager.config.registry.path).with_name("collected")
+            / "job-archive-replaced"
+        )
+        base.mkdir(parents=True)
+        target = base / "result.txt"
+        target.write_text("listed generation")
+        replacement = base / "replacement.txt"
+        replacement.write_text("new generation")
+        original_new_temp = jobs_route._new_temp_archive
+        replaced = False
+
+        def replace_after_listing(*, reserve_bytes):
+            nonlocal replaced
+            if not replaced:
+                replacement.replace(target)
+                replaced = True
+            return original_new_temp(reserve_bytes=reserve_bytes)
+
+        monkeypatch.setattr(
+            jobs_route, "_new_temp_archive", replace_after_listing,
+        )
+        with pytest.raises(
+            jobs_route.LocalResultsUnavailable, match="changed",
+        ):
+            jobs_route._build_local_archive("job-archive-replaced", base)
+
+    @pytest.mark.asyncio
+    async def test_archive_spool_reservations_are_global_and_released(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        monkeypatch.setattr(
+            jobs_route, "RESULT_ARCHIVE_SPOOL_MAX_BYTES", 1_000,
+        )
+        monkeypatch.setattr(jobs_route, "_RESULT_ARCHIVE_SPOOL_RESERVED", 0)
+        jobs_route._RESULT_ARCHIVE_TEMP_RESERVATIONS.clear()
+
+        first = jobs_route._new_temp_archive(reserve_bytes=700)
+        try:
+            with pytest.raises(
+                jobs_route.ResultsSpoolUnavailable, match="budget",
+            ):
+                jobs_route._new_temp_archive(reserve_bytes=400)
+        finally:
+            jobs_route._remove_temp_archive(first)
+
+        second = jobs_route._new_temp_archive(reserve_bytes=400)
+        jobs_route._remove_temp_archive(second)
+        assert jobs_route._RESULT_ARCHIVE_SPOOL_RESERVED == 0
+
+    @pytest.mark.asyncio
+    async def test_archive_spool_preserves_real_disk_safety_margin(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        monkeypatch.setattr(jobs_route, "_RESULT_ARCHIVE_SPOOL_RESERVED", 0)
+        jobs_route._RESULT_ARCHIVE_TEMP_RESERVATIONS.clear()
+        reserve = 4 * 1024 * 1024
+        monkeypatch.setattr(
+            jobs_route.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(
+                free=(
+                    jobs_route.RESULT_ARCHIVE_DISK_SAFETY_BYTES
+                    + reserve
+                    - 1
+                ),
+            ),
+        )
+
+        with pytest.raises(
+            jobs_route.ResultsSpoolUnavailable, match="safety margin",
+        ):
+            jobs_route._new_temp_archive(reserve_bytes=reserve)
+
+        assert jobs_route._RESULT_ARCHIVE_SPOOL_RESERVED == 0
+        assert jobs_route._RESULT_ARCHIVE_TEMP_RESERVATIONS == {}
+
+    @pytest.mark.asyncio
+    async def test_archive_disk_admission_counts_unwritten_reservations(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        monkeypatch.setattr(jobs_route, "_RESULT_ARCHIVE_SPOOL_RESERVED", 0)
+        jobs_route._RESULT_ARCHIVE_TEMP_RESERVATIONS.clear()
+        monkeypatch.setattr(
+            jobs_route.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=19_000_000_000),
+        )
+        first_reserve = 6 * 1024 * 1024
+        first = jobs_route._new_temp_archive(reserve_bytes=first_reserve)
+        try:
+            second_reserve = 3 * 1024 * 1024
+            monkeypatch.setattr(
+                jobs_route.shutil,
+                "disk_usage",
+                lambda _path: SimpleNamespace(
+                    free=(
+                        jobs_route.RESULT_ARCHIVE_DISK_SAFETY_BYTES
+                        + first_reserve
+                        + second_reserve
+                        - 1
+                    ),
+                ),
+            )
+            with pytest.raises(
+                jobs_route.ResultsSpoolUnavailable, match="safety margin",
+            ):
+                jobs_route._new_temp_archive(
+                    reserve_bytes=second_reserve,
+                )
+        finally:
+            jobs_route._remove_temp_archive(first)
+
+    @pytest.mark.asyncio
+    async def test_archive_spool_reservation_bounds_long_pax_paths(self):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        members = [
+            (("目录" * 300) + f"/result-{index}.json", index % 17)
+            for index in range(128)
+        ]
+        reservation = jobs_route._archive_spool_reservation(
+            "job-" + ("x" * 124),
+            members,
+        )
+
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            for relative, size in members:
+                info = tarfile.TarInfo(
+                    name=f"job-{'x' * 124}/{relative}"
+                )
+                info.size = size
+                archive.addfile(info, io.BytesIO(b"x" * size))
+
+        assert len(payload.getvalue()) <= reservation
+        # The old source+1%-plus-1KiB/member estimate did not account for
+        # multi-block PAX path records.
+        old_estimate = (
+            sum(size for _, size in members)
+            + sum(size for _, size in members) // 100
+            + len(members) * 1024
+            + 1024 * 1024
+        )
+        assert reservation > old_estimate
+
+    @pytest.mark.asyncio
+    async def test_live_archive_rejects_saturation_before_allocating_pipe(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(
+            jobs_route, "_RESULT_ARCHIVE_STREAM_ADMISSION", admission,
+        )
+        held = admission.try_acquire()
+        assert held is not None
+        pipe_called = False
+        original_pipe = jobs_route.os.pipe
+
+        def recording_pipe():
+            nonlocal pipe_called
+            pipe_called = True
+            return original_pipe()
+
+        monkeypatch.setattr(jobs_route.os, "pipe", recording_pipe)
+        stream = jobs_route._stream_s3_archive("job-queued", [])
+        try:
+            with pytest.raises(
+                HTTPException, match="capacity is currently exhausted",
+            ) as exc_info:
+                await anext(stream)
+            assert exc_info.value.status_code == 503
+            assert exc_info.value.headers == {"Retry-After": "1"}
+        finally:
+            await stream.aclose()
+            held.release()
+        assert pipe_called is False
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_live_response_start_cancellation_releases_unstarted_permit(
+        self,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        permit = admission.try_acquire()
+        assert permit is not None
+        owner = jobs_route._LiveArchivePermitOwner(permit)
+        iterator = jobs_route._stream_s3_archive(
+            "job-unstarted",
+            [],
+            permit=permit,
+            owner=owner,
+        )
+        response = jobs_route._LiveArchiveResponse(
+            iterator,
+            owner=owner,
+            headers={},
+        )
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.4"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/",
+                    "raw_path": b"/",
+                    "query_string": b"",
+                    "headers": [],
+                    "client": ("127.0.0.1", 1),
+                    "server": ("127.0.0.1", 80),
+                    "root_path": "",
+                },
+                receive,
+                send,
+            )
+
+        assert owner.started is False
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route", "admission_name"),
+        [
+            (
+                "/api/jobs/job-saturated/results/download",
+                "_RESULT_ARCHIVE_BUILD_ADMISSION",
+            ),
+            (
+                "/api/jobs/job-saturated/results/download/stream",
+                "_RESULT_ARCHIVE_STREAM_ADMISSION",
+            ),
+        ],
+    )
+    async def test_archive_routes_reject_saturation_before_s3_list(
+        self, client, monkeypatch, route, admission_name,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(jobs_route, admission_name, admission)
+        held = admission.try_acquire()
+        assert held is not None
+        list_calls = 0
+
+        def unexpected_list(*_args, **_kwargs):
+            nonlocal list_calls
+            list_calls += 1
+            return []
+
+        monkeypatch.setattr(jobs_route, "_s3_list_job", unexpected_list)
+        try:
+            response = await client.get(route)
+        finally:
+            held.release()
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert list_calls == 0
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_result_read_saturation_is_rejected_before_s3_list(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(jobs_route, "_RESULT_READ_ADMISSION", admission)
+        held = admission.try_acquire()
+        assert held is not None
+        list_calls = 0
+
+        def unexpected_list(*_args, **_kwargs):
+            nonlocal list_calls
+            list_calls += 1
+            return []
+
+        monkeypatch.setattr(jobs_route, "_s3_list_job", unexpected_list)
+        try:
+            response = await client.get(
+                "/api/jobs/job-saturated/results"
+            )
+        finally:
+            held.release()
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert list_calls == 0
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_result_list_holds_permit_until_thread_exits(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        list_started = threading.Event()
+        allow_list = threading.Event()
+
+        def slow_list(*_args, **_kwargs):
+            list_started.set()
+            assert allow_list.wait(timeout=5)
+            return []
+
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(jobs_route, "_RESULT_READ_ADMISSION", admission)
+        monkeypatch.setattr(jobs_route, "_s3_list_job", slow_list)
+        request = asyncio.create_task(
+            jobs_route.job_results("job-cancelled-list")
+        )
+        assert await asyncio.to_thread(list_started.wait, 1)
+        request.cancel()
+        await asyncio.sleep(0)
+
+        assert not request.done()
+        assert admission.active == 1
+        with pytest.raises(HTTPException) as saturated:
+            await jobs_route.job_results("job-second")
+        assert saturated.value.status_code == 503
+
+        allow_list.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
     async def test_missing_results_404(self, client):
         assert (await client.get("/api/jobs/nope/results")).status_code == 404
 
@@ -1896,6 +3657,105 @@ class TestJobResults:
         assert body["total"] == 2
         assert {j["job_id"] for j in body["jobs"]} == {"job-a", "job-b"}
         assert all(j["file_count"] == 2 for j in body["jobs"])
+        assert body["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_global_local_summary_directory_scan_is_bounded(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        collected = Path(manager.collected_root)
+        for index in range(3):
+            job = collected / f"job-local-{index}"
+            job.mkdir(parents=True)
+            (job / "result.txt").write_text("x")
+        monkeypatch.setattr(
+            jobs_route,
+            "RESULT_SUMMARY_MAX_DIRECTORY_ENTRIES",
+            2,
+        )
+
+        response = await client.get("/api/results")
+
+        assert response.status_code == 200
+        assert response.json()["truncated"] is True
+        assert response.json()["total"] <= 2
+
+    @pytest.mark.asyncio
+    async def test_global_s3_root_entry_scan_is_bounded(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class RootPaginator:
+            def paginate(self, **kwargs):
+                assert kwargs["Delimiter"] == "/"
+                return [{"Contents": [
+                    {"Key": f"jobs/root-marker-{index}"}
+                    for index in range(3)
+                ]}]
+
+        class RootS3:
+            def get_paginator(self, _name):
+                return RootPaginator()
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: RootS3())
+        monkeypatch.setattr(
+            jobs_route, "RESULT_SUMMARY_MAX_S3_ROOT_ENTRIES", 2,
+        )
+
+        response = await client.get("/api/results")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "jobs": [],
+            "total": 0,
+            "truncated": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_global_s3_summary_has_aggregate_object_budget(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class SummaryPaginator:
+            def paginate(self, **kwargs):
+                if kwargs.get("Delimiter") == "/":
+                    return [{"CommonPrefixes": [
+                        {"Prefix": "jobs/job-one/"},
+                        {"Prefix": "jobs/job-two/"},
+                    ]}]
+                prefix = kwargs["Prefix"]
+                job_id = prefix.rstrip("/").rsplit("/", 1)[-1]
+                return [{"Contents": [{
+                    "Key": f"{prefix}result.txt",
+                    "Size": 1,
+                    "ETag": f'"{job_id}"',
+                }]}]
+
+        class SummaryS3:
+            def get_paginator(self, _name):
+                return SummaryPaginator()
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: SummaryS3())
+        monkeypatch.setattr(
+            jobs_route, "RESULT_SUMMARY_MAX_OBJECTS", 1,
+        )
+
+        response = await client.get("/api/results")
+
+        assert response.status_code == 200
+        assert response.json()["truncated"] is True
+        assert response.json()["total"] == 1
+        assert response.json()["jobs"][0]["file_count"] == 1
 
     @pytest.mark.asyncio
     async def test_configured_s3_list_failure_is_explicit_503(
@@ -1944,6 +3804,75 @@ class TestJobResults:
         assert "unsafe object key" in response.json()["detail"]
 
     @pytest.mark.asyncio
+    async def test_s3_result_without_etag_fails_before_get(
+        self, client, monkeypatch,
+    ):
+        class MissingETagPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [{
+                    "Key": "jobs/job-no-etag/result.txt",
+                    "Size": 1,
+                }]}]
+
+        class MissingETagS3:
+            get_calls = 0
+
+            def get_paginator(self, _name):
+                return MissingETagPaginator()
+
+            def get_object(self, **kwargs):
+                self.get_calls += 1
+                raise AssertionError("GET must not run without immutable ETag")
+
+        s3 = MissingETagS3()
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client",
+            lambda: s3,
+        )
+
+        response = await client.get(
+            "/api/jobs/job-no-etag/results/download"
+        )
+
+        assert response.status_code == 503
+        assert "immutable ETag" in response.json()["detail"]
+        assert s3.get_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_s3_result_page_scan_is_bounded(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class EmptyPagePaginator:
+            def paginate(self, **kwargs):
+                return [
+                    {"Contents": []},
+                    {"Contents": []},
+                    {"Contents": []},
+                ]
+
+        class EmptyPageS3:
+            def get_paginator(self, _name):
+                return EmptyPagePaginator()
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(
+            jobs_route, "_s3_client", lambda: EmptyPageS3(),
+        )
+        monkeypatch.setattr(jobs_route, "RESULT_LIST_MAX_S3_PAGES", 2)
+
+        response = await client.get("/api/jobs/job-many-pages/results")
+
+        assert response.status_code == 413
+        assert "more than 2 pages" in response.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_s3_download_streams_objects_without_full_body_read(
         self, client, monkeypatch,
     ):
@@ -1965,6 +3894,7 @@ class TestJobResults:
                 return [{"Contents": [{
                     "Key": "jobs/job-stream/output.txt",
                     "Size": len(b"streamed-result"),
+                    "ETag": '"streamed-etag"',
                 }]}]
 
         class StreamingS3:
@@ -1972,7 +3902,11 @@ class TestJobResults:
                 return OneObjectPaginator()
 
             def get_object(self, **kwargs):
-                return {"Body": body}
+                return {
+                    "Body": body,
+                    "ContentLength": len(b"streamed-result"),
+                    "ETag": '"streamed-etag"',
+                }
 
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
         monkeypatch.setattr(
@@ -2051,7 +3985,11 @@ class TestJobResults:
                     payload = b"second"
                 else:
                     payload = first_payload
-                return {"Body": io.BytesIO(payload), "ContentLength": len(payload)}
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "ETag": kwargs["IfMatch"],
+                }
 
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
         monkeypatch.setattr(jobs_route, "_s3_client", lambda: SequencedS3())
@@ -2060,9 +3998,14 @@ class TestJobResults:
                 "first.txt",
                 len(first_payload),
                 "jobs/job-early/first.txt",
-                None,
+                '"early-first"',
             ),
-            ("second.txt", 6, "jobs/job-early/second.txt", None),
+            (
+                "second.txt",
+                6,
+                "jobs/job-early/second.txt",
+                '"early-second"',
+            ),
         ]
         stream = jobs_route._stream_s3_archive("job-early", objects)
 
@@ -2112,10 +4055,15 @@ class TestJobResults:
         class SequencedS3:
             def get_object(self, **kwargs):
                 if kwargs["Key"].endswith("/blocked.txt"):
-                    return {"Body": BlockingBody(), "ContentLength": 1}
+                    return {
+                        "Body": BlockingBody(),
+                        "ContentLength": 1,
+                        "ETag": kwargs["IfMatch"],
+                    }
                 return {
                     "Body": io.BytesIO(first_payload),
                     "ContentLength": len(first_payload),
+                    "ETag": kwargs["IfMatch"],
                 }
 
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
@@ -2125,20 +4073,40 @@ class TestJobResults:
                 "first.txt",
                 len(first_payload),
                 "jobs/job-cancel/first.txt",
-                None,
+                '"cancel-first"',
             ),
-            ("blocked.txt", 1, "jobs/job-cancel/blocked.txt", None),
+            (
+                "blocked.txt",
+                1,
+                "jobs/job-cancel/blocked.txt",
+                '"cancel-blocked"',
+            ),
         ]
-        stream = jobs_route._stream_s3_archive("job-cancel", objects)
+        admission = jobs_route._ResultOperationAdmission(1)
+        permit = admission.try_acquire()
+        assert permit is not None
+        stream = jobs_route._stream_s3_archive(
+            "job-cancel",
+            objects,
+            permit=permit,
+        )
 
         try:
             first_chunk = await asyncio.wait_for(anext(stream), timeout=1)
             assert first_chunk
             assert await asyncio.to_thread(read_started.wait, 1)
+            assert admission.active == 1
         finally:
             await stream.aclose()
 
         assert await asyncio.to_thread(body_closed.wait, 1)
+
+        async def wait_for_release() -> None:
+            while admission.active:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_release(), timeout=1)
+        assert admission.active == 0
 
     @pytest.mark.asyncio
     async def test_s3_score_reads_are_bounded_and_attempt_limited(
@@ -2160,7 +4128,11 @@ class TestJobResults:
         class ScorePaginator:
             def paginate(self, **kwargs):
                 return [{"Contents": [
-                    {"Key": f"jobs/job-scores/bad-{index}.json", "Size": 1}
+                    {
+                        "Key": f"jobs/job-scores/bad-{index}.json",
+                        "Size": 1,
+                        "ETag": f'"score-{index}"',
+                    }
                     for index in range(5)
                 ]}]
 
@@ -2176,7 +4148,11 @@ class TestJobResults:
                 self.get_calls += 1
                 body = RecordingBody(b"x")  # invalid JSON must still count
                 self.bodies.append(body)
-                return {"Body": body, "ContentLength": 1}
+                return {
+                    "Body": body,
+                    "ContentLength": 1,
+                    "ETag": kwargs["IfMatch"],
+                }
 
         s3 = ScoreS3()
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
@@ -2193,6 +4169,56 @@ class TestJobResults:
             for body in s3.bodies
             for size in body.read_sizes
         )
+
+    @pytest.mark.asyncio
+    async def test_s3_score_reads_share_an_aggregate_byte_budget(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        payload = b"not-json"
+
+        class ScorePaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [
+                    {
+                        "Key": f"jobs/job-score-bytes/{index}.json",
+                        "Size": len(payload),
+                        "ETag": f'"score-bytes-{index}"',
+                    }
+                    for index in range(10)
+                ]}]
+
+        class ScoreS3:
+            def __init__(self):
+                self.get_calls = 0
+
+            def get_paginator(self, name):
+                return ScorePaginator()
+
+            def get_object(self, **kwargs):
+                self.get_calls += 1
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "ETag": kwargs["IfMatch"],
+                }
+
+        s3 = ScoreS3()
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: s3)
+        monkeypatch.setattr(jobs_route, "RESULT_SCORE_MAX_ATTEMPTS", 10)
+        monkeypatch.setattr(
+            jobs_route, "RESULT_SCORE_TOTAL_READ_BYTES", len(payload) * 2,
+        )
+
+        response = await client.get("/api/jobs/job-score-bytes/results")
+
+        assert response.status_code == 200
+        assert response.json()["scores"] == []
+        assert s3.get_calls == 2
 
     @pytest.mark.asyncio
     async def test_s3_download_fails_closed_when_object_changes_after_list(
@@ -2242,6 +4268,7 @@ class TestJobResults:
                 return [{"Contents": [{
                     "Key": "jobs/job-changing-no-meta/output.txt",
                     "Size": 3,
+                    "ETag": '"stable-identity"',
                 }]}]
 
         class MetadataFreeS3:
@@ -2249,7 +4276,10 @@ class TestJobResults:
                 return ChangedPaginator()
 
             def get_object(self, **kwargs):
-                return {"Body": io.BytesIO(b"abcdef")}
+                return {
+                    "Body": io.BytesIO(b"abcdef"),
+                    "ETag": '"stable-identity"',
+                }
 
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
         monkeypatch.setattr(
@@ -2273,8 +4303,16 @@ class TestJobResults:
         class ObjectsPaginator:
             def paginate(self, **kwargs):
                 return [{"Contents": [
-                    {"Key": "jobs/job-limit/a", "Size": 2},
-                    {"Key": "jobs/job-limit/b", "Size": 2},
+                    {
+                        "Key": "jobs/job-limit/a",
+                        "Size": 2,
+                        "ETag": '"limit-a"',
+                    },
+                    {
+                        "Key": "jobs/job-limit/b",
+                        "Size": 2,
+                        "ETag": '"limit-b"',
+                    },
                 ]}]
 
         class ObjectsS3:
@@ -2311,6 +4349,7 @@ class TestJobResults:
                 return [{"Contents": [{
                     "Key": "jobs/job-s3/workers/shard-00000/result.json",
                     "Size": 2,
+                    "ETag": '"broken-get"',
                 }]}]
 
         class BrokenGetS3:

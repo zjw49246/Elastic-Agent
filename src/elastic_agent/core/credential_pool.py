@@ -5,11 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from elastic_agent.core.config import CredentialConfig
 from elastic_agent.core.secure_store import (
@@ -19,6 +26,53 @@ from elastic_agent.core.secure_store import (
 )
 
 logger = logging.getLogger(__name__)
+ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}")
+MAX_ACCOUNT_EMAIL_LENGTH = 320
+MAX_ACCOUNT_GROUP_LENGTH = 100
+MAX_ACCOUNT_SECRET_BYTES = 16 * 1024
+
+
+def normalize_account_id(value: str) -> str:
+    normalized = value.strip()
+    if ACCOUNT_ID_RE.fullmatch(normalized) is None:
+        raise ValueError(
+            "account id must be 1-128 safe label characters"
+        )
+    return normalized
+
+
+def normalize_account_text(
+    value: str, *, field: str, maximum: int,
+) -> str:
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > maximum
+        # Permit ordinary internal spaces in names/groups while rejecting the
+        # complete Unicode non-printable set: C0/C1 controls, line/paragraph
+        # separators, formatting controls, and lone surrogates must not enter
+        # logs, Job metadata, or cloud tags.
+        or any(not character.isprintable() for character in normalized)
+    ):
+        raise ValueError(
+            f"account {field} must be 1-{maximum} printable characters"
+        )
+    return normalized
+
+
+def validate_account_secret(
+    value: str, *, field: str, strip: bool = False,
+) -> str:
+    normalized = value.strip() if strip else value
+    if (
+        "\x00" in normalized
+        or len(normalized.encode("utf-8")) > MAX_ACCOUNT_SECRET_BYTES
+    ):
+        raise ValueError(
+            f"account {field} must be at most "
+            f"{MAX_ACCOUNT_SECRET_BYTES} UTF-8 bytes and cannot contain NUL"
+        )
+    return normalized
 
 
 def _utcnow() -> datetime:
@@ -33,6 +87,8 @@ def _utcnow() -> datetime:
 class AccountDefinition(BaseModel):
     """Single account entry from accounts.json."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: str
     email: str
     agent_type: Literal["claude", "codex"] = "claude"
@@ -41,19 +97,37 @@ class AccountDefinition(BaseModel):
     group: str = "standard"
     enabled: bool = True
 
-    @field_validator("id", "email", "group")
+    @field_validator("id")
     @classmethod
-    def require_identity_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("account id, email, and group must be non-empty")
-        return normalized
+    def safe_id(cls, value: str) -> str:
+        return normalize_account_id(value)
+
+    @field_validator("email")
+    @classmethod
+    def safe_email(cls, value: str) -> str:
+        return normalize_account_text(
+            value, field="email", maximum=MAX_ACCOUNT_EMAIL_LENGTH,
+        )
+
+    @field_validator("group")
+    @classmethod
+    def safe_group(cls, value: str) -> str:
+        return normalize_account_text(
+            value, field="group", maximum=MAX_ACCOUNT_GROUP_LENGTH,
+        )
 
     @field_validator("email_token")
     @classmethod
     def normalize_email_token(cls, value: str) -> str:
         """Mailbox query tokens are opaque, but surrounding whitespace is not."""
-        return value.strip()
+        return validate_account_secret(
+            value, field="email_token", strip=True,
+        )
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return validate_account_secret(value, field="password")
 
     @model_validator(mode="after")
     def codex_requires_login_credential(self) -> AccountDefinition:

@@ -1,5 +1,25 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-28 全量代码审计修复闭环
+
+**结果**：以 `86dd0f8` 为修复基线，关闭
+[`docs/audits/code-audit-2026-07-28.md`](docs/audits/code-audit-2026-07-28.md)
+记录的全部 35 项可复现问题。修复覆盖秘密文件权限与登录回滚、可靠事件和 Worker
+有界队列、API Key 共享与账号/EIP 释放证明、普通 shard 逐机回收、Results/外部文件
+有界流式读取、请求体/历史 Job/日志 admission、幂等恢复、旧 Job teardown-only
+兼容，以及 Batch UI 输入和状态一致性。AI4Sci Bench 的默认 ref 同步为
+`archive/youchengsong-managed-agent-api-20260728`。
+
+**关键经验**：异步取消不能等同于底层线程、云调用或文件句柄已经退出；并发 permit 必须由
+真实 owner 持有到资源关闭。账号可复用必须以实例终止、registry 删除和 durable lease
+释放证明为准，不能只看 Job phase。持久格式收紧时要为旧 journal 保留只读、不可执行的
+清理兼容层。前端不能静默丢弃格式错误配置，也不能在权威状态读取失败时把未知显示成空闲。
+
+**验证**：Unit `2510 passed`；Integration `90 passed, 12 skipped`；Batch API
+`148 passed`；UI/API 最终复核 `181 passed`。前端 JavaScript 语法、compileall、
+fatal Ruff 集合、`git diff --check`、文档相对链接和敏感 Key 扫描通过。未创建云资源，
+未部署、未重启或修改运行中的服务。
+
 ## 2026-07-28 全量代码审计基线
 
 **范围**：以最新 `origin/main` `8dc4228` 为基线（包含审计期间新增的 per-worker

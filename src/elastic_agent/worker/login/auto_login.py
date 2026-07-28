@@ -49,6 +49,20 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def _suppress_http_secret_logs() -> None:
+    """Keep query-string mailbox credentials out of the worker journal.
+
+    This is intentionally process-wide and is never restored: toggling the
+    level around one request would race with concurrent login HTTP clients.
+    """
+
+    for logger_name in ("httpx", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+_suppress_http_secret_logs()
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -289,7 +303,11 @@ async def _poll_magic_link_mailcom(
                 if "claude" not in subj.lower(): continue
                 mid_m = re.search(r"mailId=(\d+)", link)
                 mid = int(mid_m.group(1)) if mid_m else 0
-                logger.info("mailcom: found claude email mid=%d baseline=%d subj=%s", mid, baseline_mid, subj.strip()[:60])
+                logger.info(
+                    "mailcom: found Claude email mid=%d baseline=%d",
+                    mid,
+                    baseline_mid,
+                )
                 if baseline_mid == 0:
                     # 第一轮：记录当前最大 mid 作为基线，跳过所有现有邮件
                     baseline_mid = max(baseline_mid, mid)
@@ -304,8 +322,11 @@ async def _poll_magic_link_mailcom(
             c.close()
         except MailServiceError:
             raise
-        except Exception as e:
-            logger.warning("mailcom poll attempt failed: %s", e)
+        except Exception as exc:
+            logger.warning(
+                "mailcom poll attempt failed (%s)",
+                type(exc).__name__,
+            )
         await asyncio.sleep(5)
     raise MailServiceError(f"mail.com Web: 收件箱中 {timeout_s}s 内未找到新的 Claude 登录邮件")
 
@@ -413,7 +434,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
                 await ws.send(json.dumps({"id": 3, "method": "Page.reload"}))
                 await asyncio.sleep(3)
                 await handle_cf(ws, "after cookies")
-                logger.info("171mail cookies injected, url=%s", (await cdp_eval(ws, "document.location.href") or "")[:60])
+                logger.info("171mail cookies injected")
             else:
                 # ── mail.com 路径：浏览器登录 ──
                 r = await cdp_eval(ws, JS_SET_INPUT.format(type="email", value=email))
@@ -421,7 +442,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
                 if r == "no email input":
                     url = await cdp_eval(ws, "document.location.href") or ""
                     if "/new" not in url and "/chat" not in url:
-                        logger.error("Email input not found at %s", url[:80])
+                        logger.error("Email input not found on the current page")
                         return None
                 await asyncio.sleep(0.5)
                 await cdp_eval(ws, JS_CLICK_BTN.format(condition="t.includes('Continue with email')"))
@@ -448,7 +469,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
                 code_match = re.search(r"(\d{6})", body_text)
                 if code_match:
                     verify_code = code_match.group(1)
-                    logger.info("Verification code: %s", verify_code)
+                    logger.info("Verification code detected")
                     await ws.send(json.dumps({"id": 5, "method": "Page.navigate", "params": {"url": "https://claude.ai/login"}}))
                     await asyncio.sleep(3)
                     await handle_cf(ws, "login return")
@@ -462,7 +483,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
                     await cdp_eval(ws, JS_CLICK_BTN.format(condition="!t.includes('Google')&&!t.includes('SSO')&&(t.includes('Verify')||t.includes('Continue')||t.includes('Submit'))"))
                     await asyncio.sleep(10)
 
-                logger.info("Login result: %s", (await cdp_eval(ws, "document.location.href") or "")[:80])
+                logger.info("Login navigation completed")
 
             # ── 共享路径：OAuth Authorize ──
             if not oauth_url:
@@ -474,7 +495,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
             await asyncio.sleep(8)
 
             org_uuid = await cdp_eval(ws, JS_ORG)
-            logger.info("Org UUID: %s", org_uuid)
+            logger.info("Organization context found: %s", bool(org_uuid))
 
             if org_uuid:
                 parsed_url = urlparse(oauth_url.replace("claude.com/cai/", "claude.ai/"))
@@ -483,7 +504,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
                 api_body = json.dumps({"response_type": params.get("response_type", "code"), "client_id": params.get("client_id", ""), "organization_uuid": org_uuid, "redirect_uri": params.get("redirect_uri", ""), "scope": scope, "state": params.get("state", ""), "code_challenge": params.get("code_challenge", ""), "code_challenge_method": params.get("code_challenge_method", "S256")})
                 js_fetch = f"""(async function(){{var r=await fetch("/v1/oauth/{org_uuid}/authorize",{{method:"POST",headers:{{"Content-Type":"application/json","Accept":"application/json"}},credentials:"include",body:{json.dumps(api_body)}}});return r.status+" | "+await r.text()}})()"""
                 api_result = await cdp_eval(ws, js_fetch, timeout=15)
-                logger.info("Authorize API: %s", (api_result or "")[:150])
+                logger.info("Authorize API response received: %s", bool(api_result))
                 if api_result and api_result.startswith("200"):
                     _, response_text = api_result.split(" | ", 1)
                     response_data = json.loads(response_text)
@@ -508,8 +529,7 @@ async def _mailcatcher_browser_login(email: str, mail_token: str, oauth_url: str
             return None
 
     except Exception as exc:
-        logger.error("Chrome CDP login failed: %s", exc)
-        import traceback; traceback.print_exc()
+        logger.error("Chrome CDP login failed (%s)", type(exc).__name__)
         return None
     finally:
         if chrome_proc:
@@ -673,20 +693,30 @@ def load_email_tokens() -> dict:
     if not EMAIL_TOKENS_FILE.exists():
         return {}
     try:
+        from elastic_agent.core.secure_store import (
+            secure_state_directory,
+            tighten_state_file,
+        )
+
+        secure_state_directory(EMAIL_TOKENS_FILE.parent)
+        tighten_state_file(EMAIL_TOKENS_FILE)
         return json.loads(EMAIL_TOKENS_FILE.read_text())
     except Exception:
         return {}
 
 
 def save_email_token(email: str, token: str, provider: str = "171mail", mail_password: str = ""):
+    from elastic_agent.core.secure_store import atomic_write_private
+
     data = load_email_tokens()
     entry = {"token": token, "provider": provider}
     if mail_password:
         entry["mail_password"] = mail_password
     data[email] = entry
-    EMAIL_TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    EMAIL_TOKENS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    os.chmod(EMAIL_TOKENS_FILE, 0o600)
+    atomic_write_private(
+        EMAIL_TOKENS_FILE,
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
     logger.info("saved token for %s to %s", email, EMAIL_TOKENS_FILE)
 
 
@@ -764,21 +794,63 @@ async def perform_login(
     config_path = Path(config_dir).expanduser() if config_dir else (Path.home() / ".claude")
     if not config_path.is_absolute():
         config_path = Path.home() / ".claude"
-    config_path.mkdir(parents=True, exist_ok=True)
+    from elastic_agent.core.claude_oauth import (
+        ClaudeLoginCleanupError,
+        restore_claude_credentials,
+        secure_claude_credentials,
+        snapshot_claude_credentials,
+    )
+    from elastic_agent.core.secure_store import (
+        atomic_write_private,
+        secure_state_directory,
+    )
+
+    secure_state_directory(config_path)
 
     if provider:
         _use_mailcatcher = provider == "mailcom"
     else:
         _use_mailcatcher = is_mailcom_domain(email)
 
-    # Backup old credentials — only delete after successful login to avoid
-    # leaving the account in a "no credentials" state if login fails.
-    _backup_creds = {}
-    for f in [".claude.json", ".credentials.json"]:
-        fp = config_path / f
-        if fp.exists():
-            _backup_creds[f] = fp.read_bytes()
-            fp.unlink()
+    # The outer WorkerRuntime transaction spans identity validation and
+    # warm-up.  Keep this inner transaction too because perform_login is also a
+    # public worker-local API and must be safe when called directly.
+    credential_snapshot = snapshot_claude_credentials(str(config_path))
+
+    def restore_or_raise(
+        original: BaseException | None = None,
+    ) -> None:
+        """Restore credentials or promote uncertainty past Provider.login.
+
+        In particular, preserve an existing process-cleanup failure as the
+        primary error when credential rollback also fails.  The provider must
+        never convert either cleanup uncertainty into an ordinary LoginResult.
+        """
+
+        try:
+            restore_claude_credentials(credential_snapshot)
+        except BaseException as rollback_error:
+            if isinstance(original, ClaudeLoginCleanupError):
+                original.add_note(
+                    "Claude credential rollback also failed "
+                    f"({type(rollback_error).__name__})"
+                )
+                raise original
+            raise ClaudeLoginCleanupError(
+                "Claude credential rollback could not be verified"
+            ) from rollback_error
+
+    try:
+        for name in credential_snapshot.files:
+            path = config_path / name
+            if path.is_symlink():
+                raise RuntimeError(
+                    f"Claude credential path must not be a symlink: {path}"
+                )
+            path.unlink(missing_ok=True)
+    except BaseException as exc:
+        restore_or_raise(exc)
+        raise
 
     # Step 1: 171mail 域先通过 API 拿 magic link（mail.com 域在 Chrome+MailCatcher 里拿）
     magic_link_171: str | None = None
@@ -791,10 +863,15 @@ async def perform_login(
                 magic_link_171 = await _poll_magic_link(mc, token_171, send_ts, EMAIL_POLL_TIMEOUT)
                 logger.info("got magic link (%d chars)", len(magic_link_171))
         except MailServiceError as exc:
-            logger.error("171mail error: %s — restoring old credentials", exc)
-            for f, data in _backup_creds.items():
-                (config_path / f).write_bytes(data)
+            logger.error(
+                "171mail login preparation failed (%s); restoring old credentials",
+                type(exc).__name__,
+            )
+            restore_or_raise(exc)
             return False
+        except BaseException as exc:
+            restore_or_raise(exc)
+            raise
     else:
         logger.info("step 1: mail.com 域（Chrome 输入邮箱 + MailCatcher 接码）")
 
@@ -802,49 +879,72 @@ async def perform_login(
     logger.info("step 2: Chrome CDP 全流程登录...")
     script_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(script_dir))
-    from cdp_login import cdp_login
-    result = await cdp_login(
-        email=email,
-        token=token_171,
-        config_dir=str(config_path),
-        magic_link=magic_link_171,
-    )
+    try:
+        from cdp_login import cdp_login
+
+        result = await cdp_login(
+            email=email,
+            token=token_171,
+            config_dir=str(config_path),
+            magic_link=magic_link_171,
+        )
+    except BaseException as exc:
+        # Cancellation is part of the normal Manager timeout path.  Restore
+        # synchronously before it can observe the login task as completed.
+        restore_or_raise(exc)
+        raise
     if not result or not result.get("success"):
         logger.error("Chrome CDP 登录失败 — restoring old credentials")
-        for f, data in _backup_creds.items():
-            (config_path / f).write_bytes(data)
+        restore_or_raise()
         return False
+    try:
+        secure_claude_credentials(str(config_path))
+    except BaseException as exc:
+        restore_or_raise(exc)
+        raise
 
     # Merge default settings into settings.json (preserve existing hooks).
     # Extra allowed dirs are deployment-specific — set CLAUDE_SETTINGS_EXTRA_DIRS
     # (os.pathsep-separated) to grant them; empty by default.
-    settings_path = config_path / "settings.json"
-    _extra_dirs = [d for d in os.environ.get("CLAUDE_SETTINGS_EXTRA_DIRS", "").split(os.pathsep) if d]
-    _default_cc_settings = {
-        "permissions": {
-            "defaultMode": "bypassPermissions",
-            "additionalDirectories": _extra_dirs,
-        },
-        "model": "claude-opus-4-6",
-        "effortLevel": "medium",
-        "skipDangerousModePermissionPrompt": True,
-        "hasCompletedOnboarding": True,
-        "theme": "dark",
-        "showThinkingSummaries": True,
-    }
-    existing_settings: dict = {}
-    if settings_path.exists():
-        try:
-            existing_settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
-        except (json.JSONDecodeError, OSError):
+    try:
+        settings_path = config_path / "settings.json"
+        _extra_dirs = [
+            d
+            for d in os.environ.get(
+                "CLAUDE_SETTINGS_EXTRA_DIRS", ""
+            ).split(os.pathsep)
+            if d
+        ]
+        _default_cc_settings = {
+            "permissions": {
+                "defaultMode": "bypassPermissions",
+                "additionalDirectories": _extra_dirs,
+            },
+            "model": "claude-opus-4-6",
+            "effortLevel": "medium",
+            "skipDangerousModePermissionPrompt": True,
+            "hasCompletedOnboarding": True,
+            "theme": "dark",
+            "showThinkingSummaries": True,
+        }
+        existing_settings: dict = {}
+        if settings_path.exists():
+            try:
+                existing_settings = (
+                    json.loads(settings_path.read_text(encoding="utf-8")) or {}
+                )
+            except (json.JSONDecodeError, OSError):
+                existing_settings = {}
+        if not isinstance(existing_settings, dict):
             existing_settings = {}
-    if not isinstance(existing_settings, dict):
-        existing_settings = {}
-    saved_hooks = existing_settings.get("hooks")
-    merged = {**existing_settings, **_default_cc_settings}
-    if saved_hooks is not None:
-        merged["hooks"] = saved_hooks
-    settings_path.write_text(json.dumps(merged, indent=2))
+        saved_hooks = existing_settings.get("hooks")
+        merged = {**existing_settings, **_default_cc_settings}
+        if saved_hooks is not None:
+            merged["hooks"] = saved_hooks
+        atomic_write_private(settings_path, json.dumps(merged, indent=2))
+    except BaseException as exc:
+        restore_or_raise(exc)
+        raise
     logger.info("merged default settings.json to %s", settings_path)
 
     logger.info("登录成功: %s", email)

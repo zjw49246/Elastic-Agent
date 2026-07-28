@@ -1,10 +1,10 @@
-# Elastic-Agent 代码审计记录（2026-07-28）
+# Elastic-Agent 代码审计与修复闭环（2026-07-28）
 
 ## 1. 审计基线
 
-- 审计 Commit：`8dc4228`（审计期间从 `979d765` 增量复核至最新
-  `origin/main`，包含 per-worker S3 dataset 改动）
+- 初始审计 Commit：`8dc4228`；修复工作区从 `86dd0f8` 开始
 - 审计分支：`task-code-audit`
+- 修复分支：`task-fix-code-audit`
 - 审计方式：只读代码审查、完整单元/集成测试、静态检查、故障注入和本地最小复现
 - 未执行：真实云资源创建、真实账号登录、真实 Provider API 调用、生产服务重启或配置修改
 
@@ -12,10 +12,13 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| `uv run pytest -q` | `2356 passed, 12 skipped, 87 warnings` |
+| `uv run pytest -q tests/unit` | `2510 passed` |
+| `uv run pytest -q tests/integration` | `90 passed, 12 skipped`；仅既有 websockets deprecation warnings |
+| `uv run pytest -q tests/unit/test_api_batch.py` | `148 passed` |
 | 近期 Agent API、Worker、Batch、UI 专项测试及覆盖率 | `375 passed`，所选模块语句覆盖率约 `77%` |
 | 最新 S3 分片数据集增量专项测试 | `303 passed` |
 | `uv run python -m compileall -q src` | 通过 |
+| 修改范围 Ruff fatal 集合 `E9,F63,F7,F82` | 通过 |
 | `uv lock --upgrade-package claude-pty --dry-run` | 无 lockfile 变化 |
 | `uv run --extra dev ruff check .` | 失败，共 `341` 项 |
 
@@ -31,32 +34,41 @@
 
 | ID | 严重度 | 状态 | 摘要 |
 | --- | --- | --- | --- |
-| EA-AUD-001 | 高 | Open | LocalBackend 文件 API 可路径穿越，读取 Manager 本地文件 |
-| EA-AUD-002 | 高 | Open | Claude OAuth 凭据会以 `0644` 写入或恢复 |
-| EA-AUD-003 | 高 | Open | Claude 登录把 mailbox token、验证码和 OAuth code/state 写入 Worker journal |
-| EA-AUD-004 | 高 | Open | Claude 登录取消/异常不事务回滚，仍可能错误确认清理完成 |
-| EA-AUD-005 | 高 | Open | 可靠终态事件持久化失败被吞掉，Job 可永久停在运行态 |
-| EA-AUD-006 | 高 | Open | Agent API tombstone 写失败阻断 PROCESS_EXIT/RUN_EXHAUSTED 收敛 |
-| EA-AUD-007 | 高 | Open | stdout/stderr 单行超过 64 KiB 后停止排水，任务可假死或被误杀 |
-| EA-AUD-008 | 高 | Open | Agent API Key 仍按 OAuth 账号全局独占，不能多 Worker 共享 |
-| EA-AUD-009 | 高 | Open | 结果 score 解析可被 Job 输出放大为 Manager 内存/I/O DoS |
-| EA-AUD-010 | 高 | Open | S3 流式下载排队取消会泄漏 pipe FD，并使用无界 executor 队列 |
-| EA-AUD-011 | 高 | Open | 普通多 shard Job 的单 Worker 失败后不会立即销毁对应实例 |
-| EA-AUD-012 | 高 | Open | Batch 接受 `manager_distribute`，实际仍执行 Worker 本地登录 |
-| EA-AUD-013 | 高 | Open | Worker 日志发送队列无界，断线/慢连接时可 OOM |
-| EA-AUD-014 | 中 | Open | 预构建结果包断连后遗留临时文件，且无全局磁盘预算 |
-| EA-AUD-015 | 中 | Open | 幂等重放先执行当前 preflight，可能拒绝已经成功的同 Key 重试 |
-| EA-AUD-016 | 中 | Open | 本地结果下载的“快照一致性”存在 LIST→OPEN TOCTOU |
-| EA-AUD-017 | 中 | Open | 前端在 non-EIP 模式下不能指定具体账号/API Key |
-| EA-AUD-018 | 中 | Open | Claude 忽略 `account.login_timeout_seconds`，固定使用 480 秒 |
-| EA-AUD-019 | 中 | Open | PTY autonomous result 会覆盖前台 session 并重复计费 |
-| EA-AUD-020 | 中 | Open | 同名 Harness 上传失败会删除旧有效插件，并可改写历史 Job 代码 |
-| EA-AUD-021 | 中 | Open | Agent API 账号删除端点无条件返回 409 |
-| EA-AUD-022 | 中 | Open | OAuth 账号字段和请求体缺少硬大小/字符边界 |
-| EA-AUD-023 | 高 | Open | 空 hostname 会把单对象 S3 dataset 退化为整桶 prefix 同步 |
-| EA-AUD-024 | 中 | Open | dataset 丢失 Worker context 时静默回退 shard 0 |
-| EA-AUD-025 | 中 | Open | dataset 目标路径允许空格，但建父目录命令会错误拆词 |
-| EA-AUD-026 | 低 | Open | dataset URI 不兼容模板引擎支持的空白占位符语法 |
+| EA-AUD-001 | 高 | Fixed | LocalBackend 文件 API 可路径穿越，读取 Manager 本地文件 |
+| EA-AUD-002 | 高 | Fixed | Claude OAuth 凭据会以 `0644` 写入或恢复 |
+| EA-AUD-003 | 高 | Fixed | Claude 登录把 mailbox token、验证码和 OAuth code/state 写入 Worker journal |
+| EA-AUD-004 | 高 | Fixed | Claude 登录取消/异常不事务回滚，仍可能错误确认清理完成 |
+| EA-AUD-005 | 高 | Fixed | 可靠终态事件持久化失败被吞掉，Job 可永久停在运行态 |
+| EA-AUD-006 | 高 | Fixed | Agent API tombstone 写失败阻断 PROCESS_EXIT/RUN_EXHAUSTED 收敛 |
+| EA-AUD-007 | 高 | Fixed | stdout/stderr 单行超过 64 KiB 后停止排水，任务可假死或被误杀 |
+| EA-AUD-008 | 高 | Fixed | Agent API Key 仍按 OAuth 账号全局独占，不能多 Worker 共享 |
+| EA-AUD-009 | 高 | Fixed | 结果 score 解析可被 Job 输出放大为 Manager 内存/I/O DoS |
+| EA-AUD-010 | 高 | Fixed | S3 流式下载排队取消会泄漏 pipe FD，并使用无界 executor 队列 |
+| EA-AUD-011 | 高 | Fixed | 普通多 shard Job 的单 Worker 失败后不会立即销毁对应实例 |
+| EA-AUD-012 | 高 | Fixed | Batch 接受 `manager_distribute`，实际仍执行 Worker 本地登录 |
+| EA-AUD-013 | 高 | Fixed | Worker 日志发送队列无界，断线/慢连接时可 OOM |
+| EA-AUD-014 | 中 | Fixed | 预构建结果包断连后遗留临时文件，且无全局磁盘预算 |
+| EA-AUD-015 | 中 | Fixed | 幂等重放先执行当前 preflight，可能拒绝已经成功的同 Key 重试 |
+| EA-AUD-016 | 中 | Fixed | 本地结果下载的“快照一致性”存在 LIST→OPEN TOCTOU |
+| EA-AUD-017 | 中 | Fixed | 前端在 non-EIP 模式下不能指定具体账号/API Key |
+| EA-AUD-018 | 中 | Fixed | Claude 忽略 `account.login_timeout_seconds`，固定使用 480 秒 |
+| EA-AUD-019 | 中 | Fixed | PTY autonomous result 会覆盖前台 session 并重复计费 |
+| EA-AUD-020 | 中 | Fixed | 同名 Harness 上传失败会删除旧有效插件，并可改写历史 Job 代码 |
+| EA-AUD-021 | 中 | Fixed | Agent API 账号删除端点无条件返回 409 |
+| EA-AUD-022 | 中 | Fixed | OAuth 账号字段和请求体缺少硬大小/字符边界 |
+| EA-AUD-023 | 高 | Fixed | 空 hostname 会把单对象 S3 dataset 退化为整桶 prefix 同步 |
+| EA-AUD-024 | 中 | Fixed | dataset 丢失 Worker context 时静默回退 shard 0 |
+| EA-AUD-025 | 中 | Fixed | dataset 目标路径允许空格，但建父目录命令会错误拆词 |
+| EA-AUD-026 | 低 | Fixed | dataset URI 不兼容模板引擎支持的空白占位符语法 |
+| EA-AUD-027 | 高 | Fixed | 外部文件 manifest/content 使用无界整对象读取 |
+| EA-AUD-028 | 中 | Fixed | 非有限 cost 和异常 session id 可污染 Manager 记账 |
+| EA-AUD-029 | 高 | Fixed | 旧 CREDENTIAL_LOGIN 在 PTY recycle 失败后仍确认换证成功 |
+| EA-AUD-030 | 低 | Fixed | 已取消 Job 的账号占用展示不区分清理中与已释放 |
+| EA-AUD-031 | 低 | Fixed | Batch 环境变量格式错误会被前端静默丢弃 |
+| EA-AUD-032 | 中 | Fixed | 终态首次结果查询失败会永久冻结旧中间快照 |
+| EA-AUD-033 | 中 | Fixed | 升级后旧 `manager_distribute` Job 的恢复收集被新 Schema 拒绝 |
+| EA-AUD-034 | 中 | Fixed | `GET /api/jobs` 会无界枚举、读取并返回全部历史 journal |
+| EA-AUD-035 | 中 | Fixed | Job 日志读取占用共享默认 executor 且没有并发 admission |
 
 ## 3. 高严重度问题
 
@@ -856,9 +868,271 @@ API 与文档模板语法不一致；用户必须改写成无空白的 `{{shard_
 选择并固定一个契约：要么文档明确 dataset 只支持无空白形式并给出专门错误，要么先识别/保护模板
 token，再验证渲染后的 URI；UI 不应使用无法区分模板内部空白的简单 split。
 
-## 6. 工程质量和测试缺口
+## 6. 补充审计问题
 
-这些项目没有单独计入上述 26 个 Bug，但会降低回归发现能力：
+### EA-AUD-027 — 外部文件接口无界读取对象
+
+**位置**
+
+- `src/elastic_agent/api/routes/files.py`
+- `src/elastic_agent/worker/file_sync.py`
+
+**问题**
+
+`/api/external/files/{task_id}/manifest` 和 content 模式先调用
+`StorageBackend.read_file()` 把整个 Local/OSS/S3 对象装入 Manager 内存。manifest 随后还会无界构造
+响应条目；对象长度、短读、超读和客户端断连都没有统一的 reader ownership 契约。
+
+**影响**
+
+持有管理 API 凭据的调用方可借由异常大的 Job 对象放大 Manager 内存；慢对象和断连还会长时间占用
+SDK response body、线程和连接。
+
+**修复**
+
+Storage backend 新增带权威长度、定长 chunk read 和幂等 close 的 reader。manifest 限制为 8 MiB、
+10,000 条且逐字段验证；content 最大 2 GiB，以 256 KiB chunk 流式发送，并验证 exact EOF。
+Local reader 使用逐组件 `openat`/`O_NOFOLLOW`；S3/OSS reader 使用响应的 authoritative
+Content-Length。response 和 iterator 两层 `finally` 都会关闭 body。
+
+### EA-AUD-028 — result 元数据可污染 Manager 记账
+
+**位置**
+
+- `src/elastic_agent/core/log_event_parser.py`
+
+**问题**
+
+Manager 对 Worker `result` 中的 `cost_usd` 直接 `float()` 后累加，因此 `NaN`、正负无穷、
+负数或连续的大数可把 task/worker 总成本永久污染为非有限值。`session_id` 也接受任意类型、长度和
+控制字符，后续会进入 resume 参数和管理元数据。
+
+**影响**
+
+不可信 Job 输出可以破坏成本展示、排序/序列化和 resume 元数据的稳定性。
+
+**修复**
+
+只接受有限、非负、非布尔且单次与累计均不超过 10 亿美元的 cost；拒绝会令 task 或 worker 累计值
+越界的事件。session id 必须是 1–1024 个可打印字符。无效新值不会覆盖上一个有效 session。
+
+### EA-AUD-029 — 旧换证路径在 PTY recycle 失败后仍报告成功
+
+**位置**
+
+- `src/elastic_agent/worker/runtime.py` 的 `CREDENTIAL_LOGIN` handler
+- `src/elastic_agent/worker/pty_backend.py`
+
+**问题**
+
+兼容旧协议的 `CREDENTIAL_LOGIN` 先把新 OAuth 文件写进槽位，再回收仍持有旧账号的温热 PTY。
+如果 recycle 抛错，旧逻辑仍会继续增加 quota slot 并返回成功。此时磁盘是新账号，存活会话却仍是
+旧账号，Manager 无法知道该槽位混合了两种身份；取消发生在同一窗口时也没有事务回滚。
+
+**影响**
+
+后续任务可能在错误账号或无法证明身份的温热会话中执行，同时 Manager 误认为换号完成并继续调度。
+
+**修复**
+
+写入前快照旧凭据及权限；write/recycle 任一失败都恢复原 `0700/0600` 状态且不添加 quota slot。
+若新写入与回滚同时失败，则把 config dir 写入进程内 unsafe tombstone，PTY 和 subprocess
+`EXECUTE` 都可靠拒绝该槽位；只有一次完整成功的重配才清除 tombstone。取消路径同样等待回滚，
+错误文本和日志不包含 token。
+
+### EA-AUD-030 — 取消后的账号占用状态可能错误显示空闲
+
+**位置**
+
+- `src/elastic_agent/api/routes/accounts.py`
+- `src/elastic_agent/api/routes/ui.py`
+
+**问题**
+
+账号占用接口按 Worker phase 过滤终态时只处理 `done/failed`，最初还遗漏 `cancelled`；简单把全部
+终态都过滤又会在普通 Worker 实例尚未销毁、claim 尚未释放的重试窗口过早显示“空闲”。
+同一路由还会把当前 Job 列表或持久 lease 读取异常吞成空数组，使前端即使具备“状态不可用”展示，
+仍收到 `200 {allocations:{}}` 并错误显示全部空闲。
+页面本身只在首屏和账号 CRUD 后刷新 Accounts；Job submit/cancel 与 5 秒 dashboard poll 均不刷新
+占用表，因此正常运行中的 Worker/清理状态也会一直停留在旧快照，直到用户重载整页。
+
+**影响**
+
+这是展示一致性问题，不会绕过 allocator 的实际互斥，但管理员会看到与 DELETE/再次分配结果冲突的
+状态，容易在清理重试或 Manager 状态读取故障期间误判账号已经可用。
+
+**修复**
+
+终态 run 只有在 `run.cleaned_up` 或 Job 的 `accounts_released` 已给出释放证明后才从占用列表隐藏；
+否则保留 `active=false`、`cleanup_pending=true`，前端明确显示“清理中”。测试同时覆盖取消后待清理
+与释放证明提交后的两种状态。当前 Job 或 durable lease 状态读取失败时路由改为脱敏 `503`，前端
+显示“占用状态暂不可用”，不再把未知状态降级成空闲。可见页每 15 秒刷新一次 Accounts，并提供
+手动刷新；请求采用 single-flight、强制刷新合并和版本守卫，账号 CRUD / Job submit / cancel 会排队
+一次最新读取，隐藏页暂停，旧响应不能覆盖新占用状态或破坏 picker 选择。
+
+### EA-AUD-031 — Batch 环境变量格式错误会被静默丢弃
+
+**位置**
+
+- `src/elastic_agent/api/routes/ui.py`
+
+**问题**
+
+Batch Console 原先把 `run.env` / `run.secret_env` 每个文本框按行转换成对象；没有 `=` 的非空行会被
+直接跳过，同一变量重复出现时则由最后一行静默覆盖。由于 plan 按安全边界不回显环境变量值，用户无法
+从执行预览发现原本打算提交的变量已经消失。
+
+**影响**
+
+Job 可在缺少必要普通变量或秘密引用的情况下成功启动，随后以难以关联到表单输入的方式失败。后端
+JobSpec 校验无法拒绝已经被前端删除的行。
+
+**修复**
+
+前端解析器现在要求每个非空行均为 `KEY=VALUE`，变量名与后端使用同一
+`[A-Za-z_][A-Za-z0-9_]*` 规则，并拒绝同一文本框内的重复变量。plan/submit 前通过浏览器 validity
+接口标出错误；若输入位于折叠区，会先展开、聚焦并显示具体行号。Node 行为测试同时覆盖合法空值、
+值内 `=`、`__proto__` 变量、缺少分隔符、非法/空变量名、重复定义和秘密变量错误标签；解析结果使用
+null-prototype map，避免合法变量名触发 JavaScript 原型 setter 后再次被静默丢弃。
+
+### EA-AUD-032 — 终态结果查询失败会永久冻结旧中间快照
+
+**位置**
+
+- `src/elastic_agent/api/routes/ui.py`
+
+**问题**
+
+运行中的 Job 已缓存非空中间快照后，Job 转为终态时若第一次 final-results 查询返回 `503`、空结果或
+发生网络错误，旧逻辑会因为“终态且已有文件”直接把 `nextCheck` 设为 `Infinity`。页面虽然保留了旧
+快照避免闪空，但也永远不再核对最终收集结果。
+
+**影响**
+
+管理员可能一直看到并下载缺少最后一批文件的旧快照，除非刷新整页；终态收集随后成功也不会被当前
+页面发现。
+
+**修复**
+
+仅一次成功、非空的终态结果读取可以停止轮询。空结果和错误仍保留最后一个已知非空值，但继续有限
+退避；per-Job request version 保证晚到的旧响应不能覆盖较新的 final snapshot。动态 Node 测试覆盖
+“已有中间结果→终态 503/空→稍后成功 final”的完整状态转换。
+
+### EA-AUD-033 — 旧 `manager_distribute` Job 的恢复收集被拒绝
+
+**位置**
+
+- `src/elastic_agent/manager/manager.py`
+- `src/elastic_agent/core/job_spec.py`
+
+**问题**
+
+新 Schema 正确拒绝未实现的 `account.mode="manager_distribute"`，但 Manager 启动恢复也直接用同一
+`JobSpec.model_validate()` 读取旧 journal。升级前仍在运行的普通或 EIP Job 因此在实例销毁前跳过
+final collect；云资源仍会回收，但最后结果丢失。
+
+**修复**
+
+启动恢复增加 teardown-only 兼容 loader：只在读取已经持久化的旧 journal 时把该 mode 用于严格
+验证，并返回仅含 `name/setup/collect` 的 frozen 视图。该对象没有 `run/account`，不能进入
+provision/login/dispatch；新 submit 和 resubmit 继续拒绝旧 mode。普通 unbound 与 EIP lease 两条
+完整启动恢复测试均验证先 collect、后销毁，且旧 command 不可见。
+
+### EA-AUD-034 — 历史 Job API 无界枚举、读取和响应
+
+**位置**
+
+- `src/elastic_agent/api/routes/jobs.py`
+- `src/elastic_agent/core/account_binding.py`
+
+**问题**
+
+`GET /api/jobs` 每次 UI 轮询都会 `glob`、排序并逐个读取全部 `specs/*.json`，然后把全部历史 Job
+放入一个响应；精确 journal 读取本身也没有文件大小上限。历史只增不减时，请求内存、磁盘 I/O、
+线程任务和响应大小会持续增长。
+
+**修复**
+
+历史部分改用 dedicated 两线程池和 fail-fast admission；`scandir` 最多扫描 10,000 个目录项、累计
+2 MiB 文件名，保留 1,000 个候选并最多返回 500 条。单 journal 限 32 MiB、单次总读 64 MiB、历史
+响应 16 MiB，相关 lease copy 最多 10,000 条；响应保留原 `jobs/total` 并增加
+`truncated/history_scanned/history_returned`。精确读取在打开前收紧到 `0600`，使用
+`O_NOFOLLOW` 和 regular-file/byte 检查。测试禁止 `Path.glob`，并覆盖扫描、总读、响应和 admission
+饱和边界。
+
+### EA-AUD-035 — Job 日志读取可阻塞共享 executor
+
+**位置**
+
+- `src/elastic_agent/api/routes/jobs.py`
+- `src/elastic_agent/core/job_log_store.py`
+
+**问题**
+
+日志 API 虽然把单 Job 快照限制为 512 task/64 MiB，却通过 `asyncio.to_thread()` 使用进程共享默认
+executor，且没有请求并发上限。多个同时读取可占满默认线程并排队，拖慢依赖同一 executor 的生命周期
+和清理工作；客户端取消 asyncio waiter 也不会停止已经运行的文件扫描。
+
+**修复**
+
+归档日志读取使用四线程专用池和等容量 fail-fast admission，饱和时返回带 `Retry-After` 的 `503`。
+executor future 始终 shield 到真实线程退出，取消请求在此之前不归还 permit，因而不能用反复取消
+堆积后台扫描。故障注入测试验证专用线程名、饱和拒绝、取消期间容量仍占用以及线程退出后的精确释放。
+
+## 7. 修复闭环
+
+| ID | 关闭实现与关键验证 |
+| --- | --- |
+| 001 | API 和 LocalBackend 双层校验 object key；Local 读取逐组件 `openat/O_NOFOLLOW`，覆盖编码 traversal、符号链接祖先和合法带冒号 task id。 |
+| 002 | Claude 凭据目录/文件统一为 `0700/0600` 私有原子写，唯一临时文件、nofollow、inode/mode 校验、fsync；回滚保存并恢复原内容和 mode。 |
+| 003 | Claude 邮箱查询前永久压低 `httpx/httpcore` 日志；CDP 删除正文、响应体、完整 URL、code/state/token 输出；canary 测试覆盖 stdout、日志和异常。 |
+| 004 | Provider 与 Runtime 两层事务快照覆盖登录、身份验证和 warmup；CLI/Chrome/Xvfb 使用 process group 并聚合清理错误；失败结果显式携带 `cleanup_complete`，缺失/false 均按不确定隔离，成功的晚到 cancel 不伪造清理完成。 |
+| 005 | 可靠事件只有 fsync 成功才进入 pending/send；持久化失败移除 phantom exit 并强制断线，让 STATUS 丢任务恢复接管；ACK 写盘失败恢复内存真相并重连。 |
+| 006 | Agent API tombstone 写失败只让该 Key 进入进程内 quarantine，PROCESS_EXIT/RUN_EXHAUSTED 的归档、终态、收集和销毁继续执行。 |
+| 007 | stdout/stderr 改为持续 `read()` 排水，按 64 KiB byte frame 切分；短读、跨 frame UTF-8 和超长无换行均不会停止 pipe。 |
+| 008 | allocator 改为 account→claim set/refcount；仅 `binding=none` 且无持久 EIP binding 的 Agent API claim 可共享，OAuth/EIP 始终独占；同/跨 Job release 不会误清其他引用。 |
+| 009 | Local/S3 score 共用 500 次、16 MiB、500 条上限；只接受受限可打印标量和有限有界分数，递归、巨型整数、surrogate 均 fail closed。 |
+| 010 | S3 streaming 在创建 pipe/提交线程前取得 admission semaphore；取消等待不产生 FD，producer 完成前不释放令牌，活动 body 在断连时关闭。 |
+| 011 | 普通 shard 终态立即执行 final collect→exact cloud termination→registry absence readback→该 Worker claim release；partial remove、并发同 Worker、shutdown 和重试均逐 Worker 收敛。 |
+| 012 | Schema、API 和 UI 对所有 Agent 类型统一拒绝 `manager_distribute`，不再提供名义可选但无实现的路径。 |
+| 013 | LOG 和 file-data 使用独立 frame+serialized-byte 双上限队列；in-flight/retry 也计入预算，oversized/flood 只做有界计数和指数频率本地告警；可靠终态继续走 durable control path。 |
+| 014 | 预构建 archive 使用 response-level `finally` 删除；全局 semaphore、逻辑 byte reservation、按 PAX/tar/gzip 最坏上界计算的 spool reservation、实时磁盘余量与 stale cleanup 共同限制临时盘。 |
+| 015 | submit lock 内先做 exact live/journal replay，再对新提交或仅 prepared 恢复做当前 preflight；UI 将 pending Key+冻结 spec 存入 sessionStorage，并明确提示重放或双确认丢弃。 |
+| 016 | Local archive/score 将 open fd 的 dev/inode/size/mtime 与 LIST 快照比较并验证 EOF；S3 使用 ETag/size 条件读并验证 exact EOF。 |
+| 017 | non-EIP UI 可选择所需数量的唯一 ID，按账号列表顺序映射；单个 unbound Agent API 可自动填满全部槽。任意有序/重复映射仍由 JobSpec `account.ids` 表达，OAuth/EIP 重复 422。 |
+| 018 | Claude `OAuthConfig.login_timeout` 使用 Job 的 60–1200 秒值；边界和默认值均有消息→provider 测试。 |
+| 019 | autonomous raw trace 仍保留在 Worker 本地，但转发时去掉 Manager 可记账的 parsed result；orphan 继续不转发，前台 session/cost 不受影响。 |
+| 020 | Harness 先在私有临时文件验证，再按 SHA-256 发布不可变内容地址；同内容幂等，旧 Job 永远引用原版本，1 MiB 上限在 import 前执行。 |
+| 021 | Agent API DELETE 进入 allocator mutation guard 和 binding account transaction；仅无 claim、无 lease、无 binding 且 recovery ready 时 durable remove。绑定身份可用同一 fence 的 decommission+delete，释放后的存储失败显式报告部分状态并 quarantine。 |
+| 022 | OAuth ID 使用安全字符集，email/group/name 使用完整 Unicode printable 和长度边界，秘密限制 16 KiB/NUL；ASGI 在 JSON 解析前对 Content-Length 和 chunked body 统一限制。 |
+| 023 | JobSpec 预览使用非空 synthetic hostname；runtime 真实 hostname 缺失或渲染为空时 fail closed，不允许 object→prefix 类型退化。 |
+| 024 | 多 Worker 或含模板 dataset 缺少精确 WorkerContext 时拒绝 provision，不再回退 shard 0。 |
+| 025 | Manager 用 `PurePosixPath(dest).parent` 计算父目录并整体 shell quote，覆盖空格、glob 和单引号。 |
+| 026 | S3 URI 解析器识别带空白的模板 token，UI 使用模板感知行解析；最终渲染值再做 URI/path 安全校验。 |
+| 027 | 外部 manifest/content 使用 authoritative-size closeable reader、8 MiB/10,000 条 manifest 上限和 2 GiB/256 KiB content streaming；覆盖谎报长度、短读、超读和断连。 |
+| 028 | Manager result parser 拒绝非有限、负数、布尔、过大/累计越界 cost，以及过长、非字符串或含不可打印字符的 session id。 |
+| 029 | legacy `CREDENTIAL_LOGIN` 对 write/recycle 做凭据快照与事务回滚；双故障 tombstone 阻断不安全槽位，取消、权限、脱敏和 quota-slot 均有故障注入。 |
+| 030 | 账号占用只在逐 Worker/整 Job 释放证明后隐藏；Job/lease 读取失败返回脱敏 503。UI 显示“清理中/状态不可用”，并以可见页 15 秒 single-flight + 手动刷新更新状态。 |
+| 031 | Batch 的 env/secret-env 逐行严格解析并接入原生 validity；错误会展开、聚焦对应输入，Node 测试覆盖静默丢行与覆盖场景。 |
+| 032 | 终态结果仅在成功非空读取后停止轮询；503/空仍保留旧快照并有限退避，request version 防止乱序回退。 |
+| 033 | 启动恢复用不含 run/account 的 teardown-only 视图兼容旧 `manager_distribute` journal；普通/EIP 都先 collect 后销毁，新提交仍拒绝。 |
+| 034 | 历史 Job 使用 bounded scandir/read/response、专用池和 fail-fast admission，并显式返回 truncation 元数据。 |
+| 035 | Job log archive read 使用四线程专用池；admission 饱和 503，取消等真实线程退出后才归还 permit。 |
+
+修复实现交叉审查还封堵了几处组合边界：
+
+- ordinary scale-in 对 missing/extra/duplicate cloud 回执一律拒绝；registry 删除按 Worker 保存 partial
+  proof，重试只触碰未完成项，同 Worker 并发调用只执行一次实际终止/删除；
+- 即使没有 active lease，只要身份仍有任意状态的持久 EIP binding，普通共享池和 preflight 就排除它；
+  只有 bound reserve 可显式使用；
+- tar reservation 把长 UTF-8 路径产生的 PAX header、512-byte block、tar trailer 和 gzip bound 都计入，
+  不再把源文件大小近似当作磁盘上界；
+- 登录进程清理与凭据 rollback 同时失败时保留清理不确定语义，不让 rollback 异常遮蔽原始进程泄漏；
+- oversized file-data flood 不再为每次 drop 向无界 control queue 追加错误帧。
+
+## 8. 工程质量和测试缺口
+
+这些是初始基线的工程质量数据，没有单独计入上述 35 个 Bug，但会降低回归发现能力：
 
 1. Ruff 当前有 `341` 项错误：
    - `F401` 127 项；
@@ -867,12 +1141,14 @@ token，再验证渲染后的 URI；UI 不应使用无法区分模板内部空�
    - 另有 `F841` 8 项、`F541` 9 项、`F821` 1 项等。
 2. 全仓 `F`/`E9` 类共有 `145` 项（其中 `F401` 127 项）；按 Ruff
    常用致命集合 `E9,F63,F7,F82` 检查仍有 1 项 `F821`，当前没有干净的静态质量门。
-3. `87` 条测试 warning 主要来自 websockets legacy/deprecation；依赖升级后存在破坏风险。
+3. 初始基线记录的 `87` 条 warning 主要来自 websockets
+   legacy/deprecation；最终分开运行时 unit 报 `3` 条、integration 报
+   `86` 条（两组有重复的 import warning），依赖升级后仍存在破坏风险。
 4. 近期模块的专项语句覆盖率约 `77%`，缺失区域集中在错误恢复、取消、存储失败和路由异常分支；本次多数高风险问题正位于这些 fault paths。
 
 建议先增加不依赖真实云的故障注入测试，再把 Ruff 分阶段收敛为 CI gate。不能因为完整测试全绿就认为生命周期和安全边界已经覆盖。
 
-## 7. 已核对但未发现新增高风险问题的区域
+## 9. 已核对但未发现新增高风险问题的区域
 
 - Job、logs、results 路由统一带 Bearer API dependency，未发现未认证读取绕过。
 - Agent API key 的普通 REST response 仍保持 write-only，未发现直接回显。
@@ -881,14 +1157,12 @@ token，再验证渲染后的 URI；UI 不应使用无法区分模板内部空�
 - BindingManager 的正常 EIP detach → instance terminate → lease release 路径，以及通用 controller-tag orphan scan，未发现新的可复现身份越权或漏清理问题。
 - Agent API projection 的固定 endpoint、私有 key-helper、marker/inode 校验未发现直接 key 回显或任意路径删除问题。
 
-## 8. 建议修复顺序
+## 10. 后续维护顺序
 
-1. 先处理秘密与越权面：EA-AUD-001～004。
-2. 再处理会阻止终态、持续计费或资源放大的问题：EA-AUD-005～007、010～011、
-   013～014、023。
-3. 实现正确的 API Key 共享模型，并同步 preflight、JobSpec 和 UI：EA-AUD-008、017、021。
-4. 修正公开但错误的产品契约：EA-AUD-012、015、018。
-5. 最后处理结果一致性、PTY 记账、Harness、输入边界和 dataset 边界：
-   EA-AUD-009、016、019～020、022、024～026。
+35 项均已关闭。后续维护按风险继续保留以下顺序：
 
-每项修复都应先提交当前最小复现作为失败测试，再实施代码修改；涉及终态、删除、EIP 或凭据的修复应继续使用故障注入验证取消、重启、ENOSPC 和并发场景。
+1. 凭据、登录清理、可靠终态、实例/EIP 与 claim release 的 fault-injection 测试必须保持为合并门槛。
+2. 结果、外部文件和 Worker transport 的 object/frame/aggregate byte budget 变更必须同时覆盖短读、超读、
+   断连、取消和磁盘不足。
+3. API Key 共享规则必须始终同时验证四个维度：auth kind、binding、owner/slot 与全部 active claim。
+4. 逐步清理初始基线遗留的 Ruff 项并建立 CI gate；不能用“完整 pytest 全绿”替代静态检查和故障恢复审查。

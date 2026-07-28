@@ -12,7 +12,11 @@ import json
 import os
 from pathlib import Path
 
-from elastic_agent.worker.file_sync import StorageBackend
+from elastic_agent.worker.file_sync import (
+    StorageBackend,
+    StorageObjectReader,
+    _run_storage_blocking,
+)
 
 
 class MockOSS(StorageBackend):
@@ -126,11 +130,41 @@ class MockOSS(StorageBackend):
         })
         return data
 
+    async def open_reader(
+        self,
+        oss_key: str,
+        *,
+        executor=None,
+    ) -> StorageObjectReader:
+        self._check_failure("read_file")
+        root = self._root.resolve()
+        path = (root / oss_key).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("storage key escapes mock root") from exc
+        try:
+            stream = await _run_storage_blocking(
+                executor,
+                path.open,
+                "rb",
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Key not found: {oss_key}") from None
+        size = (await _run_storage_blocking(executor, path.stat)).st_size
+        return StorageObjectReader(stream, size=size, executor=executor)
+
     async def file_exists(self, oss_key: str) -> bool:
         self._check_failure("file_exists")
         return (self._root / oss_key).exists()
 
-    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+    async def get_presigned_url(
+        self,
+        oss_key: str,
+        expires: int = 3600,
+        *,
+        executor=None,
+    ) -> str | None:
         self._check_failure("get_presigned_url")
         if not (self._root / oss_key).exists():
             return None

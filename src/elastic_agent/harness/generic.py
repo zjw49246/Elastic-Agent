@@ -12,9 +12,11 @@ the two so the BatchOrchestrator only ever consumes a ``Harness``.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -327,7 +329,10 @@ def load_harness_class(ref: str) -> type[Harness]:
         path = Path(mod_part).resolve()
         if not path.is_file():
             raise FileNotFoundError(f"harness file not found: {path}")
-        mod_name = f"_elastic_harness_{path.stem}"
+        path_fingerprint = hashlib.sha256(
+            os.fsencode(path)
+        ).hexdigest()[:24]
+        mod_name = f"_elastic_harness_{path_fingerprint}"
         loaded = sys.modules.get(mod_name)
         if loaded is None:
             spec_ = importlib.util.spec_from_file_location(mod_name, path)

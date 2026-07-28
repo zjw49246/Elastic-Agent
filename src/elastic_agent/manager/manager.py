@@ -10,7 +10,8 @@ import asyncio
 import logging
 import re
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.config import ElasticAgentConfig
@@ -34,6 +35,9 @@ from elastic_agent.harness.base import Harness
 from elastic_agent.manager.connection import WorkerConnectionManager
 from elastic_agent.worker.file_sync import StorageBackend
 
+if TYPE_CHECKING:
+    from elastic_agent.core.job_spec import CollectSpec, SetupSpec
+
 logger = logging.getLogger(__name__)
 
 RESUME_STOPPING_TIMEOUT_SECONDS = 300
@@ -48,6 +52,43 @@ EIP_ALLOCATION_RECOVERY_STABLE_SCANS = 30
 # quarantine EIP work for up to five minutes before declaring it launch-free.
 BOUND_RECOVERY_STABLE_SCANS = 30
 BOUND_DISCONNECT_GRACE_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class _RecoveryCollectionSpec:
+    """Strictly limited view of a persisted Job used during teardown only."""
+
+    name: str
+    setup: SetupSpec
+    collect: CollectSpec
+
+
+def _load_recovery_collection_spec(raw_spec: object) -> _RecoveryCollectionSpec:
+    """Validate a persisted spec for final collection, including one legacy mode.
+
+    ``manager_distribute`` was accepted by older Managers.  New submission and
+    resubmission continue to reject it, but restart recovery must still collect
+    those already-running Jobs before destroying their workers.  Return only
+    the fields consumed by ``ManagerFleetDriver.collect`` so this compatibility
+    object cannot be passed back into provisioning, login, or run dispatch.
+    """
+    from elastic_agent.core.job_spec import JobSpec
+
+    if not isinstance(raw_spec, dict):
+        raise ValueError("persisted recovery JobSpec must be a JSON object")
+    candidate = dict(raw_spec)
+    raw_account = candidate.get("account")
+    if isinstance(raw_account, dict):
+        account = dict(raw_account)
+        if account.get("mode") == "manager_distribute":
+            account["mode"] = "worker_local_login"
+        candidate["account"] = account
+    validated = JobSpec.model_validate(candidate)
+    return _RecoveryCollectionSpec(
+        name=validated.name,
+        setup=validated.setup,
+        collect=validated.collect,
+    )
 
 
 class ElasticAgentManager:
@@ -1358,7 +1399,6 @@ class ElasticAgentManager:
         """Bounded best-effort collect for a prior Manager's ordinary Job."""
         import json
 
-        from elastic_agent.core.job_spec import JobSpec
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 
         job_id = str(instance.tags.get("ElasticAgentJob") or "")
@@ -1375,7 +1415,7 @@ class ElasticAgentManager:
         if not spec_path.is_file():
             return
         payload = json.loads(spec_path.read_text(encoding="utf-8"))
-        spec = JobSpec.model_validate(payload["spec"])
+        spec = _load_recovery_collection_spec(payload["spec"])
         worker_id = instance.instance_id
         node = await self.registry.get(worker_id)
         if node is None:
@@ -1413,7 +1453,6 @@ class ElasticAgentManager:
         """
         import json
 
-        from elastic_agent.core.job_spec import JobSpec
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 
         specs_dir = self.account_binding_store.path.with_name("specs")
@@ -1426,7 +1465,7 @@ class ElasticAgentManager:
                     f"persisted JobSpec missing for recovery job {lease.job_id!r}"
                 )
             payload = json.loads(spec_path.read_text(encoding="utf-8"))
-            spec = JobSpec.model_validate(payload["spec"])
+            spec = _load_recovery_collection_spec(payload["spec"])
 
             worker_id = lease.worker_id or lease.instance_id
             binding = await self.binding_manager.get_binding(lease.account_id)
@@ -1603,7 +1642,12 @@ class ElasticAgentManager:
     # Node operations
     # ------------------------------------------------------------------
 
-    async def _persist_batch_job_spec(self, job_id: str, spec) -> None:
+    async def _persist_batch_job_spec(
+        self,
+        job_id: str,
+        spec,
+        request_fingerprint: str | None = None,
+    ) -> None:
         """Journal a JobSpec before the orchestrator can reserve or scale."""
 
         from elastic_agent.core.job_spec_store import persist_job_spec
@@ -1614,6 +1658,7 @@ class ElasticAgentManager:
                 self.config.registry.path,
                 job_id,
                 spec,
+                request_fingerprint,
             )
 
     async def _update_batch_job_state(
@@ -1643,6 +1688,7 @@ class ElasticAgentManager:
                 self.account_store,
                 self.agent_api_store,
                 agent_api_admission=lambda: self.binding_recovery_ready,
+                durable_binding_loader=self.binding_manager.list_bindings,
             )
         return self._account_allocator
 

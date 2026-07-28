@@ -704,7 +704,12 @@ _BATCH_HTML = """\
 
   <!-- Accounts -->
   <div class="card">
-    <h2>Accounts</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <h2>Accounts <span class="muted" id="accountsRefresh"
+                         role="status" aria-live="polite"></span></h2>
+      <button class="btn btn-ghost" style="margin:0"
+              onclick="refreshAccounts(true)">刷新账号状态</button>
+    </div>
     <p class="hint">
       Manager 会把登录密码与接码查询 token 保存到权限 0600 的账号文件，提交后均不回显。
       Claude/Codex OAuth 凭证只在 worker 生成且不回传。Codex 至少配置 OpenAI 密码或接码查询 Token
@@ -721,26 +726,26 @@ _BATCH_HTML = """\
       <h3 id="nativeAccountTitle">添加登录账号</h3>
       <p class="hint">Claude 或 Codex 在 Worker 上完成浏览器登录；秘密写入后不会在页面回显。</p>
     <div class="grid3" style="margin-top:8px">
-      <div><label for="acctId">账号 ID</label><input id="acctId" placeholder="acc-1"></div>
-      <div><label for="acctEmail">登录邮箱</label><input id="acctEmail" type="email" placeholder="a@x.com"></div>
+      <div><label for="acctId">账号 ID</label><input id="acctId" maxlength="128" placeholder="acc-1"></div>
+      <div><label for="acctEmail">登录邮箱</label><input id="acctEmail" type="email" maxlength="320" placeholder="a@x.com"></div>
       <div><label for="acctAgent">使用的 Agent</label><select id="acctAgent">
         <option value="claude">Claude</option><option value="codex">Codex</option>
       </select></div>
     </div>
     <div class="grid3">
       <div><label for="acctPassword">登录密码</label>
-        <input id="acctPassword" type="password" autocomplete="new-password"
+        <input id="acctPassword" type="password" autocomplete="new-password" maxlength="16384"
                placeholder="OpenAI password">
         <div class="field-help">Codex 至少填写一项，可同时填写：登录密码或接码查询 Token。</div>
         <label class="check-label" for="acctClearPassword"><input id="acctClearPassword" type="checkbox">
           清除该账号已有登录密码</label></div>
       <div><label for="acctToken">接码查询 Token</label>
-        <input id="acctToken" type="password" autocomplete="new-password"
+        <input id="acctToken" type="password" autocomplete="new-password" maxlength="16384"
                placeholder="171mail / MailCatcher query token">
         <div class="field-help">只用于读取邮箱验证码，不是 OpenAI 登录凭据。</div>
         <label class="check-label" for="acctClearToken"><input id="acctClearToken" type="checkbox">
           清除该账号已有查询 token</label></div>
-      <div><label for="acctGroup">账号组</label><input id="acctGroup" value="standard">
+      <div><label for="acctGroup">账号组</label><input id="acctGroup" maxlength="100" value="standard">
         <div class="field-help">Job 可按这个 Group 自动挑选账号。</div></div>
     </div>
     <button class="btn" onclick="addAccount()">添加登录账号</button>
@@ -754,11 +759,11 @@ _BATCH_HTML = """\
           <option value="cloudrouter">CloudRouter</option>
           <option value="apex">ApexRouter</option>
         </select></div>
-        <div><label for="apiAcctName">显示名称</label><input id="apiAcctName" placeholder="research-router"></div>
-        <div><label for="apiAcctGroup">账号组</label><input id="apiAcctGroup" value="standard"></div>
+        <div><label for="apiAcctName">显示名称</label><input id="apiAcctName" maxlength="100" placeholder="research-router"></div>
+        <div><label for="apiAcctGroup">账号组</label><input id="apiAcctGroup" maxlength="100" value="standard"></div>
       </div>
       <label for="apiAcctKey">API Key（写入后不回显）</label>
-      <input id="apiAcctKey" type="password" autocomplete="new-password"
+      <input id="apiAcctKey" type="password" autocomplete="new-password" maxlength="16384"
              placeholder="CloudRouter API Key">
       <button class="btn" id="apiAcctAdd" onclick="addAgentApiAccount()">Add CloudRouter API</button>
     </section>
@@ -861,8 +866,11 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
         <summary>版本锁定、结构化步骤与 S3 数据集</summary>
         <div class="form-grid">
           <div class="field"><label for="jRepoRef">分支或标签 <span class="field-code">setup.ref</span></label>
-            <input id="jRepoRef" value="main" aria-describedby="jRepoVersionHelp">
-            <div class="field-help" id="jRepoVersionHelp">仅填写 Repo 时生效。</div></div>
+            <input id="jRepoRef" value="archive/youchengsong-managed-agent-api-20260728"
+                   aria-describedby="jRepoVersionHelp">
+            <div class="field-help" id="jRepoVersionHelp">
+              AI4Sci Bench 默认使用已锁定的归档分支；其他仓库请改成它实际存在的分支或标签。仅填写 Repo 时生效。
+            </div></div>
           <div class="field"><label for="jResolvedCommit">锁定 Commit SHA <span class="field-code">setup.resolved_commit</span></label>
             <input id="jResolvedCommit" placeholder="完整 40 位 SHA（推荐）"
                    aria-describedby="jRepoVersionHelp">
@@ -871,8 +879,8 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
             <textarea id="jSetupSteps" class="textarea-compact" placeholder='[{"name":"install","command":"uv sync","env":{"UV_LINK_MODE":"copy"},"cwd":".","timeout":1200,"retries":1}]'></textarea>
             <div class="field-help">逐行命令执行完后再执行这些步骤；可分别设置 env、cwd、timeout 和 retries，始终以 Job 用户运行。</div></div>
           <div class="field field-span-full"><label for="jS3">S3 数据集 <span class="field-code">setup.s3_datasets</span></label>
-            <textarea id="jS3" class="textarea-compact" placeholder="s3://my-bucket/datasets/ /home/ubuntu/data"></textarea>
-            <div class="field-help">每行格式为 <code>s3://桶/前缀/ 目标目录</code>；worker 用实例角色直拉，不经 Manager。</div></div>
+            <textarea id="jS3" class="textarea-compact" placeholder="s3://my-bucket/shard-{{ shard_id }}.tar /home/ubuntu/data files"></textarea>
+            <div class="field-help">每行格式为 <code>s3://桶/对象 目标路径</code>；模板内可有空格，目标路径也可包含空格。worker 用实例角色直拉，不经 Manager。</div></div>
         </div>
       </details>
       <div class="form-notice field-help">路径契约：可以把命令写成与本地 <code>git clone &amp;&amp; cd repo &amp;&amp; …</code> 相同的相对路径逻辑。</div>
@@ -889,10 +897,9 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
         <div class="field"><label for="jAcctMode">账号使用方式 <span class="field-code">account.mode</span></label>
           <select id="jAcctMode" onchange="updateAccountModeUI()" aria-describedby="jAcctModeHelp">
             <option value="worker_local_login">Worker 本地登录（推荐）</option>
-            <option value="manager_distribute">Manager 下发凭据（仅 Claude）</option>
             <option value="none">不配置账号</option>
           </select>
-          <div class="field-help" id="jAcctModeHelp">Codex 仅支持 Worker 本地登录；不透明命令自带凭据时可选择“不配置账号”。</div></div>
+          <div class="field-help" id="jAcctModeHelp">账号和 Agent API Key 均在 Worker 本地准备；不透明命令自带凭据时可选择“不配置账号”。</div></div>
         <div class="field"><label for="jAcctGroup">账号组 <span class="field-code">account.group</span></label>
           <input id="jAcctGroup" value="standard">
           <div class="field-help">未指定具体账号时，Manager 从这个组中自动分配。</div></div>
@@ -913,7 +920,10 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
         <div class="field"><label for="jAcctIds">指定账号（可选） <span class="field-code">account.ids</span></label>
           <select id="jAcctIds" multiple size="4" disabled
                   aria-describedby="jAcctIdsHelp jEipHint"></select>
-          <div class="field-help" id="jAcctIdsHelp">仅固定 EIP 模式可选；Ctrl/Cmd 多选。留空则按账号组自动选择。</div></div>
+          <div class="field-help" id="jAcctIdsHelp">
+            Ctrl/Cmd 多选，所选唯一账号按列表顺序映射；留空则按账号组自动选择。
+            普通出口下，单个 Agent API Key 可自动填满全部槽；任意排序或重复映射请直接提交 JobSpec。
+          </div></div>
       </div>
       <div class="form-notice field-help" id="jEipHint" role="status" aria-live="polite">
         固定 EIP 模式下，每台临时 EC2 只使用一个账号；指定账号数必须等于 Worker 数。
@@ -1029,11 +1039,11 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
         </div>
         <div class="form-grid" style="margin-top:10px">
           <div class="field"><label for="hFile">文件名（<code>&lt;name&gt;.py</code>）</label>
-            <input id="hFile" placeholder="my_harness.py"></div>
+            <input id="hFile" maxlength="128" placeholder="my_harness.py"></div>
           <div class="field"><label for="hClass">Harness 类名</label>
-            <input id="hClass" placeholder="MyHarness"></div>
+            <input id="hClass" maxlength="128" placeholder="MyHarness"></div>
           <div class="field field-span-full"><label for="hCode">Harness Python 代码</label>
-            <textarea id="hCode" class="textarea-command"></textarea></div>
+            <textarea id="hCode" class="textarea-command" maxlength="1048576"></textarea></div>
         </div>
         <button class="btn btn-ghost" onclick="uploadHarness()">上传并写入 harness_ref</button>
         <div class="field" style="margin-top:10px"><label for="jHarnessRef">已上传 Harness 引用 <span class="field-code">harness_ref</span></label>
@@ -1117,13 +1127,47 @@ let latestJobs = [];
 let showLegacyHistory = false;
 let dashboardPollRunning = false;
 let dashboardPollTimer = null;
+let accountsRefreshInFlight = null;
+let accountsRefreshQueued = false;
+let accountsRequestVersion = 0;
+let lastAccountsRefreshAt = 0;
 const jobResultsCache = new Map();
 const jobResultsRequestVersions = new Map();
 const resultDownloadsInFlight = new Map();
+const PENDING_JOB_SUBMISSION_KEY = 'ea_pending_job_submission';
 let latestLoginAttempts = [];
 const otpCardsByKey = new Map();
 const openedOtpChallenges = new Set();
 const otpSubmitting = new Set();
+function loadPendingJobSubmission() {
+  try {
+    const value = JSON.parse(
+      sessionStorage.getItem(PENDING_JOB_SUBMISSION_KEY) || 'null'
+    );
+    return value && typeof value.spec === 'string' && typeof value.key === 'string'
+      ? value
+      : null;
+  } catch(e) {
+    sessionStorage.removeItem(PENDING_JOB_SUBMISSION_KEY);
+    return null;
+  }
+}
+function savePendingJobSubmission(value) {
+  window._pendingJobSubmission = value;
+  sessionStorage.setItem(PENDING_JOB_SUBMISSION_KEY, JSON.stringify(value));
+}
+function clearPendingJobSubmission() {
+  window._pendingJobSubmission = null;
+  sessionStorage.removeItem(PENDING_JOB_SUBMISSION_KEY);
+}
+function parsePendingJobSpec(pending) {
+  const spec = JSON.parse(pending.spec);
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new Error('保存的待重试 Job 配置已损坏；请明确丢弃后重新提交。');
+  }
+  return spec;
+}
+window._pendingJobSubmission = loadPendingJobSubmission();
 function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
 function updateThemeLabel() {
   const button = document.getElementById('themeToggle');
@@ -1247,35 +1291,44 @@ function formatAgentApiUsage(usage) {
   }
   return `<span class="muted">${esc(state || '可用')}</span>`;
 }
-async function refreshAccounts() {
+async function refreshAccountsOnce(requestVersion) {
   try {
     const d = await api('GET', '/accounts');
     const accounts = d.accounts || [];
-    let alloc = {};
-    let eipBindings = {};
-    try { alloc = (await api('GET', '/accounts/allocations')).allocations || {}; } catch(e) {}
+    let alloc = null;
+    let eipBindings = null;
+    try {
+      alloc = (await api('GET', '/accounts/allocations')).allocations || {};
+    } catch(e) {}
     try {
       const response = await api('GET', '/accounts/bindings');
+      eipBindings = {};
       (response.bindings || []).forEach(binding => {
         eipBindings[binding.account_id] = binding;
       });
     } catch(e) {}
+    if (requestVersion !== accountsRequestVersion) return;
     document.getElementById('acctRows').innerHTML = accounts.map(a => {
       const isAgentApi = a.auth_kind === 'agent_api';
       const supported = accountSupportedAgentTypes(a);
-      const b = alloc[a.id] || [];
-      const active = b.length
-        ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} `
-          + `<span class="muted">(${esc(x.job_name||x.job_id)}·`
-          + `${esc(x.phase)}${x.active?'·当前':''})</span>`).join('<br>')
-        : '<span class="muted">空闲</span>';
-      const durable = eipBindings[a.id];
+      const b = alloc === null ? null : (alloc[a.id] || []);
+      const active = b === null
+        ? '<span class="muted">占用状态暂不可用</span>'
+        : (b.length
+          ? b.map(x => `${esc((x.worker_id||'').replace('aws:',''))} `
+            + `<span class="muted">(${esc(x.job_name||x.job_id)}·`
+            + `${esc(x.phase)}${x.active?'·当前':''}`
+            + `${x.cleanup_pending?'·清理中':''})</span>`).join('<br>')
+          : '<span class="muted">空闲</span>');
+      const durable = eipBindings === null ? null : eipBindings[a.id];
       const eipValue = durable
         ? durable.eip_ip || durable.eip_allocation_id || '分配中'
         : '';
-      const eip = durable
-        ? `${esc(eipValue)} <span class="muted">(${esc(durable.state)})</span>`
-        : '<span class="muted">无 EIP</span>';
+      const eip = eipBindings === null
+        ? '<span class="muted">EIP 状态暂不可用</span>'
+        : (durable
+          ? `${esc(eipValue)} <span class="muted">(${esc(durable.state)})</span>`
+          : '<span class="muted">无 EIP</span>');
       const secrets = isAgentApi
         ? (a.has_api_key ? 'API key' : '—')
         : (`${a.has_password ? 'password' : ''}`
@@ -1292,7 +1345,9 @@ async function refreshAccounts() {
         : '<span class="muted">OAuth</span>';
       const action = isAgentApi
         ? `<button class="btn btn-ghost" style="margin:0;padding:3px 9px"
-            onclick="refreshAgentApiAccount(${jsArg(a.id)})">刷新</button>`
+            onclick="refreshAgentApiAccount(${jsArg(a.id)})">刷新</button>
+           <button class="btn btn-danger" style="margin:3px 0 0;padding:3px 9px"
+            onclick="removeAgentApiAccount(${jsArg(a.id)})">删除</button>`
         : `<button class="btn btn-danger" style="margin:0;padding:3px 9px"
             onclick="removeAccount(${jsArg(a.id)})">✕</button>`;
       return `<tr><td>${esc(a.id)}</td><td style="font-size:.72rem">${accountType}</td>
@@ -1313,10 +1368,13 @@ async function refreshAccounts() {
       option.value = a.id;
       option.dataset.agentTypes = supported.join(',');
       option.dataset.enabled = String(enabled);
-      const durable = eipBindings[a.id];
-      const eipLabel = durable
-        ? ` · EIP ${durable.eip_ip || durable.eip_allocation_id || durable.state}`
-        : '';
+      option.dataset.authKind = a.auth_kind || 'oauth';
+      const durable = eipBindings === null ? null : eipBindings[a.id];
+      const eipLabel = eipBindings === null
+        ? ' · EIP状态未知'
+        : (durable
+          ? ` · EIP ${durable.eip_ip || durable.eip_allocation_id || durable.state}`
+          : '');
       const typeLabel = isAgentApi
         ? `${agentApiProviderMeta(a.api_provider).pickerLabel} · ${supported.join('/')}`
         : supported.join('/');
@@ -1327,7 +1385,36 @@ async function refreshAccounts() {
       picker.appendChild(option);
     });
     updateEipBindingUI();
-  } catch(e) { toast(e.message, 'error'); }
+    document.getElementById('accountsRefresh').textContent =
+      alloc === null || eipBindings === null
+        ? '· 部分状态暂不可用'
+        : '· 已更新 ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    if (requestVersion !== accountsRequestVersion) return;
+    document.getElementById('accountsRefresh').textContent =
+      '· 刷新失败，保留当前快照';
+  }
+}
+async function runAccountRefreshes() {
+  try {
+    do {
+      accountsRefreshQueued = false;
+      const requestVersion = ++accountsRequestVersion;
+      lastAccountsRefreshAt = Date.now();
+      document.getElementById('accountsRefresh').textContent = '· 刷新中…';
+      await refreshAccountsOnce(requestVersion);
+    } while (accountsRefreshQueued);
+  } finally {
+    accountsRefreshInFlight = null;
+  }
+}
+function refreshAccounts(queueAfterCurrent=false) {
+  if (accountsRefreshInFlight) {
+    if (queueAfterCurrent) accountsRefreshQueued = true;
+    return accountsRefreshInFlight;
+  }
+  accountsRefreshInFlight = runAccountRefreshes();
+  return accountsRefreshInFlight;
 }
 async function addAccount() {
   const id = document.getElementById('acctId').value.trim();
@@ -1349,7 +1436,7 @@ async function addAccount() {
     document.getElementById('acctClearPassword').checked = false;
     document.getElementById('acctToken').value = '';
     document.getElementById('acctClearToken').checked = false;
-    toast('Account added'); refreshAccounts();
+    toast('Account added'); refreshAccounts(true);
   } catch(e) { toast(e.message, 'error'); }
 }
 async function addAgentApiAccount() {
@@ -1366,15 +1453,83 @@ async function addAgentApiAccount() {
     document.getElementById('apiAcctKey').value = '';
     document.getElementById('apiAcctName').value = '';
     toast(`${meta.label} API account added`);
-    await refreshAccounts();
+    await refreshAccounts(true);
   } catch(e) { toast(e.message, 'error'); }
 }
 async function refreshAgentApiAccount(id) {
   try {
     await api('POST', '/agent-api/accounts/' + encodeURIComponent(id) + '/refresh');
     toast('Agent API models and quota refreshed');
-    await refreshAccounts();
+    await refreshAccounts(true);
   } catch(e) { toast(e.message, 'error'); }
+}
+async function bindingReleaseIsVisible(accountPath) {
+  try {
+    await api('GET', accountPath + '/binding');
+    return false;
+  } catch(e) {
+    return e.status === 404;
+  }
+}
+async function removeAgentApiAccount(id) {
+  const accountPath = '/accounts/' + encodeURIComponent(id);
+  let binding = null;
+  let releasedEip = '';
+  let attemptedEip = '';
+  let identityRemoved = false;
+  try {
+    try {
+      binding = await api('GET', accountPath + '/binding');
+    } catch(e) {
+      if (e.status !== 404) throw e;
+    }
+    if (binding) {
+      const eip = binding.eip_ip || binding.eip_allocation_id || '当前绑定地址';
+      if (!window.confirm(
+        `Agent API 账号 ${id} 仍保留 EIP ${eip}。继续会永久释放该 IP 并删除 Key。`
+      )) return;
+      const confirmation = window.prompt(
+        `请输入完整账号 ID 以确认永久释放 EIP 并删除 Agent API Key：\\n${id}`
+      );
+      if (confirmation === null || confirmation.trim() !== id) {
+        toast('账号 ID 不匹配；EIP 和 Key 均未删除。', 'error');
+        return;
+      }
+      attemptedEip = eip;
+      const retired = await api('POST', accountPath + '/binding/decommission', {
+        release_eip: true,
+        confirm_account_id: id,
+        delete_identity: true,
+      });
+      releasedEip = eip;
+      identityRemoved = retired.identity_removed === true;
+    } else if (!window.confirm(
+      `删除 Agent API 账号 ${id}？Key 会从 Manager 永久移除，且无法恢复。`
+    )) return;
+    if (!identityRemoved) {
+      await api('DELETE', '/agent-api/accounts/' + encodeURIComponent(id));
+    }
+    toast(`已删除 Agent API 账号 ${id}`);
+    await refreshAccounts(true);
+  } catch(e) {
+    if (
+      binding && !releasedEip && attemptedEip
+      && await bindingReleaseIsVisible(accountPath)
+    ) {
+      releasedEip = attemptedEip;
+    }
+    if (releasedEip) {
+      toast(`EIP ${releasedEip} 已永久释放；Agent API Key 删除状态需刷新确认：`
+        + e.message, 'error');
+      await refreshAccounts(true);
+    } else if (e.status === 409) {
+      toast(`Agent API 账号 ${id} 仍有活动任务或清理流程占用，暂不能删除。`
+        + ` ${e.message}`, 'error');
+      await refreshAccounts(true);
+    } else {
+      toast(e.message, 'error');
+    }
+  }
 }
 
 function otpKey(attempt) {
@@ -1644,6 +1799,8 @@ async function removeAccount(id) {
   const accountPath = '/accounts/' + encodeURIComponent(id);
   let binding;
   let releasedEip = '';
+  let attemptedEip = '';
+  let identityRemoved = false;
   try {
     try {
       binding = await api('GET', accountPath + '/binding');
@@ -1666,32 +1823,44 @@ async function removeAccount(id) {
         toast('账号 ID 不匹配；EIP 未释放，账号未删除。', 'error');
         return;
       }
-      await api('POST', accountPath + '/binding/decommission', {
+      attemptedEip = eip;
+      const retired = await api('POST', accountPath + '/binding/decommission', {
         release_eip: true,
         confirm_account_id: id,
+        delete_identity: true,
       });
       releasedEip = eip;
+      identityRemoved = retired.identity_removed === true;
     } else if (!window.confirm(`删除账号 ${id}？`)) {
       return;
     }
 
-    await api('DELETE', accountPath);
+    if (!identityRemoved) {
+      await api('DELETE', accountPath);
+    }
     toast(releasedEip
       ? `已永久释放 EIP ${releasedEip} 并删除账号 ${id}`
       : `已删除账号 ${id}`);
-    await refreshAccounts();
+    await refreshAccounts(true);
   } catch(e) {
+    if (
+      binding && !releasedEip && attemptedEip
+      && await bindingReleaseIsVisible(accountPath)
+    ) {
+      releasedEip = attemptedEip;
+    }
     if (releasedEip) {
       if (e.status === 404) {
         toast(`已永久释放 EIP ${releasedEip}，账号已删除`);
       } else {
-        toast(`EIP ${releasedEip} 已永久释放，但账号尚未删除：${e.message}`, 'error');
+        toast(`EIP ${releasedEip} 已永久释放；账号删除状态需刷新确认：`
+          + e.message, 'error');
       }
-      await refreshAccounts();
+      await refreshAccounts(true);
     } else if (e.status === 409) {
       toast(`账号 ${id} 仍有任务或清理流程占用，当前未释放 EIP、未删除账号。`
         + ` ${e.message}`, 'error');
-      await refreshAccounts();
+      await refreshAccounts(true);
     } else {
       toast(e.message, 'error');
     }
@@ -1712,12 +1881,58 @@ async function uploadHarness() {
 
 // ---- Job submit ----
 function buildKeyValueLines(id) {
-  const env = {};
-  for (const l of lines(id)) { const i = l.indexOf('='); if (i > 0) env[l.slice(0,i)] = l.slice(i+1); }
+  const control = document.getElementById(id);
+  const label = id === 'jSecretEnv' ? '秘密环境变量' : '普通环境变量';
+  // Environment names such as "__proto__" are valid. A null-prototype map
+  // prevents JavaScript object setters from silently dropping such a key.
+  const env = Object.create(null);
+  const rawLines = control.value.split('\\n');
+  for (let lineNumber = 0; lineNumber < rawLines.length; lineNumber += 1) {
+    const line = rawLines[lineNumber].trim();
+    if (!line) continue;
+    const separator = line.indexOf('=');
+    if (separator < 1) {
+      throw new Error(`${label}第 ${lineNumber + 1} 行必须是 KEY=VALUE。`);
+    }
+    const key = line.slice(0, separator);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(
+        `${label}第 ${lineNumber + 1} 行的变量名 ${key || '(空)'} 无效。`
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(env, key)) {
+      throw new Error(`${label}中的变量 ${key} 重复定义。`);
+    }
+    env[key] = line.slice(separator + 1);
+  }
   return env;
 }
 function buildEnv() { return buildKeyValueLines('jEnv'); }
 function buildSecretEnv() { return buildKeyValueLines('jSecretEnv'); }
+function buildSelectedAccountIds(workers, perWorker, binding, accountEnabled) {
+  if (!accountEnabled) return [];
+  const selected = Array.from(
+    document.getElementById('jAcctIds').selectedOptions
+  );
+  if (!selected.length) return [];
+  const required = binding === 'eip' ? workers : workers * perWorker;
+  if (
+    binding !== 'eip'
+    && selected.length === 1
+    && selected[0].dataset.authKind === 'agent_api'
+    && required > 1
+  ) {
+    return Array(required).fill(selected[0].value);
+  }
+  if (selected.length === required) {
+    return selected.map(option => option.value);
+  }
+  const modeLabel = binding === 'eip' ? '固定 EIP' : '普通出口';
+  throw new Error(
+    `${modeLabel}模式需要 ${required} 个账号映射，当前选择 ${selected.length} 个。`
+    + ' 只有单个 Agent API Key 可以自动共享到全部 Worker 槽。'
+  );
+}
 function markEipBindingTouched() {
   eipBindingTouched = true;
   updateEipBindingUI();
@@ -1733,8 +1948,10 @@ function updateSourceUI() {
   document.getElementById('jRepoRef').disabled = !hasRepo;
   document.getElementById('jResolvedCommit').disabled = !hasRepo;
   document.getElementById('jRepoVersionHelp').textContent = hasRepo
-    ? '分支或标签会先解析；填写完整 Commit SHA 可进一步锁定精确版本。'
-    : '当前未填写 Repo，分支、标签和 Commit SHA 不会生效。';
+    ? '当前默认是 AI4Sci Bench 的归档分支；其他仓库请改成实际分支或标签。'
+      + '填写完整 Commit SHA 可进一步锁定精确版本。'
+    : '当前未填写 Repo，分支、标签和 Commit SHA 不会生效；'
+      + 'AI4Sci Bench 填写 Repo 后默认走已锁定归档分支。';
 }
 function updateCollectUI() {
   const value = parseInt(document.getElementById('jCollectInterval').value) || 0;
@@ -1783,20 +2000,22 @@ function updateAccountModeUI() {
   const hint = document.getElementById('jAccountStateHint');
   hint.textContent = accountDisabled
     ? '当前不配置 Elastic 托管账号；账号组、模型、登录目录和登录超时均不会生效。'
-    : workerLocal
-      ? 'Worker 会在任务开始前准备账号凭据：OAuth 账号本地登录，Agent API 账号配置 Key。'
-      : 'Manager 下发凭据仅支持 Claude；不会执行 Worker 浏览器本地登录。';
+    : 'Worker 会在任务开始前准备账号凭据：OAuth 账号本地登录，Agent API 账号配置 Key。';
   updateEipBindingUI();
 }
 function updateEipBindingUI() {
   const mode = document.getElementById('jAcctMode').value;
+  const accountDisabled = mode === 'none';
   const workerLocal = mode === 'worker_local_login';
   const enabled = workerLocal
     && document.getElementById('jAcctBinding').value === 'eip';
   const picker = document.getElementById('jAcctIds');
   const rotation = document.getElementById('jRot');
   const perWorker = document.getElementById('jPerWorker');
-  picker.disabled = !enabled;
+  picker.disabled = accountDisabled;
+  if (accountDisabled) {
+    Array.from(picker.options).forEach(option => { option.selected = false; });
+  }
   if (enabled) perWorker.value = '1';
   perWorker.disabled = enabled || mode === 'none';
   const restartOption = Array.from(rotation.options)
@@ -1820,13 +2039,6 @@ function updateEipBindingUI() {
 function updateAgentUI() {
   const agentType = document.getElementById('jAgentType').value;
   const picker = document.getElementById('jAcctIds');
-  const accountMode = document.getElementById('jAcctMode');
-  const distribute = Array.from(accountMode.options)
-    .find(option => option.value === 'manager_distribute');
-  if (distribute) distribute.disabled = agentType === 'codex';
-  if (agentType === 'codex' && accountMode.value === 'manager_distribute') {
-    accountMode.value = 'worker_local_login';
-  }
   updateAccountModeUI();
   Array.from(picker.options).forEach(option => {
     option.disabled = option.dataset.enabled !== 'true'
@@ -1844,6 +2056,40 @@ function parseSetupSteps() {
   const value = JSON.parse(raw);
   if (!Array.isArray(value)) throw new Error('Structured setup steps 必须是 JSON array');
   return value;
+}
+function parseS3DatasetLine(line) {
+  let inTemplate = false;
+  let separator = -1;
+  for (let index = 0; index < line.length; index += 1) {
+    if (!inTemplate && line.startsWith('{{', index)) {
+      inTemplate = true;
+      index += 1;
+      continue;
+    }
+    if (inTemplate && line.startsWith('}}', index)) {
+      inTemplate = false;
+      index += 1;
+      continue;
+    }
+    if (!inTemplate && /\\s/.test(line[index])) {
+      separator = index;
+      break;
+    }
+  }
+  if (inTemplate || separator < 0) {
+    throw new Error('S3 数据集每行必须包含完整 URI 和目标路径。');
+  }
+  const uri = line.slice(0, separator).trim();
+  let index = separator;
+  while (index < line.length && /\\s/.test(line[index])) index += 1;
+  const dest = line.slice(index).trim();
+  if (!uri.startsWith('s3://') || !dest) {
+    throw new Error('S3 数据集每行必须是“s3://桶/路径 目标路径”。');
+  }
+  return {uri, dest};
+}
+function parseS3Datasets() {
+  return lines('jS3').map(parseS3DatasetLine);
 }
 function validateJobForm() {
   const run = document.getElementById('jRun');
@@ -1869,15 +2115,21 @@ function validateJobForm() {
       : ''
   );
   const s3 = document.getElementById('jS3');
-  const invalidDataset = lines('jS3').find(line => {
-    const parts = line.split(/ +/);
-    return !parts[0].startsWith('s3://') || !parts[1];
-  });
-  s3.setCustomValidity(
-    invalidDataset
-      ? 'S3 数据集每行必须是“s3://桶/路径 目标目录”。'
-      : ''
-  );
+  s3.setCustomValidity('');
+  try {
+    parseS3Datasets();
+  } catch(error) {
+    s3.setCustomValidity(error.message);
+  }
+  for (const id of ['jEnv', 'jSecretEnv']) {
+    const control = document.getElementById(id);
+    control.setCustomValidity('');
+    try {
+      buildKeyValueLines(id);
+    } catch(error) {
+      control.setCustomValidity(error.message);
+    }
+  }
   const controls = document.querySelectorAll(
     '#jobSubmissionCard input, #jobSubmissionCard select, #jobSubmissionCard textarea'
   );
@@ -1900,12 +2152,12 @@ function buildJobSpec() {
   const accountBinding = accountMode === 'worker_local_login'
     ? document.getElementById('jAcctBinding').value
     : 'none';
-  const accountIds = accountBinding === 'eip'
-    ? Array.from(document.getElementById('jAcctIds').selectedOptions).map(o => o.value)
-    : [];
-  if (accountBinding === 'eip' && accountIds.length && accountIds.length !== workers) {
-    throw new Error(`EIP 绑定模式下，选中账号数必须等于 Workers（当前 ${accountIds.length}/${workers}）`);
-  }
+  const perWorker = accountEnabled
+    ? parseInt(document.getElementById('jPerWorker').value) || 1
+    : 1;
+  const accountIds = buildSelectedAccountIds(
+    workers, perWorker, accountBinding, accountEnabled
+  );
   const repo = document.getElementById('jRepo').value.trim() || null;
   const setup = {
     repo: repo,
@@ -1913,8 +2165,7 @@ function buildJobSpec() {
     commands: lines('jSetup'), steps: parseSetupSteps(),
     deliver: document.getElementById('jDeliver').value,
     needs_docker: document.getElementById('jNeedsDocker').value === 'true',
-    s3_datasets: lines('jS3').map(function(l){var p=l.trim().split(/ +/); return {uri:p[0], dest:p[1]||''};})
-                  .filter(function(d){return d.uri && d.dest;})
+    s3_datasets: parseS3Datasets()
   };
   if (repo) {
     setup.ref = document.getElementById('jRepoRef').value.trim();
@@ -1940,9 +2191,7 @@ function buildJobSpec() {
               group: accountEnabled
                 ? document.getElementById('jAcctGroup').value.trim() || 'standard'
                 : 'standard',
-              per_worker: accountEnabled
-                ? parseInt(document.getElementById('jPerWorker').value) || 1
-                : 1,
+              per_worker: perWorker,
               config_dir: accountEnabled
                 ? document.getElementById('jConfigDir').value.trim()
                 : '',
@@ -1993,31 +2242,77 @@ async function previewJob() {
 }
 async function submitJob() {
   const btn = document.getElementById('jSubmitBtn');
-  if (!validateJobForm()) {
-    toast('请先修正标出的 Job 配置。', 'error');
-    return;
-  }
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
   try {
-    await providerDefaultsReady;
-    const spec = buildJobSpec();
-    // Pure preflight first: no spec journal, account claim or EC2 is created
-    // until this succeeds. The backend repeats the same check at submit time.
-    const plan = await api('POST', '/jobs/plan', spec);
-    showJobPlan(plan);
-    const serialized = JSON.stringify(spec);
-    if (!window._pendingJobSubmission || window._pendingJobSubmission.spec !== serialized) {
-      window._pendingJobSubmission = {
-        spec: serialized,
+    let pending = window._pendingJobSubmission || loadPendingJobSubmission();
+    let currentSpec = null;
+    let currentSerialized = null;
+    // Build opportunistically only to compare with a refresh-surviving
+    // pending submission. Invalid/default form state must not prevent recovery
+    // of the exact historical spec and idempotency key.
+    try {
+      currentSpec = buildJobSpec();
+      currentSerialized = JSON.stringify(currentSpec);
+    } catch(e) {}
+    let retryPending = false;
+    let spec;
+    if (pending && pending.spec === currentSerialized) {
+      spec = parsePendingJobSpec(pending);
+      retryPending = true;
+    } else if (pending) {
+      const retryOriginal = window.confirm(
+        '检测到上次提交可能已被服务器接受，但响应在返回前中断。\\n\\n' +
+        '点击“确定”将使用原始配置和原 Idempotency-Key 安全重试（推荐）；' +
+        '点击“取消”可选择丢弃该待重试记录。'
+      );
+      if (retryOriginal) {
+        spec = parsePendingJobSpec(pending);
+        retryPending = true;
+      } else {
+        const discardPending = window.confirm(
+          '确认丢弃上次待重试记录，并按当前表单创建一个全新的 Job？\\n' +
+          '丢弃记录不会取消服务器上可能已经创建的原 Job。'
+        );
+        if (!discardPending) {
+          toast('已保留原始待重试记录，未提交新 Job。');
+          return;
+        }
+        clearPendingJobSubmission();
+        pending = null;
+      }
+    }
+    if (!retryPending) {
+      // Provider discovery may apply defaults (for example AWS EIP binding),
+      // so freeze a new JobSpec only after that initialization completes.
+      await providerDefaultsReady;
+      if (!validateJobForm()) {
+        toast('请先修正标出的 Job 配置。', 'error');
+        return;
+      }
+      spec = buildJobSpec();
+      currentSerialized = JSON.stringify(spec);
+    }
+    if (retryPending) {
+      // A response may have been lost after the backend accepted this key.
+      // Retry the exact submission directly: current capacity/account policy
+      // and provider-default discovery must not block the backend's historical
+      // idempotent lookup.
+      window._pendingJobSubmission = pending;
+    } else {
+      // A new spec still gets a pure preflight before the key is persisted.
+      const plan = await api('POST', '/jobs/plan', spec);
+      showJobPlan(plan);
+      savePendingJobSubmission({
+        spec: currentSerialized,
         key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random())
-      };
+      });
     }
     const j = await api('POST', '/jobs', spec, {
       'Idempotency-Key': window._pendingJobSubmission.key
     });
-    window._pendingJobSubmission = null;
-    toast('Launched ' + j.job_id); refreshJobs(); }
+    clearPendingJobSubmission();
+    toast('Launched ' + j.job_id); refreshJobs(); refreshAccounts(true); }
   catch(e) { toast(e.message, 'error'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
@@ -2271,7 +2566,8 @@ async function cancelJob(jobId) {
   if (!window.confirm('取消 Job ' + jobId + '？将收集已有结果并销毁全部 Worker。')) return;
   try {
     await api('POST', '/jobs/' + encodeURIComponent(jobId) + '/cancel');
-    toast('Job 已取消并进入清理：' + jobId); refreshJobs();
+    toast('Job 已取消并进入清理：' + jobId);
+    refreshJobs(); refreshAccounts(true);
   } catch(e) { toast(e.message, 'error'); }
 }
 // Run async `fn` over items with at most `limit` in flight; never throws.
@@ -2592,11 +2888,12 @@ function commitJobResult(job, value, requestVersion) {
   const knownFileCount = resultFileCount(previous.value);
   const incomingFileCount = resultFileCount(value);
   const preserveKnown = knownFileCount > 0 && incomingFileCount <= 0;
-  let nextCheck = nextResultCheck(job, incomingFileCount, previous);
-  if (preserveKnown && job.done) nextCheck = Number.POSITIVE_INFINITY;
   jobResultsCache.set(jobId, {
     value: preserveKnown ? previous.value : value,
-    nextCheck,
+    // A terminal empty response may be a final-collect visibility gap. Keep
+    // the known intermediate snapshot downloadable, but continue bounded
+    // polling until one successful non-empty terminal read can be frozen.
+    nextCheck: nextResultCheck(job, incomingFileCount, previous),
     misses: incomingFileCount > 0 ? 0 : Number(previous.misses || 0) + 1,
     loading: false,
     error: null,
@@ -2608,12 +2905,11 @@ function commitJobResultError(job, error, requestVersion) {
   const jobId = String(job.job_id);
   if (requestVersion !== jobResultsRequestVersions.get(jobId)) return false;
   const previous = jobResultsCache.get(jobId) || {};
-  const knownFileCount = resultFileCount(previous.value);
   jobResultsCache.set(jobId, {
     ...previous,
-    nextCheck: knownFileCount > 0 && job.done
-      ? Number.POSITIVE_INFINITY
-      : nextResultCheck(job, 0, previous),
+    // Never let one terminal 404/5xx freeze an older intermediate snapshot.
+    // Preserve its value while retrying with the same bounded backoff.
+    nextCheck: nextResultCheck(job, 0, previous),
     misses: Number(previous.misses || 0) + 1,
     loading: false,
     error: error.message || String(error),
@@ -2920,7 +3216,11 @@ async function runDashboardPoll() {
   if (document.hidden) { scheduleDashboardPoll(5_000); return; }
   dashboardPollRunning = true;
   try {
-    await Promise.allSettled([refreshJobs(), refreshLoginAttempts()]);
+    const refreshes = [refreshJobs(), refreshLoginAttempts()];
+    if (Date.now() - lastAccountsRefreshAt >= 15_000) {
+      refreshes.push(refreshAccounts());
+    }
+    await Promise.allSettled(refreshes);
   } finally {
     dashboardPollRunning = false;
     scheduleDashboardPoll(5_000);

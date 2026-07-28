@@ -180,6 +180,239 @@ class TestAccountAllocator:
         await alloc.release_worker("w1")
         assert (await alloc.allocate("w2", "standard")).id == "a1"
 
+    async def test_unbound_agent_api_claims_are_reference_counted(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+
+        first = await alloc.allocate(
+            "job-1:w1", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+        second = await alloc.allocate(
+            "job-2:w2", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+
+        assert first.id == second.id == account.id
+        await alloc.release_worker("job-1:w1")
+        with pytest.raises(AccountClaimConflictError, match="actively claimed"):
+            async with alloc.mutation_guard(account.id):
+                pass
+
+        await alloc.release_worker("job-2:w2")
+        async with alloc.mutation_guard(account.id):
+            pass
+
+    async def test_automatic_unbound_workers_share_only_api_key(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+
+        first = await alloc.allocate(
+            "w1", "standard", agent_type="codex"
+        )
+        second = await alloc.allocate(
+            "w2", "standard", agent_type="codex"
+        )
+
+        assert first.id == second.id == account.id
+
+    async def test_automatic_slots_stay_distinct_but_explicit_can_repeat(
+        self, tmp_path,
+    ):
+        accounts = [_api_acct(), _apex_api_acct()]
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _MultiAgentApiStore(accounts),
+        )
+
+        first = await alloc.allocate(
+            "same-worker", "standard", agent_type="codex"
+        )
+        second = await alloc.allocate(
+            "same-worker", "standard", agent_type="codex"
+        )
+        repeated = await alloc.allocate(
+            "same-worker", "standard", account_id=first.id,
+            agent_type="codex",
+        )
+
+        assert {first.id, second.id} == {account.id for account in accounts}
+        assert repeated.id == first.id
+
+    async def test_bound_style_agent_api_reserve_remains_exclusive(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+
+        first = await alloc.reserve(
+            "job-1:0", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+        second = await alloc.reserve(
+            "job-2:0", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+
+        assert first is not None
+        assert second is None
+
+    async def test_durably_bound_api_is_excluded_from_unbound_allocator(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+
+        async def bindings():
+            return [SimpleNamespace(account_id=account.id)]
+
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+            durable_binding_loader=bindings,
+        )
+
+        assert await alloc.allocate(
+            "worker-unbound",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+        ) is None
+        bound = await alloc.reserve(
+            "job-bound:0",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+            allow_durable_binding=True,
+        )
+
+        assert bound is not None
+        assert bound.account.id == account.id
+        assert bound.shareable is False
+
+    async def test_allocator_rechecks_binding_after_concurrent_decommission(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        binding_exists = True
+        snapshot_taken = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        loader_calls = 0
+
+        async def bindings():
+            nonlocal loader_calls
+            loader_calls += 1
+            snapshot = binding_exists
+            if loader_calls == 1:
+                snapshot_taken.set()
+                await release_snapshot.wait()
+            return (
+                [SimpleNamespace(account_id=account.id)]
+                if snapshot
+                else []
+            )
+
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+            durable_binding_loader=bindings,
+        )
+        allocation = asyncio.create_task(alloc.allocate(
+            "worker-after-decommission",
+            "standard",
+            account_id=account.id,
+            agent_type="codex",
+        ))
+        await snapshot_taken.wait()
+        async with alloc.mutation_guard(account.id):
+            binding_exists = False
+        release_snapshot.set()
+
+        selected = await allocation
+
+        assert selected is not None
+        assert selected.id == account.id
+        assert loader_calls == 2
+
+    async def test_bound_agent_api_claim_rejects_later_unbound_sharing(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+
+        bound = await alloc.reserve(
+            "job-bound:0", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+        unbound = await alloc.allocate(
+            "worker-unbound", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+
+        assert bound is not None
+        assert unbound is None
+
+    async def test_unbound_agent_api_claim_rejects_later_bound_reserve(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+
+        unbound = await alloc.allocate(
+            "worker-unbound", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+        bound = await alloc.reserve(
+            "job-bound:0", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+
+        assert unbound is not None
+        assert bound is None
+
+    async def test_releasing_one_shared_api_claim_keeps_all_other_refs(
+        self, tmp_path,
+    ):
+        account = _api_acct()
+        alloc = AccountAllocator(
+            await _store(tmp_path, []),
+            _FakeAgentApiStore(account),
+        )
+        claims = [
+            await alloc.reserve(
+                f"worker-{index}", "standard", account_id=account.id,
+                agent_type="codex", allow_shared_agent_api=True,
+            )
+            for index in range(3)
+        ]
+
+        await alloc.release_claim(claims[1].claim_id)
+
+        assert await alloc.get_claim(claims[0].claim_id) is claims[0]
+        assert await alloc.get_claim(claims[1].claim_id) is None
+        assert await alloc.get_claim(claims[2].claim_id) is claims[2]
+        with pytest.raises(AccountClaimConflictError, match="actively claimed"):
+            async with alloc.mutation_guard(account.id):
+                pass
+
     async def test_quarantine_survives_claim_release_until_explicit_clear(
         self, tmp_path,
     ):
@@ -370,6 +603,93 @@ class TestLoginCoordinator:
         outcome = await task
         assert not outcome.success
         assert outcome.error == "boom"
+
+    @pytest.mark.parametrize(
+        ("quarantine_enabled", "expected_quarantine"),
+        [(True, ["a1"]), (False, [])],
+    )
+    async def test_uncertain_result_quarantines_only_reusable_worker(
+        self,
+        quarantine_enabled,
+        expected_quarantine,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        quarantined = []
+        coord = LoginCoordinator(
+            conn,
+            bus,
+            timeout=5,
+            quarantine_account=lambda account_id: (
+                quarantined.append(account_id) or asyncio.sleep(0)
+            ),
+        )
+        task = asyncio.create_task(coord.login(
+            "w1",
+            _acct(1),
+            "/root/.claude",
+            # An EIP caller passes False because destroying its instance is the
+            # isolation boundary; a reusable ordinary worker passes True.
+            quarantine_on_uncertain_cleanup=quarantine_enabled,
+        ))
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", {
+            "login_request_id": request.login_request_id,
+            "account_id": "a1",
+            "success": False,
+            "error": "account login cleanup could not be verified",
+            "cleanup_complete": False,
+        })
+
+        outcome = await task
+
+        assert outcome.success is False
+        assert quarantined == expected_quarantine
+
+    @pytest.mark.parametrize(
+        ("success", "cleanup_complete", "expected_quarantine"),
+        [
+            (False, None, ["a1"]),  # legacy failed result: no proof
+            (False, True, []),      # failed, verified rollback
+            (True, None, []),       # success intentionally commits credentials
+        ],
+    )
+    async def test_legacy_result_cleanup_compatibility_is_fail_closed(
+        self,
+        success,
+        cleanup_complete,
+        expected_quarantine,
+    ):
+        bus = EventBus()
+        conn = FakeConn()
+        quarantined = []
+        coord = LoginCoordinator(
+            conn,
+            bus,
+            timeout=5,
+            quarantine_account=lambda account_id: (
+                quarantined.append(account_id) or asyncio.sleep(0)
+            ),
+        )
+        task = asyncio.create_task(
+            coord.login("w1", _acct(1), "/root/.claude")
+        )
+        await asyncio.sleep(0)
+        request = conn.sent[0][1]
+        result = {
+            "login_request_id": request.login_request_id,
+            "account_id": "a1",
+            "success": success,
+        }
+        if cleanup_complete is not None:
+            result["cleanup_complete"] = cleanup_complete
+
+        await bus.emit("ACCOUNT_LOGIN_RESULT", "w1", result)
+        outcome = await task
+
+        assert outcome.success is success
+        assert quarantined == expected_quarantine
 
     async def test_codex_password_and_agent_type_are_sent_to_worker(self):
         bus = EventBus()
@@ -1040,6 +1360,29 @@ class _FakeAgentApiStore:
 
     async def mark_runtime_quota_unavailable(self, account_id, reason):
         self.runtime_quota_marks.append((account_id, reason))
+
+
+class _MultiAgentApiStore:
+    def __init__(self, accounts):
+        self.accounts = list(accounts)
+
+    async def list(self):
+        return list(self.accounts)
+
+    async def fetch_usage(self, account_id, force=False):
+        return {
+            "account_id": account_id,
+            "known": True,
+            "available": True,
+            "reason": "active",
+        }
+
+    def availability_decision(self, account_id):
+        return {
+            "known": True,
+            "available": True,
+            "reason": "active",
+        }
 
 
 def _api_acct():
@@ -2294,6 +2637,95 @@ class TestProvisionHook:
         )
         assert all("aws s3 sync" not in command for command in commands)
 
+    async def test_templated_dataset_without_worker_context_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        commands = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None, **kwargs):
+                commands.append(command)
+                return 0, "", ""
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            fanout={"workers": 2, "shard_by": "shard_index"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/shard-{{shard_id}}.jsonl",
+                    "dest": "/srv/replay/shard-{{shard_id}}.jsonl",
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("missing-worker", None, spec) is False
+        assert not any(command.startswith("aws s3 ") for command in commands)
+
+    async def test_single_dataset_quotes_parent_directory_as_one_argument(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec, WorkerContext
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        mgr._batch = SimpleNamespace(
+            worker_context_for=lambda _worker_id: WorkerContext(
+                shard_index=0,
+                num_shards=1,
+            ),
+        )
+        commands = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None, **kwargs):
+                commands.append(command)
+                return 0, "", ""
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/shard.jsonl",
+                    "dest": "/srv/replay/shard data/input.jsonl",
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("w1", None, spec) is True
+        copy = next(command for command in commands if "aws s3 cp" in command)
+        assert "mkdir -p '/srv/replay/shard data'" in copy
+        assert "$(dirname " not in copy
+
     async def test_bootstrap_failure(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
         mgr = FakeManager(tmp_path, await _store(tmp_path, []))
@@ -2560,6 +2992,46 @@ class TestProvisionHook:
 
 
 class TestWireBatchRouting:
+    async def test_runtime_tombstone_failure_does_not_block_lifecycle(
+        self, tmp_path,
+    ):
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []))
+        api_store = _FakeAgentApiStore(_api_acct())
+        api_store.mark_runtime_unavailable = AsyncMock(
+            side_effect=OSError("disk full")
+        )
+        mgr.agent_api_store = api_store
+        orch = wire_batch(mgr)
+        orch._worker_index["w1"] = "job-1"
+        orch.runtime_account_for_task = lambda *_args, **_kwargs: (
+            "cloudrouter-1", "agent_api"
+        )
+        exhausted = []
+        exits = []
+        orch.defer_exhausted = lambda worker_id, **kwargs: (
+            exhausted.append((worker_id, kwargs["task_id"])) or True
+        )
+        orch.begin_exit_archive = lambda *_args, **_kwargs: False
+
+        async def handle_exit(worker_id, exit_code, task_id=None):
+            exits.append((worker_id, exit_code, task_id))
+
+        orch.handle_exit = handle_exit
+
+        await mgr.event_bus.emit("RUN_EXHAUSTED", "w1", {
+            "task_id": "task-a",
+            "reason": "agent_api_auth_failure",
+        })
+        await mgr.event_bus.emit("PROCESS_EXIT", "w1", {
+            "task_id": "task-a",
+            "exit_code": 1,
+            "error_type": "agent_api_auth_failure",
+        })
+
+        assert exhausted == [("w1", "task-a")]
+        assert exits == [("w1", 1, "task-a")]
+        assert await orch._allocator.is_quarantined("cloudrouter-1") is True
+
     async def test_runtime_api_feedback_is_bound_to_exact_dispatch(
         self, tmp_path,
     ):

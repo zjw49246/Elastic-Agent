@@ -3,9 +3,10 @@
 Turns the ManagerFleetDriver's injected hooks into real behavior so ``/batch``
 can actually stand a fleet up:
 
-- **AccountAllocator**: hands each worker a distinct account identity from the
-  AccountStore, retires exhausted accounts on rotation so they are never
-  re-picked. Mode-B rotation is driven by stdout banners (not the quota API), so
+- **AccountAllocator**: gives OAuth/EIP identities exclusive claims while
+  unbound Agent API keys use reference-counted claims across workers. Automatic
+  multi-slot allocation on one worker still picks distinct identities for
+  rotation. Mode-B rotation is driven by stdout banners (not the quota API), so
   a simple in-memory allocator is sufficient — no CredentialPool needed.
 - **LoginCoordinator**: sends ACCOUNT_LOGIN and awaits the matching
   ACCOUNT_LOGIN_RESULT over the event bus. Credentials are minted on the worker.
@@ -26,7 +27,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
@@ -72,6 +73,11 @@ class AccountClaim:
     claim_id: str
     owner: str
     account: Any
+    # Only Agent API identities without a durable EIP binding are shareable.
+    # This property belongs to the immutable claim, not merely to a later
+    # requester: an unbound allocation must never join a key already held by an
+    # exclusive EIP lease.
+    shareable: bool = False
 
 
 class AccountClaimConflictError(RuntimeError):
@@ -85,16 +91,41 @@ class AccountAllocator:
         agent_api_store=None,
         *,
         agent_api_admission: Callable[[], bool] | None = None,
+        durable_binding_loader: (
+            Callable[[], Awaitable[list[Any]]] | None
+        ) = None,
     ) -> None:
         self._store = account_store
         self._agent_api_store = agent_api_store
         self._agent_api_admission = agent_api_admission or (lambda: True)
+        self._durable_binding_loader = durable_binding_loader
         self._claims: dict[str, AccountClaim] = {}
-        self._claim_by_account: dict[str, str] = {}
+        # OAuth identities and every EIP-bound identity remain exclusive. An
+        # unbound Agent API key is intentionally shareable, so retain every
+        # exact claim instead of collapsing account ownership to one handle.
+        self._claim_by_account: dict[str, set[str]] = {}
         self._by_owner: dict[str, set[str]] = {}
         self._quarantined_account_ids: set[str] = set()
         self._account_mutations: dict[str, asyncio.Event] = {}
+        self._mutation_generation = 0
         self._lock = asyncio.Lock()
+
+    async def _durably_bound_account_ids(self) -> set[str]:
+        """Snapshot identities reserved for the persistent-EIP path.
+
+        Every persisted binding state is fail-closed here, including ERROR or
+        DECOMMISSIONING: only a completed decommission removes the durable
+        identity record and makes the account eligible for an unbound Worker.
+        """
+
+        if self._durable_binding_loader is None:
+            return set()
+        bindings = await self._durable_binding_loader()
+        return {
+            str(getattr(binding, "account_id", ""))
+            for binding in bindings
+            if str(getattr(binding, "account_id", ""))
+        }
 
     async def _accounts(
         self,
@@ -214,9 +245,9 @@ class AccountAllocator:
         """
 
         async with self._lock:
-            claim_id = self._claim_by_account.get(account_id)
-            if claim_id:
-                claim = self._claims[claim_id]
+            claim_ids = self._claim_by_account.get(account_id)
+            if claim_ids:
+                claim = self._claims[min(claim_ids)]
                 raise AccountClaimConflictError(
                     f"account {account_id!r} is actively claimed by {claim.owner!r}"
                 )
@@ -234,6 +265,7 @@ class AccountAllocator:
                     current = self._account_mutations.get(account_id)
                     if current is completed:
                         self._account_mutations.pop(account_id, None)
+                        self._mutation_generation += 1
                         completed.set()
 
             # A caller can be cancelled repeatedly while this finally block is
@@ -248,6 +280,8 @@ class AccountAllocator:
         self, owner: str, group: str, *, account_id: str = "",
         claim_id: str = "", excluded_account_ids: set[str] | None = None,
         agent_type: str = "claude", model: str = "",
+        allow_shared_agent_api: bool = False,
+        allow_durable_binding: bool = False,
     ) -> AccountClaim | None:
         """Atomically claim an explicit account, or the next account in group.
 
@@ -262,6 +296,24 @@ class AccountAllocator:
         # responsive during a slow CloudRouter usage call.  Re-read all local
         # account state under the lock before committing a claim.
         while True:
+            async with self._lock:
+                mutation_generation = self._mutation_generation
+            durably_bound_account_ids = (
+                set()
+                if allow_durable_binding
+                else await self._durably_bound_account_ids()
+            )
+            if account_id and account_id in durably_bound_account_ids:
+                async with self._lock:
+                    if mutation_generation != self._mutation_generation:
+                        continue
+                    wait_for_binding_mutation = self._account_mutations.get(
+                        account_id
+                    )
+                if wait_for_binding_mutation is not None:
+                    await wait_for_binding_mutation.wait()
+                    continue
+                return None
             explicit_native = False
             if account_id:
                 explicit_native = any(
@@ -288,6 +340,11 @@ class AccountAllocator:
             }
             wait_for_mutation: asyncio.Event | None = None
             async with self._lock:
+                if mutation_generation != self._mutation_generation:
+                    # A binding/identity mutation completed after the durable
+                    # binding snapshot. Re-read rather than committing against
+                    # stale ownership state.
+                    continue
                 accounts = await self._accounts(
                     refresh_agent_api_usage=False,
                 )
@@ -315,14 +372,42 @@ class AccountAllocator:
                     ]
 
                 excluded = excluded_account_ids or set()
+                def is_claimable(candidate: Any) -> bool:
+                    if (
+                        candidate.id in self._quarantined_account_ids
+                        or candidate.id in excluded
+                        or candidate.id in self._account_mutations
+                        or candidate.id in durably_bound_account_ids
+                    ):
+                        return False
+                    active_claim_ids = self._claim_by_account.get(
+                        candidate.id, set()
+                    )
+                    if not active_claim_ids:
+                        return True
+                    if not (
+                        allow_shared_agent_api
+                        and getattr(
+                            candidate, "auth_kind", "oauth"
+                        ) == "agent_api"
+                    ):
+                        return False
+                    if any(
+                        not self._claims[active_claim_id].shareable
+                        for active_claim_id in active_claim_ids
+                    ):
+                        return False
+                    # Automatic per-worker multi-slot allocation still selects
+                    # distinct accounts for rotation. Repeated explicit IDs
+                    # deliberately opt the same Worker into the shared key.
+                    return bool(account_id) or all(
+                        self._claims[active_claim_id].owner != owner
+                        for active_claim_id in active_claim_ids
+                    )
+
                 account = next(
-                    (
-                        a for a in candidates
-                        if a.id not in self._claim_by_account
-                        and a.id not in self._quarantined_account_ids
-                        and a.id not in excluded
-                        and a.id not in self._account_mutations
-                    ),
+                    (candidate for candidate in candidates
+                     if is_claimable(candidate)),
                     None,
                 )
                 if account is not None:
@@ -333,9 +418,17 @@ class AccountAllocator:
                         claim_id=cid,
                         owner=owner,
                         account=account,
+                        shareable=(
+                            allow_shared_agent_api
+                            and getattr(
+                                account, "auth_kind", "oauth"
+                            ) == "agent_api"
+                        ),
                     )
                     self._claims[cid] = claim
-                    self._claim_by_account[account.id] = cid
+                    self._claim_by_account.setdefault(account.id, set()).add(
+                        cid
+                    )
                     self._by_owner.setdefault(owner, set()).add(cid)
                     return claim
                 wait_for_mutation = next(
@@ -364,10 +457,11 @@ class AccountAllocator:
     ) -> Any | None:
         """Backward-compatible worker allocation used by unbound jobs.
 
-        Each call returns a different account (so per_worker > 1 gets several) and
-        the account stays assigned to the worker for the job's lifetime — an
-        exhausted account is never re-picked because it remains assigned. Freed in
-        bulk by :meth:`release_worker`.
+        Automatic calls for the same worker return different accounts (so
+        ``per_worker > 1`` gets rotation slots). An unbound Agent API key may
+        simultaneously be claimed by other workers/jobs, or repeated
+        explicitly only when the identity has no durable EIP binding. OAuth
+        remains exclusive. Freed in bulk by :meth:`release_worker`.
         """
         claim = await self.reserve(
             worker_id,
@@ -375,6 +469,7 @@ class AccountAllocator:
             account_id=account_id,
             agent_type=agent_type,
             model=model,
+            allow_shared_agent_api=True,
         )
         return claim.account if claim else None
 
@@ -412,7 +507,11 @@ class AccountAllocator:
                     f"{expected_account_id!r}"
                 )
             self._claims.pop(claim_id)
-            self._claim_by_account.pop(claim.account.id, None)
+            account_claims = self._claim_by_account.get(claim.account.id)
+            if account_claims is not None:
+                account_claims.discard(claim_id)
+                if not account_claims:
+                    self._claim_by_account.pop(claim.account.id, None)
             owner_claims = self._by_owner.get(claim.owner)
             if owner_claims is not None:
                 owner_claims.discard(claim_id)
@@ -432,7 +531,13 @@ class AccountAllocator:
             ]
             for claim_id in matching:
                 claim = self._claims.pop(claim_id)
-                self._claim_by_account.pop(claim.account.id, None)
+                account_claims = self._claim_by_account.get(
+                    claim.account.id
+                )
+                if account_claims is not None:
+                    account_claims.discard(claim_id)
+                    if not account_claims:
+                        self._claim_by_account.pop(claim.account.id, None)
                 owner_claims.discard(claim_id)
             if not owner_claims:
                 self._by_owner.pop(owner, None)
@@ -443,7 +548,15 @@ class AccountAllocator:
             for claim_id in claim_ids:
                 claim = self._claims.pop(claim_id, None)
                 if claim is not None:
-                    self._claim_by_account.pop(claim.account.id, None)
+                    account_claims = self._claim_by_account.get(
+                        claim.account.id
+                    )
+                    if account_claims is not None:
+                        account_claims.discard(claim_id)
+                        if not account_claims:
+                            self._claim_by_account.pop(
+                                claim.account.id, None
+                            )
 
     async def release_worker(self, worker_id: str) -> None:
         """Free all of a worker's accounts (e.g. on scale-in)."""
@@ -834,11 +947,19 @@ class LoginCoordinator:
             self._cancel_acks.pop(key, None)
             self._otp_challenges.pop(request_id, None)
 
-        if data.get("cleanup_complete") is False:
+        # A failed result from an older Worker has no cleanup field.  Absence
+        # cannot prove that credentials/processes were rolled back, so reuse is
+        # safe only when failure carries an explicit ``True``.  A successful
+        # login intentionally commits credentials and therefore needs no
+        # cleanup assertion (new Workers send ``None``).
+        if (
+            not bool(data.get("success"))
+            and data.get("cleanup_complete") is not True
+        ):
             await self._quarantine_if_uncertain(
                 account.id,
                 enabled=quarantine_on_uncertain_cleanup,
-                reason="worker_disconnect",
+                reason="worker_result_cleanup_uncertain",
             )
 
         return LoginOutcome(
@@ -1411,15 +1532,6 @@ def make_provision_hook(
         # Manager. (GitHub code delivery is unchanged — still manager_rsync.)
         if spec.setup.s3_datasets:
             from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
-            ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
-            rc, _o, _e = await ex.execute(
-                "command -v aws >/dev/null 2>&1 || "
-                "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli)",
-                timeout=600,
-            )
-            if rc != 0:
-                logger.error("awscli install failed on %s: %s", worker_id, _e[:200])
-                return False
             batch = getattr(manager, "_batch", None)
             worker_ctx = (
                 batch.worker_context_for(worker_id)
@@ -1428,15 +1540,48 @@ def make_provision_hook(
                 else None
             )
             if worker_ctx is None:
+                has_templates = any(
+                    "{{" in value
+                    for dataset in spec.setup.s3_datasets
+                    for value in (dataset.uri, dataset.dest)
+                )
+                if spec.fanout.workers > 1 or has_templates:
+                    logger.error(
+                        "s3 dataset worker context is unavailable for %s; "
+                        "refusing shard-0 fallback",
+                        worker_id,
+                    )
+                    return False
                 worker_ctx = spec.worker_contexts()[0]
-            for ds in spec.render_s3_datasets(worker_ctx):
+            try:
+                rendered_datasets = spec.render_s3_datasets(worker_ctx)
+            except (KeyError, ValueError):
+                logger.exception(
+                    "s3 dataset rendering failed closed for %s", worker_id
+                )
+                return False
+            ex = SSHExecutor(
+                host, user=ssh_user, key_path=ssh_key, use_sudo=False
+            )
+            rc, _o, _e = await ex.execute(
+                "command -v aws >/dev/null 2>&1 || "
+                "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli)",
+                timeout=600,
+            )
+            if rc != 0:
+                logger.error(
+                    "awscli install failed on %s: %s", worker_id, _e[:200]
+                )
+                return False
+            for ds in rendered_datasets:
                 uri = ds.uri.strip()
                 # trailing '/' → prefix (recursive sync); otherwise a single object.
                 if uri.endswith("/"):
                     cmd = (f"mkdir -p {_shell_quote(ds.dest)} && "
                            f"aws s3 sync {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
                 else:
-                    cmd = (f"mkdir -p $(dirname {_shell_quote(ds.dest)}) && "
+                    parent = str(PurePosixPath(ds.dest).parent)
+                    cmd = (f"mkdir -p {_shell_quote(parent)} && "
                            f"aws s3 cp {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
                 rc, _o, _e = await ex.execute(cmd, timeout=3600)
                 if rc != 0:
@@ -1609,6 +1754,7 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 excluded_account_ids=attempted,
                 agent_type=spec.account.agent_type,
                 model=spec.account.model,
+                allow_durable_binding=True,
             )
             if claim is None:
                 selector = f"account '{account_id}'" if account_id else (
@@ -1947,6 +2093,11 @@ def wire_batch(
             agent_api_admission=lambda: getattr(
                 manager, "binding_recovery_ready", True
             ),
+            durable_binding_loader=(
+                manager.binding_manager.list_bindings
+                if getattr(manager, "binding_manager", None) is not None
+                else None
+            ),
         )
     coordinator = LoginCoordinator(
         manager.connection_manager,
@@ -2004,16 +2155,36 @@ def wire_batch(
             or account[1] != "agent_api"
         ):
             return
-        if sticky:
-            await api_store.mark_runtime_unavailable(
+        try:
+            if sticky:
+                await api_store.mark_runtime_unavailable(
+                    account[0],
+                    reason,
+                )
+            else:
+                await api_store.mark_runtime_quota_unavailable(
+                    account[0],
+                    reason,
+                )
+        except Exception:
+            # A tombstone is a scheduling safety aid, not the Job lifecycle
+            # transaction. Keep the rejected key fail-closed in this process,
+            # but never prevent PROCESS_EXIT/RUN_EXHAUSTED from reaching final
+            # collection and instance cleanup merely because local state is
+            # temporarily read-only/full.
+            logger.exception(
+                "Could not persist Agent API runtime rejection for %s; "
+                "quarantining it in memory and continuing lifecycle handling",
                 account[0],
-                reason,
             )
-        else:
-            await api_store.mark_runtime_quota_unavailable(
-                account[0],
-                reason,
-            )
+            try:
+                await allocator.quarantine(account[0])
+            except Exception:
+                logger.exception(
+                    "Could not quarantine Agent API account %s after "
+                    "tombstone persistence failure",
+                    account[0],
+                )
 
     async def _on_exhausted(event_type, worker_id, data):
         # Claim ROTATING synchronously, then return so the connection layer can

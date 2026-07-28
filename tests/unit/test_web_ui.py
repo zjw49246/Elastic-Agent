@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +29,20 @@ def _javascript_function(html: str, name: str) -> str:
     )
     assert match is not None, f"missing JavaScript function {name}"
     return match.group(0)
+
+
+def _run_node_json(source: str) -> object:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the inline JavaScript behavior test")
+    completed = subprocess.run(
+        [node, "-e", source],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return json.loads(completed.stdout)
 
 
 @pytest.fixture
@@ -165,7 +182,6 @@ class TestDashboardEndpoint:
             "jHarnessRef",
             "jWorkers",
             "jAcctBinding",
-            "jAcctIds",
             "jRepo",
             "jTargetDir",
             "jDeliver",
@@ -200,8 +216,9 @@ class TestDashboardEndpoint:
         for control_id in expected_direct_controls:
             assert f"document.getElementById('{control_id}')" in build_spec
 
-        for line_control in ("jSetup", "jS3", "jCollect"):
+        for line_control in ("jSetup", "jCollect"):
             assert f"lines('{line_control}')" in build_spec
+        assert "lines('jS3')" in _javascript_function(html, "parseS3Datasets")
         assert "steps: parseSetupSteps()" in build_spec
         assert "env: buildEnv()" in build_spec
         assert "secret_env: buildSecretEnv()" in build_spec
@@ -209,9 +226,13 @@ class TestDashboardEndpoint:
         assert "if (repo)" in build_spec
         assert "setup.ref =" in build_spec
         assert "setup.resolved_commit =" in build_spec
-        assert "accountBinding === 'eip'" in build_spec
-        assert ".selectedOptions" in build_spec
-        assert "accountIds.length !== workers" in build_spec
+        assert "buildSelectedAccountIds(" in build_spec
+        selected_accounts = _javascript_function(
+            html, "buildSelectedAccountIds"
+        )
+        assert "document.getElementById('jAcctIds')" in selected_accounts
+        assert ".selectedOptions" in selected_accounts
+        assert "selected.length === required" in selected_accounts
         assert "const accountEnabled = accountMode !== 'none'" in build_spec
         assert "accountMode === 'worker_local_login'" in build_spec
         assert "model: accountEnabled ?" in build_spec
@@ -220,8 +241,7 @@ class TestDashboardEndpoint:
         assert "const rotationEnabled =" in build_spec
         assert "resume_args: rotationEnabled" in build_spec
         assert "max_rotations: rotationEnabled" in build_spec
-        assert ".map(function(l)" in build_spec
-        assert ".filter(function(d)" in build_spec
+        assert "s3_datasets: parseS3Datasets()" in build_spec
         assert "=== 'true'" in build_spec
         assert "if (ref) spec.harness_ref = ref" in build_spec
 
@@ -233,6 +253,94 @@ class TestDashboardEndpoint:
         assert "document.getElementById('jSetupSteps')" in _javascript_function(
             html, "parseSetupSteps"
         )
+
+    @pytest.mark.asyncio
+    async def test_env_lines_are_strictly_validated_before_submit(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        parser = _javascript_function(html, "buildKeyValueLines")
+        validation = _javascript_function(html, "validateJobForm")
+
+        assert r"const rawLines = control.value.split('\n')" in parser
+        assert "const env = Object.create(null)" in parser
+        assert "/^[A-Za-z_][A-Za-z0-9_]*$/" in parser
+        assert "Object.prototype.hasOwnProperty.call(env, key)" in parser
+        assert "必须是 KEY=VALUE" in parser
+        assert "重复定义" in parser
+        assert "for (const id of ['jEnv', 'jSecretEnv'])" in validation
+        assert "buildKeyValueLines(id)" in validation
+        assert "control.setCustomValidity(error.message)" in validation
+        assert "const details = control.closest('details')" in validation
+        assert "details.open = true" in validation
+        assert "control.reportValidity()" in validation
+        assert "control.focus()" in validation
+
+        cases = [
+            {
+                "id": "jEnv",
+                "value": "FOO=one\nEMPTY=\n_UNDER=two=three\n__proto__=kept",
+            },
+            {"id": "jEnv", "value": "GOOD=1\nBROKEN"},
+            {"id": "jEnv", "value": "BAD-NAME=x"},
+            {"id": "jEnv", "value": "=x"},
+            {"id": "jEnv", "value": "DUP=one\nDUP=two"},
+            {"id": "jSecretEnv", "value": "SECRET_WITHOUT_EQUALS"},
+        ]
+        results = _run_node_json(
+            """
+const controls = {jEnv:{value:''}, jSecretEnv:{value:''}};
+global.document = {getElementById:(id) => controls[id]};
+"""
+            + parser
+            + "\nconst cases = "
+            + json.dumps(cases, ensure_ascii=False)
+            + """;
+const results = cases.map((item) => {
+  controls[item.id].value = item.value;
+  try {
+    return {ok:true, value:buildKeyValueLines(item.id)};
+  } catch (error) {
+    return {ok:false, error:String(error.message || error)};
+  }
+});
+process.stdout.write(JSON.stringify(results));
+"""
+        )
+
+        assert results[0] == {
+            "ok": True,
+            "value": {
+                "FOO": "one",
+                "EMPTY": "",
+                "_UNDER": "two=three",
+                "__proto__": "kept",
+            },
+        }
+        assert results[1]["ok"] is False
+        assert "第 2 行" in results[1]["error"]
+        assert "KEY=VALUE" in results[1]["error"]
+        assert results[2]["ok"] is False
+        assert "变量名 BAD-NAME 无效" in results[2]["error"]
+        assert results[3]["ok"] is False
+        assert "第 1 行必须是 KEY=VALUE" in results[3]["error"]
+        assert results[4]["ok"] is False
+        assert "变量 DUP 重复定义" in results[4]["error"]
+        assert results[5]["ok"] is False
+        assert results[5]["error"].startswith("秘密环境变量")
+
+    @pytest.mark.asyncio
+    async def test_ai4sci_bench_uses_requested_archived_branch_by_default(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        archived_ref = "archive/youchengsong-managed-agent-api-20260728"
+
+        assert f'id="jRepoRef" value="{archived_ref}"' in html
+        assert "AI4Sci Bench 默认使用已锁定的归档分支" in html
+        assert "其他仓库请改成实际分支或标签" in html
 
     @pytest.mark.asyncio
     async def test_submit_job_form_has_accessible_labels_and_contextual_help(
@@ -386,7 +494,7 @@ class TestDashboardEndpoint:
         assert "parseSetupSteps()" in validation
         assert "error instanceof SyntaxError" in validation
         assert "Number(ttl.value) < Number(runTimeout.value)" in validation
-        assert "parts[0].startsWith('s3://')" in validation
+        assert "parseS3Datasets()" in validation
         assert "control.closest('details')" in validation
         assert "details.open = true" in validation
         assert "control.reportValidity()" in validation
@@ -432,7 +540,7 @@ class TestDashboardEndpoint:
         assert "document.getElementById('apiAcctKey').value = ''" in add_account
         assert "document.getElementById('apiAcctName').value = ''" in add_account
 
-        refresh_accounts = _javascript_function(html, "refreshAccounts")
+        refresh_accounts = _javascript_function(html, "refreshAccountsOnce")
         assert "agentApiProviderMeta(a.api_provider).pickerLabel" in refresh_accounts
         assert "option.dataset.agentTypes = supported.join(',')" in refresh_accounts
         assert "option.disabled = !enabled || !supported.includes(selectedAgent)" in (
@@ -460,7 +568,7 @@ class TestDashboardEndpoint:
         assert "selectedOptions" in html
         assert "binding: accountBinding" in html
         assert "ids: accountIds" in html
-        assert "选中账号数必须等于 Workers" in html
+        assert "指定账号数必须等于 Worker 数" in html
         assert "提交后均不回显" in html
         assert 'id="acctPassword"' in html
         assert 'id="acctPassword" type="password" autocomplete="new-password"' in html
@@ -476,8 +584,7 @@ class TestDashboardEndpoint:
         assert "/accounts/login-attempts/" in html
         assert "agent_type:" in html
         assert "clear_email_token:" in html
-        assert "manager_distribute" in html
-        assert "distribute.disabled = agentType === 'codex'" in html
+        assert 'value="manager_distribute"' not in html
         assert "reconcileLoginAttempts" in html
         assert "container.replaceChildren()" not in html
         assert "textContent = `Codex OTP" in html
@@ -525,6 +632,11 @@ class TestDashboardEndpoint:
         assert "confirmation.trim() !== id" in remove_account
         assert "release_eip: true" in remove_account
         assert "confirm_account_id: id" in remove_account
+        assert "delete_identity: true" in remove_account
+        assert "retired.identity_removed === true" in remove_account
+        assert "if (!identityRemoved)" in remove_account
+        assert "bindingReleaseIsVisible(accountPath)" in remove_account
+        assert "账号删除状态需刷新确认" in remove_account
         assert decommission in remove_account
         assert identity_delete in remove_account
         assert remove_account.index(binding_get) < remove_account.index(decommission)
@@ -578,6 +690,109 @@ class TestDashboardEndpoint:
         assert "option.dataset.agentTypes.split(',').includes(agentType)" in html
         assert "async function refreshAgentApiAccount(id)" in html
         assert "'/agent-api/accounts/' + encodeURIComponent(id) + '/refresh'" in html
+        assert "async function removeAgentApiAccount(id)" in html
+        assert "api('DELETE', '/agent-api/accounts/'" in html
+        assert "仍有活动任务或清理流程占用" in html
+        assert "x.cleanup_pending?'·清理中':''" in html
+        assert "占用状态暂不可用" in html
+        assert "EIP 状态暂不可用" in html
+        assert "EIP状态未知" in html
+
+    @pytest.mark.asyncio
+    async def test_non_eip_account_picker_and_shared_api_mapping_are_explicit(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        update_binding = _javascript_function(html, "updateEipBindingUI")
+        mapping = _javascript_function(html, "buildSelectedAccountIds")
+
+        assert "picker.disabled = accountDisabled" in update_binding
+        assert "option.dataset.authKind = a.auth_kind" in html
+        assert "selected.length === 1" in mapping
+        assert "authKind === 'agent_api'" in mapping
+        assert "Array(required).fill" in mapping
+        assert "selected.length === required" in mapping
+        assert "所选唯一账号按列表顺序映射" in html
+        assert "任意排序或重复映射请直接提交 JobSpec" in html
+
+    @pytest.mark.asyncio
+    async def test_s3_dataset_parser_supports_spaced_templates_and_destinations(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        parser = _javascript_function(html, "parseS3DatasetLine")
+        datasets = _javascript_function(html, "parseS3Datasets")
+
+        assert "inTemplate" in parser
+        assert "line.startsWith('{{', index)" in parser
+        assert "line.startsWith('}}', index)" in parser
+        assert "uri.startsWith('s3://')" in parser
+        assert "dest = line.slice(index).trim()" in parser
+        assert "lines('jS3').map(parseS3DatasetLine)" in datasets
+
+    @pytest.mark.asyncio
+    async def test_pending_job_idempotency_survives_page_refresh(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        submit = _javascript_function(html, "submitJob")
+
+        assert "ea_pending_job_submission" in html
+        assert "sessionStorage.getItem" in html
+        assert "sessionStorage.setItem" in html
+        assert "sessionStorage.removeItem" in html
+        assert "pending.spec === currentSerialized" in submit
+        assert "parsePendingJobSpec(pending)" in submit
+        assert "retryOriginal = window.confirm" in submit
+        assert "discardPending = window.confirm" in submit
+        assert "clearPendingJobSubmission()" in submit
+        assert "if (!retryPending)" in submit
+        assert submit.index("pending.spec === currentSerialized") < submit.index(
+            "api('POST', '/jobs/plan'"
+        )
+        assert submit.index("clearPendingJobSubmission()") < submit.index(
+            "api('POST', '/jobs/plan'"
+        )
+        retry_branch = submit[
+            submit.index("if (retryPending)")
+            :submit.index("} else {", submit.index("if (retryPending)"))
+        ]
+        new_submission_setup = submit[
+            submit.index("if (!retryPending)")
+            :submit.index("if (retryPending)")
+        ]
+        assert "await providerDefaultsReady" not in retry_branch
+        assert "await providerDefaultsReady" in new_submission_setup
+        assert "spec: currentSerialized" in submit
+
+    @pytest.mark.asyncio
+    async def test_account_inputs_declare_browser_side_size_limits(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        for control_id in (
+            "acctId",
+            "acctEmail",
+            "acctPassword",
+            "acctToken",
+            "acctGroup",
+            "apiAcctName",
+            "apiAcctGroup",
+            "apiAcctKey",
+            "hFile",
+            "hClass",
+            "hCode",
+        ):
+            assert re.search(
+                rf'<(?:input|textarea)\b(?=[^>]*\bid="{control_id}")'
+                r'(?=[^>]*\bmaxlength="\d+")[^>]*>',
+                html,
+                re.DOTALL,
+            ), control_id
 
     @pytest.mark.asyncio
     async def test_batch_console_does_not_persist_or_put_api_key_in_download_url(
@@ -652,6 +867,90 @@ class TestDashboardEndpoint:
         assert "!document.hidden && !_logPaused" in html
 
     @pytest.mark.asyncio
+    async def test_account_status_refresh_is_visible_single_flight_and_ordered(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        refresh_once = _javascript_function(html, "refreshAccountsOnce")
+        runner = _javascript_function(html, "runAccountRefreshes")
+        refresh = _javascript_function(html, "refreshAccounts")
+        dashboard_poll = _javascript_function(html, "runDashboardPoll")
+
+        assert 'id="accountsRefresh"' in html
+        assert re.search(
+            r'id="accountsRefresh"[^>]*role="status"[^>]*aria-live="polite"',
+            html,
+        )
+        assert "onclick=\"refreshAccounts(true)\"" in html
+        assert "requestVersion !== accountsRequestVersion" in refresh_once
+        assert "accountsRefreshInFlight" in refresh
+        assert "accountsRefreshQueued = true" in refresh
+        assert "Date.now() - lastAccountsRefreshAt >= 15_000" in dashboard_poll
+        assert dashboard_poll.index("if (document.hidden)") < (
+            dashboard_poll.index("refreshAccounts()")
+        )
+        assert "refreshAccounts(true)" in _javascript_function(html, "submitJob")
+        assert "refreshAccounts(true)" in _javascript_function(html, "cancelJob")
+
+        result = _run_node_json(
+            """
+let accountsRefreshInFlight = null;
+let accountsRefreshQueued = false;
+let accountsRequestVersion = 0;
+let lastAccountsRefreshAt = 0;
+let active = 0;
+let maximumActive = 0;
+const versions = [];
+const releases = [];
+const status = {textContent:''};
+global.document = {getElementById:() => status};
+Date.now = () => 1_000;
+async function refreshAccountsOnce(version) {
+  versions.push(version);
+  active += 1;
+  maximumActive = Math.max(maximumActive, active);
+  await new Promise((resolve) => releases.push(resolve));
+  active -= 1;
+}
+"""
+            + runner
+            + "\n"
+            + refresh
+            + """
+(async () => {
+  const first = refreshAccounts();
+  const coalesced = refreshAccounts();
+  const forced = refreshAccounts(true);
+  const sharedPromise = first === coalesced && coalesced === forced;
+  releases.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  const queuedSecondPass = versions.length === 2 && releases.length === 1;
+  releases.shift()();
+  await Promise.all([first, coalesced, forced]);
+  process.stdout.write(JSON.stringify({
+    sharedPromise,
+    queuedSecondPass,
+    versions,
+    maximumActive,
+    inFlightCleared: accountsRefreshInFlight === null,
+  }));
+})().catch((error) => {
+  process.stderr.write(String(error.stack || error));
+  process.exitCode = 1;
+});
+"""
+        )
+
+        assert result == {
+            "sharedPromise": True,
+            "queuedSecondPass": True,
+            "versions": [1, 2],
+            "maximumActive": 1,
+            "inFlightCleared": True,
+        }
+
+    @pytest.mark.asyncio
     async def test_batch_console_keeps_failed_logs_and_download_action_stable(
         self, ui_client
     ):
@@ -663,12 +962,79 @@ class TestDashboardEndpoint:
         assert "requestVersion !== jobResultsRequestVersions.get(jobId)" in html
         assert "knownFileCount > 0 && incomingFileCount <= 0" in html
         assert "nextResultCheck(job, incomingFileCount, previous)" in html
+        assert "preserveKnown && job.done" not in html
+        assert "knownFileCount > 0 && job.done" not in html
         assert "function jobResultActionHtml(job, result)" in html
         assert 'data-result-action="' in html
         assert "📄 查看失败日志" in html
         assert "function jobLogLineLimit(jobId, workerId)" in html
         assert "return terminal ? 5_000 : 1_000" in html
         assert "formatTaskExitSummary(data.tasks || [])" in html
+
+    @pytest.mark.asyncio
+    async def test_terminal_result_gap_keeps_snapshot_but_continues_polling(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        functions = "\n".join(
+            _javascript_function(html, name)
+            for name in (
+                "resultFileCount",
+                "nextResultCheck",
+                "commitJobResult",
+                "commitJobResultError",
+            )
+        )
+        result = _run_node_json(
+            """
+const jobResultsCache = new Map();
+const jobResultsRequestVersions = new Map();
+Date.now = () => 1_000;
+"""
+            + functions
+            + """
+const job = {job_id:'job-1', done:true};
+const oldValue = {job_id:'job-1', file_count:2, paths:['partial']};
+jobResultsCache.set('job-1', {value:oldValue, misses:0, loading:false});
+
+jobResultsRequestVersions.set('job-1', 1);
+const failure = new Error('temporary 503');
+failure.status = 503;
+commitJobResultError(job, failure, 1);
+const afterError = jobResultsCache.get('job-1');
+
+jobResultsRequestVersions.set('job-1', 2);
+commitJobResult(job, {job_id:'job-1', file_count:0, paths:[]}, 2);
+const afterEmpty = jobResultsCache.get('job-1');
+
+jobResultsRequestVersions.set('job-1', 3);
+commitJobResult(job, {job_id:'job-1', file_count:3, paths:['final']}, 3);
+const afterFinal = jobResultsCache.get('job-1');
+
+process.stdout.write(JSON.stringify({
+  errorPreserved: afterError.value === oldValue,
+  errorRetries: Number.isFinite(afterError.nextCheck)
+    && afterError.nextCheck > Date.now(),
+  emptyPreserved: afterEmpty.value === oldValue,
+  emptyRetries: Number.isFinite(afterEmpty.nextCheck)
+    && afterEmpty.nextCheck > Date.now(),
+  finalCount: afterFinal.value.file_count,
+  finalFrozen: !Number.isFinite(afterFinal.nextCheck),
+  finalError: afterFinal.error,
+}));
+"""
+        )
+
+        assert result == {
+            "errorPreserved": True,
+            "errorRetries": True,
+            "emptyPreserved": True,
+            "emptyRetries": True,
+            "finalCount": 3,
+            "finalFrozen": True,
+            "finalError": None,
+        }
 
     @pytest.mark.asyncio
     async def test_batch_console_streams_large_downloads_with_progress_and_cancel(

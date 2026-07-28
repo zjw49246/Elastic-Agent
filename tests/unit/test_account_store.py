@@ -7,6 +7,7 @@ import stat
 
 import pytest
 
+from elastic_agent.api.routes.accounts import AccountRequest
 from elastic_agent.core.account_store import AccountStore, AccountStoreCorruptError
 from elastic_agent.core.credential_pool import AccountDefinition, AccountsConfig
 
@@ -15,6 +16,63 @@ pytestmark = pytest.mark.asyncio
 
 def _store(tmp_path):
     return AccountStore(str(tmp_path / "accounts.json"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "bad\nid"),
+        ("id", "x" * 129),
+        ("email", "x" * 321),
+        ("group", "bad\x7fgroup"),
+        ("group", "x" * 101),
+        ("email_token", "x" * (16 * 1024 + 1)),
+        ("password", "x" * (16 * 1024 + 1)),
+    ],
+)
+async def test_account_definition_rejects_oversized_or_unsafe_fields(
+    field, value,
+):
+    payload = {"id": "a", "email": "a@example.com", field: value}
+    with pytest.raises(ValueError):
+        AccountDefinition(**payload)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [AccountRequest, AccountDefinition],
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("email", "user\u0085name@example.com"),
+        ("email", "user\ud800name@example.com"),
+        ("group", "research\u009fgroup"),
+        ("group", "research\u2028group"),
+    ],
+)
+async def test_api_and_persistent_identity_models_reject_nonprintable_unicode(
+    model, field, value,
+):
+    payload = {"id": "safe-id", "email": "safe@example.com", field: value}
+
+    with pytest.raises(ValueError):
+        model(**payload)
+
+
+@pytest.mark.parametrize("model", [AccountRequest, AccountDefinition])
+async def test_api_and_persistent_identity_models_allow_trimmed_internal_spaces(
+    model,
+):
+    account = model(
+        id=" safe-id ",
+        email=" First Last <user@example.com> ",
+        group=" apex research ",
+    )
+
+    assert account.id == "safe-id"
+    assert account.email == "First Last <user@example.com>"
+    assert account.group == "apex research"
 
 
 async def test_empty_initially(tmp_path):

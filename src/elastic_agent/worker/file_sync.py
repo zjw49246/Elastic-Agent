@@ -16,17 +16,23 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
 import mimetypes
 import os
+import stat
 import threading
 import time
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from elastic_agent.harness.base import BootstrapStep
 
 logger = logging.getLogger(__name__)
 
@@ -144,16 +150,205 @@ class StorageBackend:
         raise NotImplementedError
 
     async def read_file(self, oss_key: str) -> bytes:
-        """Read file content from storage. Returns raw bytes."""
+        """Read an entire object for trusted internal callers.
+
+        External HTTP routes use :meth:`open_reader` directly so object size is
+        checked before data is buffered and large content can be streamed.
+        """
+        reader = await self.open_reader(oss_key)
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = await reader.read(256 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            await reader.close()
+
+    async def open_reader(
+        self,
+        oss_key: str,
+        *,
+        executor: Executor | None = None,
+    ) -> StorageObjectReader:
+        """Open one object with an authoritative length and closeable body."""
         raise NotImplementedError
 
     async def file_exists(self, oss_key: str) -> bool:
         """Check if a file exists in storage."""
         raise NotImplementedError
 
-    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+    async def get_presigned_url(
+        self,
+        oss_key: str,
+        expires: int = 3600,
+        *,
+        executor: Executor | None = None,
+    ) -> str | None:
         """Generate a pre-signed URL for direct download. Returns None if unsupported."""
         return None
+
+
+class StorageObjectMetadataError(OSError):
+    """A backend returned unusable object metadata or a non-stream body."""
+
+
+def _object_size(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StorageObjectMetadataError(
+            "storage object has no valid non-negative content length"
+        )
+    return value
+
+
+def _close_storage_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+        return
+    response = getattr(stream, "resp", None)
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+
+
+class StorageObjectReader:
+    """Async facade over a blocking SDK/file body with idempotent close."""
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        size: int,
+        executor: Executor | None = None,
+    ) -> None:
+        read = getattr(stream, "read", None)
+        if not callable(read):
+            _close_storage_stream(stream)
+            raise StorageObjectMetadataError(
+                "storage object body is not readable"
+            )
+        self.size = _object_size(size)
+        self._stream = stream
+        self._executor = executor
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._inflight_reads: set[asyncio.Future] = set()
+
+    def _submit_blocking(self, function: Callable[[], Any]) -> asyncio.Future:
+        return asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            function,
+        )
+
+    async def read(self, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            raise ValueError("storage read size must be positive")
+
+        def read_chunk() -> bytes:
+            with self._state_lock:
+                if self._closed:
+                    return b""
+                stream = self._stream
+            # Do not retain the state lock across a blocking SDK read. A
+            # concurrent close must be able to mark the reader closed and call
+            # body.close() from another executor thread to interrupt a hung
+            # network read after the awaiting request is cancelled.
+            chunk = stream.read(max_bytes)
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise StorageObjectMetadataError(
+                    "storage object body returned non-bytes data"
+                )
+            if len(chunk) > max_bytes:
+                raise StorageObjectMetadataError(
+                    "storage object body exceeded the bounded read request"
+                )
+            return bytes(chunk)
+
+        with self._state_lock:
+            if self._closed:
+                return b""
+            future = self._submit_blocking(read_chunk)
+            self._inflight_reads.add(future)
+
+        def read_done(completed: asyncio.Future) -> None:
+            with self._state_lock:
+                self._inflight_reads.discard(completed)
+            if completed.cancelled():
+                return
+            # A cancelled HTTP waiter no longer retrieves the executor error.
+            # Consume it here; an active waiter can still call result normally.
+            try:
+                completed.exception()
+            except BaseException:
+                return
+
+        future.add_done_callback(read_done)
+        # Shield keeps the executor future live when the HTTP task is
+        # cancelled. ``close`` concurrently calls body.close() and then waits
+        # for this exact future before a stream permit can be returned.
+        return await asyncio.shield(future)
+
+    async def close(self) -> None:
+        def close_stream() -> tuple[
+            tuple[asyncio.Future, ...],
+            BaseException | None,
+        ]:
+            # Never acquire a threading lock on the event-loop thread. A
+            # blocking SDK read may still own it after its awaiting coroutine
+            # was cancelled.
+            with self._state_lock:
+                should_close = not self._closed
+                self._closed = True
+                stream = self._stream
+                inflight = tuple(self._inflight_reads)
+            close_error: BaseException | None = None
+            if should_close:
+                try:
+                    _close_storage_stream(stream)
+                except BaseException as exc:  # preserve until reads unwind
+                    close_error = exc
+            return inflight, close_error
+
+        close_future = self._submit_blocking(close_stream)
+        inflight, close_error = await asyncio.shield(close_future)
+        if inflight:
+            await asyncio.gather(
+                *(asyncio.shield(future) for future in inflight),
+                return_exceptions=True,
+            )
+        if close_error is not None:
+            raise close_error
+
+
+async def _run_storage_blocking(
+    executor: Executor | None,
+    function: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run a storage SDK call on its caller-selected blocking pool."""
+
+    if executor is None:
+        return await asyncio.to_thread(function, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(
+        executor,
+        functools.partial(function, *args, **kwargs),
+    )
+
+
+def _storage_error_is_not_found(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict) and str(error.get("Code", "")).lower() in {
+            "404",
+            "nosuchkey",
+            "notfound",
+        }:
+            return True
+    return getattr(exc, "status", None) == 404
 
 
 class OSSBackend(StorageBackend):
@@ -165,13 +360,24 @@ class OSSBackend(StorageBackend):
         self._access_key_id = access_key_id
         self._access_key_secret = access_key_secret
         self._bucket: Any = None
+        self._bucket_lock = threading.Lock()
 
     def _get_bucket(self):
         if self._bucket is None:
-            import oss2
+            with self._bucket_lock:
+                if self._bucket is not None:
+                    return self._bucket
+                import oss2
 
-            auth = oss2.Auth(self._access_key_id, self._access_key_secret)
-            self._bucket = oss2.Bucket(auth, self._endpoint, self._bucket_name)
+                auth = oss2.Auth(
+                    self._access_key_id,
+                    self._access_key_secret,
+                )
+                self._bucket = oss2.Bucket(
+                    auth,
+                    self._endpoint,
+                    self._bucket_name,
+                )
         return self._bucket
 
     async def upload_file(self, local_path: str, oss_key: str) -> None:
@@ -216,23 +422,72 @@ class OSSBackend(StorageBackend):
 
     async def upload_bytes(self, data: bytes, oss_key: str, content_type: str = "application/octet-stream") -> None:
         bucket = self._get_bucket()
-        import oss2
 
         headers = {"Content-Type": content_type}
         await asyncio.to_thread(bucket.put_object, oss_key, data, headers=headers)
 
-    async def read_file(self, oss_key: str) -> bytes:
-        bucket = self._get_bucket()
-        result = await asyncio.to_thread(bucket.get_object, oss_key)
-        return await asyncio.to_thread(result.read)
+    async def open_reader(
+        self,
+        oss_key: str,
+        *,
+        executor: Executor | None = None,
+    ) -> StorageObjectReader:
+        def get_object():
+            return self._get_bucket().get_object(oss_key)
+
+        try:
+            result = await _run_storage_blocking(
+                executor,
+                get_object,
+            )
+        except Exception as exc:
+            if _storage_error_is_not_found(exc):
+                raise FileNotFoundError(oss_key) from exc
+            raise
+        size = getattr(result, "content_length", None)
+        if size is None:
+            headers = getattr(result, "headers", None)
+            if isinstance(headers, dict):
+                raw_size = (
+                    headers.get("Content-Length")
+                    or headers.get("content-length")
+                )
+                try:
+                    size = int(raw_size)
+                except (TypeError, ValueError):
+                    size = None
+        def build_reader() -> StorageObjectReader:
+            try:
+                return StorageObjectReader(
+                    result,
+                    size=_object_size(size),
+                    executor=executor,
+                )
+            except Exception:
+                _close_storage_stream(result)
+                raise
+
+        return await _run_storage_blocking(executor, build_reader)
 
     async def file_exists(self, oss_key: str) -> bool:
         bucket = self._get_bucket()
         return await asyncio.to_thread(bucket.object_exists, oss_key)
 
-    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
-        bucket = self._get_bucket()
-        return await asyncio.to_thread(bucket.sign_url, "GET", oss_key, expires)
+    async def get_presigned_url(
+        self,
+        oss_key: str,
+        expires: int = 3600,
+        *,
+        executor: Executor | None = None,
+    ) -> str | None:
+        return await _run_storage_blocking(
+            executor,
+            lambda: self._get_bucket().sign_url(
+                "GET",
+                oss_key,
+                expires,
+            ),
+        )
 
 
 class S3Backend(StorageBackend):
@@ -242,12 +497,19 @@ class S3Backend(StorageBackend):
         self._bucket_name = bucket_name
         self._region = region
         self._client: Any = None
+        self._client_lock = threading.Lock()
 
     def _get_client(self):
         if self._client is None:
-            import boto3
+            with self._client_lock:
+                if self._client is not None:
+                    return self._client
+                import boto3
 
-            self._client = boto3.client("s3", region_name=self._region)
+                self._client = boto3.client(
+                    "s3",
+                    region_name=self._region,
+                )
         return self._client
 
     async def upload_file(self, local_path: str, oss_key: str) -> None:
@@ -271,10 +533,41 @@ class S3Backend(StorageBackend):
             ContentType=content_type,
         )
 
-    async def read_file(self, oss_key: str) -> bytes:
-        client = self._get_client()
-        resp = await asyncio.to_thread(client.get_object, Bucket=self._bucket_name, Key=oss_key)
-        return await asyncio.to_thread(resp["Body"].read)
+    async def open_reader(
+        self,
+        oss_key: str,
+        *,
+        executor: Executor | None = None,
+    ) -> StorageObjectReader:
+        def get_object():
+            return self._get_client().get_object(
+                Bucket=self._bucket_name,
+                Key=oss_key,
+            )
+
+        try:
+            resp = await _run_storage_blocking(
+                executor,
+                get_object,
+            )
+        except Exception as exc:
+            if _storage_error_is_not_found(exc):
+                raise FileNotFoundError(oss_key) from exc
+            raise
+        body = resp.get("Body")
+
+        def build_reader() -> StorageObjectReader:
+            try:
+                return StorageObjectReader(
+                    body,
+                    size=_object_size(resp.get("ContentLength")),
+                    executor=executor,
+                )
+            except Exception:
+                _close_storage_stream(body)
+                raise
+
+        return await _run_storage_blocking(executor, build_reader)
 
     async def file_exists(self, oss_key: str) -> bool:
         client = self._get_client()
@@ -284,13 +577,20 @@ class S3Backend(StorageBackend):
         except Exception:
             return False
 
-    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
-        client = self._get_client()
-        return await asyncio.to_thread(
-            client.generate_presigned_url,
-            "get_object",
-            Params={"Bucket": self._bucket_name, "Key": oss_key},
-            ExpiresIn=expires,
+    async def get_presigned_url(
+        self,
+        oss_key: str,
+        expires: int = 3600,
+        *,
+        executor: Executor | None = None,
+    ) -> str | None:
+        return await _run_storage_blocking(
+            executor,
+            lambda: self._get_client().generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._bucket_name, "Key": oss_key},
+                ExpiresIn=expires,
+            ),
         )
 
 
@@ -298,29 +598,127 @@ class LocalBackend(StorageBackend):
     """Local filesystem backend for testing."""
 
     def __init__(self, base_dir: str) -> None:
-        self._base_dir = Path(base_dir)
+        self._base_dir = Path(base_dir).resolve()
         self._base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path_for_key(self, oss_key: str) -> Path:
+        """Resolve a storage key without ever leaving ``base_dir``.
+
+        LocalBackend is used by development Managers as well as tests, so it
+        must enforce the same object-key boundary as a remote object store.
+        Validation is intentionally repeated here rather than relying on API
+        callers: sync and manifest writers call the backend directly.
+        """
+
+        if (
+            not isinstance(oss_key, str)
+            or not oss_key
+            or not oss_key.isprintable()
+            or "\\" in oss_key
+            or PurePosixPath(oss_key).is_absolute()
+            or any(part in {"", ".", ".."} for part in oss_key.split("/"))
+        ):
+            raise ValueError("unsafe storage key")
+        candidate = (self._base_dir / oss_key).resolve(strict=False)
+        try:
+            candidate.relative_to(self._base_dir)
+        except ValueError as exc:
+            raise ValueError("storage key escapes storage root") from exc
+        return candidate
 
     async def upload_file(self, local_path: str, oss_key: str) -> None:
         import shutil
 
-        dest = self._base_dir / oss_key
+        dest = self._path_for_key(oss_key)
         dest.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copy2, local_path, str(dest))
 
     async def upload_bytes(self, data: bytes, oss_key: str, content_type: str = "application/octet-stream") -> None:
-        dest = self._base_dir / oss_key
+        dest = self._path_for_key(oss_key)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
+        await asyncio.to_thread(dest.write_bytes, data)
 
     async def read_file(self, oss_key: str) -> bytes:
-        dest = self._base_dir / oss_key
-        return await asyncio.to_thread(dest.read_bytes)
+        return await super().read_file(oss_key)
+
+    def _open_local_reader(
+        self,
+        oss_key: str,
+        executor: Executor | None = None,
+    ) -> StorageObjectReader:
+        # Validate syntax and current containment before the component-wise
+        # open. O_NOFOLLOW on every component then closes the symlink race
+        # between validation and opening the final object.
+        self._path_for_key(oss_key)
+        parts = oss_key.split("/")
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        directory_fd = os.open(self._base_dir, directory_flags)
+        try:
+            for part in parts[:-1]:
+                next_fd = os.open(
+                    part,
+                    directory_flags,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(
+                parts[-1],
+                file_flags,
+                dir_fd=directory_fd,
+            )
+        finally:
+            os.close(directory_fd)
+        try:
+            item_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(item_stat.st_mode):
+                raise StorageObjectMetadataError(
+                    "local storage object is not a regular file"
+                )
+            stream = os.fdopen(file_fd, "rb")
+            file_fd = -1
+            return StorageObjectReader(
+                stream,
+                size=item_stat.st_size,
+                executor=executor,
+            )
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+
+    async def open_reader(
+        self,
+        oss_key: str,
+        *,
+        executor: Executor | None = None,
+    ) -> StorageObjectReader:
+        return await _run_storage_blocking(
+            executor,
+            self._open_local_reader,
+            oss_key,
+            executor,
+        )
 
     async def file_exists(self, oss_key: str) -> bool:
-        return (self._base_dir / oss_key).exists()
+        return await asyncio.to_thread(self._path_for_key(oss_key).is_file)
 
-    async def get_presigned_url(self, oss_key: str, expires: int = 3600) -> str | None:
+    async def get_presigned_url(
+        self,
+        oss_key: str,
+        expires: int = 3600,
+        *,
+        executor: Executor | None = None,
+    ) -> str | None:
         return None
 
 
@@ -838,7 +1236,6 @@ class FileSyncManager:
     def _start_watching(self, paths: list[str]) -> None:
         try:
             from watchdog.observers import Observer
-            from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
             if self._observer is None:
                 self._observer = Observer()
@@ -991,7 +1388,7 @@ def cloud_storage_credentials_step(
     s3_bucket: str = "",
     s3_region: str = "",
     timeout: int = 60,
-) -> "BootstrapStep":
+) -> BootstrapStep:
     """T-032: Bootstrap step to inject cloud storage credentials on Worker.
 
     Writes environment variables to /etc/elastic-agent/storage.env so the
@@ -1006,13 +1403,13 @@ def cloud_storage_credentials_step(
             f"OSS_ACCESS_KEY_SECRET={oss_access_key_secret}",
             f"OSS_BUCKET={oss_bucket}",
             f"OSS_ENDPOINT={oss_endpoint}",
-            f"STORAGE_TYPE=oss",
+            "STORAGE_TYPE=oss",
         ])
     elif storage_type == "s3":
         env_lines.extend([
             f"S3_BUCKET={s3_bucket}",
             f"S3_REGION={s3_region}",
-            f"STORAGE_TYPE=s3",
+            "STORAGE_TYPE=s3",
         ])
 
     env_content = "\\n".join(env_lines)
@@ -1021,8 +1418,10 @@ def cloud_storage_credentials_step(
         "mkdir -p /etc/elastic-agent && "
         f"echo -e '{env_content}' > /etc/elastic-agent/storage.env && "
         "chmod 600 /etc/elastic-agent/storage.env && "
-        "grep -qxF 'set -a; source /etc/elastic-agent/storage.env; set +a' /etc/profile.d/elastic-agent.sh 2>/dev/null || "
-        "echo 'set -a; source /etc/elastic-agent/storage.env; set +a' >> /etc/profile.d/elastic-agent.sh"
+        "grep -qxF 'set -a; source /etc/elastic-agent/storage.env; set +a' "
+        "/etc/profile.d/elastic-agent.sh 2>/dev/null || "
+        "echo 'set -a; source /etc/elastic-agent/storage.env; set +a' >> "
+        "/etc/profile.d/elastic-agent.sh"
     )
 
     return BootstrapStep(

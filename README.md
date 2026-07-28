@@ -70,7 +70,11 @@ Credential rotation: account swaps are in-place (new tokens written into the
 same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
 bound to that config_dir — warm sessions authenticated under the old account
 must not be hot-reused; the next EXECUTE cold-resumes with the new
-credentials.
+credentials. The update is transactional: a write or PTY-recycle failure
+restores the prior private credential snapshot and reports failure without
+adding the new quota slot. If both the update and rollback fail, that config
+directory is tombstoned in the Worker process and both PTY and subprocess
+execution refuse it until a complete successful reconfiguration.
 
 Timeouts: `ExecuteMessage.timeout` (or `agent_params.response_timeout`) is
 plumbed into the PTY session's turn timeout, so long production turns are not
@@ -128,7 +132,7 @@ spec = JobSpec.model_validate({
     "environment": {"profile": "ubuntu-agent-docker-v1"},
     "setup": {
         "repo": "https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git",
-        "ref": "main",
+        "ref": "archive/youchengsong-managed-agent-api-20260728",
         "steps": [{"name": "install", "command": "uv sync",
                    "timeout": 1200, "retries": 1}],
     },
@@ -144,10 +148,15 @@ spec = JobSpec.model_validate({
 job = await manager.batch.launch(spec)   # scale → bootstrap → login → run, per worker
 ```
 
+The AI4Sci Bench example intentionally uses the archived
+`archive/youchengsong-managed-agent-api-20260728` branch. Change `setup.ref`
+when submitting a different repository.
+
 Template `{{shard_index}}` / `{{shard_id}}` / `{{num_shards}}` /
 `{{hostname}}` are rendered by the Manager; `shard_id` is the zero-padded
 five-digit shard index. Shell constructs like `$(hostname -s)` are evaluated on
-the worker. The same templates work in `setup.s3_datasets[].uri` and `dest`, so
+the worker. Whitespace inside a token, such as `{{ shard_id }}`, is accepted.
+The same templates work in `setup.s3_datasets[].uri` and `dest`, so
 a fanout Job can stage one exact S3 object per worker instead of copying a whole
 prefix to every worker:
 
@@ -155,6 +164,12 @@ prefix to every worker:
 {"uri": "s3://private-data/run/shard-{{shard_id}}.jsonl",
  "dest": "/srv/replay/shard-{{shard_id}}.jsonl"}
 ```
+
+Dataset provisioning requires the exact Worker context. Missing context,
+unknown or empty template values, and an unavailable hostname fail closed
+instead of falling back to shard zero or converting a single-object `cp` into a
+whole-prefix `sync`. Destination parent paths are computed and quoted without
+shell word splitting, including spaces, globs, and single quotes.
 
 The AWS worker instance profile must grant `s3:GetObject` for the exact dataset
 prefix. The production policy limits that read grant to `jobs/datasets/*`;
@@ -255,6 +270,14 @@ routing but does not rewrite the opaque run command's own model arguments.
 Jobs do not need a separate API mode and API identities support the same
 persistent EIP binding flow.
 
+For `account.binding="none"`, one Agent API identity may be shared by multiple
+Workers or Jobs through independent reference-counted claims. OAuth identities
+remain exclusive. Any identity with a durable EIP binding also remains
+exclusive even when it has no active lease; it must be used with
+`binding="eip"` or explicitly decommissioned first. Automatic `per_worker`
+slots never repeat one API identity on the same Worker, while explicit
+`account.ids` may repeat only an unbound Agent API ID.
+
 Provider waits have nested wall-clock bounds: each Agent API HTTP request is
 limited to 15 seconds; automatic pool selection refreshes at most 16 keys
 concurrently for 30 seconds total, excludes unfinished keys for that attempt,
@@ -282,8 +305,9 @@ Job files cannot redirect the provider or credential helper.
 
 During Manager startup recovery, Agent API allocation stays closed until every
 previous Worker has a confirmed terminal cloud readback. OAuth allocation can
-continue. This prevents a surviving orphan Worker and a new Job from using the
-same API key concurrently.
+continue. Once recovery completes, intentional unbound sharing is tracked by
+claim refcounts; recovery fencing prevents an untracked orphan from retaining a
+delegated key outside that ownership graph.
 
 Nested containers require an explicit container-owner contract. For a validated
 projection the Worker exports the non-secret
@@ -316,9 +340,14 @@ runtime hard-quota event writes the same recoverable durable state; a later
 successful provider probe clears it, while invalid-key/model tombstones require
 an explicit refresh. Invalid/unknown 200-response schemas fail closed, numeric
 and nested display fields are bounded and allowlisted, and deterministic
-model-refresh failures bench the stale catalog. Deletion is intentionally
-disabled until every delegated Worker can be durably fenced; terminate Jobs and
-retire the upstream key when necessary.
+model-refresh failures bench the stale catalog. `DELETE
+/api/agent-api/accounts/{id}` is reference-aware: it succeeds only after
+startup recovery is complete and the identity has no active claim, lease, or
+durable binding. A bound identity must first use the explicit EIP decommission
+flow; adding `"delete_identity":true` to that request retires the identity under
+the same allocation fence. Storage failure never reports a full success: the
+released-EIP/retained-identity partial state is quarantined and shown explicitly
+in the UI.
 
 ApexRouter `/usage` reports per-key `used` values but shared-group
 `remaining`, `limits`, and `concurrency`; Elastic keeps those scopes separate
@@ -387,8 +416,18 @@ within 60 seconds, that account is quarantined from further allocation; an EIP
 Job instead remains protected by terminating its temporary instance before the
 account claim is released.
 
-`account.login_timeout_seconds` controls only the Codex browser state machine
-(default `900`, accepted range `60`–`1200`). The Manager keeps a separate
+Claude credential writes and both login implementations are transactional
+through identity validation and warm-up. A failed login result carries
+`cleanup_complete=true` only after every tracked CLI/browser/Xvfb process has
+exited and the previous credential snapshot has been restored. `false`, or a
+missing field from an older Worker, quarantines an ordinary account; successful
+logins intentionally carry no cleanup claim, so a late cancel cannot falsely
+say committed credentials were removed. The legacy `CREDENTIAL_LOGIN` rotation
+path follows the same rollback rule around PTY recycle and fails closed on an
+unrecoverable slot instead of confirming a mixed old-session/new-file identity.
+
+`account.login_timeout_seconds` controls the Claude or Codex browser state
+machine (default `900`, accepted range `60`–`1200`). The Manager keeps a separate
 3600-second end-to-end budget for mailbox/manual OTP waits, exact-account
 validation, the real `codex exec` smoke test, and correlated cleanup. Current
 OpenAI email-code labels including “one-time code” and “login code” are handled;
@@ -425,11 +464,14 @@ not implemented. Before mailbox polling, the
 worker suppresses `httpx`/`httpcore` request logging so a query token cannot be
 written as part of a full request URL in the worker journal.
 
-Codex support here is for declarative Mode-B `worker_local_login` Jobs.
-`manager_distribute` is rejected for Codex because `auth.json` must be minted
-and verified on the worker. Codex Jobs also deploy the current Manager's worker
-source so an older runtime cannot interpret the login as a legacy Claude flow.
-Mode-A PTY-hosted execution remains Claude-only.
+Managed account support here is for declarative Mode-B `worker_local_login`
+Jobs. `manager_distribute` is rejected for both Claude and Codex because no
+production Batch path implements Manager-side credential distribution. Codex
+Jobs also deploy the current Manager's worker source so an older runtime cannot
+interpret the login as a legacy Claude flow. Mode-A PTY-hosted execution remains
+Claude-only. Restart recovery has a teardown-only compatibility reader for an
+already-running legacy `manager_distribute` Job: it exposes only collection
+paths and the setup root, performs final collection, and cannot replay the run.
 
 ### One account, one AWS EIP
 
@@ -524,20 +566,25 @@ authenticated management API:
 | `GET` | `/api/accounts/bindings` | List durable account/EIP mappings |
 | `GET` | `/api/accounts/{account_id}/binding` | Read one mapping |
 | `PUT` | `/api/accounts/{account_id}/binding` | Idempotently allocate/ensure the EIP; optional body `{"region":"us-east-1"}` |
-| `POST` | `/api/accounts/{account_id}/binding/decommission` | Permanently release the EIP; requires `{"release_eip":true,"confirm_account_id":"..."}` and no active claim/lease |
+| `POST` | `/api/accounts/{account_id}/binding/decommission` | Permanently release the EIP; requires `{"release_eip":true,"confirm_account_id":"..."}` and no active claim/lease. Optional `"delete_identity":true` retires the OAuth/API identity under the same fence |
 | `GET` | `/api/accounts/allocations` | Inspect current account-to-Job/worker allocations |
 
-Deleting an account identity does not release infrastructure implicitly: first
-call the explicit decommission endpoint. This separation prevents an ordinary
-Job cleanup or account edit from losing its stable address.
+The standalone OAuth/Agent-API DELETE endpoints never release infrastructure
+implicitly. Decommission first, or use the double-confirmed
+`delete_identity:true` form to release the EIP and retire its identity in one
+fenced operation. This prevents ordinary Job cleanup or account edits from
+losing a stable address while also closing a claim race between two admin
+requests.
 
-The Batch Console guides this sequence for OAuth accounts. If the account has
-a binding, the delete action shows the exact EIP, warns that release is
-permanent, requires the full account ID to be typed, calls `decommission`, and
-only then deletes the identity. A failed or completed Job does not release the
-EIP automatically. An active claim, lease, or unfinished cleanup still returns
-`409`, leaving both the binding and identity intact. API clients must continue
-to perform the same two explicit calls.
+The Batch Console guides this sequence for OAuth and Agent API identities. If
+the account has a binding, the delete action shows the exact EIP, warns that
+release is permanent, requires the full account ID to be typed, then sends one
+atomic decommission-and-retire request. A failed or completed Job does not
+release the EIP automatically. An active claim, lease, unfinished cleanup, or
+incomplete startup recovery still returns `409`, leaving both the binding and
+identity intact. API clients should use the same atomic form when retiring the
+identity; omit `delete_identity` only when intentionally keeping the identity
+after releasing its EIP.
 
 Manager-wired `submit()` and `launch()` (including REST) atomically persist the
 JobSpec in a mode-`0600` recovery journal before registration, account/EIP
@@ -584,6 +631,44 @@ write them into a collected directory if they must be retained in S3. Final
 collection also runs for failed and cancelled Jobs, so already-written partial
 results are preserved before the ephemeral EC2 is terminated.
 
+Result metadata is bounded independently from collected data size. The listing
+reports the authoritative `file_count` but returns at most 500 preview paths
+with explicit truncation fields and aggregate path/JSON budgets. Local and S3
+score discovery share a 500-candidate, 16 MiB read, 500-result ceiling and
+accept only bounded printable scalar metadata plus finite numeric scores.
+Local reads bind an open fd to the listed inode/stat and verify exact EOF; S3
+reads bind ETag/size and likewise reject short, long, or changed objects.
+
+The cancellable S3 archive endpoint acquires admission before creating its pipe
+or queueing a producer, holds it until the producer exits, and closes an active
+object body on disconnect. The strict prebuilt endpoint uses a response-level
+`finally` for its temporary file plus global build concurrency and a 20 GiB
+logical spool budget. Its reservation includes worst-case UTF-8 PAX headers,
+tar block/trailer overhead and gzip bounds, and it refuses a build unless the
+temporary filesystem retains 512 MiB of free headroom.
+
+Authenticated external sync reads under
+`/api/external/files/{task_id}/...` are also bounded. Task IDs and paths are
+validated before storage access; Local storage opens every path component with
+`O_NOFOLLOW`, while S3/OSS readers bind one GET body's authoritative length.
+Manifests are limited to 8 MiB, 10,000 entries, and bounded printable fields.
+Content mode streams at most 2 GiB in 256 KiB chunks, verifies exact EOF, and
+closes the reader on normal completion, errors, or client disconnect. URL mode
+intentionally returns a direct presigned-storage URL without the 2 GiB Manager
+streaming limit. Incoming HTTP request bodies are capped before JSON parsing by
+`ELASTIC_AGENT_MAX_REQUEST_BODY_BYTES` (16 MiB default; configurable from
+64 KiB through 64 MiB), including chunked requests and dishonest
+`Content-Length`. Conventionally bodyless GET/HEAD/OPTIONS/TRACE requests
+bypass pre-reading. Body-bearing requests have one strict whole-read deadline
+(`ELASTIC_AGENT_REQUEST_BODY_READ_TIMEOUT_SECONDS`, 30 seconds by default) and
+fail-fast admission
+(`ELASTIC_AGENT_MAX_CONCURRENT_REQUEST_BODIES`, 16 by default). Their
+conservative three-copy reservation remains held through route JSON/Pydantic
+processing under
+`ELASTIC_AGENT_MAX_AGGREGATE_REQUEST_BODY_BYTES` (256 MiB by default, 1 MiB–4
+GiB, and always at least three times the per-request limit). Saturation returns
+an uncached 503 without reading the body; timeout returns an uncached 408.
+
 For diagnosis, the Manager separately archives the bounded tail of each
 command's stdout/stderr before Worker teardown (up to 5,000 entries, 8 MiB per
 task, 64 KiB per entry, 512 task attempts/64 MiB per Job, and 1 GiB across the
@@ -601,6 +686,15 @@ their Workers have already been destroyed. In the Batch Console, a failed Job
 uses a prominent **查看失败日志** action; terminal runs load the complete bounded
 5,000-line archive and show the task exit code/error summary alongside stderr.
 
+Worker pipe drainage is independent of Manager link speed: arbitrarily long
+physical lines are split into 64 KiB byte frames without breaking UTF-8, while
+the byte-exact raw record remains in the Worker's local NDJSON. LOG and
+file-data transports have separate frame-count and serialized-byte budgets
+that include retry/in-flight frames; reliable terminal events retain their
+durable priority path. Manager result accounting rejects non-finite, negative,
+boolean or cumulative-overflow costs and accepts only bounded printable
+session IDs.
+
 Use an `Idempotency-Key` header when retrying `POST /api/jobs`: the same key and
 spec resolve to the same deterministic Job, while reusing it for different
 content returns `409`. `POST /api/jobs/{job_id}/cancel` sends TERM/KILL as
@@ -608,6 +702,12 @@ needed, waits for the reliable process-exit event, performs final collection,
 and then force-terminates ordinary Job Workers (EIP Jobs detach/terminate via
 their lease). Disposable ordinary Workers are also removed from the live Node
 registry after cloud termination, preventing unbounded dashboard/state growth.
+Each ordinary shard settles independently as soon as it is terminal:
+final collect, exact cloud termination proof, authoritative registry-absence
+readback, then only that Worker's claim release. Partial registry failures,
+replayed exits, concurrent cleanup and Manager shutdown retry only the
+unsettled Worker; another long-running shard cannot keep a failed instance
+billable.
 On restart, durable `prepared/launching/running/terminal` state is
 used to resume preparation or collect and clean up interrupted Workers.
 Ordinary Job cloud creates also have a separate private
@@ -633,7 +733,10 @@ shapes remain excluded.
 inside the Manager, upload and `harness_ref` use are disabled by default. A
 trusted deployment may explicitly set `ELASTIC_AGENT_ENABLE_HARNESS_UPLOAD=1`,
 then upload a `.py` through `POST /api/jobs/harness` and use the returned
-`harness_ref`. Prefer declarative JobSpec for untrusted submitters.
+`harness_ref`. Uploads are capped at 1 MiB, validated from a private temporary
+file, then published under a SHA-256 content address. The same bytes are
+idempotent; new bytes cannot overwrite or delete the code referenced by an old
+Job. Prefer declarative JobSpec for untrusted submitters.
 
 **Frontend**: the Batch Console at `/batch` uses a light theme by default, with
 an optional session-scoped dark theme. The Job submission form keeps the
@@ -646,18 +749,27 @@ with an adjacent reason when they do not apply. Result paths and the in-run
 collection interval remain prominent, and the validation/launch action stays
 reachable on desktop while stacking into full-width buttons on narrow screens.
 The client also checks native numeric limits, required run command, Job TTL
-ordering, and S3 dataset line format before preflight.
+ordering, template-aware S3 dataset line format, and strict `KEY=VALUE`
+environment-variable lines before preflight.
 
 The console manages Claude and Codex identities,
 accepts write-only OpenAI passwords/mailbox query tokens (at least one for
 Codex; both may be configured), filters Job account choices by `agent_type`,
-and shows active Codex OTP challenges as Worker-specific cards inside the
+supports reference-aware Agent API deletion, and lets EIP/non-EIP Jobs choose
+the required number of unique identities in account-list order. Selecting one
+unbound Agent API identity in non-EIP mode can auto-fill every slot. Use
+JobSpec `account.ids` directly for another ordered/repeated mapping; OAuth and
+EIP-bound identities cannot repeat.
+The console shows active Codex OTP challenges as Worker-specific cards inside the
 corresponding Job. Each card is keyed by login request and challenge, while a
 single floating reminder links to all affected Workers and remains hidden when
 no manual OTP is needed. Stable keyed rendering and
 non-overlapping, visibility-aware polling preserve focus, expanded sections,
 scroll position, and log viewing instead of rebuilding the whole page every
-five seconds. OTP inputs, focus, and cursor selection also survive a Job-card
+five seconds. Accounts and allocation state use their own visible-page
+15-second single-flight refresh plus a manual action; backend state-read
+failures render as unavailable rather than an empty/free allocation map.
+OTP inputs, focus, and cursor selection also survive a Job-card
 replacement without persisting the code in browser storage. Job cards start
 collapsed with their identity, state, phase,
 submission time, and Worker count visible; opening a card reveals its actions,
@@ -666,10 +778,14 @@ the user's open/closed choice. Completed execution rows remain available as
 history. Command output remains queryable after teardown; the read-only live
 system-journal action remains available until the Worker resource is released,
 then stops polling on a not-found/conflict response; destructive terminate
-actions disappear at execution terminal state. Each Job keeps a stable result
+actions disappear at execution terminal state. Historical Job enumeration is
+explicitly bounded and reports `truncated`; archived Job-log disk reads use a
+dedicated fail-fast worker pool, so concurrent/cancelled readers cannot occupy
+the Manager's shared lifecycle executor. Each Job keeps a stable result
 action while metadata loads. Per-Job request versions reject stale responses,
 known non-empty results never regress to empty on a transient or out-of-order
-refresh, terminal empty results retry with bounded backoff, and duplicate
+refresh, and terminal empty/error reads retain the last snapshot but retry with
+bounded backoff until a successful non-empty final snapshot. Duplicate
 archive downloads are suppressed. S3 result archives use the UI's cancellable
 streaming endpoint, which starts returning the tarball while objects are read
 instead of waiting for a complete Manager-side temporary archive. The action
@@ -679,6 +795,10 @@ API use a memory-backed fallback only below 256 MiB of source data and reject
 larger snapshots with a desktop-Chrome instruction instead of risking a tab
 crash. Running Jobs label the action as a download of the latest uploaded
 intermediate snapshot.
+An unresolved submission stores its Idempotency-Key together with the frozen
+spec in `sessionStorage`. After refresh or form edits, the console recommends
+replaying that exact pair and does not wait for mutable provider defaults;
+discarding it to create a new Key requires a separate double confirmation.
 The original strict download endpoint remains available to API clients that
 prefer a prebuilt archive and an HTTP error before response headers. API keys
 are accepted only in
@@ -722,6 +842,10 @@ ELASTIC_AGENT_LOG_LEVEL
 ELASTIC_AGENT_RESULTS_S3_BUCKET
 ELASTIC_AGENT_RESULTS_S3_PREFIX
 ELASTIC_AGENT_RESULTS_S3_INTERVAL
+ELASTIC_AGENT_MAX_REQUEST_BODY_BYTES
+ELASTIC_AGENT_REQUEST_BODY_READ_TIMEOUT_SECONDS
+ELASTIC_AGENT_MAX_CONCURRENT_REQUEST_BODIES
+ELASTIC_AGENT_MAX_AGGREGATE_REQUEST_BODY_BYTES
 ```
 
 Keep secrets such as `ELASTIC_AGENT_EXTERNAL_API_KEYS` in

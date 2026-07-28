@@ -18,6 +18,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Literal
 
@@ -533,15 +534,29 @@ class AccountBindingStore:
         *,
         account_id: str | None = None,
         active_only: bool = False,
+        job_ids: Collection[str] | None = None,
+        limit: int | None = None,
     ) -> list[AccountLease]:
+        if limit is not None and limit < 1:
+            raise ValueError("lease list limit must be positive")
+        selected_jobs = frozenset(job_ids) if job_ids is not None else None
         async with self._lock:
             self._ensure_loaded()
-            leases = self._config.leases
-            if account_id is not None:
-                leases = [lease for lease in leases if lease.account_id == account_id]
-            if active_only:
-                leases = [lease for lease in leases if self._is_active(lease)]
-            return [lease.model_copy(deep=True) for lease in leases]
+            result: list[AccountLease] = []
+            for lease in self._config.leases:
+                if account_id is not None and lease.account_id != account_id:
+                    continue
+                if (
+                    selected_jobs is not None
+                    and lease.job_id not in selected_jobs
+                ):
+                    continue
+                if active_only and not self._is_active(lease):
+                    continue
+                result.append(lease.model_copy(deep=True))
+                if limit is not None and len(result) >= limit:
+                    break
+            return result
 
     async def get_lease(self, lease_id: str) -> AccountLease | None:
         async with self._lock:

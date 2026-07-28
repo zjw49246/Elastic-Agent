@@ -565,6 +565,30 @@ class TestWorkerToManagerMessages:
         assert restored.challenge_id == "challenge-1"
         assert restored.expires_at == expires_at
 
+    @pytest.mark.parametrize("cleanup_complete", [None, True, False])
+    def test_account_login_result_cleanup_roundtrip(self, cleanup_complete):
+        msg = AccountLoginResultMessage(
+            login_request_id="login-1",
+            account_id="codex-a",
+            slot_index=0,
+            success=cleanup_complete is None,
+            cleanup_complete=cleanup_complete,
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AccountLoginResultMessage)
+        assert restored.cleanup_complete is cleanup_complete
+
+    def test_legacy_account_login_result_without_cleanup_field_is_accepted(self):
+        restored = parse_message(
+            '{"type":"ACCOUNT_LOGIN_RESULT","login_request_id":"login-1",'
+            '"account_id":"claude-a","slot_index":0,"success":false}'
+        )
+
+        assert isinstance(restored, AccountLoginResultMessage)
+        assert restored.cleanup_complete is None
+
     def test_account_login_cancel_roundtrip(self):
         msg = AccountLoginCancelMessage(
             login_request_id="login-abc",

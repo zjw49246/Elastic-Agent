@@ -26,11 +26,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
+import stat
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    fsync_directory,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,25 @@ MAIL_API_BASE = "https://b.171mail.com/api/v1"
 ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 ANTHROPIC_ACCOUNT_URL = "https://claude.ai/api/account"
+
+
+class ClaudeLoginCleanupError(RuntimeError):
+    """A Claude browser/CLI process group could not be proven terminated."""
+
+
+def _safe_login_error(text: str, *, secrets: tuple[str, ...] = ()) -> str:
+    """Return a bounded diagnostic with URLs and known login inputs removed."""
+
+    safe = re.sub(r"https?://\S+", "[redacted-url]", text or "")
+    safe = re.sub(
+        r"(?i)(token|code|state|password)=([^\s&]+)",
+        r"\1=[redacted]",
+        safe,
+    )
+    for secret in secrets:
+        if secret:
+            safe = safe.replace(secret, "[redacted]")
+    return (safe.strip() or "auto_login failed")[-500:]
 
 
 def normalize_local_config_dir(config_dir: str | None) -> str:
@@ -82,6 +110,99 @@ class OAuthConfig:
     # "171mail" (API 接码) or "mailcom" (Chrome 接码). Auto-detected from the
     # email domain when None.
     provider: str | None = None
+
+
+_CLAUDE_CREDENTIAL_FILES = (".claude.json", ".credentials.json")
+
+
+@dataclass
+class ClaudeCredentialSnapshot:
+    """Private, in-memory snapshot used to make a login transactional.
+
+    The snapshot deliberately covers only credential-bearing files.  Settings
+    are not authentication state and are merged only after the browser flow
+    succeeds.
+    """
+
+    config_dir: Path
+    files: dict[str, bytes | None] = field(default_factory=dict)
+
+
+def snapshot_claude_credentials(config_dir: str) -> ClaudeCredentialSnapshot:
+    """Capture Claude credential files without following symlinks.
+
+    Existing legacy files are tightened before they are read.  A missing
+    directory is not created here, which lets callers snapshot a fresh slot
+    without introducing filesystem side effects before login starts.
+    """
+
+    directory = Path(config_dir).expanduser()
+    snapshot = ClaudeCredentialSnapshot(config_dir=directory)
+    if directory.is_symlink():
+        raise RuntimeError(
+            f"Claude credential directory must not be a symlink: {directory}"
+        )
+    if directory.exists():
+        if not directory.is_dir():
+            raise RuntimeError(
+                f"Claude credential directory is not a directory: {directory}"
+            )
+        secure_state_directory(directory)
+    for name in _CLAUDE_CREDENTIAL_FILES:
+        path = directory / name
+        if not path.exists() and not path.is_symlink():
+            snapshot.files[name] = None
+            continue
+        mode = path.lstat().st_mode
+        if path.is_symlink() or not stat.S_ISREG(mode):
+            raise RuntimeError(f"Claude credential path is not a regular file: {path}")
+        tighten_state_file(path)
+        content = path.read_bytes()
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"Claude credential file is not valid UTF-8: {path}"
+            ) from exc
+        snapshot.files[name] = content
+    return snapshot
+
+
+def restore_claude_credentials(snapshot: ClaudeCredentialSnapshot) -> None:
+    """Rollback a credential snapshot using durable 0600 replacements."""
+
+    if snapshot.config_dir.is_symlink():
+        raise RuntimeError(
+            f"Claude credential directory became a symlink: {snapshot.config_dir}"
+        )
+    removed_entry = False
+    for name, content in snapshot.files.items():
+        path = snapshot.config_dir / name
+        if content is None:
+            if path.is_symlink():
+                raise RuntimeError(f"Claude credential path became a symlink: {path}")
+            removed_entry = removed_entry or path.exists()
+            path.unlink(missing_ok=True)
+            continue
+        # Both files are JSON/UTF-8.  Reject corrupt backup bytes instead of
+        # publishing an altered or lossy credential file.
+        text = content.decode("utf-8")
+        atomic_write_private(path, text)
+    # An unlink is not durable until its parent directory is fsynced.  A late
+    # cancellation ACK must never let the Manager release an account while a
+    # crash can resurrect the newly written credential.
+    if removed_entry and snapshot.config_dir.is_dir():
+        fsync_directory(snapshot.config_dir)
+
+
+def secure_claude_credentials(config_dir: str) -> None:
+    """Tighten a successfully written Claude credential set in place."""
+
+    directory = secure_state_directory(config_dir)
+    for name in _CLAUDE_CREDENTIAL_FILES:
+        path = directory / name
+        if path.exists() or path.is_symlink():
+            tighten_state_file(path)
 
 
 def resolve_provider(config: OAuthConfig) -> str:
@@ -128,19 +249,34 @@ class ClaudeOAuthProvider:
                 ok, output = await self._login_on_worker(config, provider)
             else:
                 ok, output = await self._login_local(config, provider)
+        except ClaudeLoginCleanupError:
+            # This is not an ordinary failed attempt: Runtime must withhold its
+            # cleanup acknowledgement so the Manager quarantines the worker.
+            raise
         except asyncio.TimeoutError:
             return LoginResult(
                 success=False, account_id=config.account_id,
                 error=f"login timed out after {config.login_timeout}s",
             )
         except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("Login errored for %s", config.account_id)
-            return LoginResult(success=False, account_id=config.account_id, error=str(exc))
+            logger.error(
+                "Login errored for %s (%s)",
+                config.account_id,
+                type(exc).__name__,
+            )
+            return LoginResult(
+                success=False,
+                account_id=config.account_id,
+                error="Claude login failed unexpectedly",
+            )
 
         if not ok:
             return LoginResult(
                 success=False, account_id=config.account_id,
-                error=(output or "auto_login failed").strip()[-500:],
+                error=_safe_login_error(
+                    output,
+                    secrets=(config.email_token,),
+                ),
             )
 
         oauth = await self._fetch_written_credentials(config)
@@ -245,8 +381,8 @@ def _post_form_urllib(url: str, body: str) -> dict[str, Any] | None:
     (or None on non-200 / transport error). This is the aiohttp-free refresh
     path: the worker framework env may not ship aiohttp, and a missing aiohttp
     previously crashed every QuotaChecker token refresh."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     req = urllib.request.Request(
         url,
@@ -301,31 +437,28 @@ async def refresh_access_token(
             "refreshToken": new_refresh,
             "expiresAt": expires_at,
         }
-    except Exception:
-        logger.exception("Token refresh failed")
+    except Exception as exc:
+        # Injected HTTP clients may include the form body (refresh token) in
+        # exception text; retain only the exception class in worker logs.
+        logger.error("Token refresh failed (%s)", type(exc).__name__)
         return None
 
 
 def write_credentials(config_dir: str, creds: dict[str, Any]) -> None:
-    """Write credentials to .credentials.json."""
-    from pathlib import Path
-
+    """Durably write Claude credentials with directory/file mode 0700/0600."""
     cred_path = Path(config_dir) / ".credentials.json"
-    cred_path.parent.mkdir(parents=True, exist_ok=True)
     data = {"claudeAiOauth": creds}
-    tmp = cred_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(cred_path)
+    atomic_write_private(cred_path, json.dumps(data, indent=2))
 
 
 def read_credentials(config_dir: str) -> dict[str, Any] | None:
     """Read .credentials.json and return the claudeAiOauth object."""
-    from pathlib import Path
-
     cred_path = Path(config_dir) / ".credentials.json"
     if not cred_path.exists():
         return None
     try:
+        secure_state_directory(cred_path.parent)
+        tighten_state_file(cred_path)
         data = json.loads(cred_path.read_text())
         return data.get("claudeAiOauth")
     except Exception:

@@ -16,6 +16,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocket
 
+from elastic_agent.api.body_limit import (
+    RequestBodyLimitMiddleware,
+    configured_max_aggregate_request_body_bytes,
+    configured_max_concurrent_request_bodies,
+    configured_max_request_body_bytes,
+    configured_request_body_read_timeout_seconds,
+)
 from elastic_agent.manager.manager import ElasticAgentManager
 
 logger = logging.getLogger(__name__)
@@ -48,10 +55,23 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    max_request_body_bytes = configured_max_request_body_bytes()
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=max_request_body_bytes,
+        read_timeout_seconds=(configured_request_body_read_timeout_seconds()),
+        max_concurrent_bodies=(configured_max_concurrent_request_bodies()),
+        max_aggregate_body_bytes=(
+            configured_max_aggregate_request_body_bytes(
+                max_request_body_bytes=max_request_body_bytes,
+            )
+        ),
+    )
 
     @app.exception_handler(RequestValidationError)
     async def safe_request_validation_error(
-        _request: Request, exc: RequestValidationError,
+        _request: Request,
+        exc: RequestValidationError,
     ) -> JSONResponse:
         """Return useful validation locations without reflecting request data.
 
@@ -63,11 +83,7 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
         """
 
         errors = [
-            {
-                key: value
-                for key, value in error.items()
-                if key in {"type", "loc", "msg", "url"}
-            }
+            {key: value for key, value in error.items() if key in {"type", "loc", "msg", "url"}}
             for error in exc.errors()
         ]
         return JSONResponse(

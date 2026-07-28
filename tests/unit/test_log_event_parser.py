@@ -280,6 +280,81 @@ class TestCostAggregation:
         })
         assert parser.get_task_cost("task-1") == 0.0
 
+    @pytest.mark.parametrize(
+        "cost",
+        [float("nan"), float("inf"), float("-inf"), -0.01, True, 1_000_000_001],
+    )
+    def test_non_finite_negative_boolean_or_excessive_cost_ignored(self, parser, cost):
+        result = parser.process_log_event("worker-1", {
+            "task_id": "task-1",
+            "stream": "stdout",
+            "data": "",
+            "parsed": {"type": "result", "session_id": None, "cost_usd": cost, "subtype": None},
+        })
+
+        assert result["cost_usd"] is None
+        assert parser.get_task_cost("task-1") == 0.0
+        assert parser.get_worker_cost("worker-1") == 0.0
+
+    def test_cost_aggregation_cannot_overflow_accounting_bound(self, parser):
+        first = parser.process_log_event("worker-1", {
+            "task_id": "task-1",
+            "stream": "stdout",
+            "data": "",
+            "parsed": {
+                "type": "result",
+                "session_id": None,
+                "cost_usd": 999_999_999,
+                "subtype": None,
+            },
+        })
+        second = parser.process_log_event("worker-1", {
+            "task_id": "task-1",
+            "stream": "stdout",
+            "data": "",
+            "parsed": {
+                "type": "result",
+                "session_id": None,
+                "cost_usd": 2,
+                "subtype": None,
+            },
+        })
+
+        assert first["cost_usd"] == 999_999_999
+        assert second["cost_usd"] is None
+        assert parser.get_task_cost("task-1") == 999_999_999
+
+    @pytest.mark.parametrize(
+        "session_id",
+        ["bad\nsession", "x" * 1025, {"not": "a string"}],
+    )
+    def test_invalid_session_id_does_not_replace_last_valid_value(self, parser, session_id):
+        parser.process_log_event("worker-1", {
+            "task_id": "task-1",
+            "stream": "stdout",
+            "data": "",
+            "parsed": {
+                "type": "result",
+                "session_id": "valid-session",
+                "cost_usd": 0,
+                "subtype": None,
+            },
+        })
+        result = parser.process_log_event("worker-1", {
+            "task_id": "task-1",
+            "stream": "stdout",
+            "data": "",
+            "parsed": {
+                "type": "result",
+                "session_id": session_id,
+                "cost_usd": 0,
+                "subtype": None,
+            },
+        })
+
+        assert result["session_id"] == "valid-session"
+        assert parser.get_task_session("task-1").session_id == "valid-session"
+
 
 class TestReleaseTask:
     def test_release_clears_buffer(self, parser):

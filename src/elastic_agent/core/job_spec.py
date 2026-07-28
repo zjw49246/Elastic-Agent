@@ -242,6 +242,14 @@ class S3Dataset(StrictSpecModel):
     @classmethod
     def valid_s3_uri(cls, uri: str) -> str:
         value = uri.strip()
+        # The generic template grammar permits readability whitespace inside
+        # braces. Canonicalize only recognized placeholders before applying the
+        # URI's strict no-whitespace rule; ordinary URI whitespace remains
+        # rejected and unknown variables still fail in JobSpec rendering.
+        value = _TEMPLATE_RE.sub(
+            lambda match: "{{" + match.group(1) + "}}",
+            value,
+        )
         match = _S3_URI_RE.fullmatch(value)
         if (
             match is None
@@ -515,9 +523,8 @@ class AccountSpec(StrictSpecModel):
     #   after the Manager sends the selected email + write-only mailbox token;
     #   generated Claude OAuth credentials stay on the worker and are not sent
     #   back. Remote worker transport is required to use WSS.
-    # manager_distribute: Manager sends already-obtained tokens (CREDENTIAL_LOGIN).
     # none: caller has already provisioned credentials; Elastic does nothing.
-    mode: Literal["worker_local_login", "manager_distribute", "none"] = "worker_local_login"
+    mode: Literal["worker_local_login", "none"] = "worker_local_login"
     per_worker: int = Field(default=1, ge=1, le=32)
     group: str = "standard"
     # eip: each account keeps a durable EIP identity while the EC2 instance is
@@ -537,6 +544,16 @@ class AccountSpec(StrictSpecModel):
     # default (~/.claude or ~/.codex). An absolute path is required when
     # per_worker > 1 (distinct dirs per account).
     config_dir: str = ""
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def reject_unimplemented_manager_distribution(cls, mode: Any) -> Any:
+        if mode == "manager_distribute":
+            raise ValueError(
+                "account.mode='manager_distribute' is not implemented; use "
+                "worker_local_login so credentials are minted on the worker"
+            )
+        return mode
 
     @field_validator("model")
     @classmethod
@@ -571,15 +588,19 @@ class AccountSpec(StrictSpecModel):
     @field_validator("ids")
     @classmethod
     def normalize_ids(cls, ids: list[str]) -> list[str]:
-        """Trim and stably de-duplicate explicit account IDs."""
-        unique: list[str] = []
-        seen: set[str] = set()
+        """Trim IDs while preserving their worker×slot positions.
+
+        Repeated IDs are resolved against the account stores during preflight:
+        only unbound Agent API identities may repeat. Schema-level
+        de-duplication would erase that intentional sharing topology before the
+        API can prove the selected identity kind.
+        """
+        normalized: list[str] = []
         for raw_id in ids:
             account_id = raw_id.strip()
-            if account_id and account_id not in seen:
-                seen.add(account_id)
-                unique.append(account_id)
-        return unique
+            if account_id:
+                normalized.append(account_id)
+        return normalized
 
 
 class RotationSpec(StrictSpecModel):
@@ -708,21 +729,20 @@ class JobSpec(StrictSpecModel):
     @model_validator(mode="after")
     def dataset_templates_are_renderable(self) -> JobSpec:
         try:
-            self.render_s3_datasets(self.worker_contexts()[0])
+            context = self.worker_contexts()[0]
+            # Submission-time validation must not reject legitimate
+            # ``{{hostname}}`` datasets merely because the real worker does not
+            # exist yet. Runtime rendering still rejects a missing/empty
+            # hostname and therefore cannot turn one object into a whole-prefix
+            # sync.
+            context.hostname = "validation-host"
+            self.render_s3_datasets(context)
         except (KeyError, ValueError) as exc:
             raise ValueError(f"invalid S3 dataset template: {exc}") from exc
         return self
 
     @model_validator(mode="after")
     def validate_agent_account_mode(self) -> JobSpec:
-        if (
-            self.account.agent_type == "codex"
-            and self.account.mode == "manager_distribute"
-        ):
-            raise ValueError(
-                "Codex accounts do not support manager_distribute; use "
-                "worker_local_login so auth.json is minted on the worker"
-            )
         if (
             self.account.agent_type == "codex"
             and self.account.mode == "worker_local_login"
@@ -763,7 +783,7 @@ class JobSpec(StrictSpecModel):
                 if len(self.account.ids) != required:
                     raise ValueError(
                         "account.ids must contain exactly "
-                        f"{required} unique account(s), one per worker slot"
+                        f"{required} account reference(s), one per worker slot"
                     )
             return self
         if self.account.per_worker != 1:
@@ -774,7 +794,10 @@ class JobSpec(StrictSpecModel):
                 "account.mode='worker_local_login' so the selected identity "
                 "is the identity logged in on the EIP worker"
             )
-        if self.account.ids and len(self.account.ids) != self.fanout.workers:
+        if self.account.ids and (
+            len(self.account.ids) != self.fanout.workers
+            or len(set(self.account.ids)) != self.fanout.workers
+        ):
             raise ValueError(
                 "account.ids must contain exactly "
                 f"{self.fanout.workers} unique account(s), one per fanout worker"
@@ -839,13 +862,38 @@ class JobSpec(StrictSpecModel):
     def render_s3_datasets(self, ctx: WorkerContext) -> list[S3Dataset]:
         """Render and revalidate per-worker S3 object locations."""
         values = ctx.as_dict()
-        return [
-            S3Dataset(
-                uri=render_template(dataset.uri, values),
-                dest=render_template(dataset.dest, values),
-            )
-            for dataset in self.setup.s3_datasets
-        ]
+        rendered: list[S3Dataset] = []
+        for dataset in self.setup.s3_datasets:
+            for field_name, template in (
+                ("uri", dataset.uri),
+                ("dest", dataset.dest),
+            ):
+                for match in _TEMPLATE_RE.finditer(template):
+                    variable = match.group(1)
+                    if variable not in values:
+                        raise KeyError(
+                            f"unknown template variable: "
+                            f"{{{{{variable}}}}}"
+                        )
+                    if (
+                        values[variable] is None
+                        or not str(values[variable]).strip()
+                    ):
+                        raise ValueError(
+                            f"S3 dataset {field_name} template variable "
+                            f"{variable!r} resolved empty"
+                        )
+            rendered_uri = render_template(dataset.uri, values)
+            rendered_dest = render_template(dataset.dest, values)
+            if dataset.uri.endswith("/") != rendered_uri.endswith("/"):
+                raise ValueError(
+                    "S3 dataset uri rendering cannot change object/prefix mode"
+                )
+            rendered.append(S3Dataset(
+                uri=rendered_uri,
+                dest=rendered_dest,
+            ))
+        return rendered
 
     def render_command(self, ctx: WorkerContext) -> list[str]:
         """Produce the ExecuteMessage argv for one worker.

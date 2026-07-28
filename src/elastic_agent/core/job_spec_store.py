@@ -23,7 +23,10 @@ from elastic_agent.core.secure_store import (
 )
 
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SAFE_REQUEST_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _JOB_STATES = {"prepared", "launching", "running", "succeeded", "failed", "cancelled"}
+JOB_REQUEST_FINGERPRINT_SCHEMA = 1
+JOB_REQUEST_FINGERPRINT_ALGORITHM = "sha256"
 _UNBOUND_LAUNCH_INTENTS_VERSION = 1
 _MAX_UNBOUND_LAUNCH_JOBS = 10_000
 _MAX_UNBOUND_LAUNCHES_PER_JOB = 1_000
@@ -43,6 +46,7 @@ def persist_job_spec(
     registry_path: str | Path,
     job_id: str,
     spec: JobSpec,
+    request_fingerprint: str | None = None,
 ) -> Path:
     """Atomically and durably write one recovery JobSpec.
 
@@ -53,22 +57,38 @@ def persist_job_spec(
 
     if _SAFE_JOB_ID.fullmatch(job_id) is None:
         raise ValueError(f"invalid job id for persistence: {job_id!r}")
+    if (
+        request_fingerprint is not None
+        and _SAFE_REQUEST_FINGERPRINT.fullmatch(request_fingerprint) is None
+    ):
+        raise ValueError("invalid Job request fingerprint")
 
     specs_dir = job_specs_dir(registry_path)
     destination = specs_dir / f"{job_id}.json"
+    journal = {
+        "job_id": job_id,
+        "name": spec.name,
+        "submitted_at": time.time(),
+        # ``prepared`` means the durable write completed but the
+        # orchestrator has not crossed its launch gate.  Idempotent retry
+        # may safely schedule this exact spec instead of mistaking the mere
+        # presence of a journal for a completed submission.
+        "submission_state": "prepared",
+        "state_updated_at": time.time(),
+        "spec": spec.model_dump(),
+    }
+    if request_fingerprint is not None:
+        # Keep the fingerprint in the same atomic/fsynced write as the first
+        # prepared journal.  A later Manager version can therefore recognize
+        # an exact historical request before attempting to validate it with
+        # the current JobSpec schema.
+        journal["request_fingerprint"] = {
+            "schema": JOB_REQUEST_FINGERPRINT_SCHEMA,
+            "algorithm": JOB_REQUEST_FINGERPRINT_ALGORITHM,
+            "digest": request_fingerprint,
+        }
     payload = json.dumps(
-        {
-            "job_id": job_id,
-            "name": spec.name,
-            "submitted_at": time.time(),
-            # ``prepared`` means the durable write completed but the
-            # orchestrator has not crossed its launch gate.  Idempotent retry
-            # may safely schedule this exact spec instead of mistaking the mere
-            # presence of a journal for a completed submission.
-            "submission_state": "prepared",
-            "state_updated_at": time.time(),
-            "spec": spec.model_dump(),
-        },
+        journal,
         ensure_ascii=False,
         indent=2,
     )

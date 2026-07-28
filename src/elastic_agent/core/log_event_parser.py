@@ -7,6 +7,7 @@ from 'result' type events, and provides trace buffer filtering by parsed.type.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 CLAUDE_CODE_TYPES = frozenset({"system", "assistant", "user", "tool_use", "tool_result", "result"})
+MAX_SESSION_ID_LENGTH = 1024
+MAX_ACCOUNTED_COST_USD = 1_000_000_000.0
 
 
 def _utcnow() -> datetime:
@@ -102,27 +105,44 @@ class LogEventParser:
         worker_id: str,
         parsed: dict[str, Any],
     ) -> dict[str, Any]:
-        session_id = parsed.get("session_id")
-        cost_usd = parsed.get("cost_usd")
+        raw_session_id = parsed.get("session_id")
+        raw_cost_usd = parsed.get("cost_usd")
 
         if task_id not in self._task_sessions:
             self._task_sessions[task_id] = TaskSession(task_id=task_id)
 
         session = self._task_sessions[task_id]
-        if session_id:
-            session.session_id = session_id
-        if cost_usd is not None:
+        if (
+            isinstance(raw_session_id, str)
+            and 0 < len(raw_session_id) <= MAX_SESSION_ID_LENGTH
+            and raw_session_id.isprintable()
+        ):
+            session.session_id = raw_session_id
+
+        accepted_cost: float | None = None
+        if raw_cost_usd is not None and not isinstance(raw_cost_usd, bool):
             try:
-                cost_val = float(cost_usd)
-                session.total_cost_usd += cost_val
-                self._worker_costs[worker_id] += cost_val
-            except (ValueError, TypeError):
+                candidate = float(raw_cost_usd)
+                task_total = session.total_cost_usd + candidate
+                worker_total = self._worker_costs[worker_id] + candidate
+                if (
+                    math.isfinite(candidate)
+                    and 0.0 <= candidate <= MAX_ACCOUNTED_COST_USD
+                    and math.isfinite(task_total)
+                    and task_total <= MAX_ACCOUNTED_COST_USD
+                    and math.isfinite(worker_total)
+                    and worker_total <= MAX_ACCOUNTED_COST_USD
+                ):
+                    accepted_cost = candidate
+                    session.total_cost_usd = task_total
+                    self._worker_costs[worker_id] = worker_total
+            except (OverflowError, ValueError, TypeError):
                 pass
         session.last_updated = _utcnow()
 
         return {
             "session_id": session.session_id,
-            "cost_usd": cost_usd,
+            "cost_usd": accepted_cost,
             "total_cost_usd": session.total_cost_usd,
         }
 

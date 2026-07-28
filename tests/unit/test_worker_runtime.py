@@ -1889,11 +1889,12 @@ class TestHandleAccountLogin:
             new=AsyncMock(return_value=LoginResult(
                 success=True, account_id="a1", access_token="at")),
         ):
-            await runtime._handle_account_login(self._msg())
+            config_dir = str(runtime._log_dir / "claude")
+            await runtime._handle_account_login(self._msg(config_dir=config_dir))
 
-        runtime._warmup_config_dir.assert_awaited_once_with("/root/.claude-prod")
-        runtime._pty_backend.recycle_config_dir.assert_awaited_once_with("/root/.claude-prod")
-        runtime._quota_checker.add_slot.assert_called_once_with("a1", "/root/.claude-prod")
+        runtime._warmup_config_dir.assert_awaited_once_with(config_dir)
+        runtime._pty_backend.recycle_config_dir.assert_awaited_once_with(config_dir)
+        runtime._quota_checker.add_slot.assert_called_once_with("a1", config_dir)
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
         assert res.success and res.account_id == "a1" and res.slot_index == 2
         assert res.login_request_id == "login-request-1"
@@ -1943,7 +1944,9 @@ class TestHandleAccountLogin:
             new=AsyncMock(return_value=LoginResult(
                 success=False, account_id="a1", error="cf blocked")),
         ):
-            await runtime._handle_account_login(self._msg())
+            await runtime._handle_account_login(
+                self._msg(config_dir=str(runtime._log_dir / "claude"))
+            )
 
         runtime._warmup_config_dir.assert_not_awaited()
         runtime._pty_backend.recycle_config_dir.assert_not_awaited()
@@ -1971,7 +1974,9 @@ class TestHandleAccountLogin:
                 success=True, account_id="a1", access_token="at"
             )),
         ):
-            await runtime._handle_account_login(self._msg())
+            await runtime._handle_account_login(
+                self._msg(config_dir=str(runtime._log_dir / "claude"))
+            )
 
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
         assert res.success is False
@@ -2000,10 +2005,13 @@ class TestHandleAccountLogin:
                 success=True, account_id="a1", access_token="at"
             )),
         ):
-            await runtime._handle_account_login(self._msg(email="expected@x.com"))
+            config_dir = str(runtime._log_dir / "claude")
+            await runtime._handle_account_login(
+                self._msg(email="expected@x.com", config_dir=config_dir)
+            )
 
         runtime._verify_config_identity.assert_awaited_once_with(
-            "/root/.claude-prod", "expected@x.com"
+            config_dir, "expected@x.com"
         )
         runtime._warmup_config_dir.assert_not_awaited()
         runtime._pty_backend.recycle_config_dir.assert_not_awaited()
@@ -2026,9 +2034,13 @@ class TestHandleAccountLogin:
             "elastic_agent.core.claude_oauth.ClaudeOAuthProvider.login",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ):
-            await runtime._handle_account_login(self._msg())
+            await runtime._handle_account_login(
+                self._msg(config_dir=str(runtime._log_dir / "claude"))
+            )
         res = [m for m in sent if isinstance(m, AccountLoginResultMessage)][0]
-        assert not res.success and "boom" in res.error
+        assert not res.success
+        assert res.error == "Claude login automation failed unexpectedly"
+        assert "boom" not in res.error
 
     @pytest.mark.asyncio
     async def test_codex_password_login_uses_codex_home_and_reports_success(
@@ -2252,6 +2264,7 @@ class TestHandleAccountLogin:
             try:
                 await asyncio.Future()
             finally:
+                runtime._confirm_account_login_cleanup(_message)
                 cancelled.set()
 
         runtime._handle_account_login = block

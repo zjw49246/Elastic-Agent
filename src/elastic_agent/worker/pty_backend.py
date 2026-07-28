@@ -500,11 +500,21 @@ if PTY_AVAILABLE:
             finally:
                 self._finalized_tasks.add(task_id)
 
-        async def _emit_log(self, task_id: str, line: str) -> None:
+        async def _emit_log(
+            self,
+            task_id: str,
+            line: str,
+            *,
+            event_scope: str = "foreground",
+        ) -> None:
             from elastic_agent.core.protocols.messages import LogMessage
             from elastic_agent.worker.runtime import WorkerRuntime
 
             parsed = WorkerRuntime._try_parse_ndjson(line)
+            if event_scope != "foreground":
+                # Keep raw_json byte-exact and visible in the trace, but do not
+                # offer autonomous sub-agent metadata to Manager accounting.
+                parsed = None
             log_path = self._log_dir / f"{task_id}.ndjson"
             try:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -593,7 +603,15 @@ if PTY_AVAILABLE:
             line = event_to_log_line(event_dict)
             if line is None:
                 return
-            await self._emit_log(task_id, line)
+            await self._emit_log(
+                task_id,
+                line,
+                event_scope=(
+                    "autonomous"
+                    if event_dict.get("autonomous")
+                    else "foreground"
+                ),
+            )
 
         async def on_exit(self, key: Any, exit_code: int | None, **context) -> None:
             task_id = key

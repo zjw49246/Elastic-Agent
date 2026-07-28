@@ -42,7 +42,7 @@ from elastic_agent.harness.generic import build_execute, resolve_harness
 
 logger = logging.getLogger(__name__)
 
-PersistSpecHook = Callable[[str, JobSpec], Awaitable[None]]
+PersistSpecHook = Callable[[str, JobSpec, str | None], Awaitable[None]]
 JobStateHook = Callable[[str, str, dict[str, Any] | None], Awaitable[None]]
 
 
@@ -148,6 +148,10 @@ class WorkerRun:
     assignment: WorkerAssignment | None = field(default=None, repr=False)
     final_collected: bool = False
     collection_error: str | None = None
+    # Ordinary cleanup has two ordered commits: cloud termination first, then
+    # allocator reference release. Keep them separate so a failed claim
+    # release can retry without needlessly repeating a destructive cloud call.
+    infrastructure_released: bool = False
     cleaned_up: bool = False
     cleanup_error: str | None = None
     cleanup_attempts: int = 0
@@ -188,6 +192,10 @@ class BatchJob:
     job_id: str
     spec: JobSpec
     harness: Harness
+    # SHA-256 of the canonical raw POST /jobs JSON, when the Job originated
+    # from that endpoint. It is journaled atomically with the prepared spec so
+    # exact replay remains possible across JobSpec schema upgrades.
+    request_fingerprint: str | None = None
     runs: dict[str, WorkerRun] = field(default_factory=dict)
     # Reservations that never reached a usable WorkerRun still need durable
     # lease/account cleanup (for example, one shard failed before scale-out or
@@ -234,20 +242,22 @@ class BatchJob:
             for r in self.runs.values()
             if self.spec.account.binding == "eip" and not r.cleaned_up
         ) + len(self.pending_cleanup)
-        ordinary_teardown_pending = bool(
-            self.launch_complete
-            and terminal
-            and self.runs
-            and self.release_workers_on_complete
-            and not self.resources_released
+        ordinary_cleanup_pending = sum(
+            1
+            for r in self.runs.values()
+            if (
+                self.spec.account.binding != "eip"
+                and self.release_workers_on_complete
+                and not self.resources_released
+                and r.phase in TERMINAL_WORKER_PHASES
+                and not r.cleaned_up
+            )
         )
-        if ordinary_teardown_pending:
-            cleanup_pending += len(self.runs)
+        cleanup_pending += ordinary_cleanup_pending
         done = (
             self.launch_complete
             and terminal
             and cleanup_pending == 0
-            and not ordinary_teardown_pending
         )
         if done and self.cancel_requested and not self.cancel_as_failure:
             state = "cancelled"
@@ -290,6 +300,10 @@ class BatchJob:
                         r.cleaned_up
                         if self.spec.account.binding == "eip"
                         else self.resources_released
+                        or (
+                            self.release_workers_on_complete
+                            and r.cleaned_up
+                        )
                     ),
                 }
                 for r in self.runs.values()
@@ -786,7 +800,11 @@ class BatchOrchestrator:
             raise ValueError(f"job {job.job_id!r} is already registered")
         if self._persist_spec_hook is not None:
             try:
-                await self._persist_spec_hook(job.job_id, job.spec)
+                await self._persist_spec_hook(
+                    job.job_id,
+                    job.spec,
+                    job.request_fingerprint,
+                )
             except Exception as exc:  # noqa: BLE001
                 raise JobSpecPersistenceError(
                     f"failed to persist JobSpec for {job.job_id!r} before launch: {exc}"
@@ -987,19 +1005,31 @@ class BatchOrchestrator:
                 ):
                     continue
                 for attempt in range(1, 4):
-                    try:
-                        await self._driver.scale_in(list(job.runs))
-                    except Exception:
-                        logger.exception(
-                            "shutdown ordinary cleanup attempt %s/3 failed for %s",
-                            attempt,
-                            job.job_id,
-                        )
-                    else:
+                    pending = [
+                        run
+                        for run in job.runs.values()
+                        if not run.cleaned_up
+                    ]
+                    if not pending:
                         job.resources_released = True
-                        for worker_id in job.runs:
-                            self._worker_index.pop(worker_id, None)
                         break
+                    await asyncio.gather(*(
+                        self._settle_ordinary_run_for_shutdown(job, run)
+                        for run in pending
+                    ))
+                    if all(run.cleaned_up for run in job.runs.values()):
+                        job.resources_released = True
+                        break
+                    logger.error(
+                        "shutdown ordinary cleanup attempt %s/3 left %d "
+                        "worker(s) unsettled for %s",
+                        attempt,
+                        sum(
+                            not run.cleaned_up
+                            for run in job.runs.values()
+                        ),
+                        job.job_id,
+                    )
 
             for job in self._jobs.values():
                 await self._maybe_finish(job)
@@ -1941,6 +1971,7 @@ class BatchOrchestrator:
             # The first handler may have completed process accounting but hit a
             # transient scale-in error.  A reliable replay must re-enter finish
             # logic instead of ACKing away the only cleanup retry trigger.
+            await self._finalize_terminal_run(job, run)
             await self._maybe_finish(job)
             return
         if run.phase == WorkerPhase.ROTATING:
@@ -1981,7 +2012,12 @@ class BatchOrchestrator:
             self._fail(run, reason)
         await self._finalize_terminal_run(job, run)
         await self._maybe_finish(job)
-        return not self._is_eip_bound(job.spec) or run.cleaned_up
+        if (
+            self._is_eip_bound(job.spec)
+            or job.release_workers_on_complete
+        ):
+            return run.cleaned_up
+        return True
 
     @_tracked_lifecycle
     async def cancel_job(self, job_id: str, reason: str = "job cancelled") -> bool:
@@ -2212,6 +2248,99 @@ class BatchOrchestrator:
                     run.cleaned_up = True
                     run.cleanup_error = None
                     self._worker_index.pop(run.worker_id, None)
+            elif (
+                not self._is_eip_bound(job.spec)
+                and job.release_workers_on_complete
+                and not run.cleaned_up
+            ):
+                await self._cleanup_ordinary_run_locked(job, run)
+
+    async def _cleanup_ordinary_run_locked(
+        self,
+        job: BatchJob,
+        run: WorkerRun,
+        *,
+        schedule_retry: bool = True,
+    ) -> None:
+        """Terminate one ordinary Worker, then release only its account refs.
+
+        The caller owns ``run._finalize_lock``. This exact per-run transaction
+        prevents a failed shard from retaining a billable instance and
+        delegated key until unrelated long-running shards finish.
+        """
+
+        try:
+            if not run.infrastructure_released:
+                run.cleanup_attempts += 1
+                await self._driver.scale_in([run.worker_id])
+                run.infrastructure_released = True
+
+            allocator = getattr(self, "_allocator", None)
+            if allocator is not None:
+                await allocator.release_worker(run.worker_id)
+        except Exception as exc:  # noqa: BLE001
+            run.cleanup_error = str(exc) or type(exc).__name__
+            logger.exception(
+                "ordinary cleanup failed for worker %s", run.worker_id
+            )
+            if schedule_retry:
+                self._schedule_unbound_run_cleanup(job, run)
+            return
+
+        run.cleaned_up = True
+        run.cleanup_error = None
+        self._worker_index.pop(run.worker_id, None)
+
+    async def _settle_ordinary_run_for_shutdown(
+        self,
+        job: BatchJob,
+        run: WorkerRun,
+    ) -> None:
+        """Finish one pending ordinary teardown without spawning retry tasks."""
+
+        async with run._finalize_lock:
+            if run.cleaned_up:
+                return
+            await self._cleanup_ordinary_run_locked(
+                job,
+                run,
+                schedule_retry=False,
+            )
+
+    def _schedule_unbound_run_cleanup(
+        self, job: BatchJob, run: WorkerRun,
+    ) -> None:
+        """Retry one ordinary worker's ordered teardown transaction."""
+
+        key = f"ordinary:{run.worker_id}"
+        existing = self._cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            try:
+                while not run.cleaned_up:
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=self._cleanup_retry_seconds,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    async with run._finalize_lock:
+                        if run.cleaned_up:
+                            return
+                        await self._cleanup_ordinary_run_locked(job, run)
+                    if run.cleaned_up:
+                        await self._maybe_finish(job)
+                        return
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._cleanup_tasks.pop(key, None)
+
+        self._cleanup_tasks[key] = asyncio.create_task(retry())
 
     def _schedule_bound_cleanup(self, job: BatchJob, run: WorkerRun) -> None:
         existing = self._cleanup_tasks.get(run.worker_id)
@@ -2260,44 +2389,6 @@ class BatchOrchestrator:
 
         self._cleanup_tasks[run.worker_id] = asyncio.create_task(retry())
 
-    def _schedule_unbound_cleanup(self, job: BatchJob) -> None:
-        """Retry idempotent ordinary-worker termination until it succeeds."""
-        key = f"job:{job.job_id}"
-        existing = self._cleanup_tasks.get(key)
-        if existing is not None and not existing.done():
-            return
-
-        async def retry() -> None:
-            try:
-                while not job.resources_released:
-                    try:
-                        await asyncio.wait_for(
-                            self._shutdown_event.wait(),
-                            timeout=self._cleanup_retry_seconds,
-                        )
-                        return
-                    except asyncio.TimeoutError:
-                        pass
-                    try:
-                        await self._driver.scale_in(list(job.runs))
-                    except Exception:
-                        logger.exception(
-                            "retrying ordinary cleanup failed for job %s",
-                            job.job_id,
-                        )
-                    else:
-                        job.resources_released = True
-                        for worker_id in job.runs:
-                            self._worker_index.pop(worker_id, None)
-                        await self._maybe_finish(job)
-                        return
-            except asyncio.CancelledError:
-                return
-            finally:
-                self._cleanup_tasks.pop(key, None)
-
-        self._cleanup_tasks[key] = asyncio.create_task(retry())
-
     def _schedule_finish_retry(self, job: BatchJob) -> None:
         key = f"finish:{job.job_id}"
         existing = self._cleanup_tasks.get(key)
@@ -2332,6 +2423,15 @@ class BatchOrchestrator:
             # while other shards keep running for hours.
             for run in job.runs.values():
                 if run.phase in terminal:
+                    if (
+                        not self._is_eip_bound(job.spec)
+                        and run.final_collected
+                    ):
+                        # Ordinary run handlers already attempted their exact
+                        # teardown before entering this method. Avoid silently
+                        # turning one reliable event into two cloud mutations;
+                        # a replay or the owned retry loop performs the retry.
+                        continue
                     await self._finalize_terminal_run(job, run)
 
             if not job.launch_complete or not all(
@@ -2339,56 +2439,50 @@ class BatchOrchestrator:
             ):
                 return
 
-            # Ordinary API-account projections retain a delegated key on the
-            # Worker. Do not return that identity to the shared pool until the
-            # instance is confirmed torn down; otherwise a teardown failure
-            # could let two live Workers use the same account/EIP identity.
-            if (
+            # Ordinary ephemeral workers are finalized independently as soon as
+            # their shard terminates. The whole Job becomes resource-released
+            # only when every exact per-run teardown has committed.
+            per_run_ordinary_cleanup = (
                 not self._is_eip_bound(job.spec)
                 and job.release_workers_on_complete
-                and not job.resources_released
-            ):
-                try:
-                    await self._driver.scale_in(list(job.runs))
-                except Exception as exc:  # noqa: BLE001
-                    job.error = job.error or (
-                        "worker teardown failed: "
-                        f"{str(exc) or type(exc).__name__}"
-                    )
-                    logger.exception(
-                        "ordinary worker teardown failed for job %s", job.job_id
-                    )
-                    self._schedule_unbound_cleanup(job)
+            )
+            if per_run_ordinary_cleanup:
+                if any(not run.cleaned_up for run in job.runs.values()):
                     return
                 job.resources_released = True
-                for worker_id in job.runs:
-                    self._worker_index.pop(worker_id, None)
+
+            # Bound cleanup owns the exact lease/account claim transaction.
+            # Never mark accounts released (or run the broad legacy
+            # release_worker fallback) while any EIP detach/instance
+            # termination/lease release is still pending.
+            eip_bound = self._is_eip_bound(job.spec)
+            if eip_bound and (
+                job.pending_cleanup
+                or any(not run.cleaned_up for run in job.runs.values())
+            ):
+                return
 
             if not job.accounts_released:
-                allocator = getattr(self, "_allocator", None)
-                if allocator is not None:
-                    failures: list[str] = []
-                    for worker_id in job.runs:
-                        try:
-                            await allocator.release_worker(worker_id)
-                        except Exception as exc:  # pragma: no cover - defensive
-                            failures.append(f"{worker_id}: {exc}")
-                            logger.exception(
-                                "account release failed for %s", worker_id
+                if not per_run_ordinary_cleanup and not eip_bound:
+                    allocator = getattr(self, "_allocator", None)
+                    if allocator is not None:
+                        failures: list[str] = []
+                        for worker_id in job.runs:
+                            try:
+                                await allocator.release_worker(worker_id)
+                            except Exception as exc:  # pragma: no cover - defensive
+                                failures.append(f"{worker_id}: {exc}")
+                                logger.exception(
+                                    "account release failed for %s", worker_id
+                                )
+                        if failures:
+                            job.error = job.error or (
+                                "account release failed: "
+                                + "; ".join(failures[:3])
                             )
-                    if failures:
-                        job.error = job.error or (
-                            "account release failed: " + "; ".join(failures[:3])
-                        )
-                        self._schedule_finish_retry(job)
-                        return
+                            self._schedule_finish_retry(job)
+                            return
                 job.accounts_released = True
-
-            if self._is_eip_bound(job.spec):
-                if job.pending_cleanup or any(
-                    not run.cleaned_up for run in job.runs.values()
-                ):
-                    return
 
             if job.completed_at is None:
                 job.completed_at = datetime.now(timezone.utc)

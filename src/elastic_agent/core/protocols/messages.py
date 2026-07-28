@@ -335,6 +335,12 @@ class AccountLoginResultMessage(Message):
     slot_index: int
     success: bool
     error: str | None = None
+    # ``True`` is an explicit proof that a failed attempt restored credentials
+    # and stopped its login processes. ``False`` means cleanup is uncertain
+    # and an ordinary reusable worker/account must be quarantined. Successful
+    # logins leave this ``None`` because their credentials are intentionally
+    # committed rather than cleaned up.
+    cleanup_complete: bool | None = None
 
 
 class AccountLoginOtpRequiredMessage(Message):
