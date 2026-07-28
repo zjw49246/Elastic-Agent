@@ -8,6 +8,12 @@
       "Resource": "arn:aws:s3:::elastic-agent-results-297645381734"
     },
     {
+      "Sid": "ReadOnlyJobDatasets",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::elastic-agent-results-297645381734/jobs/datasets/*"
+    },
+    {
       "Sid": "WriteOnlyResultsObjects",
       "Effect": "Allow",
       "Action": [

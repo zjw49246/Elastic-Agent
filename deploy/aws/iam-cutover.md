@@ -38,10 +38,10 @@ from the shared role can break CCM and other machines. Create a dedicated
 `i-07988886030e168cc`.
 
 The production audit found 65 persisted JobSpecs, zero `setup.s3_datasets`
-entries, and zero `run.secret_env` entries. Therefore the Worker policy can be
-write-only under `jobs/*` without breaking a historical Job. A future S3
-dataset must get an explicit, separately reviewed read statement for its exact
-bucket/prefix; do not restore `AmazonS3FullAccess`.
+entries, and zero `run.secret_env` entries. The Worker policy writes only under
+`jobs/*` and reads only `jobs/datasets/*`; the latter is the reviewed staging
+namespace for `setup.s3_datasets`. Do not restore `AmazonS3FullAccess` or grant
+object reads outside that dataset prefix.
 
 CloudTrail for the target Manager instance observed only these runtime service
 families/actions: EC2 instance/EIP describe, create, associate, detach and
@@ -463,8 +463,9 @@ aws s3api get-bucket-policy --bucket "$EA_RESULTS_BUCKET" \
 
 Run a second one-Worker canary. Verify upload and final result download, then
 verify the instance/EBS is gone. From inside that disposable Worker (or with
-custom-policy simulation), also verify `GetObject`, `DeleteObject`, another
-bucket, and a non-`jobs/*` key are denied.
+custom-policy simulation), verify `GetObject` succeeds only for
+`jobs/datasets/*`, while result-object reads, `DeleteObject`, another bucket,
+and a non-`jobs/*` key are denied.
 
 The shared Worker profile cannot isolate one Job from another under `jobs/*`:
 a malicious Job can overwrite another Job's key even though it cannot read or

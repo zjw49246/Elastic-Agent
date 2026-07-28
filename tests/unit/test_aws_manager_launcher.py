@@ -211,7 +211,7 @@ def test_manager_policy_tags_and_detaches_only_managed_network_interfaces():
     assert release["Resource"].endswith(":elastic-ip/*")
 
 
-def test_worker_policy_is_write_only_for_the_results_prefix():
+def test_worker_policy_reads_only_datasets_and_writes_results():
     policy = json.loads(WORKER_POLICY.read_text(encoding="utf-8"))
     statements = {statement["Sid"]: statement for statement in policy["Statement"]}
 
@@ -220,6 +220,14 @@ def test_worker_policy_is_write_only_for_the_results_prefix():
         "Effect": "Allow",
         "Action": "s3:GetBucketLocation",
         "Resource": "arn:aws:s3:::elastic-agent-results-297645381734",
+    }
+    assert statements["ReadOnlyJobDatasets"] == {
+        "Sid": "ReadOnlyJobDatasets",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": (
+            "arn:aws:s3:::elastic-agent-results-297645381734/jobs/datasets/*"
+        ),
     }
     assert set(statements["WriteOnlyResultsObjects"]["Action"]) == {
         "s3:PutObject",

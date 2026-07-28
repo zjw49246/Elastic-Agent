@@ -156,6 +156,10 @@ prefix to every worker:
  "dest": "/srv/replay/shard-{{shard_id}}.jsonl"}
 ```
 
+The AWS worker instance profile must grant `s3:GetObject` for the exact dataset
+prefix. The production policy limits that read grant to `jobs/datasets/*`;
+result objects remain unreadable and undeletable from workers.
+
 `environment.profile` selects a versioned common platform definition maintained
 by the framework. Jobs add only their repository, setup steps, datasets, run
 environment, and command. `ubuntu-agent-v1` is the compatibility default;
