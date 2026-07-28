@@ -524,3 +524,20 @@ Repo/账号/EIP/换号等条件字段看不出何时生效；结果收集间隔�
 **验证**：新增归档有效性、后续对象阻塞时提前产出、active body close 异常下取消清理，以及 UI 流读取、直接落盘、大文件保护、原位进度和运行中快照测试。API/UI 聚焦测试 **101 passed**；完整套件 **2101 passed / 12 skipped / 0 failed**；变更模块 Ruff、`compileall`、Batch JavaScript 语法和 `git diff --check` 均通过。后端与浏览器侧独立复核最终均无 blocker/high。
 
 **生产发布（runtime `a44e38c`）**：首次候选 `01a78dc` 已证明大 Job 首字节和取消正常；真实 Chrome 进一步发现下载状态虽然从 Map 清除，按钮却因开始时没有提交一次 active 渲染签名而停在“正在取消”。follow-up `a44e38c` 在下载开始时只做一次 keyed reconcile，传输进度仍全部原位更新，终止时签名可靠回到 idle。东京 Manager 已原子切换到 `/home/ubuntu/elastic-agent.release-a44e38c`，`release-01a78dc` 与对应 unit/env 作为即时回滚。公网大 Job首字节 1.649 秒、5 秒传输 7,004,160 bytes 后主动取消；Chrome 验证写入、取消、toast 和按钮恢复为“下载结果 (5184)”；另一个 628 对象 Job 在 25.33 秒完整下载 34,151,654-byte 有效 tar。发布后公网 health 正常，新 Invocation 的 ERROR/Traceback/Exception 为 0，活跃 Job、Node、账号占用、OTP、非终态 managed EC2 与已挂载 EIP 均为 0，4 个绑定全部 `ready`。
+
+## 2026-07-28 逐 Worker S3 shard 与不可变代码交付（commit `cdfd958`）
+
+**问题**：Mode-B 的 `setup.s3_datasets` 只能静态配置，100 个 replay worker 会各自拉取整个 shard
+prefix；Manager rsync 虽然在提交前校验 `resolved_commit`，clone 阶段仍先解析可变 ref，存在 ref
+漂移导致交付失败的窗口。
+
+**解决**：dataset `uri/dest` 支持与 run command 相同的 worker 模板，并新增五位
+`shard_id`；provision 按真实 worker context 渲染和重新校验，每个 worker 只下载自己的单个
+S3 object，plan API 同时显示首 worker 的数据集预览。Manager rsync 在给出
+`resolved_commit` 时直接 fetch 完整 commit SHA，并严格核对解析结果。
+
+**以后避免**：fanout 资源不能在 provision 阶段退回首 worker 的静态 context；任何声明为
+不可变的源码交付都必须从 fetch 起点绑定 commit，而不只是 checkout 后验校验。
+
+**验证**：新增 dataset 模板拒绝/渲染、worker 上下文、provision 分片、plan 预览和 commit
+fetch 测试；完整套件 **2356 passed / 12 skipped / 0 failed**，`git diff --check` 通过。
