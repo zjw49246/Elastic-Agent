@@ -177,10 +177,12 @@ The focused suite covers:
   fallback, one shared 60-second usage→key-delivery→Worker-ACK deadline,
   Claude/Codex model projection,
   optional exact `account.model` admission at plan/allocation/configure,
-  60-second usage caching, unlimited/exhausted/auth/transient-last-known-dead
-  admission, invalid-schema/numeric/expiry fail-closed behavior, per-account
-  concurrent refresh, deterministic model-refresh benching, and private atomic
-  Manager storage;
+  60-second usage caching, unrestricted zero-balance admission without masking
+  explicit quota/status/expiry exhaustion,
+  unlimited/exhausted/auth/transient-last-known-dead admission,
+  invalid-schema/numeric/expiry fail-closed behavior, per-account concurrent
+  refresh, deterministic model-refresh benching, and private atomic Manager
+  storage;
 - correlated Manager-to-Worker API-key projection, 0700/0600 ownership and
   no-symlink checks, version-2 marker, fixed Claude/Codex routing, byte-exact
   helper plus environment-sanitizing launcher integrity,

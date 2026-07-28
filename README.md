@@ -225,6 +225,10 @@ curl -fsS -X POST "$EA_URL/api/agent-api/accounts" \
 
 Use `"provider":"apex"` for ApexRouter. CloudRouter validates against its fixed
 `/v1/models` endpoint and may project the key into Claude, Codex, or both.
+CloudRouter's explicit `mode="unrestricted"` means the key has no spend cap:
+top-level `balance=0` and `remaining=0` stay visible but are not exhaustion
+signals. Explicit exhausted status, expiry, quota, and rate-limit windows still
+block allocation.
 ApexRouter is Codex-only: it queries
 `https://35-75-22-186.sslip.io/v1/models` with the pinned Codex CLI version and
 configures the `apexrouter` Responses API provider. Fresh allocation prefers a

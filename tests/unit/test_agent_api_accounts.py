@@ -677,6 +677,56 @@ async def test_usage_active_exhausted_unlimited_and_auth_failure(
 
 
 @pytest.mark.asyncio
+async def test_unrestricted_zero_balance_remains_available(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    adapter = _adapter(store)
+    monkeypatch.setattr(adapter, "_request_json", AsyncMock(return_value={
+        "balance": 0,
+        "isValid": True,
+        "mode": "unrestricted",
+        "planName": "钱包余额",
+        "remaining": 0,
+        "unit": "USD",
+    }))
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["mode"] == "unrestricted"
+    assert snapshot["state"] == "active"
+    assert snapshot["available"] is True
+    assert snapshot["currency"] == "USD"
+    assert snapshot["balance"] == 0
+    assert snapshot["remaining"] == 0
+    assert "balance_unlimited" not in snapshot
+    assert "remaining_unlimited" not in snapshot
+    assert store.availability_decision(account.id)["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_explicit_quota_exhaustion_still_blocks_admission(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    adapter = _adapter(store)
+    monkeypatch.setattr(adapter, "_request_json", AsyncMock(return_value={
+        "balance": 0,
+        "isValid": True,
+        "mode": "unrestricted",
+        "remaining": 0,
+        "quota": {"limit": 100, "used": 100, "remaining": 0},
+    }))
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["mode"] == "unrestricted"
+    assert snapshot["state"] == "exhausted"
+    assert snapshot["available"] is False
+    assert store.availability_decision(account.id)["available"] is False
+
+
+@pytest.mark.asyncio
 async def test_wallet_sentinels_are_independent_and_usage_is_allowlisted(
     tmp_path, monkeypatch,
 ):

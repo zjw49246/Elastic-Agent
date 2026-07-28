@@ -391,9 +391,12 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         raise AgentApiUpstreamError("invalid_usage_response")
     else:
         mode = raw_mode.strip().lower()
-        if mode == "unrestricted":
-            mode = "subscription" if isinstance(subscription, dict) else "wallet"
-        elif mode not in {"quota_limited", "subscription", "wallet"}:
+        if mode not in {
+            "quota_limited",
+            "subscription",
+            "unrestricted",
+            "wallet",
+        }:
             if invalid or upstream_status != "active":
                 mode = "unknown"
             else:
@@ -423,7 +426,10 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         subscription_uses_usd = has_usd
     currency = (
         "USD"
-        if mode in {"quota_limited", "wallet"} or subscription_uses_usd
+        if (
+            mode in {"quota_limited", "unrestricted", "wallet"}
+            or subscription_uses_usd
+        )
         else "credits"
     )
 
@@ -540,7 +546,13 @@ def _normalise_usage(account_id: str, payload: Any) -> dict[str, Any]:
         # CloudRouter uses exactly -1 as the unlimited sentinel.
         return value is not None and value != Decimal("-1") and value <= 0
 
-    if scalar_depleted(balance) or scalar_depleted(remaining):
+    # CloudRouter reports spend-cap-free accounts as unrestricted. Their
+    # top-level balance/remaining values are informational, commonly both
+    # zero, and must not bench the key. Explicit status, expiry, quota, and
+    # rate-limit exhaustion above remain authoritative.
+    if mode != "unrestricted" and (
+        scalar_depleted(balance) or scalar_depleted(remaining)
+    ):
         exhausted = True
 
     expiry_sources = [payload]

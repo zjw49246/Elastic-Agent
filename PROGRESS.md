@@ -1,5 +1,27 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-28 同步 CloudRouter unrestricted 准入语义
+
+**问题**：CCM `387834d` 明确了 CloudRouter 无消费上限账号会返回
+`mode=unrestricted`，同时可能把顶层 `balance` 和 `remaining` 都报告为 0；
+这些数值只是展示信息。Elastic 仍把该模式改写成 `wallet`，进而把 0 判为 exhausted，
+导致有效 Key 在 usage probe 后被错误排除，无法进入 Agent API 登录/调度。
+
+**解决**：保留 `unrestricted` 为一等模式并使用 USD 展示；只对该模式忽略顶层
+balance/remaining 的耗尽推断，原值仍原样返回。显式 exhausted/invalid status、
+expiry、quota 和 rate-limit window 继续走原有严格门禁。没有改 Worker Key 投影、
+WSS 下发协议或其他 provider，也没有混入 CCM 相邻的大型 Fast-tier/API 删除功能。
+
+**避免复发**：额度字段必须结合 provider 的明确模式解释，不能把“0”脱离语义统一
+视为耗尽，也不能为了方便改写上游模式。同步上游小修时既要加入同构回归，也要额外
+锁定原有 fail-closed 门禁，避免修正假阴性时引入真正的无限准入。
+
+**验证**：先用两条红测试复现 `unrestricted→wallet/exhausted`，修复后同时验证
+零余额可准入且显式 quota 耗尽仍拦截；Agent API/Worker/API/编排定向回归
+`271 passed`，完整套件 `2351 passed / 12 skipped / 0 failed`。Ruff、`compileall`、
+`git diff --check` 和独立对照审查均通过；claude-pty lock 与上游 main 一致。
+按用户要求未部署、重启或修改任何运行中的服务。
+
 ## 2026-07-28 使用过的 EIP 账号安全删除
 
 **问题**：EIP Job 无论成功还是失败，终态都会销毁临时 EC2、释放 lease，
