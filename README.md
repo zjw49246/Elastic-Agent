@@ -610,7 +610,19 @@ then upload a `.py` through `POST /api/jobs/harness` and use the returned
 `harness_ref`. Prefer declarative JobSpec for untrusted submitters.
 
 **Frontend**: the Batch Console at `/batch` uses a light theme by default, with
-an optional session-scoped dark theme. It manages Claude and Codex identities,
+an optional session-scoped dark theme. The Job submission form keeps the
+JobSpec wire format unchanged while grouping inputs into eight numbered
+sections: basics, compute, source/setup, account, run, results, rotation, and
+trusted Harness settings. Labels name the user-facing purpose first and show
+the raw JobSpec field second; low-frequency settings use disclosure panels.
+Conditional account, EIP, repo, and rotation controls are visibly disabled
+with an adjacent reason when they do not apply. Result paths and the in-run
+collection interval remain prominent, and the validation/launch action stays
+reachable on desktop while stacking into full-width buttons on narrow screens.
+The client also checks native numeric limits, required run command, Job TTL
+ordering, and S3 dataset line format before preflight.
+
+The console manages Claude and Codex identities,
 accepts write-only OpenAI passwords/mailbox query tokens (at least one for
 Codex; both may be configured), filters Job account choices by `agent_type`,
 and shows active Codex OTP challenges as Worker-specific cards inside the

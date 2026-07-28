@@ -462,15 +462,19 @@ _BATCH_HTML = """\
   .card { background:var(--surface); border:1px solid var(--border); border-radius:12px;
           padding:18px; margin-bottom:20px; box-shadow:var(--shadow); }
   .card h2 { font-size:1.05rem; margin-bottom:12px; }
-  label { display:block; font-size:.8rem; color:var(--muted); margin:8px 0 3px; }
+  label { display:block; font-size:.84rem; color:var(--text); font-weight:600;
+    margin:8px 0 5px; line-height:1.35; }
   input, select, textarea { width:100%; background:var(--surface-soft); color:var(--text);
-    border:1px solid var(--border); border-radius:6px; padding:7px 9px; font-size:.85rem;
-    font-family:inherit; }
+    border:1px solid var(--border); border-radius:7px; padding:8px 10px; font-size:.88rem;
+    font-family:inherit; min-height:40px; }
   input:focus, select:focus, textarea:focus { outline:2px solid color-mix(in srgb,var(--accent) 28%,transparent);
     border-color:var(--accent); }
+  input:disabled, select:disabled, textarea:disabled { opacity:.68; cursor:not-allowed;
+    background:color-mix(in srgb,var(--surface-soft) 72%,var(--border)); }
+  input[type="checkbox"] { width:auto; min-height:auto; accent-color:var(--accent); }
   textarea { resize:vertical; min-height:52px; font-family:ui-monospace,Menlo,monospace; }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+  .grid2 { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; }
+  .grid3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
   .btn { background:var(--accent); color:#fff; border:none; border-radius:6px;
     padding:8px 14px; font-size:.85rem; cursor:pointer; margin-top:10px; }
   .btn:hover { filter:brightness(.96); }
@@ -497,9 +501,52 @@ _BATCH_HTML = """\
     transition:opacity .3s; pointer-events:none; z-index:1200; box-shadow:var(--shadow); }
   .toast.show { opacity:1; } .toast.error { border-color:var(--red); }
   details { margin-top:6px; } summary { cursor:pointer; }
-  .hint { font-size:.72rem; color:var(--muted); margin-top:2px; }
+  .hint { font-size:.78rem; color:var(--muted); margin-top:3px; line-height:1.45; }
   code { background:var(--surface-soft); border:1px solid var(--border); border-radius:4px;
     padding:1px 4px; }
+  .account-editor { border-top:1px solid var(--border); margin-top:18px; padding-top:16px; }
+  .account-editor h3 { font-size:.95rem; margin-bottom:5px; }
+  .check-label { display:flex; gap:7px; align-items:flex-start; font-weight:400;
+    color:var(--muted); margin-top:7px; }
+  .check-label input { margin-top:2px; flex:none; }
+  .job-form { display:grid; gap:14px; }
+  .form-section { min-width:0; border:1px solid var(--border); border-radius:10px;
+    padding:10px 14px 14px; background:var(--surface-soft); }
+  .form-section > legend { padding:0 8px; color:var(--text); font-size:.94rem;
+    font-weight:700; letter-spacing:-.01em; }
+  .section-intro { color:var(--muted); font-size:.79rem; line-height:1.45;
+    margin:0 0 10px; }
+  .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(235px,1fr));
+    gap:10px 12px; }
+  .form-grid + .form-grid, .form-grid + .field, .field + .form-grid { margin-top:9px; }
+  .field { min-width:0; }
+  .field > label { margin-top:0; }
+  .field-span-full { grid-column:1 / -1; }
+  .field-help { color:var(--muted); font-size:.78rem; line-height:1.45; margin-top:5px; }
+  .field-help[data-state] { min-height:1.15em; }
+  .field-code { color:var(--muted); font-size:.72rem; font-weight:400; white-space:nowrap; }
+  .required-mark { color:var(--red); font-size:.75rem; margin-left:4px; }
+  .textarea-setup { min-height:118px; }
+  .textarea-command { min-height:108px; }
+  .textarea-compact { min-height:78px; }
+  .form-details { border-top:1px dashed var(--border); margin-top:12px; padding-top:9px; }
+  .form-details > summary { color:var(--accent); font-size:.8rem; font-weight:600;
+    width:max-content; max-width:100%; }
+  .form-details[open] > summary { margin-bottom:10px; }
+  .form-notice { border:1px solid color-mix(in srgb,var(--accent) 28%,var(--border));
+    background:color-mix(in srgb,var(--accent) 5%,var(--surface)); border-radius:7px;
+    padding:8px 10px; margin-top:10px; }
+  .form-notice.warning { border-color:color-mix(in srgb,var(--orange) 42%,var(--border));
+    background:color-mix(in srgb,var(--orange) 7%,var(--surface)); color:var(--orange); }
+  .form-actions { position:sticky; bottom:8px; z-index:20; display:flex;
+    justify-content:flex-end; align-items:center; gap:8px; padding:10px;
+    border:1px solid var(--border); border-radius:10px;
+    background:color-mix(in srgb,var(--surface) 94%,transparent);
+    box-shadow:0 8px 24px rgba(15,23,42,.11); backdrop-filter:blur(8px); }
+  .form-actions .btn { margin:0; min-height:40px; }
+  .plan-result { white-space:pre-wrap; background:var(--bg); border:1px solid var(--border);
+    border-radius:7px; padding:10px; margin-top:0; font-size:.75rem; max-height:420px;
+    overflow:auto; }
   .workflow { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-top:12px; }
   .workflow-step { background:var(--surface-soft); border:1px solid var(--border);
     border-radius:9px; padding:10px; font-size:.78rem; text-align:center; }
@@ -583,6 +630,9 @@ _BATCH_HTML = """\
     padding:12px; border-radius:7px; font-size:.76rem; line-height:1.45; flex:1;
     white-space:pre-wrap; margin:0; tab-size:2; }
   #logMeta { color:var(--muted); font-size:.75rem; margin-bottom:7px; min-height:1.2em; }
+  @media (max-width:960px) {
+    .form-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  }
   @media (max-width:800px) {
     .grid2,.grid3 { grid-template-columns:1fr; }
     .workflow { grid-template-columns:repeat(2,1fr); }
@@ -597,6 +647,15 @@ _BATCH_HTML = """\
     .otp-action-card.otp-minimized .otp-action-head { align-items:center;
       flex-direction:row; }
     .otp-controls { grid-template-columns:1fr; }
+  }
+  @media (max-width:620px) {
+    input,select,textarea { min-height:44px; font-size:16px; }
+    input[type="checkbox"] { min-height:auto; }
+    .form-grid { grid-template-columns:1fr; }
+    .field-span-full { grid-column:auto; }
+    .form-section { padding:8px 10px 12px; }
+    .form-actions { position:static; display:grid; grid-template-columns:1fr; }
+    .form-actions .btn { width:100%; min-height:44px; }
   }
 </style>
 </head>
@@ -615,7 +674,7 @@ _BATCH_HTML = """\
 
   <div class="card">
     <h2>Job 怎么运行</h2>
-    <p class="muted">填写代码与命令后先点「Validate / Preview」，确认计划再启动。日志用于排错，结果目录才会收集并上传 S3；Job 结束后临时 Worker 会自动销毁。</p>
+    <p class="muted">填写代码与命令后可先点「仅校验并查看计划」；「校验并启动 Job」也会先执行相同预检。日志用于排错，只有明确填写的结果目录才会被收集；Job 结束后临时 Worker 会自动销毁。</p>
     <div class="workflow">
       <div class="workflow-step"><b>1</b>申请机器</div>
       <div class="workflow-step"><b>2</b>初始化环境</div>
@@ -653,63 +712,101 @@ _BATCH_HTML = """\
       仅有 Token 时会切换到邮箱验证码并自动取码。没有可用查询 Token、自动查询失败，或自动验证码被拒绝时，
       只有对应 Worker 才会弹出人工验证码卡。
     </p>
-    <table><thead><tr><th>ID</th><th>类型 / 支持 Agent</th><th>账号</th><th>Secrets</th>
-      <th>Group</th><th>Enabled</th><th>额度</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
-      <tbody id="acctRows"></tbody></table>
-    <div class="grid3" style="margin-top:12px">
-      <div><label>ID</label><input id="acctId" placeholder="acc-1"></div>
-      <div><label>Email</label><input id="acctEmail" placeholder="a@x.com"></div>
-      <div><label>Agent</label><select id="acctAgent">
+    <div class="table-scroll">
+      <table><thead><tr><th>ID</th><th>类型 / 支持 Agent</th><th>账号</th><th>Secrets</th>
+        <th>Group</th><th>Enabled</th><th>额度</th><th>EIP / 当前 Worker</th><th></th></tr></thead>
+        <tbody id="acctRows"></tbody></table>
+    </div>
+    <section class="account-editor" aria-labelledby="nativeAccountTitle">
+      <h3 id="nativeAccountTitle">添加登录账号</h3>
+      <p class="hint">Claude 或 Codex 在 Worker 上完成浏览器登录；秘密写入后不会在页面回显。</p>
+    <div class="grid3" style="margin-top:8px">
+      <div><label for="acctId">账号 ID</label><input id="acctId" placeholder="acc-1"></div>
+      <div><label for="acctEmail">登录邮箱</label><input id="acctEmail" type="email" placeholder="a@x.com"></div>
+      <div><label for="acctAgent">使用的 Agent</label><select id="acctAgent">
         <option value="claude">Claude</option><option value="codex">Codex</option>
       </select></div>
     </div>
     <div class="grid3">
-      <div><label>登录密码（Codex 至少填写一项，可同时填写；写入后不回显）</label>
-        <input id="acctPassword" type="password" placeholder="OpenAI password">
-        <label style="margin-top:5px"><input id="acctClearPassword" type="checkbox" style="width:auto">
+      <div><label for="acctPassword">登录密码</label>
+        <input id="acctPassword" type="password" autocomplete="new-password"
+               placeholder="OpenAI password">
+        <div class="field-help">Codex 至少填写一项，可同时填写：登录密码或接码查询 Token。</div>
+        <label class="check-label" for="acctClearPassword"><input id="acctClearPassword" type="checkbox">
           清除该账号已有登录密码</label></div>
-      <div><label>接码查询 Token（只用于读取邮箱验证码；写入后不回显）</label>
-        <input id="acctToken" type="password" placeholder="171mail / MailCatcher query token">
-        <label style="margin-top:5px"><input id="acctClearToken" type="checkbox" style="width:auto">
+      <div><label for="acctToken">接码查询 Token</label>
+        <input id="acctToken" type="password" autocomplete="new-password"
+               placeholder="171mail / MailCatcher query token">
+        <div class="field-help">只用于读取邮箱验证码，不是 OpenAI 登录凭据。</div>
+        <label class="check-label" for="acctClearToken"><input id="acctClearToken" type="checkbox">
           清除该账号已有查询 token</label></div>
-      <div><label>Group</label><input id="acctGroup" value="standard"></div>
+      <div><label for="acctGroup">账号组</label><input id="acctGroup" value="standard">
+        <div class="field-help">Job 可按这个 Group 自动挑选账号。</div></div>
     </div>
-    <button class="btn" onclick="addAccount()">Add Account</button>
+    <button class="btn" onclick="addAccount()">添加登录账号</button>
+    </section>
 
-    <div style="border-top:1px solid var(--border);margin-top:18px;padding-top:16px">
-      <h3 style="font-size:.95rem;margin-bottom:6px">Agent API accounts</h3>
+    <section class="account-editor" aria-labelledby="agentApiAccountTitle">
+      <h3 id="agentApiAccountTitle">添加 Agent API 账号 <span class="field-code">Agent API accounts</span></h3>
       <p class="hint" id="apiAcctHint"></p>
       <div class="grid3" style="margin-top:8px">
-        <div><label>Provider</label><select id="apiAcctProvider" onchange="updateAgentApiProviderUI()">
+        <div><label for="apiAcctProvider">API Provider</label><select id="apiAcctProvider" onchange="updateAgentApiProviderUI()">
           <option value="cloudrouter">CloudRouter</option>
           <option value="apex">ApexRouter</option>
         </select></div>
-        <div><label>Name</label><input id="apiAcctName" placeholder="research-router"></div>
-        <div><label>Group</label><input id="apiAcctGroup" value="standard"></div>
+        <div><label for="apiAcctName">显示名称</label><input id="apiAcctName" placeholder="research-router"></div>
+        <div><label for="apiAcctGroup">账号组</label><input id="apiAcctGroup" value="standard"></div>
       </div>
-      <label>API Key（写入后不回显）</label>
+      <label for="apiAcctKey">API Key（写入后不回显）</label>
       <input id="apiAcctKey" type="password" autocomplete="new-password"
              placeholder="CloudRouter API Key">
       <button class="btn" id="apiAcctAdd" onclick="addAgentApiAccount()">Add CloudRouter API</button>
-    </div>
+    </section>
   </div>
 
   <!-- Job submission -->
-  <div class="card">
-    <h2>Submit Job</h2>
-    <div class="grid3">
-      <div><label>Job name</label><input id="jName" placeholder="ai4sci-opus48-seed128"></div>
-      <div><label>Workers (fan-out)</label><input id="jWorkers" type="number" value="1" min="1"></div>
-      <div><label>Environment profile（固定通用环境）</label>
-        <select id="jProfile"><option value="ubuntu-agent-v1">ubuntu-agent-v1</option>
-          <option value="ubuntu-agent-docker-v1">ubuntu-agent-docker-v1</option></select></div>
-    </div>
-    <div class="grid3">
-      <div><label>机器命名前缀（EC2 Name=前缀-i；空=用 Job name）</label>
-        <input id="jNamePrefix" placeholder="my-fleet"></div>
-      <div><label>机型 instance_type（空=Manager 默认）</label>
+  <div class="card" id="jobSubmissionCard">
+    <h2>提交 Job <span class="field-code">Submit Job</span></h2>
+    <p class="section-intro">先完成必需项，再按任务需要展开高级设置。页面中的原始 JobSpec 字段名以小字标出。</p>
+    <div class="job-form">
+    <fieldset class="form-section" data-job-section="basics">
+      <legend>1 · 基本信息</legend>
+      <p class="section-intro">给本次任务命名，并选择所有 Worker 共用的版本化基础环境。</p>
+      <div class="form-grid">
+        <div class="field"><label for="jName">Job 名称</label>
+          <input id="jName" placeholder="ai4sci-opus48-seed128" autocomplete="off">
+          <div class="field-help">用于页面识别、云资源标签和默认机器名称。</div></div>
+        <div class="field"><label for="jProfile">Worker 基础环境 <span class="field-code">environment.profile</span></label>
+          <select id="jProfile" aria-describedby="jProfileHelp">
+            <option value="ubuntu-agent-v1">标准 Agent 环境（ubuntu-agent-v1）</option>
+            <option value="ubuntu-agent-docker-v1">预装 Docker 环境（ubuntu-agent-docker-v1）</option>
+          </select>
+          <div class="field-help" id="jProfileHelp">版本化、不可变的通用环境；Job 专属依赖请在“代码与初始化”中安装。</div></div>
+      </div>
+      <details class="form-details">
+        <summary>机器命名与 Region</summary>
+        <div class="form-grid">
+          <div class="field"><label for="jNamePrefix">机器名称前缀 <span class="field-code">fanout.name_prefix</span></label>
+            <input id="jNamePrefix" placeholder="留空则使用 Job 名称">
+            <div class="field-help">EC2 Name 会写成“前缀-i”；不影响 Job ID。</div></div>
+          <div class="field"><label for="jRegion">运行 Region <span class="field-code">fanout.region</span></label>
+            <input id="jRegion" placeholder="留空则使用当前 Manager Region">
+            <div class="field-help">目前不支持跨区，填写值必须与 Manager 的 provider Region 一致。</div></div>
+        </div>
+      </details>
+    </fieldset>
+
+    <fieldset class="form-section" data-job-section="compute">
+      <legend>2 · 计算资源</legend>
+      <p class="section-intro">这些资源按每台 Worker 计算；Worker 数量会同时影响机器数、账号数和总成本。</p>
+      <div class="form-grid">
+        <div class="field"><label for="jWorkers">Worker 数量 <span class="field-code">fanout.workers</span></label>
+          <input id="jWorkers" type="number" value="1" min="1" max="100"
+                 aria-describedby="jWorkersHelp">
+          <div class="field-help" id="jWorkersHelp">每台 Worker 各运行一次命令；上限 100，仍受部署容量策略限制。</div></div>
+      <div class="field"><label for="jInstanceType">每台 Worker 的实例类型 <span class="field-code">fanout.instance_type</span></label>
         <select id="jInstanceType">
-          <option value="">（默认）</option>
+          <option value="">使用 Manager 默认实例类型</option>
           <optgroup label="通用/便宜">
             <option>t3.large</option><option>t3.xlarge</option><option>t3.2xlarge</option>
             <option>m5.xlarge</option><option>m5.2xlarge</option><option>m5.4xlarge</option>
@@ -721,132 +818,237 @@ _BATCH_HTML = """\
           <optgroup label="计算型">
             <option>c5.xlarge</option><option>c5.2xlarge</option><option>c5.4xlarge</option><option>c5.9xlarge</option>
           </optgroup>
-        </select></div>
-      <div><label>Region（空=当前 Manager 区域；目前不支持跨区）</label>
-        <input id="jRegion" placeholder="留空；仅可填当前 Manager 配置的区域"></div>
-    </div>
-    <div class="grid2">
-      <div><label>根盘 disk_gb（0=Manager 默认；吃盘任务如 ai4sci 建议 ≥60）</label>
-        <input id="jDiskGb" type="number" value="0" min="0"></div>
-    </div>
-    <label>Setup — repo URL（clone 到「代码目录」= target_dir）</label>
-    <input id="jRepo" placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git">
-    <div class="grid3">
-      <div><label>Repo branch/tag ref</label><input id="jRepoRef" value="main"></div>
-      <div><label>Resolved commit（推荐，完整 40 位 SHA）</label><input id="jResolvedCommit" placeholder="精确复现时填写"></div>
-      <div><label>代码目录 target_dir（绝对路径）</label>
-        <input id="jTargetDir" value="/opt/elastic-agent/harness"></div>
-    </div>
-    <label>代码分发方式</label>
-    <select id="jDeliver">
-      <option value="manager_rsync">manager_rsync（私有 repo 推荐：token 只在 Manager，clone 后 rsync 到 worker，token 不上机）</option>
-      <option value="worker_clone">worker_clone（公开 repo：worker 自己 git clone）</option>
-    </select>
-    <label>Setup — commands（每行一条,在代码目录里跑；默认已装 uv 并 pin Python 3.13）</label>
-    <textarea id="jSetup" placeholder="uv sync">curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3.13</textarea>
-    <details><summary class="muted">Structured setup steps（JSON，可单独设置 env/cwd/timeout/retries）</summary>
-      <textarea id="jSetupSteps" style="min-height:90px" placeholder='[{"name":"install","command":"uv sync","env":{"UV_LINK_MODE":"copy"},"cwd":".","timeout":1200,"retries":1}]'></textarea>
-      <div class="hint">每一步固定以 Job 用户运行；不允许指定 root 或其他用户名。旧的逐行 commands 仍兼容。</div>
-    </details>
-    <div class="hint">💡 契约：repo 会 clone 到「代码目录」,setup 和 run 命令<b>都从这个目录跑</b>——你照「本地 <code>git clone && cd repo && …</code>」那样写命令即可。</div>
-    <div class="grid2">
-      <div><label>需要 Docker（run 用 Docker,如 ai4sci <code>--sandbox os</code>）</label>
-        <select id="jNeedsDocker"><option value="false">否</option><option value="true">是</option></select></div>
-      <div><label>S3 数据集（每行 <code>s3://桶/前缀/ 目标目录</code>；worker 用实例角色直拉，不经 Manager）</label>
-        <textarea id="jS3" placeholder="s3://my-bucket/datasets/ /home/ubuntu/data"></textarea></div>
-    </div>
-    <label>Run command（shell;从代码目录运行;支持 {{shard_index}} 和 $(hostname -s)）</label>
-    <textarea id="jRun" placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
-    <div class="grid3">
-      <div><label>Working dir（空/. = 代码目录;相对路径=其子目录）</label><input id="jCwd" value="."></div>
-      <div><label>Shard by</label>
-        <select id="jShard"><option value="hostname">hostname</option>
-          <option value="shard_index">shard_index</option><option value="none">none</option></select></div>
-      <div><label>Shell mode</label><select id="jShell"><option value="true">bash -lc</option>
-        <option value="false">direct argv</option></select></div>
-    </div>
-    <div class="grid2">
-      <div><label>Run timeout 秒（默认 24h，最长 30 天）</label>
-        <input id="jRunTimeout" type="number" value="86400" min="60" max="2592000"></div>
-      <div><label>Job TTL 秒（含启动/登录/收集；默认 48h）</label>
-        <input id="jTtl" type="number" value="172800" min="300" max="2592000"></div>
-    </div>
-    <label>Env (KEY=VALUE per line)</label>
-    <textarea id="jEnv" placeholder="AI4SCI_SANDBOX_CPU=1&#10;AI4SCI_SANDBOX_MEM=4g"></textarea>
-    <label>Secret env references（KEY=aws-secretsmanager://... 或 KEY=aws-ssm://...）</label>
-    <textarea id="jSecretEnv" placeholder="OPENAI_API_KEY=aws-secretsmanager://prod/openai#api_key&#10;DB_PASSWORD=aws-ssm:///prod/db/password"></textarea>
-    <div class="hint">只提交 AWS 引用；明文仅在命令下发前解析，不写回 JobSpec，也不在 API 中回显。</div>
-    <div class="grid2">
-      <div><label>结果收集目录 collect.paths（每行一个,相对代码目录,如 results）</label>
-        <textarea id="jCollect" placeholder="results">results</textarea></div>
-      <div><label>增量收集间隔秒（0=只在完成时收集；&gt;0=边跑边收→持续上 S3，长跑推荐 120）</label>
-        <input id="jCollectInterval" type="number" value="0" min="0"></div>
-    </div>
-    <div class="grid3">
-      <div><label>Account mode</label>
-        <select id="jAcctMode" onchange="updateAccountModeUI()">
-          <option value="worker_local_login">worker_local_login</option>
-          <option value="manager_distribute">manager_distribute</option><option value="none">none</option></select></div>
-      <div><label>Agent</label><select id="jAgentType" onchange="updateAgentUI()">
-        <option value="claude">Claude</option><option value="codex">Codex</option>
-      </select></div>
-      <div><label>Account group</label><input id="jAcctGroup" value="standard"></div>
-    </div>
-    <div><label>Agent model（可选；Agent API 账号按 provider 模型列表精确校验）</label>
-      <input id="jAgentModel" placeholder="如 gpt-5.4 或 claude-opus-4-8"></div>
-    <div class="grid3">
-      <div><label>config_dir（空 = Agent 默认目录）</label>
-        <input id="jConfigDir" placeholder="留空，或填写 worker 上的绝对路径"></div>
-      <div><label>Accounts per worker</label>
-        <input id="jPerWorker" type="number" value="1" min="1" max="32"></div>
-      <div><label>自动登录页面超时秒（60–1200）</label>
-        <input id="jLoginTimeout" type="number" value="900" min="60" max="1200"></div>
-    </div>
-    <div class="grid2">
-      <div><label>账号固定 EIP</label>
-        <select id="jAcctBinding" onchange="markEipBindingTouched()">
-          <option value="none">关闭（普通临时 EC2）</option>
-          <option value="eip">启用（一号一 IP）</option>
-        </select></div>
-      <div><label>指定账号（Ctrl/Cmd 多选；留空则按 Group 自动选择）</label>
-        <select id="jAcctIds" multiple size="4" disabled></select></div>
-    </div>
-    <div class="hint" id="jEipHint">
-      启用后，一个账号固定绑定一个 IPv4 EIP，每台临时 EC2 只使用一个账号；如指定账号，
-      选中账号数必须等于 Workers。新 EC2 仍会重新登录 Claude，任务结束先收集结果再销毁 EC2，
-      但保留 EIP。Claude 与 Codex 账号都按 account_id 绑定各自 EIP。
-    </div>
-    <div class="grid2">
-      <div><label>Rotation strategy</label>
-        <select id="jRot"><option value="none">none</option>
-          <option value="on_exhaust_restart_resume">on_exhaust_restart_resume (a)</option></select></div>
-      <div><label>Resume args (appended on rotation restart)</label>
-        <input id="jResume" placeholder='--resume "results/opus48_$(hostname -s)_seed128"'></div>
-    </div>
-    <div class="grid2">
-      <div><label>Max rotations</label><input id="jMaxRotations" type="number" value="20" min="0" max="100"></div>
-      <div><label>Spot instance</label><select id="jSpot"><option value="false">否</option><option value="true">是</option></select></div>
-    </div>
-
-    <details>
-      <summary class="muted">Advanced: upload Harness code (escape hatch)</summary>
-      <div class="grid2" style="margin-top:8px">
-        <div><label>Filename (&lt;name&gt;.py)</label><input id="hFile" placeholder="my_harness.py"></div>
-        <div><label>Class name</label><input id="hClass" placeholder="MyHarness"></div>
+        </select>
+        <div class="field-help">仅允许部署白名单中的类型；AI4Sci 等内存任务通常选 r5 系列。</div></div>
+      <div class="field"><label for="jDiskGb">每台 Worker 根盘（GiB） <span class="field-code">fanout.disk_gb</span></label>
+        <input id="jDiskGb" type="number" value="0" min="0" max="2048"
+               aria-describedby="jDiskGbHelp">
+        <div class="field-help" id="jDiskGbHelp">0 使用 Manager 默认值；吃盘任务建议至少 60 GiB。Worker 销毁时根盘一并删除。</div></div>
+      <div class="field"><label for="jSpot">购买方式 <span class="field-code">fanout.spot</span></label>
+        <select id="jSpot"><option value="false">按需实例（推荐）</option><option value="true">Spot 实例</option></select>
+        <div class="field-help">Spot 成本较低，但云厂商可能随时回收实例。</div></div>
+      <div class="field"><label for="jNeedsDocker">运行时是否需要 Docker <span class="field-code">setup.needs_docker</span></label>
+        <select id="jNeedsDocker"><option value="false">不需要</option><option value="true">需要</option></select>
+        <div class="field-help">运行命令会使用 Docker（例如 AI4Sci <code>--sandbox os</code>）时选择“需要”。</div></div>
       </div>
-      <label>Harness code (a Harness subclass)</label>
-      <textarea id="hCode" style="min-height:120px"></textarea>
-      <button class="btn btn-ghost" onclick="uploadHarness()">Upload → set harness_ref</button>
-      <div><label>harness_ref (set = uploaded code drives the job; blank = declarative)</label>
-        <input id="jHarnessRef" placeholder=""></div>
-    </details>
+    </fieldset>
 
-    <div>
-      <button class="btn btn-ghost" id="jPlanBtn" onclick="previewJob()">Validate / Preview</button>
-      <button class="btn" id="jSubmitBtn" onclick="submitJob()">Launch Job</button>
+    <fieldset class="form-section" data-job-section="source">
+      <legend>3 · 代码与初始化</legend>
+      <p class="section-intro">指定代码来源和启动前命令；Setup 与 Run 默认都在 Worker 代码目录中执行。</p>
+      <div class="form-grid">
+        <div class="field field-span-full"><label for="jRepo">代码仓库 URL <span class="field-code">setup.repo</span></label>
+          <input id="jRepo" aria-describedby="jRepoHelp"
+                 placeholder="https://github.com/ApexIntelligence-AI/Agent-AI4Sci-Bench.git"
+                 oninput="updateSourceUI()">
+          <div class="field-help" id="jRepoHelp">可留空直接执行命令；填写后仓库会放到下方 Worker 代码目录。</div></div>
+        <div class="field"><label for="jDeliver">代码分发方式 <span class="field-code">setup.deliver</span></label>
+          <select id="jDeliver" onchange="updateDeliveryUI()" aria-describedby="jDeliverHelp">
+            <option value="manager_rsync">Manager 安全分发（私库推荐）</option>
+            <option value="worker_clone">Worker 直接克隆（公开仓库）</option>
+          </select>
+          <div class="field-help" id="jDeliverHelp" data-state></div></div>
+        <div class="field"><label for="jTargetDir">Worker 代码目录 <span class="field-code">setup.target_dir</span></label>
+          <input id="jTargetDir" value="/opt/elastic-agent/harness">
+          <div class="field-help">Repo 克隆到这里；Setup 与 Run 默认都从这里开始。</div></div>
+      </div>
+      <div class="field" style="margin-top:10px"><label for="jSetup">初始化命令 <span class="field-code">setup.commands</span></label>
+        <textarea id="jSetup" class="textarea-setup" placeholder="uv sync">curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3.13</textarea>
+        <div class="field-help">每行一条并按顺序执行。默认命令会安装 uv、固定 Python 3.13 并同步依赖。</div>
+      </div>
+      <details class="form-details">
+        <summary>版本锁定、结构化步骤与 S3 数据集</summary>
+        <div class="form-grid">
+          <div class="field"><label for="jRepoRef">分支或标签 <span class="field-code">setup.ref</span></label>
+            <input id="jRepoRef" value="main" aria-describedby="jRepoVersionHelp">
+            <div class="field-help" id="jRepoVersionHelp">仅填写 Repo 时生效。</div></div>
+          <div class="field"><label for="jResolvedCommit">锁定 Commit SHA <span class="field-code">setup.resolved_commit</span></label>
+            <input id="jResolvedCommit" placeholder="完整 40 位 SHA（推荐）"
+                   aria-describedby="jRepoVersionHelp">
+            <div class="field-help">锁定精确代码版本，便于复现。</div></div>
+          <div class="field field-span-full"><label for="jSetupSteps">结构化初始化步骤（JSON） <span class="field-code">setup.steps</span></label>
+            <textarea id="jSetupSteps" class="textarea-compact" placeholder='[{"name":"install","command":"uv sync","env":{"UV_LINK_MODE":"copy"},"cwd":".","timeout":1200,"retries":1}]'></textarea>
+            <div class="field-help">逐行命令执行完后再执行这些步骤；可分别设置 env、cwd、timeout 和 retries，始终以 Job 用户运行。</div></div>
+          <div class="field field-span-full"><label for="jS3">S3 数据集 <span class="field-code">setup.s3_datasets</span></label>
+            <textarea id="jS3" class="textarea-compact" placeholder="s3://my-bucket/datasets/ /home/ubuntu/data"></textarea>
+            <div class="field-help">每行格式为 <code>s3://桶/前缀/ 目标目录</code>；worker 用实例角色直拉，不经 Manager。</div></div>
+        </div>
+      </details>
+      <div class="form-notice field-help">路径契约：可以把命令写成与本地 <code>git clone &amp;&amp; cd repo &amp;&amp; …</code> 相同的相对路径逻辑。</div>
+    </fieldset>
+    <fieldset class="form-section" data-job-section="account">
+      <legend>4 · Agent 与账号</legend>
+      <p class="section-intro">选择运行命令使用的 Agent、凭据来源和账号池；Agent API 账号也会按能力自动进入对应账号池。</p>
+      <div class="form-grid">
+        <div class="field"><label for="jAgentType">Agent</label>
+          <select id="jAgentType" onchange="updateAgentUI()">
+            <option value="claude">Claude Code</option><option value="codex">Codex</option>
+          </select>
+          <div class="field-help">决定安装、登录和注入哪一种 Agent 凭据。</div></div>
+        <div class="field"><label for="jAcctMode">账号使用方式 <span class="field-code">account.mode</span></label>
+          <select id="jAcctMode" onchange="updateAccountModeUI()" aria-describedby="jAcctModeHelp">
+            <option value="worker_local_login">Worker 本地登录（推荐）</option>
+            <option value="manager_distribute">Manager 下发凭据（仅 Claude）</option>
+            <option value="none">不配置账号</option>
+          </select>
+          <div class="field-help" id="jAcctModeHelp">Codex 仅支持 Worker 本地登录；不透明命令自带凭据时可选择“不配置账号”。</div></div>
+        <div class="field"><label for="jAcctGroup">账号组 <span class="field-code">account.group</span></label>
+          <input id="jAcctGroup" value="standard">
+          <div class="field-help">未指定具体账号时，Manager 从这个组中自动分配。</div></div>
+        <div class="field"><label for="jAgentModel">Agent 模型（可选） <span class="field-code">account.model</span></label>
+          <input id="jAgentModel" placeholder="如 gpt-5.4 或 claude-opus-4-8">
+          <div class="field-help">Agent API 账号会按 Provider 返回的模型列表精确校验。</div></div>
+      </div>
+      <div class="field-help" id="jAccountStateHint" data-state role="status" aria-live="polite"></div>
+
+      <div class="form-grid" style="margin-top:10px">
+        <div class="field"><label for="jAcctBinding">固定公网出口 <span class="field-code">account.binding</span></label>
+          <select id="jAcctBinding" onchange="markEipBindingTouched()"
+                  aria-describedby="jAcctBindingHelp jEipHint">
+            <option value="none">普通临时公网出口</option>
+            <option value="eip">账号固定 EIP（一号一 IP）</option>
+          </select>
+          <div class="field-help" id="jAcctBindingHelp">只适用于 Worker 本地登录；AWS Manager 默认选择固定 EIP。</div></div>
+        <div class="field"><label for="jAcctIds">指定账号（可选） <span class="field-code">account.ids</span></label>
+          <select id="jAcctIds" multiple size="4" disabled
+                  aria-describedby="jAcctIdsHelp jEipHint"></select>
+          <div class="field-help" id="jAcctIdsHelp">仅固定 EIP 模式可选；Ctrl/Cmd 多选。留空则按账号组自动选择。</div></div>
+      </div>
+      <div class="form-notice field-help" id="jEipHint" role="status" aria-live="polite">
+        固定 EIP 模式下，每台临时 EC2 只使用一个账号；指定账号数必须等于 Worker 数。
+        新 EC2 会重新准备账号凭据：OAuth 账号本地登录，Agent API 账号配置 Key。
+        Job 结束后会销毁 EC2，但保留并继续计费 EIP。
+      </div>
+
+      <details class="form-details">
+        <summary>登录目录、每机账号池与超时</summary>
+        <div class="form-grid">
+          <div class="field"><label for="jConfigDir">凭据目录 <span class="field-code">account.config_dir</span></label>
+            <input id="jConfigDir" placeholder="留空则使用 Agent 默认目录">
+            <div class="field-help">多账号槽必须填写 Worker 上可写的绝对路径。</div></div>
+          <div class="field"><label for="jPerWorker">每台 Worker 预登录账号数 <span class="field-code">account.per_worker</span></label>
+            <input id="jPerWorker" type="number" value="1" min="1" max="32"
+                   aria-describedby="jPerWorkerHelp">
+            <div class="field-help" id="jPerWorkerHelp">普通模式可预登录多个账号以便快速切换；固定 EIP 模式强制为 1。</div></div>
+          <div class="field"><label for="jLoginTimeout">自动登录页面超时（秒） <span class="field-code">account.login_timeout_seconds</span></label>
+            <input id="jLoginTimeout" type="number" value="900" min="60" max="1200">
+            <div class="field-help">仅控制浏览器自动登录阶段；范围 60–1200 秒。</div></div>
+        </div>
+      </details>
+    </fieldset>
+
+    <fieldset class="form-section" data-job-section="run">
+      <legend>5 · 运行命令</legend>
+      <p class="section-intro">这是每台 Worker 真正执行的命令。模板变量会在分发时解析，Shell 变量留给 Worker。</p>
+      <div class="field"><label for="jRun">运行命令<span class="required-mark">必填</span> <span class="field-code">run.command</span></label>
+        <textarea id="jRun" class="textarea-command" required aria-describedby="jRunHelp"
+                  placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
+        <div class="field-help" id="jRunHelp">支持 Manager 模板 <code>{{shard_index}}</code>/<code>{{num_shards}}</code>，以及 Worker Shell 变量（如 <code>$(hostname -s)</code>）。</div>
+      </div>
+      <div class="form-grid" style="margin-top:10px">
+        <div class="field"><label for="jCwd">命令工作目录 <span class="field-code">run.cwd</span></label>
+          <input id="jCwd" value=".">
+          <div class="field-help">空或 <code>.</code> 为代码目录；相对路径表示其子目录。</div></div>
+        <div class="field"><label for="jShard">Worker 区分方式 <span class="field-code">fanout.shard_by</span></label>
+          <select id="jShard">
+            <option value="hostname">按主机名</option>
+            <option value="shard_index">按分片序号</option>
+            <option value="none">不区分</option>
+          </select>
+          <div class="field-help">决定多 Worker 任务使用哪种稳定标识。</div></div>
+        <div class="field"><label for="jShell">命令解析方式 <span class="field-code">run.shell</span></label>
+          <select id="jShell"><option value="true">Shell（bash -lc，推荐）</option>
+            <option value="false">直接 argv（不展开 Shell 语法）</option></select>
+          <div class="field-help">命令含管道、重定向或变量时使用 Shell。</div></div>
+        <div class="field"><label for="jRunTimeout">运行超时（秒） <span class="field-code">run.timeout</span></label>
+          <input id="jRunTimeout" type="number" value="86400" min="60" max="2592000"
+                 aria-describedby="jRunTimeoutHelp">
+          <div class="field-help" id="jRunTimeoutHelp">默认 24 小时，最长 30 天；仅计算命令执行阶段。</div></div>
+        <div class="field"><label for="jTtl">Job 总生命周期（秒） <span class="field-code">ttl_seconds</span></label>
+          <input id="jTtl" type="number" value="172800" min="300" max="2592000"
+                 aria-describedby="jTtlHelp">
+          <div class="field-help" id="jTtlHelp">包含申请机器、初始化、登录、运行和结果收集；不得短于运行超时。</div></div>
+      </div>
+      <details class="form-details">
+        <summary>环境变量与秘密引用</summary>
+        <div class="form-grid">
+          <div class="field"><label for="jEnv">普通环境变量 <span class="field-code">run.env</span></label>
+            <textarea id="jEnv" class="textarea-compact" placeholder="AI4SCI_SANDBOX_CPU=1&#10;AI4SCI_SANDBOX_MEM=4g"></textarea>
+            <div class="field-help">每行一个 <code>KEY=VALUE</code>；会保存在 JobSpec 中。</div></div>
+          <div class="field"><label for="jSecretEnv">秘密环境变量引用 <span class="field-code">run.secret_env</span></label>
+            <textarea id="jSecretEnv" class="textarea-compact" placeholder="OPENAI_API_KEY=aws-secretsmanager://prod/openai#api_key&#10;DB_PASSWORD=aws-ssm:///prod/db/password"></textarea>
+            <div class="field-help">每行一个 AWS Secrets Manager 或 SSM 引用；明文只在下发前解析，不写回 JobSpec。</div></div>
+        </div>
+      </details>
+    </fieldset>
+
+    <fieldset class="form-section" data-job-section="results">
+      <legend>6 · 结果收集</legend>
+      <p class="section-intro">只有这里明确列出的目录会成为可下载结果；命令 stdout/stderr 属于任务日志，不会自动上传。</p>
+      <div class="form-grid">
+        <div class="field"><label for="jCollect">需要保存的结果目录 <span class="field-code">collect.paths</span></label>
+          <textarea id="jCollect" class="textarea-compact" placeholder="results"
+                    aria-describedby="jCollectHelp">results</textarea>
+          <div class="field-help" id="jCollectHelp">每行一个、相对代码目录。为空表示不收集任何结果。</div></div>
+        <div class="field"><label for="jCollectInterval">运行中收集间隔（秒） <span class="field-code">collect.interval_seconds</span></label>
+          <input id="jCollectInterval" type="number" value="0" min="0" max="86400"
+                 oninput="updateCollectUI()" aria-describedby="jCollectIntervalHelp">
+          <div class="field-help" id="jCollectIntervalHelp" data-state role="status" aria-live="polite">
+            0 表示只在成功、失败或取消时做最终收集。
+          </div></div>
+      </div>
+      <div class="form-notice field-help">长任务建议设为 120 秒。间隔大于 0 时页面可下载最近一次完整快照；配置结果桶时会同步到 S3，否则保留在 Manager 本地。</div>
+    </fieldset>
+
+    <fieldset class="form-section" data-job-section="rotation">
+      <legend>7 · 额度耗尽与续跑</legend>
+      <p class="section-intro">仅用于 Elastic 能从输出中识别额度耗尽、并由新账号恢复执行的普通 Worker 模式。</p>
+      <div class="form-grid">
+        <div class="field"><label for="jRot">额度耗尽后的处理 <span class="field-code">rotation.strategy</span></label>
+          <select id="jRot" onchange="updateRotationUI()" aria-describedby="jRotationHint">
+            <option value="none">不自动切换账号</option>
+            <option value="on_exhaust_restart_resume">换号、重启并追加续跑参数</option>
+          </select></div>
+        <div class="field"><label for="jResume">换号重启时追加的参数 <span class="field-code">rotation.resume_args</span></label>
+          <input id="jResume" aria-describedby="jRotationHint"
+                 placeholder='--resume "results/opus48_$(hostname -s)_seed128"'></div>
+        <div class="field"><label for="jMaxRotations">最多自动换号次数 <span class="field-code">rotation.max_rotations</span></label>
+          <input id="jMaxRotations" type="number" value="20" min="0" max="100"></div>
+      </div>
+      <div class="field-help" id="jRotationHint" data-state role="status" aria-live="polite"></div>
+    </fieldset>
+
+    <fieldset class="form-section" data-job-section="advanced">
+      <legend>8 · 高级：自定义 Harness</legend>
+      <p class="section-intro">绝大多数 Job 不需要填写。留空时使用上面配置生成的声明式 JobSpec。</p>
+      <details class="form-details">
+        <summary>上传并使用 Harness Python 代码</summary>
+        <div class="form-notice warning field-help">
+          仅限受信任管理员：Harness 是 Manager 任意代码执行边界，生产默认关闭上传接口。
+        </div>
+        <div class="form-grid" style="margin-top:10px">
+          <div class="field"><label for="hFile">文件名（<code>&lt;name&gt;.py</code>）</label>
+            <input id="hFile" placeholder="my_harness.py"></div>
+          <div class="field"><label for="hClass">Harness 类名</label>
+            <input id="hClass" placeholder="MyHarness"></div>
+          <div class="field field-span-full"><label for="hCode">Harness Python 代码</label>
+            <textarea id="hCode" class="textarea-command"></textarea></div>
+        </div>
+        <button class="btn btn-ghost" onclick="uploadHarness()">上传并写入 harness_ref</button>
+        <div class="field" style="margin-top:10px"><label for="jHarnessRef">已上传 Harness 引用 <span class="field-code">harness_ref</span></label>
+          <input id="jHarnessRef" placeholder="留空则使用声明式配置">
+          <div class="field-help">设置后由上传的 Harness 驱动 Job；上方声明式字段仍用于预览，但执行边界以 Harness 为准。</div></div>
+      </details>
+    </fieldset>
+
+    <div class="form-actions">
+      <button class="btn btn-ghost" id="jPlanBtn" onclick="previewJob()">仅校验并查看计划</button>
+      <button class="btn" id="jSubmitBtn" onclick="submitJob()">校验并启动 Job</button>
     </div>
-    <pre id="jPlanOutput" style="display:none;white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:10px;font-size:.72rem"></pre>
+    <pre id="jPlanOutput" class="plan-result" role="status" aria-live="polite"
+         tabindex="0" style="display:none"></pre>
+    </div>
   </div>
 
   <!-- Jobs monitor -->
@@ -892,7 +1094,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     <div id="resultsList"><p class="muted">No results yet.</p></div>
   </div>
 </div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 const _params = new URLSearchParams(window.location.search);
@@ -1467,6 +1669,41 @@ function markEipBindingTouched() {
   eipBindingTouched = true;
   updateEipBindingUI();
 }
+function updateDeliveryUI() {
+  const delivery = document.getElementById('jDeliver').value;
+  document.getElementById('jDeliverHelp').textContent = delivery === 'manager_rsync'
+    ? 'Manager 克隆后移除凭据和 .git，再 rsync 到 Worker；私库推荐，Git token 不会上机。'
+    : 'Worker 自行 git clone；只适合 Worker 无需 Manager 凭据即可访问的公开仓库。';
+}
+function updateSourceUI() {
+  const hasRepo = Boolean(document.getElementById('jRepo').value.trim());
+  document.getElementById('jRepoRef').disabled = !hasRepo;
+  document.getElementById('jResolvedCommit').disabled = !hasRepo;
+  document.getElementById('jRepoVersionHelp').textContent = hasRepo
+    ? '分支或标签会先解析；填写完整 Commit SHA 可进一步锁定精确版本。'
+    : '当前未填写 Repo，分支、标签和 Commit SHA 不会生效。';
+}
+function updateCollectUI() {
+  const value = parseInt(document.getElementById('jCollectInterval').value) || 0;
+  document.getElementById('jCollectIntervalHelp').textContent = value > 0
+    ? `运行期间每 ${value} 秒收集一次；下载按钮读取最近一次已完成的快照。`
+    : '0 表示只在成功、失败或取消时做最终收集。';
+}
+function updateRotationUI() {
+  const rotation = document.getElementById('jRot');
+  const resume = document.getElementById('jResume');
+  const maxRotations = document.getElementById('jMaxRotations');
+  const accountEnabled = document.getElementById('jAcctMode').value !== 'none';
+  const enabled = accountEnabled
+    && rotation.value === 'on_exhaust_restart_resume';
+  resume.disabled = !enabled;
+  maxRotations.disabled = !enabled;
+  document.getElementById('jRotationHint').textContent = !accountEnabled
+    ? '当前未配置 Elastic 托管账号，因此不能自动切换账号。'
+    : enabled
+      ? '已启用：检测到额度耗尽后会切换账号、重启原命令，并追加上面的续跑参数。'
+      : '当前不会自动切换账号；续跑参数和次数不会写入有效执行路径。';
+}
 async function initializeProviderDefaults() {
   try {
     const health = await api('GET', '/health');
@@ -1475,26 +1712,57 @@ async function initializeProviderDefaults() {
   } catch(e) {}
 }
 function updateAccountModeUI() {
-  const workerLocal = document.getElementById('jAcctMode').value === 'worker_local_login';
+  const mode = document.getElementById('jAcctMode').value;
+  const workerLocal = mode === 'worker_local_login';
   const binding = document.getElementById('jAcctBinding');
+  const rotation = document.getElementById('jRot');
+  const accountDisabled = mode === 'none';
+  for (const id of [
+    'jAcctGroup', 'jAgentModel', 'jConfigDir', 'jPerWorker', 'jLoginTimeout',
+  ]) {
+    document.getElementById(id).disabled = accountDisabled;
+  }
   binding.disabled = !workerLocal;
+  rotation.disabled = accountDisabled;
+  if (accountDisabled) rotation.value = 'none';
   if (!workerLocal) binding.value = 'none';
   else if (providerType === 'aws' && !eipBindingTouched) binding.value = 'eip';
+  const hint = document.getElementById('jAccountStateHint');
+  hint.textContent = accountDisabled
+    ? '当前不配置 Elastic 托管账号；账号组、模型、登录目录和登录超时均不会生效。'
+    : workerLocal
+      ? 'Worker 会在任务开始前准备账号凭据：OAuth 账号本地登录，Agent API 账号配置 Key。'
+      : 'Manager 下发凭据仅支持 Claude；不会执行 Worker 浏览器本地登录。';
   updateEipBindingUI();
 }
 function updateEipBindingUI() {
-  const enabled = document.getElementById('jAcctMode').value === 'worker_local_login'
+  const mode = document.getElementById('jAcctMode').value;
+  const workerLocal = mode === 'worker_local_login';
+  const enabled = workerLocal
     && document.getElementById('jAcctBinding').value === 'eip';
   const picker = document.getElementById('jAcctIds');
   const rotation = document.getElementById('jRot');
   const perWorker = document.getElementById('jPerWorker');
   picker.disabled = !enabled;
   if (enabled) perWorker.value = '1';
-  perWorker.disabled = enabled;
+  perWorker.disabled = enabled || mode === 'none';
   const restartOption = Array.from(rotation.options)
     .find(o => o.value === 'on_exhaust_restart_resume');
-  if (restartOption) restartOption.disabled = enabled;
+  if (restartOption) restartOption.disabled = enabled || mode === 'none';
   if (enabled && rotation.value === 'on_exhaust_restart_resume') rotation.value = 'none';
+  const eipHint = document.getElementById('jEipHint');
+  if (enabled) {
+    eipHint.textContent = '固定 EIP 已启用：每台临时 EC2 只使用一个账号；指定账号数必须等于 Worker 数。'
+      + ' 新 EC2 会重新准备账号凭据：OAuth 账号本地登录，Agent API 账号配置 Key。'
+      + ' Job 结束后会销毁 EC2，但保留并继续计费 EIP。';
+  } else if (!workerLocal) {
+    eipHint.textContent = '当前账号模式不使用固定 EIP；Worker 会使用普通临时公网出口。';
+  } else {
+    eipHint.textContent = providerType === 'aws'
+      ? '当前 AWS Manager 默认建议固定 EIP；你已选择普通临时公网出口。'
+      : '启用后可让一个账号固定绑定一个 IPv4 EIP；Job 结束销毁 EC2，但会保留 EIP。';
+  }
+  updateRotationUI();
 }
 function updateAgentUI() {
   const agentType = document.getElementById('jAgentType').value;
@@ -1524,10 +1792,61 @@ function parseSetupSteps() {
   if (!Array.isArray(value)) throw new Error('Structured setup steps 必须是 JSON array');
   return value;
 }
+function validateJobForm() {
+  const run = document.getElementById('jRun');
+  run.setCustomValidity(
+    run.value.trim() ? '' : '请填写运行命令。'
+  );
+  const setupSteps = document.getElementById('jSetupSteps');
+  setupSteps.setCustomValidity('');
+  try {
+    parseSetupSteps();
+  } catch(error) {
+    setupSteps.setCustomValidity(
+      error instanceof SyntaxError
+        ? '结构化初始化步骤必须是有效的 JSON array。'
+        : error.message
+    );
+  }
+  const ttl = document.getElementById('jTtl');
+  const runTimeout = document.getElementById('jRunTimeout');
+  ttl.setCustomValidity(
+    Number(ttl.value) < Number(runTimeout.value)
+      ? 'Job 总生命周期不能短于运行超时。'
+      : ''
+  );
+  const s3 = document.getElementById('jS3');
+  const invalidDataset = lines('jS3').find(line => {
+    const parts = line.split(/ +/);
+    return !parts[0].startsWith('s3://') || !parts[1];
+  });
+  s3.setCustomValidity(
+    invalidDataset
+      ? 'S3 数据集每行必须是“s3://桶/路径 目标目录”。'
+      : ''
+  );
+  const controls = document.querySelectorAll(
+    '#jobSubmissionCard input, #jobSubmissionCard select, #jobSubmissionCard textarea'
+  );
+  for (const control of controls) {
+    if (!control.disabled && !control.checkValidity()) {
+      const details = control.closest('details');
+      if (details) details.open = true;
+      control.reportValidity();
+      control.focus();
+      return false;
+    }
+  }
+  return true;
+}
 function buildJobSpec() {
   const ref = document.getElementById('jHarnessRef').value.trim();
   const workers = parseInt(document.getElementById('jWorkers').value) || 1;
-  const accountBinding = document.getElementById('jAcctBinding').value;
+  const accountMode = document.getElementById('jAcctMode').value;
+  const accountEnabled = accountMode !== 'none';
+  const accountBinding = accountMode === 'worker_local_login'
+    ? document.getElementById('jAcctBinding').value
+    : 'none';
   const accountIds = accountBinding === 'eip'
     ? Array.from(document.getElementById('jAcctIds').selectedOptions).map(o => o.value)
     : [];
@@ -1548,6 +1867,10 @@ function buildJobSpec() {
     setup.ref = document.getElementById('jRepoRef').value.trim();
     setup.resolved_commit = document.getElementById('jResolvedCommit').value.trim();
   }
+  const rotationStrategy = accountEnabled
+    ? document.getElementById('jRot').value
+    : 'none';
+  const rotationEnabled = rotationStrategy === 'on_exhaust_restart_resume';
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
     environment: {profile: document.getElementById('jProfile').value},
@@ -1558,18 +1881,30 @@ function buildJobSpec() {
           timeout: parseInt(document.getElementById('jRunTimeout').value) || 86400,
           shell: document.getElementById('jShell').value === 'true'},
     ttl_seconds: parseInt(document.getElementById('jTtl').value) || 172800,
-    account: {mode: document.getElementById('jAcctMode').value,
+    account: {mode: accountMode,
               agent_type: document.getElementById('jAgentType').value,
-              model: document.getElementById('jAgentModel').value.trim(),
-              group: document.getElementById('jAcctGroup').value.trim() || 'standard',
-              per_worker: parseInt(document.getElementById('jPerWorker').value) || 1,
-              config_dir: document.getElementById('jConfigDir').value.trim(),
-              login_timeout_seconds: parseInt(document.getElementById('jLoginTimeout').value) || 900,
+              model: accountEnabled ? document.getElementById('jAgentModel').value.trim() : '',
+              group: accountEnabled
+                ? document.getElementById('jAcctGroup').value.trim() || 'standard'
+                : 'standard',
+              per_worker: accountEnabled
+                ? parseInt(document.getElementById('jPerWorker').value) || 1
+                : 1,
+              config_dir: accountEnabled
+                ? document.getElementById('jConfigDir').value.trim()
+                : '',
+              login_timeout_seconds: accountEnabled
+                ? parseInt(document.getElementById('jLoginTimeout').value) || 900
+                : 900,
               binding: accountBinding,
               ids: accountIds},
-    rotation: {strategy: document.getElementById('jRot').value,
-               resume_args: document.getElementById('jResume').value.trim(),
-               max_rotations: parseInt(document.getElementById('jMaxRotations').value) || 0},
+    rotation: {strategy: rotationStrategy,
+               resume_args: rotationEnabled
+                 ? document.getElementById('jResume').value.trim()
+                 : '',
+               max_rotations: rotationEnabled
+                 ? parseInt(document.getElementById('jMaxRotations').value) || 0
+                 : 0},
     fanout: {workers: workers,
              shard_by: document.getElementById('jShard').value,
              name_prefix: document.getElementById('jNamePrefix').value.trim(),
@@ -1590,6 +1925,10 @@ function showJobPlan(plan) {
 }
 async function previewJob() {
   const button = document.getElementById('jPlanBtn');
+  if (!validateJobForm()) {
+    toast('请先修正标出的 Job 配置。', 'error');
+    return null;
+  }
   const label = button.textContent;
   button.disabled = true; button.textContent = 'Validating…';
   try {
@@ -1601,6 +1940,10 @@ async function previewJob() {
 }
 async function submitJob() {
   const btn = document.getElementById('jSubmitBtn');
+  if (!validateJobForm()) {
+    toast('请先修正标出的 Job 配置。', 'error');
+    return;
+  }
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
   try {
@@ -2545,6 +2888,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 updateThemeLabel();
+updateDeliveryUI(); updateSourceUI(); updateCollectUI(); updateRotationUI();
 updateEipBindingUI(); updateAgentUI(); updateAgentApiProviderUI();
 providerDefaultsReady = initializeProviderDefaults();
 refreshAccounts(); refreshResults(); runDashboardPoll();

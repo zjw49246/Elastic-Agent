@@ -211,6 +211,11 @@ The focused suite covers:
   add/refresh/usage controls, provider-aware Agent support (ApexRouter is
   Codex-only), quota/model display, no browser-persisted Key, and sanitized
   validation/upstream errors.
+- Batch Job form information architecture: eight ordered fieldsets retain every
+  existing JobSpec control ID and mapping; representative controls stay in the
+  correct section; labels/help are programmatically associated; conditional
+  account/EIP/rotation controls expose clear disabled states; native bounds,
+  mobile full-width actions, and CloudRouter/ApexRouter behavior remain covered.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   suppress live actions after teardown, keep read-only system logs until release,
