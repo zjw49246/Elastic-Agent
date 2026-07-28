@@ -564,3 +564,17 @@ S3 object，plan API 同时显示首 worker 的数据集预览。Manager rsync �
 
 **验证**：新增 dataset 模板拒绝/渲染、worker 上下文、provision 分片、plan 预览和 commit
 fetch 测试；完整套件 **2356 passed / 12 skipped / 0 failed**，`git diff --check` 通过。
+
+## 2026-07-28 Worker dataset staging 最小读权限（commit `6f4af60`）
+
+**问题**：`setup.s3_datasets` 已改为 worker 直拉，但生产 worker policy 仍只有结果
+`PutObject/AbortMultipartUpload`，因此真实 shard staging 会在 `aws s3 cp` 处被拒绝。
+
+**解决**：仅对结果桶 `jobs/datasets/*` 增加 `s3:GetObject`；结果对象仍不可读、不可删，
+也不授予 `ListBucket`。runbook、README 和架构说明同步该边界。
+
+**避免复发**：增加 S3 dataset 功能时必须同时验证 worker instance profile 的实际 data-plane
+权限，不能只验证 JobSpec schema 和本地 mock provision。
+
+**验证**：IAM、dataset provision、JobSpec 和 worker projection 定向测试 **276 passed**，
+`git diff --check` 通过。
