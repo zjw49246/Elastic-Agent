@@ -513,6 +513,14 @@ Deleting an account identity does not release infrastructure implicitly: first
 call the explicit decommission endpoint. This separation prevents an ordinary
 Job cleanup or account edit from losing its stable address.
 
+The Batch Console guides this sequence for OAuth accounts. If the account has
+a binding, the delete action shows the exact EIP, warns that release is
+permanent, requires the full account ID to be typed, calls `decommission`, and
+only then deletes the identity. A failed or completed Job does not release the
+EIP automatically. An active claim, lease, or unfinished cleanup still returns
+`409`, leaving both the binding and identity intact. API clients must continue
+to perform the same two explicit calls.
+
 Manager-wired `submit()` and `launch()` (including REST) atomically persist the
 JobSpec in a mode-`0600` recovery journal before registration, account/EIP
 reservation, or cloud creation; a journal failure produces no launch side

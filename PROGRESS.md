@@ -1,5 +1,28 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-28 使用过的 EIP 账号安全删除
+
+**问题**：EIP Job 无论成功还是失败，终态都会销毁临时 EC2、释放 lease，
+但按设计保留账号的持久 EIP。后端因此正确拒绝直接删除仍有 binding 的账号；
+Batch Console 却只调用 identity DELETE，没有提供显式 decommission 入口，导致已经
+清理完成、binding 回到 `ready` 的旧账号也只能看到 409，无法从页面删除。
+
+**解决**：OAuth 账号删除前重新读取权威 binding。无 binding 时确认后正常删除；
+有 binding 时展示具体 EIP 和不可恢复警告，并要求输入完整账号 ID，再调用双确认
+decommission，成功后才删除 identity。活跃 claim/lease 或清理未完成仍由服务端
+409 阻止，EIP 与账号保持不变；若两个 API 之间发生并发抢占，页面会准确报告
+“EIP 已释放但账号尚未删除”并刷新真实状态，不误报成功。
+
+**避免复发**：持久云资源不能由普通 identity DELETE 隐式释放，但安全边界也必须
+提供完整的管理 UX。内联 JavaScript 的测试要检查 Python 字符串解析后的真实 HTTP
+响应；仅对源码运行语法检查会漏掉 `\n` 转义被解释成字面换行的问题。
+
+**验证**：先以红测试复现缺少 decommission 流程，修复后 Web/API 定向回归
+`117 passed`；精确页面响应通过 Node 语法检查，并动态验证绑定成功、活跃 lease
+阻断、无绑定删除三条路径；完整套件 `2349 passed / 12 skipped / 0 failed`，
+Ruff（忽略该内联 HTML 文件既有 E501）、`compileall` 和 `git diff --check` 通过。
+按用户要求未部署、重启或修改运行中的服务。
+
 ## 2026-07-28 Batch Job 表单信息架构与可访问性
 
 **问题**：JobSpec 的几十个字段长期平铺在一张卡片中，标签以内部字段名为主，

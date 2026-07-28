@@ -1641,8 +1641,61 @@ async function terminateWorker(wid) {
   catch(e) { toast(e.message, 'error'); }
 }
 async function removeAccount(id) {
-  try { await api('DELETE', '/accounts/' + encodeURIComponent(id)); toast('Removed'); refreshAccounts(); }
-  catch(e) { toast(e.message, 'error'); }
+  const accountPath = '/accounts/' + encodeURIComponent(id);
+  let binding;
+  let releasedEip = '';
+  try {
+    try {
+      binding = await api('GET', accountPath + '/binding');
+    } catch(e) {
+      if (e.status === 404) binding = null;
+      else throw e;
+    }
+
+    if (binding) {
+      const eip = binding.eip_ip || binding.eip_allocation_id || '当前绑定地址';
+      const warning = `账号 ${id} 仍保留持久 EIP ${eip}。\n\n`
+        + '继续会永久释放这个公网 IP（不可恢复），然后删除账号。'
+        + '\\n失败 Job 结束后 EIP 仍会按设计保留；只有这里的明确确认才会释放。';
+      if (!window.confirm(warning)) return;
+      const confirmation = window.prompt(
+        `危险操作：请输入完整账号 ID 以确认永久释放 EIP 并删除账号：\n${id}`
+      );
+      if (confirmation === null) return;
+      if (confirmation.trim() !== id) {
+        toast('账号 ID 不匹配；EIP 未释放，账号未删除。', 'error');
+        return;
+      }
+      await api('POST', accountPath + '/binding/decommission', {
+        release_eip: true,
+        confirm_account_id: id,
+      });
+      releasedEip = eip;
+    } else if (!window.confirm(`删除账号 ${id}？`)) {
+      return;
+    }
+
+    await api('DELETE', accountPath);
+    toast(releasedEip
+      ? `已永久释放 EIP ${releasedEip} 并删除账号 ${id}`
+      : `已删除账号 ${id}`);
+    await refreshAccounts();
+  } catch(e) {
+    if (releasedEip) {
+      if (e.status === 404) {
+        toast(`已永久释放 EIP ${releasedEip}，账号已删除`);
+      } else {
+        toast(`EIP ${releasedEip} 已永久释放，但账号尚未删除：${e.message}`, 'error');
+      }
+      await refreshAccounts();
+    } else if (e.status === 409) {
+      toast(`账号 ${id} 仍有任务或清理流程占用，当前未释放 EIP、未删除账号。`
+        + ` ${e.message}`, 'error');
+      await refreshAccounts();
+    } else {
+      toast(e.message, 'error');
+    }
+  }
 }
 
 // ---- Harness upload ----

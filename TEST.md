@@ -285,6 +285,13 @@ The endpoint must return `409` while an active account claim or lease exists.
 Account deletion must also return `409` until its binding has been explicitly
 decommissioned.
 
+The Batch Console account-delete regression additionally verifies that a
+bound OAuth account is handled in this order: read the current binding, show
+the irreversible EIP warning, require an exact typed account ID, decommission
+with both confirmations, and only then delete the identity. A missing binding
+uses the ordinary confirmed delete path. A `409` from an active Job or cleanup
+must stop before identity deletion.
+
 ## Real AWS smoke checklist
 
 Use a disposable account identity and a non-production AWS account/Region.

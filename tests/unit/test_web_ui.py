@@ -500,6 +500,40 @@ class TestDashboardEndpoint:
         assert "accounts/bindings" in html
 
     @pytest.mark.asyncio
+    async def test_batch_console_decommissions_bound_eip_before_account_delete(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        remove_account = _javascript_function(html, "removeAccount")
+
+        binding_get = "await api('GET', accountPath + '/binding')"
+        decommission = (
+            "await api('POST', accountPath + '/binding/decommission',"
+        )
+        identity_delete = "await api('DELETE', accountPath)"
+
+        assert binding_get in remove_account
+        assert "if (e.status === 404) binding = null" in remove_account
+        assert "永久释放" in remove_account
+        assert (
+            "+ '\\n失败 Job 结束后 EIP 仍会按设计保留"
+            in remove_account
+        )
+        assert "window.confirm" in remove_account
+        assert "window.prompt" in remove_account
+        assert "confirmation.trim() !== id" in remove_account
+        assert "release_eip: true" in remove_account
+        assert "confirm_account_id: id" in remove_account
+        assert decommission in remove_account
+        assert identity_delete in remove_account
+        assert remove_account.index(binding_get) < remove_account.index(decommission)
+        assert remove_account.index(decommission) < remove_account.index(
+            identity_delete
+        )
+        assert "仍有任务或清理流程占用" in remove_account
+
+    @pytest.mark.asyncio
     async def test_batch_console_exposes_selectable_agent_api_providers(
         self, ui_client
     ):
