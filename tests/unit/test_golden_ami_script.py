@@ -48,6 +48,26 @@ def test_builder_installs_verifier_and_writes_manifest_schema() -> None:
         assert f'"{component}"' in source
 
 
+def test_builder_disables_background_updates_before_image_creation() -> None:
+    source = SCRIPT.read_text()
+    hardening = source.index(
+        "/etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades"
+    )
+    create_image = source.index("aws ec2 create-image")
+
+    assert hardening < create_image
+    assert 'APT::Periodic::Enable "0";' in source
+    assert "apt-daily.timer" in source
+    assert "apt-daily-upgrade.timer" in source
+    assert "unattended-upgrades.service" in source
+    assert "systemctl mask" in source
+    assert "/etc/needrestart/conf.d/99-elastic-agent.conf" in source
+    assert "$nrconf{restart} = 'l';" in source
+    assert "ea-runtime" in source
+    assert "elastic-agent-runtime" in source
+    assert "ea-task@" in source
+
+
 def test_builder_scrubs_identity_and_tags_image_and_snapshot() -> None:
     source = SCRIPT.read_text()
     assert "cloud-init clean --logs --machine-id --seed" in source

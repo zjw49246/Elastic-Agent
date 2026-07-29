@@ -15,6 +15,13 @@ from elastic_agent.harness.base import BootstrapStep
 CLAUDE_CODE_VERSION = "2.1.181"
 CODEX_CLI_VERSION = "0.144.6"
 GOLDEN_IMAGE_VERIFY_PATH = "/usr/local/bin/elastic-agent-image-verify"
+BACKGROUND_UPDATE_UNITS = (
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "apt-daily.service",
+    "apt-daily-upgrade.service",
+    "unattended-upgrades.service",
+)
 
 
 def _golden_verify_command(component: str, args: list[str] | None = None) -> str:
@@ -80,9 +87,14 @@ def system_init_step(
     Defaults include node/npm (Claude Code CLI is an npm package) and rsync
     (manager_rsync code delivery) so a blank Ubuntu image is provisionable.
     """
-    package_names = packages or [
+    package_names = list(packages or [
         "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
-    ]
+    ])
+    # S3 dataset staging and worker-direct result collection run after the
+    # runtime has started.  Install their CLI dependency here so those paths
+    # never invoke apt while a user task is live.
+    if "awscli" not in package_names:
+        package_names.append("awscli")
     pkg_list = shlex.join(package_names)
     fallback = (
         "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
@@ -107,6 +119,67 @@ def system_init_step(
         timeout=timeout,
         retry_count=2,
         description="Install system packages and base dependencies",
+    )
+
+
+def host_update_hardening_step(timeout: int = 300) -> BootstrapStep:
+    """Disable host package automation before the Worker Runtime starts.
+
+    Ubuntu 24.04+ runs needrestart in automatic mode from APT hooks.  A daily
+    upgrade can consequently restart ``ea-runtime.service`` and kill opaque
+    Mode-B children in its cgroup.  Explicit bootstrap APT commands have
+    already completed when this step runs; afterwards, background package
+    activity is disabled and needrestart is constrained to reporting only.
+    """
+    units = " ".join(BACKGROUND_UPDATE_UNITS)
+    return BootstrapStep(
+        name="host-update-hardening",
+        command=(
+            "set -e\n"
+            "install -d -m 0755 /etc/apt/apt.conf.d\n"
+            "cat > /etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades "
+            "<<'APTCONF'\n"
+            'APT::Periodic::Enable "0";\n'
+            'APT::Periodic::Update-Package-Lists "0";\n'
+            'APT::Periodic::Download-Upgradeable-Packages "0";\n'
+            'APT::Periodic::AutocleanInterval "0";\n'
+            'APT::Periodic::Unattended-Upgrade "0";\n'
+            "APTCONF\n"
+            "chmod 0644 /etc/apt/apt.conf.d/"
+            "99elastic-agent-no-background-upgrades\n"
+            "install -d -m 0755 /etc/needrestart/conf.d\n"
+            "cat > /etc/needrestart/conf.d/99-elastic-agent.conf "
+            "<<'NEEDRESTART'\n"
+            "$nrconf{restart} = 'l';\n"
+            "$nrconf{blacklist_rc} = [] "
+            "unless ref($nrconf{blacklist_rc}) eq 'ARRAY';\n"
+            "push @{$nrconf{blacklist_rc}}, "
+            "qr/^(?:ea-runtime|elastic-agent-runtime|"
+            "ea-task@.+|elastic-agent-task@.+)\\.service$/;\n"
+            "NEEDRESTART\n"
+            "chmod 0644 /etc/needrestart/conf.d/99-elastic-agent.conf\n"
+            # Stop future triggers first.  Do not SIGTERM a package manager
+            # that may be completing a boot-time transaction; the service
+            # units are masked below and any already-active oneshot is allowed
+            # to finish before provisioning proceeds.
+            "systemctl disable --now apt-daily.timer "
+            "apt-daily-upgrade.timer >/dev/null 2>&1 || true\n"
+            "systemctl disable unattended-upgrades.service "
+            ">/dev/null 2>&1 || true\n"
+            f"systemctl mask --force {units}\n"
+            "for unit in apt-daily.service apt-daily-upgrade.service; do\n"
+            "  while systemctl is-active --quiet \"$unit\"; do sleep 2; done\n"
+            "done\n"
+            f"for unit in {units}; do\n"
+            "  state=$(systemctl is-enabled \"$unit\" 2>/dev/null || true)\n"
+            "  test \"$state\" = masked\n"
+            "done"
+        ),
+        timeout=timeout,
+        retry_count=1,
+        description=(
+            "Disable unattended host upgrades and make needrestart report-only"
+        ),
     )
 
 
@@ -593,10 +666,24 @@ def build_default_bootstrap_steps(
     include_pty: bool = False,
     pty_package: str | None = None,
 ) -> list[BootstrapStep]:
-    """Build the standard bootstrap sequence (4 or 5 steps depending on login deps)."""
+    """Build the standard bootstrap sequence with host-update hardening."""
     steps = [
         system_init_step(packages=system_packages),
         agent_install_step(agent_install_command=agent_install_command),
+    ]
+    if include_pty:
+        steps.append(
+            pty_install_step(
+                **({"pty_package": pty_package} if pty_package else {})
+            )
+        )
+    if include_login_deps:
+        steps.append(
+            credential_login_deps_step(login_dependencies=login_dependencies)
+        )
+    # No framework-controlled APT command may run after this boundary.
+    steps.extend([
+        host_update_hardening_step(),
         runtime_deploy_step(
             manager_url=manager_url,
             auth_token=auth_token,
@@ -605,12 +692,9 @@ def build_default_bootstrap_steps(
             heartbeat_interval=heartbeat_interval,
         ),
         harness_code_step(repo_url=repo_url),
-    ]
+    ])
     if include_pty:
-        steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
         # refresh hook must land after runtime_deploy_step writes the unit
         steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
-    if include_login_deps:
-        steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps

@@ -8,6 +8,7 @@ from elastic_agent.core.bootstrap_steps import (
     credential_login_deps_step,
     docker_install_step,
     harness_code_step,
+    host_update_hardening_step,
     pty_install_step,
     runtime_deploy_from_src_step,
     runtime_deploy_step,
@@ -23,6 +24,7 @@ class TestSystemInitStep:
         assert "golden image system packages verified" in step.command
         assert "apt-get" in step.command and "update" in step.command
         assert "python3" in step.command
+        assert "awscli" in step.command
         assert "cloud-init status --wait" in step.command   # fresh-boot apt lock
         assert "DPkg::Lock::Timeout" in step.command
         assert step.retry_count == 2
@@ -30,6 +32,7 @@ class TestSystemInitStep:
     def test_custom_packages(self) -> None:
         step = system_init_step(packages=["nodejs", "npm"])
         assert "nodejs npm" in step.command
+        assert "awscli" in step.command
 
     def test_custom_timeout(self) -> None:
         step = system_init_step(timeout=600)
@@ -92,6 +95,29 @@ class TestRuntimeDeployStep:
             worker_id="w1",
         )
         assert "EnvironmentFile=-/etc/elastic-agent/storage.env" in step.command
+
+
+class TestHostUpdateHardeningStep:
+    def test_disables_background_updates_and_needrestart_restarts(self) -> None:
+        step = host_update_hardening_step()
+
+        assert step.name == "host-update-hardening"
+        assert "/etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades" in step.command
+        assert 'APT::Periodic::Enable "0";' in step.command
+        for unit in (
+            "apt-daily.timer",
+            "apt-daily-upgrade.timer",
+            "apt-daily.service",
+            "apt-daily-upgrade.service",
+            "unattended-upgrades.service",
+        ):
+            assert unit in step.command
+        assert "systemctl mask" in step.command
+        assert "/etc/needrestart/conf.d/99-elastic-agent.conf" in step.command
+        assert "$nrconf{restart} = 'l';" in step.command
+        assert "ea-runtime" in step.command
+        assert "elastic-agent-runtime" in step.command
+        assert "ea-task@" in step.command
 
 
 class TestHarnessCodeStep:
@@ -189,17 +215,20 @@ class TestRuntimeDeployFromSrc:
 
 
 class TestBuildDefaultSteps:
-    def test_returns_four_steps(self) -> None:
+    def test_returns_hardened_steps(self) -> None:
         steps = build_default_bootstrap_steps(
             manager_url="ws://10.0.0.1:8000/ws/runtime",
             auth_token="token",
             worker_id="w1",
         )
-        assert len(steps) == 4
-        assert steps[0].name == "system-init"
-        assert steps[1].name == "agent-install"
-        assert steps[2].name == "runtime-deploy"
-        assert steps[3].name == "harness-code"
+        names = [step.name for step in steps]
+        assert names == [
+            "system-init",
+            "agent-install",
+            "host-update-hardening",
+            "runtime-deploy",
+            "harness-code",
+        ]
 
     def test_custom_agent_command(self) -> None:
         steps = build_default_bootstrap_steps(
@@ -208,7 +237,9 @@ class TestBuildDefaultSteps:
             worker_id="w1",
             agent_install_command="pip install custom-agent",
         )
-        assert "custom-agent" in steps[1].command
+        assert "custom-agent" in next(
+            step.command for step in steps if step.name == "agent-install"
+        )
 
     def test_with_login_deps(self) -> None:
         steps = build_default_bootstrap_steps(
@@ -217,8 +248,13 @@ class TestBuildDefaultSteps:
             worker_id="w1",
             include_login_deps=True,
         )
-        assert len(steps) == 5
-        assert steps[4].name == "credential-login-deps"
+        names = [step.name for step in steps]
+        assert names.index("credential-login-deps") < names.index(
+            "host-update-hardening"
+        )
+        assert names.index("host-update-hardening") < names.index(
+            "runtime-deploy"
+        )
 
     def test_without_login_deps(self) -> None:
         steps = build_default_bootstrap_steps(
@@ -227,7 +263,7 @@ class TestBuildDefaultSteps:
             worker_id="w1",
             include_login_deps=False,
         )
-        assert len(steps) == 4
+        assert "credential-login-deps" not in [step.name for step in steps]
 
 
 class TestCredentialLoginDepsStep:

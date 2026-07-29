@@ -2629,6 +2629,8 @@ class TestProvisionHook:
         )
 
         assert await hook("w1", None, spec) is True
+        assert any(command.startswith("command -v aws ") for command in commands)
+        assert all("apt-get" not in command for command in commands)
         assert any(
             "aws s3 cp" in command
             and "s3://private-data/run/shard-00007.jsonl" in command
@@ -2636,6 +2638,49 @@ class TestProvisionHook:
             for command in commands
         )
         assert all("aws s3 sync" not in command for command in commands)
+
+    async def test_s3_dataset_missing_awscli_fails_without_runtime_install(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        commands = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None, **kwargs):
+                commands.append(command)
+                if command.startswith("command -v aws "):
+                    return 127, "", "awscli is required"
+                raise AssertionError("dataset pull must stop before aws s3")
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/shard.jsonl",
+                    "dest": "/srv/replay/shard.jsonl",
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("w1", None, spec) is False
+        assert commands
+        assert all("apt-get" not in command for command in commands)
 
     async def test_templated_dataset_without_worker_context_fails_closed(
         self, tmp_path, monkeypatch,

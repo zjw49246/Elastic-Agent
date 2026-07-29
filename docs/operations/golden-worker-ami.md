@@ -29,10 +29,12 @@ Run `--help` for all options. The script:
 
 1. validates the pinned source and builder ownership before any cleanup;
 2. installs version-pinned dependencies and reboots once;
-3. validates every command, import, CLI version, and claude-pty commit;
-4. removes account/browser/cloud credentials, runtime tokens, logs, host keys,
+3. disables and masks background APT/unattended-upgrade units, makes
+   `needrestart` report-only, and validates that policy after reboot;
+4. validates every command, import, CLI version, and claude-pty commit;
+5. removes account/browser/cloud credentials, runtime tokens, logs, host keys,
    machine identity, and caches;
-5. stops the builder, creates an AMI from its encrypted volume, tags both the
+6. stops the builder, creates an AMI from its encrypted volume, tags both the
    AMI and snapshot, verifies the launch invariants, and terminates the builder.
 
 AMI creation uses an explicit 15-second poll for up to 60 minutes because an
@@ -60,6 +62,17 @@ Do not bake account state, `auth.json`, browser profiles, Job code/data, the
 Manager URL/token, or a running Elastic-Agent service. Current framework source
 and the per-worker runtime unit are still delivered at provision time.
 
+Workers are immutable for the lifetime of a Job. Both the image builder and
+normal bootstrap write
+`/etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades`, mask
+`apt-daily*` and `unattended-upgrades.service`, and configure `needrestart` in
+list-only mode. Elastic runtime/task units are additionally excluded from
+`needrestart` selection. Framework-owned APT dependencies—including
+`awscli`—must finish before `ea-runtime` starts; S3 dataset staging and
+worker-direct result collection only verify `aws` and fail closed if the
+bootstrap invariant is broken. Do not unmask these units on an active worker.
+Apply OS security updates by building and promoting a replacement AMI.
+
 ## Promotion and rollback
 
 Before promotion, verify that the AMI is owned by this account, available,
@@ -79,6 +92,19 @@ deregistering an old AMI and deleting its snapshot.
 Rebuild whenever the base OS security image, pinned Claude/Codex/claude-pty,
 Chrome, Docker, Node, or Python dependency set changes. The manifest and image
 tags retain the source AMI, source commit, build timestamp, and build-tree hash.
+
+Before promotion, also verify:
+
+```bash
+for unit in apt-daily.timer apt-daily-upgrade.timer \
+  apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+  test "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = masked
+done
+grep -F 'APT::Periodic::Enable "0";' \
+  /etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades
+grep -F "\$nrconf{restart} = 'l';" \
+  /etc/needrestart/conf.d/99-elastic-agent.conf
+```
 
 ## Current production promotion (2026-07-22)
 
@@ -101,3 +127,7 @@ token-only Codex login bound to its retained EIP. Every canary uploaded its
 explicit result paths to S3, terminated its EC2/root EBS, and removed its Node
 record. The Codex canary also verified its observed IPv4 address against the
 account binding and completed a real `codex exec` without a manual OTP.
+
+This 2026-07-22 image predates the immutable-host update policy above. New
+bootstrap code hardens it before starting a runtime, but the next golden build
+must carry and pass the baked-policy verification before it replaces this AMI.

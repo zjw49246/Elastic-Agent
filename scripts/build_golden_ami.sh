@@ -294,6 +294,45 @@ apt-get -o DPkg::Lock::Timeout=600 install -y -qq "$chrome_deb"
 test "$(dpkg-query -W -f='${Version}' google-chrome-stable)" = "$CHROME_VERSION"
 rm -f "$chrome_deb"
 
+# Long-running workers are immutable during a Job.  Ubuntu 24.04+ otherwise
+# runs needrestart automatically from APT hooks, and apt-daily-upgrade can
+# restart ea-runtime.service (taking opaque task children down with its cgroup).
+install -d -m 0755 /etc/apt/apt.conf.d
+cat > /etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades <<'APTCONF'
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+APTCONF
+chmod 0644 /etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades
+
+install -d -m 0755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/99-elastic-agent.conf <<'NEEDRESTART'
+$nrconf{restart} = 'l';
+$nrconf{blacklist_rc} = [] unless ref($nrconf{blacklist_rc}) eq 'ARRAY';
+push @{$nrconf{blacklist_rc}},
+  qr/^(?:ea-runtime|elastic-agent-runtime|ea-task@.+|elastic-agent-task@.+)\.service$/;
+NEEDRESTART
+chmod 0644 /etc/needrestart/conf.d/99-elastic-agent.conf
+
+background_update_units=(
+  apt-daily.timer apt-daily-upgrade.timer
+  apt-daily.service apt-daily-upgrade.service
+  unattended-upgrades.service
+)
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer \
+  >/dev/null 2>&1 || true
+systemctl disable unattended-upgrades.service >/dev/null 2>&1 || true
+systemctl mask --force "${background_update_units[@]}"
+for unit in apt-daily.service apt-daily-upgrade.service; do
+  while systemctl is-active --quiet "$unit"; do sleep 2; done
+done
+for unit in "${background_update_units[@]}"; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  test "$state" = masked
+done
+
 npm install -g "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
   --include=optional --foreground-scripts --force
 npm install -g "@openai/codex@$CODEX_VERSION" \
@@ -404,6 +443,16 @@ $V python pydantic pydantic-settings websockets httpx psutil
 $V pty "$PTY_COMMIT"
 aws --version
 uv --version
+
+for unit in apt-daily.timer apt-daily-upgrade.timer \
+  apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  test "$state" = masked
+done
+grep -Fq 'APT::Periodic::Enable "0";' \
+  /etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades
+grep -Fq "\$nrconf{restart} = 'l';" \
+  /etc/needrestart/conf.d/99-elastic-agent.conf
 
 chrome_tmp=$(mktemp -d /tmp/ea-chrome-check.XXXXXX)
 chown "$SSH_USER:$SSH_USER" "$chrome_tmp"

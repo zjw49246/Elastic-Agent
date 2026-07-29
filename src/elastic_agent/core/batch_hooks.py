@@ -1526,10 +1526,11 @@ def make_provision_hook(
 
         # S3 datasets: the worker pulls them DIRECTLY from S3 with its instance-
         # profile credentials (no Manager download+rsync relay). The worker IAM
-        # role (fanout provider's worker_instance_profile) grants S3 access; we
-        # ensure awscli is present, then `aws s3 sync/cp` each dataset in place
-        # before the run. Done on the worker so large datasets never transit the
-        # Manager. (GitHub code delivery is unchanged — still manager_rsync.)
+        # role (fanout provider's worker_instance_profile) grants S3 access.
+        # awscli is a bootstrap dependency: this post-runtime phase only verifies
+        # it and fails closed rather than invoking apt beside a live service.
+        # Done on the worker so large datasets never transit the Manager.
+        # (GitHub code delivery is unchanged — still manager_rsync.)
         if spec.setup.s3_datasets:
             from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
             batch = getattr(manager, "_batch", None)
@@ -1564,13 +1565,15 @@ def make_provision_hook(
                 host, user=ssh_user, key_path=ssh_key, use_sudo=False
             )
             rc, _o, _e = await ex.execute(
-                "command -v aws >/dev/null 2>&1 || "
-                "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli)",
-                timeout=600,
+                "command -v aws >/dev/null 2>&1",
+                timeout=30,
             )
             if rc != 0:
                 logger.error(
-                    "awscli install failed on %s: %s", worker_id, _e[:200]
+                    "awscli is unavailable on %s after bootstrap; refusing "
+                    "runtime package installation: %s",
+                    worker_id,
+                    _e[:200],
                 )
                 return False
             for ds in rendered_datasets:

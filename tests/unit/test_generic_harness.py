@@ -40,10 +40,41 @@ class TestBootstrapSteps:
         names = [s.name for s in compile_bootstrap_steps(
             spec, manager_url="u", auth_token="t", worker_id="w", include_pty=True,
         )]
-        # harness-code must land after runtime-deploy; refresh/health after it.
+        # Every framework APT path and host hardening must finish before the
+        # runtime starts; refresh/health still patch the resulting unit.
+        assert names.index("credential-login-deps") < names.index(
+            "host-update-hardening"
+        )
+        assert names.index("host-update-hardening") < names.index(
+            "runtime-deploy"
+        )
         assert names.index("harness-code") > names.index("runtime-deploy")
         assert names.index("pty-refresh-hook") > names.index("harness-code")
         assert "credential-login-deps" in names  # auto-enabled for worker_local_login
+
+    def test_no_framework_apt_install_runs_after_runtime_deploy(self):
+        spec = _spec(
+            setup={"needs_docker": True},
+            account={"agent_type": "codex"},
+        )
+        steps = compile_bootstrap_steps(
+            spec,
+            manager_url="u",
+            auth_token="t",
+            worker_id="w",
+        )
+        runtime_index = next(
+            i for i, step in enumerate(steps) if step.name == "runtime-deploy"
+        )
+
+        assert all(
+            "apt-get" not in step.command for step in steps[runtime_index + 1 :]
+        )
+        assert all(
+            steps.index(step) < runtime_index
+            for step in steps
+            if "apt-get" in step.command
+        )
 
     def test_login_deps_skipped_when_account_none(self):
         spec = _spec(account={"mode": "none"})
@@ -60,6 +91,7 @@ class TestBootstrapSteps:
         assert "runtime-deploy" not in names       # PyPI deploy skipped
         assert "pty-refresh-hook" not in names      # patches that unit → also skipped
         assert "agent-install" in names             # claude CLI still installed
+        assert "host-update-hardening" in names     # source runtime starts later
 
     def test_docker_step_added_only_when_needs_docker(self):
         spec = _spec(setup={"needs_docker": True})

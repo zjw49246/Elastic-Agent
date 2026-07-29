@@ -648,13 +648,21 @@ class ManagerFleetDriver:
                 f"--exclude {_shell_quote(pattern)}"
                 for pattern in exclude
             )
+            rc, _stdout, stderr = await ex.execute(
+                "command -v aws >/dev/null 2>&1",
+                timeout=30,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    "worker S3 collect cannot start: awscli is unavailable "
+                    f"(rc={rc}); worker bootstrap must install it before "
+                    f"ea-runtime starts: {stderr[-300:]}"
+                )
             for rel in paths:
                 r = rel.rstrip("/")
                 src = f"{spec.setup.target_dir.rstrip('/')}/{r}/"
                 uri = f"s3://{bucket}/{s3_root}/{r}/"
                 rc, _stdout, stderr = await ex.execute(
-                    "command -v aws >/dev/null 2>&1 || "
-                    "(sudo apt-get update -qq && sudo apt-get install -y -qq awscli); "
                     # ``aws s3 sync`` can skip an in-place rewrite whose size
                     # and mtime were preserved.  Collection correctness is more
                     # important than that metadata shortcut: recursive cp

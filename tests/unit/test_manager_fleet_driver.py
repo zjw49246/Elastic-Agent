@@ -195,6 +195,8 @@ async def test_worker_direct_s3_uses_isolated_prefix_and_manifest(
     )
 
     assert hosts and set(hosts) == {"10.0.0.11"}
+    assert any(command.startswith("command -v aws ") for command in commands)
+    assert all("apt-get" not in command for command in commands)
     assert any(
         "s3://result-bucket/batch-results/job-1/workers/"
         "shard-00001/results/" in command
@@ -265,6 +267,36 @@ async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
     assert commit["paths"] == ["results"]
     assert commit["exclude"] == ["**/core"]
     assert commit["metadata"]["resolved_commit"] == "a" * 40
+
+
+async def test_worker_direct_s3_missing_awscli_fails_without_runtime_install(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    commands = []
+
+    class FakeSSHExecutor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def execute(self, command, timeout=None):
+            commands.append(command)
+            if command.startswith("command -v aws "):
+                return 127, "", "awscli is required"
+            raise AssertionError("collection must stop before any S3 upload")
+
+    monkeypatch.setattr(
+        "elastic_agent.core.bootstrap.SSHExecutor", FakeSSHExecutor,
+    )
+    manager = FakeManager(tmp_path, worker_profile="worker-role")
+
+    with pytest.raises(RuntimeError, match="awscli is unavailable"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _spec(tmp_path), "job-1",
+        )
+
+    assert commands
+    assert all("apt-get" not in command for command in commands)
 
 
 async def test_restart_recovery_reuses_durable_lease_slot(tmp_path):

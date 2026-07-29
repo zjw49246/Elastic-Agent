@@ -28,6 +28,7 @@ from elastic_agent.core.bootstrap_steps import (
     credential_login_deps_step,
     docker_install_step,
     harness_code_step,
+    host_update_hardening_step,
     ipv4_only_egress_step,
     pty_install_step,
     pty_refresh_step,
@@ -249,6 +250,21 @@ def compile_bootstrap_steps(
     # membership must exist when systemd starts the unit (see docker_install_step).
     if spec.setup.needs_docker or profile["docker"]:
         steps.append(docker_install_step(run_as=run_as))
+    if include_claude_pty:
+        steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
+    if include_login_deps:
+        login_dependencies = (
+            ["playwright"] if spec.account.agent_type == "codex" else None
+        )
+        steps.append(
+            credential_login_deps_step(
+                login_dependencies=login_dependencies
+            )
+        )
+    # All framework-controlled APT fallback paths are above this boundary.
+    # A runtime service or task must never be restarted by a background host
+    # upgrade or by needrestart.
+    steps.append(host_update_hardening_step())
     if not runtime_from_src:
         steps.append(runtime_deploy_step(
             manager_url=manager_url,
@@ -257,8 +273,6 @@ def compile_bootstrap_steps(
             runtime_port=runtime_port,
             heartbeat_interval=heartbeat_interval,
         ))
-    if include_claude_pty:
-        steps.insert(2, pty_install_step(**({"pty_package": pty_package} if pty_package else {})))
 
     # Job-specific provisioning. For manager_rsync *with a repository* the
     # Manager clones + rsyncs the code and runs setup commands (see
@@ -282,11 +296,6 @@ def compile_bootstrap_steps(
     if include_claude_pty and not runtime_from_src:
         steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
-    if include_login_deps:
-        login_dependencies = (
-            ["playwright"] if spec.account.agent_type == "codex" else None
-        )
-        steps.append(credential_login_deps_step(login_dependencies=login_dependencies))
     return steps
 
 
