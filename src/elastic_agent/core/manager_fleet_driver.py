@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,14 +28,19 @@ from typing import Awaitable, Callable
 from urllib.parse import urlparse
 
 from elastic_agent.core.batch_orchestrator import LoginOutcome, WorkerAssignment
-from elastic_agent.core.job_spec import JobSpec
+from elastic_agent.core.checkpoint_store import S3CheckpointStore
+from elastic_agent.core.job_spec import JobSpec, WorkerContext
+from elastic_agent.core.job_spec_store import load_job_spec_journal
 from elastic_agent.core.network import worker_management_host
+from elastic_agent.core.secure_store import secure_state_directory
 from elastic_agent.core.secret_env import resolve_secret_env as resolve_aws_secret_env
 from elastic_agent.harness.base import Harness
 
 logger = logging.getLogger(__name__)
 
 _COLLECTION_MANIFEST = "_elastic_agent/collection.json"
+_TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled"})
+_SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def _secret_env_transport_error(manager) -> str | None:
@@ -191,6 +198,256 @@ class ManagerFleetDriver:
 
     async def provision(self, worker_id: str, harness: Harness, spec: JobSpec) -> bool:
         return await self._provision(worker_id, harness, spec)
+
+    def _checkpoint_store(self) -> S3CheckpointStore:
+        existing = getattr(self._mgr, "_checkpoint_store", None)
+        if existing is not None:
+            return existing
+        bucket = os.environ.get(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "",
+        ).strip()
+        if not bucket:
+            raise RuntimeError(
+                "checkpoint recovery requires "
+                "ELASTIC_AGENT_RESULTS_S3_BUCKET"
+            )
+        provider = self._mgr.config.provider
+        region = (
+            getattr(provider.aws, "region", "ap-northeast-1")
+            if provider.type == "aws"
+            else "ap-northeast-1"
+        )
+        store = S3CheckpointStore(
+            bucket=bucket,
+            prefix=os.environ.get(
+                "ELASTIC_AGENT_RESULTS_S3_PREFIX", "jobs",
+            ),
+            region=region,
+        )
+        self._mgr._checkpoint_store = store
+        return store
+
+    def _recovery_staging_root(self) -> Path:
+        registry_path = Path(
+            self._mgr.config.registry.path,
+        ).expanduser()
+        return secure_state_directory(
+            registry_path.with_name("recovery-staging")
+        )
+
+    @staticmethod
+    def _job_hash(spec: JobSpec) -> str:
+        payload = json.dumps(
+            spec.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _command_hash(spec: JobSpec, ctx: WorkerContext) -> str:
+        payload = json.dumps(
+            spec.render_command(ctx),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _validate_recovery_contract(
+        source_payload: dict,
+        source_spec: JobSpec,
+        target_spec: JobSpec,
+    ) -> None:
+        if source_payload.get("submission_state") not in _TERMINAL_JOB_STATES:
+            raise RuntimeError(
+                "recovery source Job must have a durable terminal state"
+            )
+        if source_spec.fanout.workers != target_spec.fanout.workers:
+            raise RuntimeError(
+                "recovery source and target fanout.workers must match"
+            )
+        source_commit = source_spec.setup.resolved_commit
+        target_commit = target_spec.setup.resolved_commit
+        if (
+            not source_commit
+            or not target_commit
+            or source_commit != target_commit
+        ):
+            raise RuntimeError(
+                "recovery requires the same non-empty setup.resolved_commit "
+                "as the source Job"
+            )
+        if source_spec.setup.repo != target_spec.setup.repo:
+            raise RuntimeError(
+                "recovery source and target setup.repo must match"
+            )
+        unavailable = (
+            set(target_spec.recovery.paths)
+            - set(source_spec.collect.paths)
+        )
+        if unavailable:
+            raise RuntimeError(
+                "recovery paths were not collected by the source Job: "
+                + ", ".join(sorted(unavailable))
+            )
+        if (
+            target_spec.recovery.policy == "checkpoint"
+            and not source_spec.collect.checkpoint
+        ):
+            raise RuntimeError(
+                "source Job did not enable immutable checkpoint collection"
+            )
+        if target_spec.recovery.policy == "legacy_final_collection":
+            workers = (
+                source_payload.get("terminal_summary", {})
+                .get("terminal_workers", [])
+            )
+            if (
+                not isinstance(workers, list)
+                or len(workers) < source_spec.fanout.workers
+                or any(
+                    not isinstance(worker, dict)
+                    or not worker.get("final_collected")
+                    or worker.get("collection_error")
+                    for worker in workers
+                )
+            ):
+                raise RuntimeError(
+                    "legacy recovery requires a proven successful final "
+                    "collection for every source shard"
+                )
+
+    async def prepare_recovery(self, job_id: str, spec: JobSpec) -> None:
+        """Stage every source shard before any billable worker is created."""
+
+        if _SAFE_JOB_ID.fullmatch(job_id) is None:
+            raise RuntimeError("invalid recovery target Job id")
+        source_id = spec.recovery.source_job_id
+        source_payload = await asyncio.to_thread(
+            load_job_spec_journal,
+            self._mgr.config.registry.path,
+            source_id,
+        )
+        try:
+            source_spec = JobSpec.model_validate(source_payload["spec"])
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("recovery source JobSpec is invalid") from exc
+        self._validate_recovery_contract(
+            source_payload, source_spec, spec,
+        )
+
+        root = self._recovery_staging_root() / job_id
+        if root.exists():
+            # A deterministic/idempotent resubmit may follow a Manager crash.
+            # Never trust an uncommitted partial staging tree; rebuild it from
+            # the authoritative S3 generation.
+            await asyncio.to_thread(shutil.rmtree, root)
+        root.mkdir(mode=0o700)
+        store = self._checkpoint_store()
+        try:
+            for shard_index in range(spec.fanout.workers):
+                namespace = f"shard-{shard_index:05d}"
+                destination = root / namespace
+                kwargs = {
+                    "source_job_id": source_id,
+                    "worker_namespace": namespace,
+                    "destination": destination,
+                    "paths": list(spec.recovery.paths),
+                }
+                if spec.recovery.policy == "checkpoint":
+                    kwargs["generation"] = spec.recovery.generation
+                    await asyncio.to_thread(
+                        store.restore_checkpoint, **kwargs,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        store.restore_legacy_collection, **kwargs,
+                    )
+        except BaseException:
+            await asyncio.to_thread(shutil.rmtree, root, True)
+            raise
+
+    async def restore_recovery(
+        self,
+        worker_id: str,
+        job_id: str,
+        spec: JobSpec,
+        ctx: WorkerContext,
+    ) -> None:
+        """Merge one validated staging shard into the worker checkout."""
+
+        shard_index = int(ctx.shard_index)
+        if shard_index < 0 or shard_index >= spec.fanout.workers:
+            raise RuntimeError("invalid recovery shard index")
+        source = (
+            self._recovery_staging_root()
+            / job_id
+            / f"shard-{shard_index:05d}"
+        )
+        if not source.is_dir():
+            raise RuntimeError("prepared recovery shard is missing")
+        node = await self._mgr.registry.get(worker_id)
+        provider = self._mgr.config.provider
+        host = worker_management_host(node, provider_type=provider.type)
+        if not host:
+            raise RuntimeError("recovery worker has no management address")
+        ssh_user = self._mgr.config.worker.ssh_user
+        ssh_key = (
+            provider.aliyun.ssh_key_path
+            if provider.type == "aliyun"
+            else provider.aws.ssh_key_path
+        )
+        ssh = (
+            "ssh -o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null -o BatchMode=yes "
+            "-o ConnectTimeout=10 -o ServerAliveInterval=15 "
+            "-o ServerAliveCountMax=2"
+        )
+        if ssh_key:
+            ssh += f" -i {shlex.quote(ssh_key)}"
+        remote = (
+            f"{ssh_user}@{host}:"
+            f"{shlex.quote(spec.setup.target_dir.rstrip('/') + '/')}"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "rsync",
+            "-azc",
+            "--safe-links",
+            "-e",
+            ssh,
+            str(source) + "/",
+            remote,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=3_600,
+            )
+        except asyncio.TimeoutError as exc:
+            await _terminate_subprocess(proc)
+            raise RuntimeError("recovery restore timed out") from exc
+        except asyncio.CancelledError:
+            await _terminate_subprocess(proc)
+            raise
+        if proc.returncode != 0:
+            detail = (stderr or b"").decode(errors="replace")[-500:]
+            raise RuntimeError(
+                f"recovery rsync failed (rc={proc.returncode}): {detail}"
+            )
+
+    async def cleanup_recovery(self, job_id: str) -> None:
+        """Delete only this Job's private, validated staging directory."""
+
+        if _SAFE_JOB_ID.fullmatch(job_id) is None:
+            raise RuntimeError("invalid recovery target Job id")
+        root = self._recovery_staging_root()
+        target = root / job_id
+        try:
+            target.relative_to(root)
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise RuntimeError("unsafe recovery cleanup target") from exc
+        await asyncio.to_thread(shutil.rmtree, target, True)
 
     async def login(
         self, worker_id: str, spec: JobSpec, config_dir: str, *,
@@ -367,12 +624,30 @@ class ManagerFleetDriver:
         )
 
         bucket = os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET", "").strip()
-        worker_direct = bool(pc.type == "aws" and pc.aws.worker_instance_profile and bucket)
+        if spec.collect.checkpoint and not bucket:
+            raise RuntimeError(
+                "checkpoint collection requires "
+                "ELASTIC_AGENT_RESULTS_S3_BUCKET"
+            )
+        # Mutable worker-direct keys cannot form an atomic generation. Exact
+        # checkpoint mode intentionally relays through the Manager, which
+        # hashes a quiescent rsync snapshot before publishing COMMITTED.json.
+        worker_direct = bool(
+            pc.type == "aws"
+            and pc.aws.worker_instance_profile
+            and bucket
+            and not spec.collect.checkpoint
+        )
+        exclude = list(spec.collect.exclude)
 
         if worker_direct:
             from elastic_agent.core.bootstrap import SSHExecutor, _shell_quote
             ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key, use_sudo=False)
             s3_root = self._s3_job_prefix(job_id, namespace)
+            exclude_flags = " ".join(
+                f"--exclude {_shell_quote(pattern)}"
+                for pattern in exclude
+            )
             for rel in paths:
                 r = rel.rstrip("/")
                 src = f"{spec.setup.target_dir.rstrip('/')}/{r}/"
@@ -386,7 +661,8 @@ class ManagerFleetDriver:
                     # uploads every current regular file, so the awaited final
                     # collect always refreshes S3 from the stopped worker.
                     f"aws s3 cp {_shell_quote(src)} {_shell_quote(uri)} "
-                    "--recursive --no-follow-symlinks --no-progress",
+                    "--recursive --no-follow-symlinks --no-progress "
+                    f"{exclude_flags}".rstrip(),
                     timeout=1800,
                 )
                 if rc != 0:
@@ -430,12 +706,20 @@ class ManagerFleetDriver:
             local_path = dest / clean_rel
             local_path.mkdir(parents=True, exist_ok=True)
             src = f"{ssh_user}@{host}:{spec.setup.target_dir.rstrip('/')}/{clean_rel}/"
+            rsync_args = ["rsync", "-azc", "--safe-links"]
+            if spec.collect.checkpoint:
+                # The local tree is the exact generation input. Remove files
+                # that disappeared remotely or became excluded, rather than
+                # letting an earlier collection leak into a later generation.
+                rsync_args.extend(["--delete", "--delete-excluded"])
+            for pattern in exclude:
+                rsync_args.extend(["--exclude", pattern])
+            rsync_args.extend(["-e", ssh, src, str(local_path) + "/"])
             proc = await asyncio.create_subprocess_exec(
                 # Checksum comparison catches same-size, same-mtime rewrites;
                 # the Manager-side uploader then uses SHA-256 as its own
                 # authoritative S3 deduplication key.
-                "rsync", "-azc", "--safe-links", "-e", ssh, src,
-                str(local_path) + "/",
+                *rsync_args,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             try:
                 _stdout, stderr = await asyncio.wait_for(
@@ -483,6 +767,41 @@ class ManagerFleetDriver:
                 raise RuntimeError(
                     f"Manager S3 collect failed for job {job_id!r}: {exc}"
                 ) from exc
+            if spec.collect.checkpoint:
+                if shard_index is None:
+                    raise RuntimeError(
+                        "checkpoint collection requires a stable shard index"
+                    )
+                context = spec.worker_contexts()[shard_index]
+                batch = getattr(self._mgr, "_batch", None)
+                if batch is not None:
+                    job = batch.get_job(job_id)
+                    run = job.runs.get(worker_id) if job is not None else None
+                    if (
+                        run is not None
+                        and callable(getattr(run.ctx, "as_dict", None))
+                    ):
+                        context = run.ctx
+                metadata = {
+                    "resolved_commit": spec.setup.resolved_commit,
+                    "job_spec_sha256": self._job_hash(spec),
+                    "command_sha256": self._command_hash(spec, context),
+                }
+                try:
+                    await asyncio.to_thread(
+                        self._checkpoint_store().commit,
+                        job_id=job_id,
+                        worker_namespace=namespace,
+                        source_root=dest,
+                        paths=paths,
+                        exclude=exclude,
+                        metadata=metadata,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"S3 checkpoint commit failed for job "
+                        f"{job_id!r}: {exc}"
+                    ) from exc
 
     async def scale_in(self, worker_ids: list[str]) -> None:
         requested = list(dict.fromkeys(worker_ids))

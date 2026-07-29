@@ -11,6 +11,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from elastic_agent.core.job_spec import JobSpec
+from elastic_agent.core.job_spec_store import (
+    persist_job_spec,
+    update_job_state,
+)
 from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 
 pytestmark = pytest.mark.asyncio
@@ -56,6 +60,7 @@ class FakeManager:
         self.scale_in_calls = []
         self.removed_nodes = []
         self.config = SimpleNamespace(
+            registry=SimpleNamespace(path=str(tmp_path / "registry.json")),
             server=SimpleNamespace(host="127.0.0.1", port=8080),
             worker=SimpleNamespace(ssh_user="ubuntu"),
             provider=SimpleNamespace(
@@ -92,6 +97,30 @@ def _spec(tmp_path):
         "run": {"command": "true"},
         "collect": {"paths": ["results"]},
     })
+
+
+class FakeCheckpointStore:
+    def __init__(self):
+        self.restores = []
+        self.commits = []
+
+    def restore_checkpoint(self, **kwargs):
+        self.restores.append(("checkpoint", kwargs))
+        destination = Path(kwargs["destination"])
+        (destination / "results").mkdir(parents=True)
+        (destination / "results" / "restored.json").write_text("ok")
+        return {"generation": "g1"}
+
+    def restore_legacy_collection(self, **kwargs):
+        self.restores.append(("legacy", kwargs))
+        destination = Path(kwargs["destination"])
+        (destination / "results").mkdir(parents=True)
+        (destination / "results" / "restored.json").write_text("ok")
+        return {"collected_at": "now"}
+
+    def commit(self, **kwargs):
+        self.commits.append(kwargs)
+        return {"generation": "new-generation"}
 
 
 async def test_local_collect_isolated_by_shard_and_writes_manifest(
@@ -181,6 +210,63 @@ async def test_worker_direct_s3_uses_isolated_prefix_and_manifest(
     )
 
 
+async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    calls = []
+
+    async def fake_subprocess(*args, **kwargs):
+        calls.append(args)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+
+    class Uploader:
+        def sync_job(self, _job_id):
+            return 1
+
+    manager = FakeManager(tmp_path, worker_profile="worker-role")
+    manager._s3_uploader = Uploader()
+    manager._checkpoint_store = FakeCheckpointStore()
+    local_result = Path(manager.collected_root) / (
+        "job-1/workers/shard-00000/results"
+    )
+    local_result.mkdir(parents=True)
+    (local_result / "answer.json").write_text("42")
+    spec = JobSpec.model_validate({
+        "name": "checkpoint",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "target_dir": str(tmp_path / "remote-work"),
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "bench"},
+        "collect": {
+            "paths": ["results"],
+            "checkpoint": True,
+            "exclude": ["**/core"],
+        },
+    })
+
+    await ManagerFleetDriver(manager).collect("worker-a", spec, "job-1")
+
+    assert calls
+    assert "--delete" in calls[0]
+    assert "--delete-excluded" in calls[0]
+    assert "--exclude" in calls[0]
+    assert manager._checkpoint_store.commits
+    commit = manager._checkpoint_store.commits[0]
+    assert commit["job_id"] == "job-1"
+    assert commit["worker_namespace"] == "shard-00000"
+    assert commit["paths"] == ["results"]
+    assert commit["exclude"] == ["**/core"]
+    assert commit["metadata"]["resolved_commit"] == "a" * 40
+
+
 async def test_restart_recovery_reuses_durable_lease_slot(tmp_path):
     manager = FakeManager(tmp_path)
     manager._batch = None
@@ -200,6 +286,138 @@ async def test_restart_recovery_reuses_durable_lease_slot(tmp_path):
         manager,
     )._collection_identity("worker-a", "job-1")
     assert (namespace, shard_index) == ("shard-00007", 7)
+
+
+async def test_prepare_and_restore_checkpoint_before_run(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    manager = FakeManager(tmp_path)
+    manager._checkpoint_store = FakeCheckpointStore()
+    source = JobSpec.model_validate({
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "fanout": {"workers": 2},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+    persist_job_spec(
+        manager.config.registry.path,
+        "job-source",
+        source,
+    )
+    update_job_state(
+        manager.config.registry.path,
+        "job-source",
+        "failed",
+    )
+    recovering = JobSpec.model_validate({
+        "name": "resume",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "target_dir": str(tmp_path / "remote-work"),
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "resume"},
+        "fanout": {"workers": 2},
+        "recovery": {
+            "policy": "checkpoint",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+    driver = ManagerFleetDriver(manager)
+
+    await driver.prepare_recovery("job-new", recovering)
+
+    assert [
+        (kind, call["worker_namespace"])
+        for kind, call in manager._checkpoint_store.restores
+    ] == [
+        ("checkpoint", "shard-00000"),
+        ("checkpoint", "shard-00001"),
+    ]
+
+    commands = []
+
+    async def fake_subprocess(*args, **kwargs):
+        commands.append(args)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    await driver.restore_recovery(
+        "worker-a",
+        "job-new",
+        recovering,
+        SimpleNamespace(shard_index=0),
+    )
+
+    assert commands
+    assert commands[0][0] == "rsync"
+    assert "--safe-links" in commands[0]
+    assert commands[0][-1].endswith(
+        f":{recovering.setup.target_dir.rstrip('/')}/"
+    )
+
+    await driver.cleanup_recovery("job-new")
+    assert not (
+        Path(manager.config.registry.path).with_name("recovery-staging")
+        / "job-new"
+    ).exists()
+
+
+async def test_prepare_recovery_rejects_mismatched_source_contract(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    manager = FakeManager(tmp_path)
+    manager._checkpoint_store = FakeCheckpointStore()
+    source = JobSpec.model_validate({
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "fanout": {"workers": 1},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+    persist_job_spec(
+        manager.config.registry.path,
+        "job-source",
+        source,
+    )
+    update_job_state(
+        manager.config.registry.path,
+        "job-source",
+        "failed",
+    )
+    wrong_commit = JobSpec.model_validate({
+        "name": "resume",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "b" * 40,
+        },
+        "run": {"command": "resume"},
+        "recovery": {
+            "policy": "checkpoint",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+
+    with pytest.raises(RuntimeError, match="resolved_commit"):
+        await ManagerFleetDriver(manager).prepare_recovery(
+            "job-new", wrong_commit,
+        )
+
+    assert manager._checkpoint_store.restores == []
 
 
 async def test_empty_collect_paths_is_noop_before_registry_or_storage(

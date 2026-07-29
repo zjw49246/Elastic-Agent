@@ -31,6 +31,7 @@ _UNBOUND_LAUNCH_INTENTS_VERSION = 1
 _MAX_UNBOUND_LAUNCH_JOBS = 10_000
 _MAX_UNBOUND_LAUNCHES_PER_JOB = 1_000
 _MAX_UNBOUND_LAUNCH_INTENTS_BYTES = 2 * 1024 * 1024
+_MAX_JOB_SPEC_JOURNAL_BYTES = 32 * 1024 * 1024
 
 
 def job_specs_dir(registry_path: str | Path) -> Path:
@@ -94,6 +95,56 @@ def persist_job_spec(
     )
 
     return atomic_write_private(destination, payload)
+
+
+def load_job_spec_journal(
+    registry_path: str | Path,
+    job_id: str,
+    *,
+    max_bytes: int = _MAX_JOB_SPEC_JOURNAL_BYTES,
+) -> dict:
+    """Read one exact private Job journal without following replacements."""
+
+    if _SAFE_JOB_ID.fullmatch(job_id) is None:
+        raise ValueError(f"invalid Job id: {job_id!r}")
+    if max_bytes <= 0 or max_bytes > _MAX_JOB_SPEC_JOURNAL_BYTES:
+        raise ValueError("invalid Job journal read limit")
+    path = job_specs_dir(registry_path) / f"{job_id}.json"
+    tighten_state_file(path)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 1
+            or metadata.st_size > max_bytes
+        ):
+            raise ValueError("invalid Job journal file")
+        chunks: list[bytes] = []
+        consumed = 0
+        while chunk := os.read(
+            descriptor,
+            min(64 * 1024, max_bytes + 1 - consumed),
+        ):
+            chunks.append(chunk)
+            consumed += len(chunk)
+            if consumed > max_bytes:
+                raise ValueError("Job journal exceeds read limit")
+    finally:
+        os.close(descriptor)
+    payload = json.loads(b"".join(chunks).decode("utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("job_id") != job_id
+        or not isinstance(payload.get("spec"), dict)
+    ):
+        raise ValueError("invalid Job journal payload")
+    return payload
 
 
 def update_job_state(

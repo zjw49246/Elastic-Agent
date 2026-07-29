@@ -48,6 +48,9 @@ class FakeDriver:
         self.resolved_secret_env: dict[str, str] = {}
         self.secret_resolve_calls: list[dict[str, str]] = []
         self.secret_resolve_error: str | None = None
+        self.recovery_prepare_error: str | None = None
+        self.recovery_restore_error: str | None = None
+        self.recovery_cleanup_error: str | None = None
 
     async def acquire_capacity(self, count):
         self.events.append(("capacity_acquire", count))
@@ -114,6 +117,30 @@ class FakeDriver:
     async def provision(self, worker_id, harness, spec):
         self.events.append(("provision", worker_id))
         return self.provision_ok
+
+    async def prepare_recovery(self, job_id, spec):
+        self.events.append((
+            "recovery_prepare",
+            job_id,
+            spec.recovery.source_job_id,
+        ))
+        if self.recovery_prepare_error:
+            raise RuntimeError(self.recovery_prepare_error)
+
+    async def restore_recovery(self, worker_id, job_id, spec, ctx):
+        self.events.append((
+            "recovery_restore",
+            worker_id,
+            job_id,
+            ctx.shard_index,
+        ))
+        if self.recovery_restore_error:
+            raise RuntimeError(self.recovery_restore_error)
+
+    async def cleanup_recovery(self, job_id):
+        self.events.append(("recovery_cleanup", job_id))
+        if self.recovery_cleanup_error:
+            raise RuntimeError(self.recovery_cleanup_error)
 
     async def login(self, worker_id, spec, config_dir, *, account_id="", claim_id=""):
         self.login_calls.append((worker_id, config_dir))
@@ -313,6 +340,67 @@ class TestLaunch:
         for r in job.runs.values():
             assert r.account_id  # each worker got an account
             assert r.ctx.account_email
+
+    async def test_recovery_is_staged_before_scale_and_restored_before_login(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        job = await BatchOrchestrator(d).launch(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+
+        event_names = [event[0] for event in d.events]
+        assert event_names.index("recovery_prepare") < event_names.index("scale")
+        assert event_names.index("provision") < event_names.index(
+            "recovery_restore"
+        )
+        assert event_names.index("recovery_restore") < event_names.index("login")
+        assert event_names.index("login") < len(event_names)
+        assert d.dispatched
+        assert ("recovery_cleanup", job.job_id) in d.events
+
+    async def test_recovery_prepare_failure_creates_no_worker(self):
+        d = FakeDriver(workers=1)
+        d.recovery_prepare_error = "checkpoint missing"
+
+        job = await BatchOrchestrator(d).launch(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+
+        assert job.error == "checkpoint missing"
+        assert job.runs == {}
+        assert not any(event[0] == "scale" for event in d.events)
+
+    async def test_recovery_restore_failure_stops_before_login_and_dispatch(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        d.recovery_restore_error = "checkpoint checksum mismatch"
+
+        job = await BatchOrchestrator(d).launch(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+
+        run = next(iter(job.runs.values()))
+        assert run.phase == WorkerPhase.FAILED
+        assert "checkpoint checksum mismatch" in (run.error or "")
+        assert not d.login_calls
+        assert not d.dispatched
 
     async def test_account_none_skips_login(self):
         d = FakeDriver()

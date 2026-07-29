@@ -361,6 +361,24 @@ class FleetDriver(Protocol):
         """Run the bootstrap pipeline; return True on success."""
         ...
 
+    async def prepare_recovery(self, job_id: str, spec: JobSpec) -> None:
+        """Stage and validate every requested source shard before cloud create."""
+        ...
+
+    async def restore_recovery(
+        self,
+        worker_id: str,
+        job_id: str,
+        spec: JobSpec,
+        ctx: WorkerContext,
+    ) -> None:
+        """Copy one already-validated source shard onto a provisioned worker."""
+        ...
+
+    async def cleanup_recovery(self, job_id: str) -> None:
+        """Remove Manager-local staging after all workers consumed it."""
+        ...
+
     async def login(
         self, worker_id: str, spec: JobSpec, config_dir: str, *,
         account_id: str = "", claim_id: str = "",
@@ -1037,11 +1055,24 @@ class BatchOrchestrator:
     async def _bring_up_all(self, job: BatchJob) -> None:
         spec = job.spec
         job.started_at = datetime.now(timezone.utc)
+        recovery_attempted = False
         try:
             # This durable gate is crossed before account reservation or any
             # cloud call.  A journal left at ``prepared`` can therefore be
             # safely scheduled by an idempotent retry after a crash.
             await self._record_job_state(job, "launching")
+            if spec.recovery.policy != "none":
+                prepare_recovery = getattr(
+                    self._driver, "prepare_recovery", None,
+                )
+                if not callable(prepare_recovery):
+                    raise RuntimeError(
+                        "fleet driver does not support checkpoint recovery"
+                    )
+                recovery_attempted = True
+                # Validate and stage before scale_out/reserve so a missing or
+                # corrupt checkpoint cannot create a billable worker.
+                await prepare_recovery(job.job_id, spec)
             if self._is_eip_bound(spec):
                 await self._bring_up_bound_all(job)
             else:
@@ -1052,6 +1083,21 @@ class BatchOrchestrator:
             job.error = str(exc)
             logger.exception("bring-up failed for job %s", job.job_id)
         finally:
+            if recovery_attempted:
+                cleanup_recovery = getattr(
+                    self._driver, "cleanup_recovery", None,
+                )
+                if callable(cleanup_recovery):
+                    try:
+                        await cleanup_recovery(job.job_id)
+                    except Exception:
+                        # Staging cleanup must not turn an already-dispatched,
+                        # healthy run into failure. The real driver records and
+                        # retries its private Manager-local cleanup.
+                        logger.exception(
+                            "recovery staging cleanup failed for job %s",
+                            job.job_id,
+                        )
             job.launch_complete = True
             # A job that fails entirely during provision/login never reaches a
             # run exit, so settle terminal state and resources here too.  A
@@ -1502,6 +1548,21 @@ class BatchOrchestrator:
             run.phase = WorkerPhase.BOOTSTRAPPING
             if not await self._driver.provision(worker_id, job.harness, spec):
                 return self._fail(run, "bootstrap failed")
+            if spec.recovery.policy != "none":
+                restore_recovery = getattr(
+                    self._driver, "restore_recovery", None,
+                )
+                if not callable(restore_recovery):
+                    return self._fail(
+                        run,
+                        "fleet driver does not support checkpoint recovery",
+                    )
+                await restore_recovery(
+                    worker_id,
+                    job.job_id,
+                    spec,
+                    run.ctx,
+                )
             if self._shutting_down:
                 return self._fail(run, "manager shutting down")
             if job.cancel_requested:

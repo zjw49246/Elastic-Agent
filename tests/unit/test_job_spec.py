@@ -100,6 +100,119 @@ class TestWorkerContexts:
             )
 
 
+class TestCheckpointRecovery:
+    def test_checkpoint_collection_requires_paths(self):
+        with pytest.raises(
+            ValidationError,
+            match="checkpoint collection requires collect.paths",
+        ):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={"checkpoint": True},
+            )
+
+    def test_checkpoint_recovery_requires_source_and_paths(self):
+        with pytest.raises(
+            ValidationError,
+            match="recovery.source_job_id is required",
+        ):
+            JobSpec(
+                name="resume",
+                run=RunSpec(command="bench --resume"),
+                recovery={"policy": "checkpoint", "paths": ["results"]},
+            )
+        with pytest.raises(
+            ValidationError,
+            match="recovery.paths is required",
+        ):
+            JobSpec(
+                name="resume",
+                run=RunSpec(command="bench --resume"),
+                recovery={
+                    "policy": "checkpoint",
+                    "source_job_id": "job-0123456789abcdef",
+                },
+            )
+
+    @pytest.mark.parametrize(
+        "source_job_id",
+        ["../job-secret", "/tmp/job", "job x", "x" * 129],
+    )
+    def test_checkpoint_recovery_rejects_unsafe_source_job_id(
+        self, source_job_id
+    ):
+        with pytest.raises(ValidationError, match="source_job_id"):
+            JobSpec(
+                name="resume",
+                run=RunSpec(command="bench --resume"),
+                recovery={
+                    "policy": "checkpoint",
+                    "source_job_id": source_job_id,
+                    "paths": ["results"],
+                },
+            )
+
+    def test_recovery_none_rejects_hidden_source(self):
+        with pytest.raises(
+            ValidationError,
+            match="must be empty when recovery.policy is 'none'",
+        ):
+            JobSpec(
+                name="resume",
+                run=RunSpec(command="bench"),
+                recovery={
+                    "source_job_id": "job-0123456789abcdef",
+                    "paths": ["results"],
+                },
+            )
+
+    def test_checkpoint_and_legacy_recovery_are_explicit(self):
+        checkpoint = JobSpec(
+            name="resume",
+            run=RunSpec(command="bench --resume"),
+            collect={
+                "paths": ["results"],
+                "checkpoint": True,
+                "exclude": ["**/core", "*.tmp"],
+            },
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-0123456789abcdef",
+                "paths": ["results"],
+            },
+        )
+        legacy = JobSpec(
+            name="resume-legacy",
+            run=RunSpec(command="bench --resume"),
+            recovery={
+                "policy": "legacy_final_collection",
+                "source_job_id": "job-fedcba9876543210",
+                "paths": ["results"],
+            },
+        )
+
+        assert checkpoint.collect.checkpoint is True
+        assert checkpoint.collect.exclude == ["**/core", "*.tmp"]
+        assert checkpoint.recovery.policy == "checkpoint"
+        assert legacy.recovery.policy == "legacy_final_collection"
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["/absolute", "../escape", "results/../../escape", "-danger", "bad\\path"],
+    )
+    def test_collect_exclude_patterns_are_safe(self, pattern):
+        with pytest.raises(ValidationError, match="collect.exclude"):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={
+                    "paths": ["results"],
+                    "exclude": [pattern],
+                },
+            )
+
+
 class TestEnvironmentAndSetup:
     def test_versioned_environment_profile_is_fixed(self):
         env = EnvironmentSpec(profile="ubuntu-agent-docker-v1")

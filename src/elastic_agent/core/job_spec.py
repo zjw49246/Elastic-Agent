@@ -58,6 +58,10 @@ _ROUTING_PROXY_ENV_KEYS = frozenset({
 _S3_URI_RE = re.compile(
     r"s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/(?P<key>.*))?"
 )
+_SAFE_JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SAFE_CHECKPOINT_GENERATION_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
 
 
 def _validate_env_map(env: dict[str, str], *, label: str) -> dict[str, str]:
@@ -653,6 +657,15 @@ class CollectSpec(StrictSpecModel):
     """What to pull back from each worker, and how often."""
 
     paths: list[str] = Field(default_factory=list)
+    # Build an immutable, hash-verified S3 generation after each successful
+    # Manager-side collection. Checkpoint mode deliberately uses the Manager
+    # relay even when direct worker uploads are available: the latter overwrite
+    # mutable keys and cannot prove that a live file stayed unchanged.
+    checkpoint: bool = False
+    # Relative glob patterns omitted from both ordinary collection and
+    # checkpoint generations. This keeps crash dumps/caches out of durable
+    # results without exposing an arbitrary rsync/CLI option surface.
+    exclude: list[str] = Field(default_factory=list)
     # Pull results back periodically WHILE the run is going (seconds), not only
     # on completion — so long runs stream partial results to the Manager → S3 as
     # tasks finish, and a run that quota-outs/fails partway still yields whatever
@@ -679,6 +692,105 @@ class CollectSpec(StrictSpecModel):
             normalized.append(value)
         return normalized
 
+    @field_validator("exclude")
+    @classmethod
+    def safe_exclude_patterns(cls, patterns: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in patterns:
+            value = raw.strip()
+            if (
+                not value
+                or len(value) > 1_024
+                or value.startswith(("-", "/"))
+                or "\x00" in value
+                or "\\" in value
+                or any(ord(character) < 0x20 for character in value)
+                or ".." in PurePosixPath(value).parts
+            ):
+                raise ValueError(
+                    "collect.exclude entries must be safe relative glob patterns"
+                )
+            normalized.append(value)
+        return normalized
+
+
+class RecoverySpec(StrictSpecModel):
+    """Restore one trusted prior Job shard before dispatching this Job.
+
+    ``checkpoint`` accepts only immutable COMMITTED generations. The explicit
+    ``legacy_final_collection`` escape hatch exists for pre-checkpoint Jobs and
+    is intentionally opt-in because their mutable S3 trees have no hash
+    manifest.
+    """
+
+    policy: Literal[
+        "none", "checkpoint", "legacy_final_collection",
+    ] = "none"
+    source_job_id: str = ""
+    paths: list[str] = Field(default_factory=list)
+    generation: str = ""
+
+    @field_validator("source_job_id")
+    @classmethod
+    def safe_source_job_id(cls, source_job_id: str) -> str:
+        value = source_job_id.strip()
+        if value and _SAFE_JOB_ID_RE.fullmatch(value) is None:
+            raise ValueError("recovery.source_job_id is invalid")
+        return value
+
+    @field_validator("paths")
+    @classmethod
+    def safe_recovery_paths(cls, paths: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in paths:
+            try:
+                value = _validate_worker_path(
+                    raw,
+                    label="recovery.paths entries",
+                    absolute=False,
+                    allow_dot=False,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "recovery.paths entries must be safe relative paths"
+                ) from exc
+            normalized.append(value)
+        return normalized
+
+    @field_validator("generation")
+    @classmethod
+    def safe_generation(cls, generation: str) -> str:
+        value = generation.strip()
+        if (
+            value
+            and _SAFE_CHECKPOINT_GENERATION_RE.fullmatch(value) is None
+        ):
+            raise ValueError("recovery.generation is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def complete_configuration(self) -> RecoverySpec:
+        if self.policy == "none":
+            if self.source_job_id or self.paths or self.generation:
+                raise ValueError(
+                    "recovery source_job_id/paths/generation must be empty "
+                    "when recovery.policy is 'none'"
+                )
+            return self
+        if not self.source_job_id:
+            raise ValueError(
+                "recovery.source_job_id is required when recovery is enabled"
+            )
+        if not self.paths:
+            raise ValueError(
+                "recovery.paths is required when recovery is enabled"
+            )
+        if self.policy == "legacy_final_collection" and self.generation:
+            raise ValueError(
+                "recovery.generation is supported only for checkpoint recovery"
+            )
+        return self
+
 
 class CompletionSpec(StrictSpecModel):
     """How to decide a worker's run is done."""
@@ -697,6 +809,7 @@ class JobSpec(StrictSpecModel):
     rotation: RotationSpec = Field(default_factory=RotationSpec)
     fanout: FanoutSpec = Field(default_factory=FanoutSpec)
     collect: CollectSpec = Field(default_factory=CollectSpec)
+    recovery: RecoverySpec = Field(default_factory=RecoverySpec)
     completion: CompletionSpec = Field(default_factory=CompletionSpec)
     # Overall control-plane lease, including provisioning/login/collection.
     # Runtime enforcement is orchestrator-owned; keeping it in the durable spec
@@ -723,6 +836,14 @@ class JobSpec(StrictSpecModel):
         if self.ttl_seconds < self.run.timeout:
             raise ValueError(
                 "ttl_seconds must be greater than or equal to run.timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def checkpoint_collection_has_paths(self) -> JobSpec:
+        if self.collect.checkpoint and not self.collect.paths:
+            raise ValueError(
+                "checkpoint collection requires collect.paths"
             )
         return self
 
