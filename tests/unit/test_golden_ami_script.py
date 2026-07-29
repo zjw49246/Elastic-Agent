@@ -77,6 +77,9 @@ def test_builder_scrubs_identity_and_tags_image_and_snapshot() -> None:
     assert '{"ResourceType": "snapshot", "Tags": tags}' in source
     assert '{"Key": "ManagedBy", "Value": "elastic-agent"}' in source
     assert '{"Key": "Role", "Value": "worker-golden"}' in source
+    assert "ea-task-supervisor.service" in source
+    assert "/usr/local/bin/ea-task-supervisor.sh" in source
+    assert "/ea-tasks" in source and "/ea-logs" in source
 
 
 def test_existing_instance_must_have_builder_ownership_tags_before_cleanup() -> None:

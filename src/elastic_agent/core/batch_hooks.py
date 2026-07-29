@@ -2256,7 +2256,11 @@ def wire_batch(
             active_or_pending = list(data.get("active_processes") or [])
             active_or_pending.extend(data.get("pending_process_exits") or [])
             await orch.reconcile_worker_status(
-                worker_id, active_or_pending
+                worker_id,
+                active_or_pending,
+                process_inventory_complete=bool(
+                    data.get("process_inventory_complete", True)
+                ),
             )
 
     async def _on_disconnect(event_type, worker_id, data):

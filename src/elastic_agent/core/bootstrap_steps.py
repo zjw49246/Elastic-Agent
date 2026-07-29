@@ -295,12 +295,24 @@ def runtime_deploy_from_src_step(
         f"pip3 install -q --break-system-packages {deps}",
     )
     home = "/root" if run_as == "root" else f"/home/{run_as}"
+    task_socket = "/run/elastic-agent-task-supervisor/control.sock"
+    task_wrapper = (
+        "#!/bin/bash\n"
+        "set -eu\n"
+        f"export HOME={home}\n"
+        f"export PYTHONPATH={src_dir}\n"
+        f"export PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        f"exec python3 -m elastic_agent.worker.task_supervisor "
+        f"--socket={task_socket} --state-dir={home}/ea-tasks "
+        f"--log-dir={home}/ea-logs\n"
+    )
     wrapper = (
         "#!/bin/bash\n"
         "set -u\n"
         f"export HOME={home}\n"
         f"export DISPLAY={display}\n"
         f"export ELASTIC_AGENT_AGENT_TYPE={agent_type}\n"
+        f"export ELASTIC_AGENT_TASK_SUPERVISOR_SOCKET={task_socket}\n"
         f"export PYTHONPATH={src_dir}\n"
         f"export PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\n"
         + ("export IS_SANDBOX=1\n" if run_as == "root" else "")
@@ -319,13 +331,30 @@ def runtime_deploy_from_src_step(
     unit = (
         "[Unit]\n"
         "Description=Elastic Agent Worker Runtime (from src)\n"
-        "After=network.target\n\n"
+        "Wants=ea-task-supervisor.service\n"
+        "After=network.target ea-task-supervisor.service\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"User={run_as}\n"
         "ExecStart=/bin/bash /usr/local/bin/ea-runtime.sh\n"
         "Restart=always\n"
         "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    task_unit = (
+        "[Unit]\n"
+        "Description=Elastic Agent Independent Mode-B Task Supervisor\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={run_as}\n"
+        "RuntimeDirectory=elastic-agent-task-supervisor\n"
+        "RuntimeDirectoryMode=0700\n"
+        "ExecStart=/bin/bash /usr/local/bin/ea-task-supervisor.sh\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "KillMode=control-group\n\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
     )
@@ -342,7 +371,13 @@ def runtime_deploy_from_src_step(
         # the process exit → the Manager's run phase sticks at RUNNING and
         # collect/S3 never fire. chown it to the runtime user.
         f"mkdir -p {home}/ea-logs\n"
-        f"chown {run_as} {home}/ea-logs\n"
+        f"mkdir -p {home}/ea-tasks\n"
+        f"chown {run_as} {home}/ea-logs {home}/ea-tasks\n"
+        f"chmod 700 {home}/ea-logs {home}/ea-tasks\n"
+        "cat > /usr/local/bin/ea-task-supervisor.sh << 'TASKWRAP'\n"
+        f"{task_wrapper}"
+        "TASKWRAP\n"
+        "chmod +x /usr/local/bin/ea-task-supervisor.sh\n"
         "cat > /usr/local/bin/ea-runtime.sh << 'WRAP'\n"
         f"{wrapper}"
         "WRAP\n"
@@ -350,12 +385,17 @@ def runtime_deploy_from_src_step(
         "cat > /etc/systemd/system/ea-runtime.service << 'UNIT'\n"
         f"{unit}"
         "UNIT\n"
+        "cat > /etc/systemd/system/ea-task-supervisor.service << 'TASKUNIT'\n"
+        f"{task_unit}"
+        "TASKUNIT\n"
         # A baked AMI may still have the old PyPI runtime unit enabled.  Stop it
         # before starting the source-pinned runtime so connection readiness can
         # only be satisfied by the worker that implements current login checks.
         "(systemctl disable --now elastic-agent-runtime.service "
         ">/dev/null 2>&1 || true)\n"
         "systemctl daemon-reload\n"
+        "systemctl enable ea-task-supervisor\n"
+        "systemctl restart ea-task-supervisor\n"
         "systemctl enable ea-runtime\n"
         "systemctl restart ea-runtime"
     )

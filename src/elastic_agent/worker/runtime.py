@@ -24,8 +24,10 @@ import subprocess
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import websockets
@@ -349,6 +351,7 @@ class WorkerRuntime:
         worker_id: str | None = None,
         heartbeat_interval: int = 30,
         log_dir: str = "logs",
+        task_supervisor_socket: str | None = None,
     ) -> None:
         self._manager_url = manager_url
         self._auth_token = auth_token
@@ -381,6 +384,29 @@ class WorkerRuntime:
         # can be delegated to another run.
         self._process_groups: dict[str, int] = {}
         self._process_group_locks: dict[str, asyncio.Lock] = {}
+        # Mode-B commands can be delegated to the independent
+        # ea-task-supervisor service.  Unlike ``_processes``, these children are
+        # not in ea-runtime's systemd cgroup and survive a runtime replacement.
+        # The new runtime inventories the private socket before advertising a
+        # complete STATUS snapshot.
+        supervisor_socket = (
+            task_supervisor_socket
+            if task_supervisor_socket is not None
+            else os.environ.get("ELASTIC_AGENT_TASK_SUPERVISOR_SOCKET", "")
+        ).strip()
+        self._task_supervisor: Any = None
+        if supervisor_socket:
+            from elastic_agent.worker.task_supervisor import (
+                TaskSupervisorClient,
+            )
+
+            self._task_supervisor = TaskSupervisorClient(supervisor_socket)
+        self._supervised_tasks: dict[str, Any] = {}
+        self._supervised_monitor_tasks: dict[str, asyncio.Task] = {}
+        self._supervised_offsets: dict[str, int] = {}
+        self._supervisor_event_task_ids: dict[str, str] = {}
+        self._process_inventory_complete = self._task_supervisor is None
+        self._process_inventory_error: str | None = None
         # A process is removed from ``_processes`` before potentially slow final
         # file sync and durable PROCESS_EXIT persistence.  Keep that transition
         # visible to STATUS reconciliation so the Manager cannot mistake the
@@ -452,6 +478,11 @@ class WorkerRuntime:
     @property
     def active_processes(self) -> list[str]:
         tasks = list(self._processes.keys())
+        tasks.extend(
+            task_id
+            for task_id, descriptor in self._supervised_tasks.items()
+            if descriptor.state == "running"
+        )
         if self._pty_backend is not None:
             tasks.extend(self._pty_backend.active_tasks)
         return tasks
@@ -463,6 +494,11 @@ class WorkerRuntime:
         backoff = 1.0
 
         while self._running:
+            if (
+                self._task_supervisor is not None
+                and not self._process_inventory_complete
+            ):
+                await self._recover_supervised_task_inventory()
             try:
                 async with websockets.connect(self._manager_url) as ws:
                     self._ws = ws
@@ -527,6 +563,20 @@ class WorkerRuntime:
             await self._file_sync_manager.stop()
         for task_id in list(self._processes.keys()):
             await self._stop_process(task_id, "SIGTERM")
+        # Runtime replacement intentionally detaches from supervised Mode-B
+        # tasks. STOP/timeout/exhaustion use explicit supervisor RPCs; merely
+        # stopping the reconnectable control plane must never kill the Job.
+        supervised_monitors = list(self._supervised_monitor_tasks.values())
+        for task in supervised_monitors:
+            task.cancel()
+        if supervised_monitors:
+            await asyncio.gather(
+                *supervised_monitors,
+                return_exceptions=True,
+            )
+        self._supervised_monitor_tasks.clear()
+        if self._task_supervisor is not None:
+            self._process_inventory_complete = False
         login_tasks = list(self._account_login_tasks.values())
         for task in login_tasks:
             task.cancel()
@@ -795,8 +845,13 @@ class WorkerRuntime:
 
     async def _handle_execute(self, msg: ExecuteMessage) -> None:
         task_id = msg.task_id
-        if task_id in self._processes or (
-            self._pty_backend is not None and self._pty_backend.has_task(task_id)
+        if (
+            task_id in self._processes
+            or task_id in self._supervised_tasks
+            or (
+                self._pty_backend is not None
+                and self._pty_backend.has_task(task_id)
+            )
         ):
             await self._send_event(ErrorMessage(
                 error_type="duplicate_task",
@@ -956,6 +1011,81 @@ class WorkerRuntime:
             return
         cwd = msg.cwd if msg.cwd else None
 
+        if self._task_supervisor is not None:
+            from elastic_agent.worker.task_supervisor import (
+                SupervisedTaskLaunch,
+                TaskSupervisorError,
+            )
+
+            try:
+                descriptor = await self._task_supervisor.launch(
+                    SupervisedTaskLaunch(
+                        task_id=task_id,
+                        command=command,
+                        cwd=cwd or os.getcwd(),
+                        env=env,
+                        timeout_seconds=msg.timeout,
+                        job_id=getattr(msg, "job_id", None) or "",
+                        watch_exhaustion=bool(
+                            getattr(msg, "watch_exhaustion", False)
+                        ),
+                        agent_api_provider=(
+                            projection.provider
+                            if projection is not None
+                            else None
+                        ),
+                        agent_type=(
+                            projection.agent_type
+                            if projection is not None
+                            else None
+                        ),
+                    )
+                )
+            except TaskSupervisorError:
+                # A response can be lost after the supervisor has committed the
+                # launch. Inventory before reporting failure, otherwise a retry
+                # could create a duplicate side-effecting command.
+                descriptor = None
+                try:
+                    inventory = await self._task_supervisor.list_tasks()
+                    descriptor = next(
+                        (
+                            item
+                            for item in inventory
+                            if item.task_id == task_id
+                        ),
+                        None,
+                    )
+                except TaskSupervisorError:
+                    pass
+                if descriptor is None:
+                    self._agent_api_tasks.pop(task_id, None)
+                    await self._send_event(ErrorMessage(
+                        error_type="execute_failed",
+                        message=(
+                            "Independent task supervisor could not start "
+                            "the process"
+                        ),
+                        recoverable=True,
+                    ))
+                    await self._send_process_exit(ProcessExitMessage(
+                        task_id=task_id,
+                        exit_code=-1,
+                        error_type="execute_failed",
+                        error_message=(
+                            "Independent task supervisor could not start "
+                            "the process"
+                        ),
+                    ))
+                    return
+            self._register_supervised_task(descriptor)
+            logger.info(
+                "Started supervised process for task %s (pid=%d)",
+                task_id,
+                descriptor.pid,
+            )
+            return
+
         spawn_kwargs: dict[str, Any] = {}
         if os.name == "posix":
             spawn_kwargs["start_new_session"] = True
@@ -997,6 +1127,263 @@ class WorkerRuntime:
 
         task = asyncio.create_task(self._monitor_process(task_id, proc, log_path, msg.timeout))
         self._process_tasks[task_id] = task
+
+    async def _recover_supervised_task_inventory(self) -> bool:
+        """Inventory the independent runner before STATUS reconciliation.
+
+        A failed/partial scan is advertised as incomplete.  The Manager must
+        retain its run instead of interpreting an empty first snapshot as
+        proof that the task disappeared.
+        """
+
+        if self._task_supervisor is None:
+            self._process_inventory_complete = True
+            self._process_inventory_error = None
+            return True
+        self._process_inventory_complete = False
+        self._process_inventory_error = None
+        try:
+            descriptors = await self._task_supervisor.list_tasks()
+            task_ids = [descriptor.task_id for descriptor in descriptors]
+            if len(task_ids) != len(set(task_ids)):
+                raise RuntimeError("duplicate supervisor inventory")
+            for descriptor in descriptors:
+                if (
+                    descriptor.task_id in self._processes
+                    or (
+                        self._pty_backend is not None
+                        and self._pty_backend.has_task(descriptor.task_id)
+                    )
+                ):
+                    raise RuntimeError("conflicting task ownership")
+            inventory_ids = {
+                descriptor.task_id for descriptor in descriptors
+            }
+            for stale_task_id in (
+                set(self._supervised_tasks) - inventory_ids
+            ):
+                stale_monitor = self._supervised_monitor_tasks.pop(
+                    stale_task_id,
+                    None,
+                )
+                if stale_monitor is not None:
+                    stale_monitor.cancel()
+                self._supervised_tasks.pop(stale_task_id, None)
+                self._supervised_offsets.pop(stale_task_id, None)
+                self._exhaustion_watch.pop(stale_task_id, None)
+                self._exhaustion_fired.discard(stale_task_id)
+                self._agent_api_tasks.pop(stale_task_id, None)
+            for descriptor in descriptors:
+                self._register_supervised_task(descriptor)
+        except Exception as exc:
+            logger.warning(
+                "Independent task inventory is incomplete (%s)",
+                type(exc).__name__,
+            )
+            self._process_inventory_error = (
+                "independent task inventory is unavailable"
+            )
+            return False
+        self._process_inventory_complete = True
+        self._process_inventory_error = None
+        logger.info(
+            "Recovered %d task(s) from independent supervisor",
+            len(descriptors),
+        )
+        return True
+
+    def _register_supervised_task(self, descriptor: Any) -> None:
+        """Attach one descriptor exactly once without owning its process."""
+
+        task_id = descriptor.task_id
+        previous = self._supervised_tasks.get(task_id)
+        self._supervised_tasks[task_id] = descriptor
+        self._supervised_offsets.setdefault(task_id, 0)
+        if descriptor.watch_exhaustion:
+            self._exhaustion_watch[task_id] = descriptor.job_id
+        pending = descriptor.pending_exhaustion
+        if pending is not None:
+            self._exhaustion_fired.add(task_id)
+            self._supervisor_event_task_ids[pending["event_id"]] = task_id
+        self._supervisor_event_task_ids[
+            descriptor.terminal_event_id
+        ] = task_id
+        if (
+            descriptor.agent_api_provider is not None
+            and task_id not in self._agent_api_tasks
+        ):
+            # Only classification metadata is reconstructed. API keys, command,
+            # environment and credential paths never enter the descriptor.
+            self._agent_api_tasks[task_id] = SimpleNamespace(
+                provider=descriptor.agent_api_provider,
+                agent_type=descriptor.agent_type,
+            )
+        monitor = self._supervised_monitor_tasks.get(task_id)
+        if monitor is None or monitor.done():
+            monitor = asyncio.create_task(
+                self._monitor_supervised_task(task_id)
+            )
+            self._supervised_monitor_tasks[task_id] = monitor
+        elif previous is not None and previous != descriptor:
+            # The active monitor reads the current descriptor from the map.
+            logger.debug("Refreshed supervised task %s metadata", task_id)
+
+    async def _monitor_supervised_task(self, task_id: str) -> None:
+        """Replay spool records and bridge one stable terminal event."""
+
+        try:
+            descriptor = self._supervised_tasks[task_id]
+            if (
+                descriptor.pending_exhaustion is not None
+                and descriptor.state == "running"
+            ):
+                # A previous runtime may have durably marked exhaustion and
+                # died before signaling. Re-establish the no-concurrent-resume
+                # fence before replaying RUN_EXHAUSTED.
+                await self._stop_process(task_id, "SIGINT")
+
+            while task_id in self._supervised_tasks:
+                offset = self._supervised_offsets.get(task_id, 0)
+                snapshot = await self._task_supervisor.poll(
+                    task_id,
+                    offset=offset,
+                )
+                self._supervised_offsets[task_id] = snapshot.next_offset
+                for record in snapshot.records:
+                    stream = record.get("stream")
+                    data = record.get("data")
+                    if (
+                        stream not in {"stdout", "stderr"}
+                        or not isinstance(data, str)
+                    ):
+                        raise RuntimeError("invalid supervised spool record")
+                    await self._handle_process_log_line(
+                        task_id,
+                        stream,
+                        data,
+                    )
+                if snapshot.terminal is not None:
+                    await self._finish_supervised_task(
+                        task_id,
+                        snapshot.terminal,
+                    )
+                    return
+                await asyncio.sleep(0.05 if snapshot.records else 0.5)
+        except asyncio.CancelledError:
+            # Runtime replacement detaches; the supervisor continues owning the
+            # process, pipes, timeout and terminal record.
+            raise
+        except Exception as exc:
+            self._process_inventory_complete = False
+            self._process_inventory_error = (
+                "independent task monitor is unavailable"
+            )
+            logger.error(
+                "Lost supervised task monitor for %s (%s)",
+                task_id,
+                type(exc).__name__,
+            )
+        finally:
+            current = self._supervised_monitor_tasks.get(task_id)
+            if current is asyncio.current_task():
+                self._supervised_monitor_tasks.pop(task_id, None)
+
+    async def _finish_supervised_task(
+        self,
+        task_id: str,
+        terminal: dict[str, Any],
+    ) -> None:
+        descriptor = self._supervised_tasks.get(task_id)
+        if descriptor is None:
+            return
+        if (
+            terminal.get("task_id") != task_id
+            or terminal.get("event_id") != descriptor.terminal_event_id
+            or not isinstance(terminal.get("exit_code"), int)
+        ):
+            raise RuntimeError("supervisor terminal identity mismatch")
+
+        # Rotation must be committed ahead of the stale PROCESS_EXIT, matching
+        # the direct-subprocess ordering contract.
+        pending = descriptor.pending_exhaustion
+        if pending is not None:
+            exhausted = RunExhaustedMessage(
+                task_id=task_id,
+                job_id=descriptor.job_id,
+                worker_id=self._worker_id or "unknown",
+                reason=pending["reason"],
+                event_id=pending["event_id"],
+            )
+            self._supervisor_event_task_ids[exhausted.event_id] = task_id
+            await self._send_event(exhausted)
+
+        semantic_error = self._agent_api_task_errors.pop(task_id, None)
+        exit_code = int(terminal["exit_code"])
+        if semantic_error is not None and exit_code == 0:
+            exit_code = 1
+        error_type = semantic_error[0] if semantic_error else terminal.get(
+            "error_type"
+        )
+        error_message = (
+            semantic_error[1]
+            if semantic_error
+            else terminal.get("error_message")
+        )
+
+        await self._mark_task_exiting(task_id)
+        self._supervised_tasks.pop(task_id, None)
+        self._supervised_offsets.pop(task_id, None)
+        self._exhaustion_watch.pop(task_id, None)
+        self._exhaustion_fired.discard(task_id)
+        self._agent_api_tasks.pop(task_id, None)
+        if self._file_sync_manager:
+            try:
+                synced = await self._file_sync_manager.force_sync(task_id)
+                logger.info(
+                    "Force-synced %d files for supervised task %s on exit",
+                    synced,
+                    task_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to force-sync files for supervised task %s",
+                    task_id,
+                )
+        event_id = str(terminal["event_id"])
+        self._supervisor_event_task_ids[event_id] = task_id
+        await self._send_process_exit(ProcessExitMessage(
+            task_id=task_id,
+            exit_code=exit_code,
+            error_type=error_type,
+            error_message=error_message,
+            event_id=event_id,
+        ))
+
+    async def _wait_supervised_terminal(
+        self,
+        task_id: str,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                descriptor = next(
+                    (
+                        item
+                        for item in await self._task_supervisor.list_tasks()
+                        if item.task_id == task_id
+                    ),
+                    None,
+                )
+            except Exception:
+                return False
+            if descriptor is None:
+                return False
+            self._supervised_tasks[task_id] = descriptor
+            if descriptor.state == "terminal":
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     @staticmethod
     async def _wait_process_exit(proc: asyncio.subprocess.Process, timeout: float | None) -> bool:
@@ -1324,77 +1711,92 @@ class WorkerRuntime:
                 log_file.write(json.dumps(log_entry) + "\n")
                 log_file.flush()
 
-            await self._send_event(LogMessage(
-                task_id=task_id,
-                stream=stream_name,
-                data=line,
+            await self._handle_process_log_line(
+                task_id,
+                stream_name,
+                line,
                 parsed=parsed,
-            ))
+            )
 
-            projection = self._agent_api_tasks.get(task_id)
-            provider_error = None
-            if projection is not None:
-                if self._agent_api_terminal_success(line):
-                    previous = self._agent_api_task_errors.get(task_id)
-                    # Codex emits reconnecting ``type=error`` frames for
-                    # retryable 500/502 responses before a later successful
-                    # turn.completed. Only durable auth/hard-limit evidence
-                    # survives a success terminal.
-                    if previous is not None and previous[0] in {
-                        "agent_api_error",
-                        "agent_api_transient_error",
-                    }:
-                        self._agent_api_task_errors.pop(task_id, None)
-                provider_error = _classify_agent_api_provider_error(
-                    projection.provider,
-                    line,
-                )
-                semantic_error = provider_error or self._agent_api_fatal_error(
-                    line,
-                    provider=projection.provider,
-                    agent_type=projection.agent_type,
-                )
-                if semantic_error is not None:
-                    previous = self._agent_api_task_errors.get(task_id)
-                    if (
-                        previous is None
-                        or _AGENT_API_ERROR_PRIORITY.get(semantic_error[0], 0)
-                        > _AGENT_API_ERROR_PRIORITY.get(previous[0], 0)
-                    ):
-                        self._agent_api_task_errors[task_id] = semantic_error
+    async def _handle_process_log_line(
+        self,
+        task_id: str,
+        stream_name: str,
+        line: str,
+        *,
+        parsed: dict | None = None,
+    ) -> None:
+        """Apply identical logging/error/rotation semantics to either runner."""
 
-            # Mode-B rotation (a): the opaque command consumes the Claude account
-            # internally, so we can't rotate per turn — instead we watch its
-            # output and, on the first exhaustion banner, interrupt + signal the
-            # Manager to swap accounts and restart with --resume.
-            exhaustion_reason = None
-            if (
-                task_id in self._exhaustion_watch
-                and task_id not in self._exhaustion_fired
-            ):
+        if parsed is None and stream_name == "stdout":
+            parsed = self._try_parse_ndjson(line)
+        await self._send_event(LogMessage(
+            task_id=task_id,
+            stream=stream_name,
+            data=line,
+            parsed=parsed,
+        ))
+
+        projection = self._agent_api_tasks.get(task_id)
+        provider_error = None
+        if projection is not None:
+            if self._agent_api_terminal_success(line):
+                previous = self._agent_api_task_errors.get(task_id)
+                # Codex emits reconnecting ``type=error`` frames for retryable
+                # 500/502 responses before a later successful turn.completed.
+                if previous is not None and previous[0] in {
+                    "agent_api_error",
+                    "agent_api_transient_error",
+                }:
+                    self._agent_api_task_errors.pop(task_id, None)
+            provider_error = _classify_agent_api_provider_error(
+                projection.provider,
+                line,
+            )
+            semantic_error = provider_error or self._agent_api_fatal_error(
+                line,
+                provider=projection.provider,
+                agent_type=projection.agent_type,
+            )
+            if semantic_error is not None:
+                previous = self._agent_api_task_errors.get(task_id)
                 if (
-                    provider_error is not None
-                    and provider_error[0] == "agent_api_auth_failure"
+                    previous is None
+                    or _AGENT_API_ERROR_PRIORITY.get(semantic_error[0], 0)
+                    > _AGENT_API_ERROR_PRIORITY.get(previous[0], 0)
                 ):
-                    exhaustion_reason = "agent_api_auth_failure"
-                elif (
-                    provider_error is not None
-                    and provider_error[0] == "agent_api_rate_limited"
-                ):
-                    exhaustion_reason = "agent_api_rate_limited"
-                elif (
-                    provider_error is None
-                    and (
-                        is_rate_limited(line)
-                        or is_auth_failure(line)
-                    )
-                ):
-                    exhaustion_reason = "rate_limit"
-            if exhaustion_reason is not None:
-                await self._signal_exhaustion(
-                    task_id,
-                    reason=exhaustion_reason,
+                    self._agent_api_task_errors[task_id] = semantic_error
+
+        # Mode-B rotation (a): the opaque command consumes the account
+        # internally, so rotation occurs only after its process group is gone.
+        exhaustion_reason = None
+        if (
+            task_id in self._exhaustion_watch
+            and task_id not in self._exhaustion_fired
+        ):
+            if (
+                provider_error is not None
+                and provider_error[0] == "agent_api_auth_failure"
+            ):
+                exhaustion_reason = "agent_api_auth_failure"
+            elif (
+                provider_error is not None
+                and provider_error[0] == "agent_api_rate_limited"
+            ):
+                exhaustion_reason = "agent_api_rate_limited"
+            elif (
+                provider_error is None
+                and (
+                    is_rate_limited(line)
+                    or is_auth_failure(line)
                 )
+            ):
+                exhaustion_reason = "rate_limit"
+        if exhaustion_reason is not None:
+            await self._signal_exhaustion(
+                task_id,
+                reason=exhaustion_reason,
+            )
 
     async def _signal_exhaustion(
         self,
@@ -1408,6 +1810,42 @@ class WorkerRuntime:
             return
         self._exhaustion_fired.add(task_id)
         job_id = self._exhaustion_watch.get(task_id, "")
+        exhausted_event = RunExhaustedMessage(
+            task_id=task_id,
+            job_id=job_id,
+            worker_id=self._worker_id or "unknown",
+            reason=reason,
+        )
+        supervised = task_id in self._supervised_tasks
+        if supervised:
+            try:
+                await self._task_supervisor.mark_exhaustion(
+                    task_id,
+                    reason=reason,
+                    event_id=exhausted_event.event_id,
+                )
+            except Exception as exc:
+                # Rotation without a durable ownership fence could dispatch a
+                # second command after runtime replacement. Fail the eventual
+                # PROCESS_EXIT instead of risking concurrent credential use.
+                logger.error(
+                    "Could not persist exhaustion for task %s (%s)",
+                    task_id,
+                    type(exc).__name__,
+                )
+                return
+            descriptor = self._supervised_tasks[task_id]
+            pending = {
+                "event_id": exhausted_event.event_id,
+                "reason": reason,
+            }
+            self._supervised_tasks[task_id] = replace(
+                descriptor,
+                pending_exhaustion=pending,
+            )
+            self._supervisor_event_task_ids[
+                exhausted_event.event_id
+            ] = task_id
         logger.warning(
             "Task %s tripped exhaustion detector; interrupting before rotation", task_id
         )
@@ -1417,6 +1855,13 @@ class WorkerRuntime:
         # this RUN_EXHAUSTED event, so task-id guards can discard that stale exit.
         proc = self._processes.get(task_id)
         await self._stop_process(task_id, "SIGINT")
+        if supervised:
+            if not await self._wait_supervised_terminal(task_id, 20):
+                logger.error(
+                    "Task %s did not stop after exhaustion; refusing rotation",
+                    task_id,
+                )
+                return
         if proc is not None and proc.returncode is None:
             if not await self._wait_process_exit(proc, 15):
                 logger.warning(
@@ -1434,12 +1879,7 @@ class WorkerRuntime:
                         task_id,
                     )
                     return
-        await self._send_event(RunExhaustedMessage(
-            task_id=task_id,
-            job_id=job_id,
-            worker_id=self._worker_id or "unknown",
-            reason=reason,
-        ))
+        await self._send_event(exhausted_event)
 
     @staticmethod
     def _try_parse_ndjson(line: str) -> dict | None:
@@ -1577,6 +2017,19 @@ class WorkerRuntime:
         await self._stop_process(msg.task_id, sig_name)
 
     async def _stop_process(self, task_id: str, sig_name: str) -> None:
+        if task_id in self._supervised_tasks:
+            try:
+                await self._task_supervisor.signal(
+                    task_id,
+                    signal_name=sig_name,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to signal supervised task %s (%s)",
+                    task_id,
+                    type(exc).__name__,
+                )
+            return
         proc = self._processes.get(task_id)
         if proc is None:
             return
@@ -1743,6 +2196,11 @@ class WorkerRuntime:
             ))
 
     async def _handle_health_check(self, _msg: HealthCheckMessage) -> None:
+        if (
+            self._task_supervisor is not None
+            and not self._process_inventory_complete
+        ):
+            await self._recover_supervised_task_inventory()
         await self._send_status()
 
     def _check_claude_cli(self) -> dict[str, Any]:
@@ -1884,6 +2342,8 @@ class WorkerRuntime:
             disk=round(disk, 1),
             active_processes=self.active_processes,
             pending_process_exits=pending_process_exits,
+            process_inventory_complete=self._process_inventory_complete,
+            process_inventory_error=self._process_inventory_error,
             runtime_ready=runtime_ready,
             runtime_error=None if runtime_ready else selected["error"],
             agent_type=expected_agent,
@@ -1915,6 +2375,22 @@ class WorkerRuntime:
             ))
 
     async def _handle_message(self, msg: SendInputMessage) -> None:
+        if msg.task_id in self._supervised_tasks:
+            try:
+                await self._task_supervisor.write_stdin(
+                    msg.task_id,
+                    msg.payload,
+                )
+            except Exception:
+                await self._send_event(ErrorMessage(
+                    error_type="stdin_write_failed",
+                    message=(
+                        "Failed to write to independent task stdin for "
+                        f"{msg.task_id}"
+                    ),
+                    recoverable=True,
+                ))
+            return
         stdin = self._stdin_pipes.get(msg.task_id)
         if stdin is None:
             await self._send_event(ErrorMessage(
@@ -2721,6 +3197,12 @@ class WorkerRuntime:
         while self._running and self._ws:
             uptime = int(time.monotonic() - self._start_time)
             await self._send_event(HeartbeatMessage(uptime_seconds=uptime))
+            if (
+                self._task_supervisor is not None
+                and not self._process_inventory_complete
+            ):
+                await self._recover_supervised_task_inventory()
+                await self._send_status()
             await asyncio.sleep(self._heartbeat_interval)
 
     # ---- Send helper ----
@@ -2794,6 +3276,14 @@ class WorkerRuntime:
         async with self._event_outbox_lock:
             pending = list(self._reliable_events.values())
             task_ids: set[str] = set(self._exiting_task_ids)
+        # A replacement runtime can inventory a supervisor terminal before it
+        # has replayed a large spool and persisted PROCESS_EXIT into its own
+        # outbox. Keep that transition visible to the Manager.
+        task_ids.update(
+            task_id
+            for task_id, descriptor in self._supervised_tasks.items()
+            if descriptor.state == "terminal"
+        )
         for data in pending:
             try:
                 payload = json.loads(data)
@@ -2831,23 +3321,53 @@ class WorkerRuntime:
 
     async def _handle_event_ack(self, msg: EventAckMessage) -> None:
         persist_error: Exception | None = None
+        removed: str | None = None
         async with self._event_outbox_lock:
             previous_events = dict(self._reliable_events)
             removed = self._reliable_events.pop(msg.event_id, None)
-            if removed is None:
-                return
-            try:
-                self._persist_reliable_events()
-            except Exception as exc:
-                # The on-disk outbox still contains the event.  Restore memory
-                # to the same truth so reconnect replay remains possible.
-                self._reliable_events = previous_events
-                persist_error = exc
+            if removed is not None:
+                try:
+                    self._persist_reliable_events()
+                except Exception as exc:
+                    # The on-disk outbox still contains the event. Restore
+                    # memory to the same truth so replay remains possible.
+                    self._reliable_events = previous_events
+                    persist_error = exc
         if persist_error is not None:
             await self._force_reconnect_for_outbox_failure()
             raise ReliableEventPersistenceError(
                 "failed to durably acknowledge terminal event"
             ) from persist_error
+        if (
+            self._task_supervisor is not None
+            and msg.event_id in self._supervisor_event_task_ids
+        ):
+            try:
+                await self._task_supervisor.ack_event(msg.event_id)
+            except Exception as exc:
+                # The stable supervisor record remains authoritative. A later
+                # runtime inventories and replays the same id; Manager-side
+                # event dedupe will ACK it again without repeating lifecycle
+                # side effects.
+                logger.warning(
+                    "Could not acknowledge supervisor event (%s)",
+                    type(exc).__name__,
+                )
+                return
+            task_id = self._supervisor_event_task_ids.pop(
+                msg.event_id,
+                None,
+            )
+            descriptor = self._supervised_tasks.get(task_id or "")
+            if (
+                descriptor is not None
+                and descriptor.pending_exhaustion is not None
+                and descriptor.pending_exhaustion["event_id"] == msg.event_id
+            ):
+                self._supervised_tasks[task_id] = replace(
+                    descriptor,
+                    pending_exhaustion=None,
+                )
 
     def _transport_reservation(self, kind: str) -> tuple[int, int]:
         reserved_bytes = 0

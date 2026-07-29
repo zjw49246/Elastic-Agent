@@ -720,7 +720,11 @@ class BatchOrchestrator:
         run.exit_archive_event.set()
 
     async def reconcile_worker_status(
-        self, worker_id: str, active_processes: list[str]
+        self,
+        worker_id: str,
+        active_processes: list[str],
+        *,
+        process_inventory_complete: bool = True,
     ) -> bool:
         """Fail closed when a reconnected worker no longer owns its run task.
 
@@ -728,6 +732,12 @@ class BatchOrchestrator:
         also closes the upgrade window for old runtimes that could lose the
         one-shot exit while their WebSocket was down.
         """
+        # A freshly replaced runtime has authenticated but may still be
+        # scanning the independent task supervisor. Its empty list is not an
+        # authoritative absence proof. A later complete STATUS or reliable
+        # terminal replay settles the run.
+        if not process_inventory_complete:
+            return False
         job_id = self._worker_index.get(worker_id)
         job = self._jobs.get(job_id) if job_id else None
         run = job.runs.get(worker_id) if job is not None else None

@@ -168,6 +168,19 @@ class TestRuntimeDeployFromSrc:
         c = step.command
         assert step.name == "runtime-deploy-from-src"
         assert "ea-runtime.service" in c and "Restart=always" in c
+        assert "ea-task-supervisor.service" in c
+        assert "elastic_agent.worker.task_supervisor" in c
+        assert (
+            "ELASTIC_AGENT_TASK_SUPERVISOR_SOCKET="
+            "/run/elastic-agent-task-supervisor/control.sock"
+        ) in c
+        assert "Wants=ea-task-supervisor.service" in c
+        assert "After=network.target ea-task-supervisor.service" in c
+        # The task runner is a separate unit/cgroup. Restarting ea-runtime must
+        # not propagate a stop to it.
+        assert "PartOf=ea-runtime.service" not in c
+        assert "RuntimeDirectoryMode=0700" in c
+        assert "KillMode=control-group" in c
         assert "User=ubuntu" in c
         assert "PYTHONPATH=/opt/ea/src" in c
         assert "ELASTIC_AGENT_AGENT_TYPE=claude" in c

@@ -116,10 +116,14 @@ class WorkerConnectionManager:
 
     def is_worker_runtime_ready(self, worker_id: str) -> bool:
         status = self.get_worker_status(worker_id)
-        return bool(status and status.get("runtime_ready", False))
+        return bool(
+            status
+            and status.get("runtime_ready", False)
+            and status.get("process_inventory_complete", True)
+        )
 
     async def wait_until_worker_ready(self, worker_id: str, timeout: float = 15.0) -> bool:
-        """Request a health check and wait until the Worker reports runtime_ready."""
+        """Wait for CLI health and a complete independent-task inventory."""
         if not self.is_connected(worker_id):
             return False
 

@@ -1430,6 +1430,30 @@ class TestCompletion:
         assert "no longer active" in job.runs[wid].error
         assert d.scaled_in == [wid]
 
+    async def test_recovering_inventory_does_not_fail_missing_running_task(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, status_reconcile_grace_seconds=0)
+        job = await orch.launch(_spec(fanout={"workers": 1}))
+        wid = next(iter(job.runs))
+
+        assert await orch.reconcile_worker_status(
+            wid,
+            [],
+            process_inventory_complete=False,
+        ) is False
+
+        assert job.runs[wid].phase == WorkerPhase.RUNNING
+        assert d.scaled_in == []
+
+        # The first authoritative complete inventory still fails closed if the
+        # supervisor confirms that neither a process nor terminal record exists.
+        assert await orch.reconcile_worker_status(
+            wid,
+            [],
+            process_inventory_complete=True,
+        ) is True
+        assert job.runs[wid].phase == WorkerPhase.FAILED
+
     async def test_exit_zero_marks_done(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)

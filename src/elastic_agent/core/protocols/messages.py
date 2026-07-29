@@ -259,6 +259,11 @@ class StatusMessage(Message):
     # PROCESS_EXIT is delivered/ACKed.  Advertising those pending task ids keeps
     # reconnect reconciliation from falsely failing a run in that narrow gap.
     pending_process_exits: list[str] = Field(default_factory=list)
+    # A replacement runtime inventories the independent Mode-B supervisor
+    # before an empty process list is authoritative. Managers must never fail a
+    # run from a recovering/failed first snapshot.
+    process_inventory_complete: bool = True
+    process_inventory_error: str | None = None
     runtime_ready: bool = True
     runtime_error: str | None = None
     agent_type: Literal["claude", "codex"] = "claude"

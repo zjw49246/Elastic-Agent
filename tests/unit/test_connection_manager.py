@@ -579,6 +579,17 @@ class TestSendCommand:
         assert status is not None
         assert status["claude_version"] == "2.1.181 (Claude Code)"
 
+    def test_recovering_process_inventory_is_not_dispatch_ready(self, manager):
+        manager._worker_status["worker-1"] = StatusMessage(
+            cpu=1.0,
+            mem=2.0,
+            disk=3.0,
+            runtime_ready=True,
+            process_inventory_complete=False,
+        ).model_dump(mode="json")
+
+        assert manager.is_worker_runtime_ready("worker-1") is False
+
     @pytest.mark.asyncio
     async def test_send_input_command(self, manager):
         ws = FakeWebSocket()

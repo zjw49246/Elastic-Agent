@@ -482,18 +482,23 @@ ssh "${SSH_OPTS[@]}" "$SSH_USER@$BUILDER_HOST" sudo bash -s -- \
 set -Eeuo pipefail
 SSH_USER=$1
 RUNTIME_USER=$2
-systemctl disable --now ea-runtime.service elastic-agent-runtime.service \
+systemctl disable --now ea-runtime.service ea-task-supervisor.service \
+  elastic-agent-runtime.service \
   docker.service docker.socket containerd.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/ea-runtime.service \
+  /etc/systemd/system/ea-task-supervisor.service \
   /etc/systemd/system/elastic-agent-runtime.service \
-  /usr/local/bin/ea-runtime.sh
+  /usr/local/bin/ea-runtime.sh /usr/local/bin/ea-task-supervisor.sh
 systemctl daemon-reload
 rm -rf -- \
   "/home/$SSH_USER/.claude" "/home/$SSH_USER/.codex" \
   "/home/$SSH_USER/.config/google-chrome" "/home/$SSH_USER/.aws" \
+  "/home/$SSH_USER/ea-tasks" "/home/$SSH_USER/ea-logs" \
   "/home/$RUNTIME_USER/.claude" "/home/$RUNTIME_USER/.codex" \
   "/home/$RUNTIME_USER/.config/google-chrome" "/home/$RUNTIME_USER/.aws" \
+  "/home/$RUNTIME_USER/ea-tasks" "/home/$RUNTIME_USER/ea-logs" \
   /root/.claude /root/.codex /root/.config/google-chrome /root/.aws \
+  /root/ea-tasks /root/ea-logs \
   /root/.cache/pip /root/.npm /var/lib/docker/* /var/lib/containerd/*
 rm -f -- "/home/$SSH_USER/.bash_history" "/home/$RUNTIME_USER/.bash_history" \
   /root/.bash_history /root/.python_history

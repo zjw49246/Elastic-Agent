@@ -462,6 +462,8 @@ class TestWorkerToManagerMessages:
         assert restored.mem == 72.8
         assert len(restored.active_processes) == 2
         assert restored.pending_process_exits == ["claude-pid-finished"]
+        assert restored.process_inventory_complete is True
+        assert restored.process_inventory_error is None
         assert restored.runtime_ready is True
         assert restored.claude_cli_ok is True
 
@@ -469,6 +471,24 @@ class TestWorkerToManagerMessages:
         msg = StatusMessage(cpu=0.0, mem=0.0, disk=0.0)
         assert msg.active_processes == []
         assert msg.pending_process_exits == []
+        assert msg.process_inventory_complete is True
+
+    def test_recovering_process_inventory_roundtrip(self):
+        msg = StatusMessage(
+            cpu=0.0,
+            mem=0.0,
+            disk=0.0,
+            active_processes=[],
+            process_inventory_complete=False,
+            process_inventory_error=(
+                "independent task inventory is unavailable"
+            ),
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert restored.process_inventory_complete is False
+        assert "unavailable" in restored.process_inventory_error
 
     def test_codex_status_roundtrip(self):
         msg = StatusMessage(
