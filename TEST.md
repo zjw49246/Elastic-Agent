@@ -103,6 +103,7 @@ uv run pytest -q \
   tests/unit/test_protocol_messages.py \
   tests/unit/test_connection_manager.py \
   tests/unit/test_worker_runtime.py \
+  tests/unit/test_task_supervisor.py \
   tests/unit/test_audit_worker_regressions.py \
   tests/unit/test_worker_agent_api.py \
   tests/unit/test_file_sync.py \
@@ -171,6 +172,16 @@ The focused suite covers:
   Worker-side fsync/re-measure, crash-injected multi-directory roll-forward,
   installed-marker dispatch/collect gates, and fail-closed rejection of legacy
   mutable recovery;
+- durable cold interruption and one-click continuation: atomic
+  `suspending` plus hashed Idempotency-Key intent, same-key replay after a
+  Manager restart, full-history cross-Job conflict validation, HTTP caller
+  cancellation ownership, non-escalating group SIGINT followed by bounded
+  TERM/KILL, reliable-exit and host-quiescence fences, final-set and
+  previous-complete-set fallback, non-resumable failure without a complete
+  set, exact ordinary-registry/EIP-lease teardown proofs, terminal-write crash
+  replay, sleeping/exhausted retry convergence during Manager shutdown,
+  exact suspended generation/timestamp verification, private
+  `run.resume_command`, and multi-attempt root/direct lineage;
 - startup collection quiescence: current/legacy and templated task units are
   stopped and runtime-masked, Job-user linger/session respawn is disabled, all
   dedicated-Worker Docker containers are removed, Docker/containerd units and

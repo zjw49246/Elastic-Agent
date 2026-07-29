@@ -148,6 +148,7 @@ spec = JobSpec.model_validate({
                    "timeout": 1200, "retries": 1}],
     },
     "run": {"command": 'uv run ai4sci-bench run --output-dir "results/opus48_shard-{{shard_id}}_seed128"',
+            "resume_command": 'uv run ai4sci-bench run --output-dir "results/opus48_shard-{{shard_id}}_seed128" --resume "results/opus48_shard-{{shard_id}}_seed128"',
             "env": {"AI4SCI_SANDBOX_CPU": "1", "AI4SCI_SANDBOX_MEM": "4g"},
             "cwd": ".", "timeout": 86400, "shell": True},
     "ttl_seconds": 172800,
@@ -677,6 +678,30 @@ same stable shard-relative output path. For AI4Sci `run`, for example, keep
 `--resume` directory; for `batch-run`, pass the same batch root to
 `--output-dir` and `--resume`. Do not use a hostname-derived path because the
 replacement EC2 has a different hostname.
+
+For an operator-controlled cold stop, also set `run.resume_command` and use
+**中断并保存进度** on the live Job. The API equivalent is
+`POST /api/jobs/{job_id}/interrupt` with a stable `Idempotency-Key`. Elastic
+first durably commits `suspending`, sends a non-escalating `SIGINT` to the task
+process group, then uses bounded `SIGTERM`/`SIGKILL` fallbacks. It stops and
+proves all task, runtime, container, and escaped writers quiescent before the
+final checkpoint attempt and compute teardown. A Job becomes `suspended` only
+after cleanup is complete and an exact complete checkpoint set is available;
+otherwise it becomes `failed`. If final collection fails but a previous
+complete set exists, the Job remains resumable from that older set and reports
+the fallback warning. Host quiescence requires the configured Worker runtime
+user to be non-root; root-user deployments reject the cold-interrupt
+transaction rather than snapshotting an ambiguous filesystem.
+
+**一键续跑** calls `POST /api/jobs/{job_id}/resume` with the exact verified
+generation and another stable `Idempotency-Key`. It creates a new Job rather
+than mutating or replaying the stopped one, uses the private persisted
+`run.resume_command`, and records `resumed_from_job_id`, `root_job_id`, and
+`attempt_no` (parallel branches from one source may share an attempt number).
+Secret references and redacted environment values never round-trip through the
+browser. The first signal can also reach active child processes; already
+published application completion markers are retained, but any unit without a
+complete marker must run again after restore.
 See [Mode-B reconnect and checkpoint recovery](docs/operations/checkpoint-recovery.md).
 
 S3 upload is automatic only when `ELASTIC_AGENT_RESULTS_S3_BUCKET` is set. On

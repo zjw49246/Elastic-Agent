@@ -310,11 +310,20 @@ class TaskSupervisorClient:
             terminal=terminal,
         )
 
-    async def signal(self, task_id: str, *, signal_name: str) -> bool:
+    async def signal(
+        self,
+        task_id: str,
+        *,
+        signal_name: str,
+        scope: str = "group",
+        escalate: bool = True,
+    ) -> bool:
         response = await self._request({
             "op": "signal",
             "task_id": task_id,
             "signal": signal_name,
+            "scope": scope,
+            "escalate": escalate,
         })
         return bool(response.get("signalled"))
 
@@ -690,10 +699,19 @@ class TaskSupervisorServer:
             signal_name = request.get("signal")
             if signal_name not in _SIGNALS:
                 raise TaskSupervisorError("invalid signal")
+            scope = request.get("scope", "group")
+            escalate = request.get("escalate", True)
+            if (
+                scope not in {"process", "group"}
+                or not isinstance(escalate, bool)
+            ):
+                raise TaskSupervisorError("invalid signal policy")
             task = await self._get_task(task_id)
             signalled = await self._stop_task_group(
                 task,
                 _SIGNALS[signal_name],
+                scope=scope,
+                escalate=escalate,
             )
             return {"ok": True, "signalled": signalled}
         if op == "stdin":
@@ -1464,6 +1482,9 @@ class TaskSupervisorServer:
         self,
         task: _ServerTask,
         initial_signal: signal.Signals,
+        *,
+        scope: str = "group",
+        escalate: bool = True,
     ) -> bool:
         process = task.process
         if (
@@ -1478,6 +1499,10 @@ class TaskSupervisorServer:
             pgid = task.descriptor.pgid
             if not self._group_exists(pgid):
                 return False
+            if scope == "process" and process.returncode is not None:
+                # The leader PID may already have been recycled while escaped
+                # descendants keep the original pgid alive.
+                return False
             if (
                 process.returncode is None
                 and task.descriptor.pid_start_ticks
@@ -1490,15 +1515,20 @@ class TaskSupervisorServer:
                 )
                 return False
 
-            async def send(sig: signal.Signals) -> bool:
+            async def send(sig: signal.Signals, target: str = "group") -> bool:
                 try:
-                    os.killpg(pgid, sig)
+                    if target == "process":
+                        os.kill(process.pid, sig)
+                    else:
+                        os.killpg(pgid, sig)
                     return True
                 except (ProcessLookupError, PermissionError):
                     return False
 
-            if not await send(initial_signal):
+            if not await send(initial_signal, scope):
                 return False
+            if not escalate:
+                return True
             first_grace = 5.0 if initial_signal == signal.SIGKILL else 10.0
             if await self._wait_group_exit(pgid, first_grace):
                 return True

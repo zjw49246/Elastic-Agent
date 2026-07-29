@@ -459,6 +459,12 @@ class RunSpec(StrictSpecModel):
     """The long-running command that consumes the selected agent account."""
 
     command: str = Field(min_length=1, max_length=65_536)
+    # Optional application-level command used only after a complete immutable
+    # checkpoint has been restored onto a replacement Worker.  Keeping this
+    # separate from rotation.resume_args prevents the control plane from
+    # guessing how to replay an opaque Mode-B command and lets one-click
+    # suspend/resume remain server-side and auditable.
+    resume_command: str = Field(default="", max_length=65_536)
     env: dict[str, str] = Field(default_factory=dict)
     # Values are references only. Plaintext is resolved immediately before
     # dispatch and never written back to this model/persistence journal.
@@ -479,6 +485,13 @@ class RunSpec(StrictSpecModel):
     @classmethod
     def safe_command(cls, command: str) -> str:
         return _validate_command(command, label="run.command")
+
+    @field_validator("resume_command")
+    @classmethod
+    def safe_resume_command(cls, command: str) -> str:
+        if not command.strip():
+            return ""
+        return _validate_command(command, label="run.resume_command")
 
     @field_validator("cwd")
     @classmethod
@@ -893,6 +906,7 @@ class JobSpec(StrictSpecModel):
         if self.collect.checkpoint:
             recovery_sensitive_values = [
                 self.run.command,
+                self.run.resume_command,
                 self.run.cwd,
                 self.rotation.resume_args,
                 *self.run.env.values(),
@@ -1133,6 +1147,21 @@ class JobSpec(StrictSpecModel):
         base = render_template(self.run.command, ctx.as_dict())
         extra = render_template(self.rotation.resume_args, ctx.as_dict()).strip()
         rendered = f"{base} {extra}".strip() if extra else base
+        if self.run.shell:
+            return ["bash", "-lc", rendered]
+        return shlex.split(rendered)
+
+    def render_recovery_command(self, ctx: WorkerContext) -> list[str]:
+        """Render the explicit application-level checkpoint resume command."""
+
+        if not self.run.resume_command:
+            raise ValueError(
+                "run.resume_command is required for one-click checkpoint resume"
+            )
+        rendered = render_template(
+            self.run.resume_command,
+            ctx.as_dict(),
+        )
         if self.run.shell:
             return ["bash", "-lc", rendered]
         return shlex.split(rendered)

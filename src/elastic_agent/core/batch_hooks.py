@@ -2116,6 +2116,11 @@ def wire_batch(
         scale_in_on_complete=scale_in_on_complete,
         persist_spec_hook=getattr(manager, "_persist_batch_job_spec", None),
         job_state_hook=getattr(manager, "_update_batch_job_state", None),
+        interrupt_intent_hook=getattr(
+            manager,
+            "_update_batch_interrupt_intent",
+            None,
+        ),
     )
 
     async def _bench_runtime_rejected_api_key(

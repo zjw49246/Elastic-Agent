@@ -17,6 +17,8 @@ from elastic_agent.core.checkpoint_store import IncompleteCheckpointSetError
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import (
     persist_job_spec,
+    update_job_checkpoint,
+    update_job_interrupt_intent,
     update_job_state,
 )
 from elastic_agent.core.manager_fleet_driver import (
@@ -24,6 +26,7 @@ from elastic_agent.core.manager_fleet_driver import (
     _terminate_subprocess,
     _UnsettledSubprocessError,
 )
+from elastic_agent.core.registry import NodeStatus
 
 pytestmark = pytest.mark.asyncio
 _REAL_REMOTE_COLLECTION_INVENTORY = (
@@ -48,12 +51,14 @@ class FakeRegistry:
         self.nodes = {
             "worker-a": SimpleNamespace(
                 instance_id="worker-a",
+                status=NodeStatus.READY,
                 public_ip="203.0.113.10",
                 private_ip="10.0.0.10",
                 metadata={"job_id": "job-1", "shard_index": 0},
             ),
             "worker-b": SimpleNamespace(
                 instance_id="worker-b",
+                status=NodeStatus.READY,
                 public_ip="203.0.113.11",
                 private_ip="10.0.0.11",
                 metadata={"job_id": "job-1", "shard_index": 1},
@@ -66,13 +71,31 @@ class FakeRegistry:
     async def list_all(self):
         return list(self.nodes.values())
 
+    async def update(self, worker_id, **fields):
+        node = self.nodes.get(worker_id)
+        if node is None:
+            return None
+        for name, value in fields.items():
+            setattr(node, name, value)
+        return node
+
 
 class FakeConnectionManager:
     def __init__(self):
         self.stopped = []
+        self.stop_policies = []
 
-    async def stop_process(self, worker_id, task_id, sig="SIGTERM"):
+    async def stop_process(
+        self,
+        worker_id,
+        task_id,
+        sig="SIGTERM",
+        *,
+        scope="group",
+        escalate=True,
+    ):
         self.stopped.append((worker_id, task_id, sig))
+        self.stop_policies.append((scope, escalate))
 
 
 class FakeBatch:
@@ -125,12 +148,19 @@ class FakeManager:
 
     async def scale_in(self, *, node_ids, force):
         self.scale_in_calls.append((node_ids, force))
+        for node_id in node_ids:
+            node = self.registry.nodes.get(node_id)
+            if node is not None:
+                node.status = NodeStatus.TERMINATED
         return list(node_ids)
 
     async def remove_node(self, node_id):
         self.removed_nodes.append(node_id)
         self.registry.nodes.pop(node_id, None)
         return True
+
+    async def remove_terminated_node_record(self, node_id):
+        return await self.remove_node(node_id)
 
 
 class FakeProcess:
@@ -974,6 +1004,69 @@ async def test_fanout_checkpoint_publishes_with_constant_s3_inventory_scans(
         manager._checkpoint_store.checkpoint_set_attempts
     ) == 2
     assert len(manager._checkpoint_store.checkpoint_sets) == 1
+
+
+async def test_checkpoint_pointer_failure_is_not_exposed_and_retries(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+    manager._checkpoint_store = FakeCheckpointStore()
+    manager._checkpoint_store.commits.append({
+        "worker_namespace": "shard-00000",
+        "generation": "periodic-00000001",
+    })
+    manager._batch.job.latest_checkpoint_generation = (
+        "periodic-00000000"
+    )
+    manager._batch.job.latest_checkpoint_committed_at = (
+        "2026-07-28T00:00:00+00:00"
+    )
+    pointer_attempts: list[tuple[str, str, str]] = []
+
+    async def persist_pointer(job_id, generation, committed_at):
+        pointer_attempts.append((job_id, generation, committed_at))
+        if len(pointer_attempts) == 1:
+            raise OSError("injected journal fsync failure")
+
+    manager._update_batch_checkpoint_generation = persist_pointer
+    spec = JobSpec.model_validate({
+        "name": "checkpoint-pointer-retry",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "bench"},
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+    driver = ManagerFleetDriver(manager)
+    publish = {
+        "job_id": "job-1",
+        "spec": spec,
+        "worker_namespace": "shard-00000",
+        "generation": "periodic-00000001",
+        "shard_manifest": {"generation": "periodic-00000001"},
+    }
+
+    with pytest.raises(OSError, match="journal fsync failure"):
+        await driver._publish_checkpoint_generation(**publish)
+    assert manager._batch.job.latest_checkpoint_generation == (
+        "periodic-00000000"
+    )
+    assert (
+        "job-1",
+        "periodic-00000001",
+    ) not in manager._checkpoint_published_generations
+
+    assert await driver._publish_checkpoint_generation(**publish) is True
+    assert len(pointer_attempts) == 2
+    assert manager._batch.job.latest_checkpoint_generation == (
+        "periodic-00000001"
+    )
+    assert (
+        "job-1",
+        "periodic-00000001",
+    ) in manager._checkpoint_published_generations
 
 
 async def test_concurrent_terminal_collects_publish_all_final_shards(
@@ -2251,6 +2344,13 @@ async def test_interrupted_checkpoint_source_requires_quiescence_proof():
         source_quiescent=True,
     )
 
+    ManagerFleetDriver._validate_recovery_contract(
+        {"submission_state": "suspended"},
+        source,
+        target,
+        source_quiescent=True,
+    )
+
 
 async def test_recovery_rejects_changed_workload_dataset_identity():
     base = {
@@ -2372,12 +2472,166 @@ async def test_scale_in_force_terminates_and_stop_command_forwards_signal(tmp_pa
 
     await driver.scale_in(["worker-a", "worker-b"])
     await driver.stop_command("worker-a", "task-1", signal="SIGINT")
+    await driver.stop_command(
+        "worker-a",
+        "task-2",
+        signal="SIGINT",
+        scope="process",
+        escalate=False,
+    )
 
     assert manager.scale_in_calls == [(["worker-a", "worker-b"], True)]
     assert manager.removed_nodes == ["worker-a", "worker-b"]
     assert manager.connection_manager.stopped == [
-        ("worker-a", "task-1", "SIGINT")
+        ("worker-a", "task-1", "SIGINT"),
+        ("worker-a", "task-2", "SIGINT"),
     ]
+    assert manager.connection_manager.stop_policies == [
+        ("group", True),
+        ("process", False),
+    ]
+
+
+async def test_interrupt_scale_in_retains_exact_tombstone_until_terminal_journal(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+    driver = ManagerFleetDriver(manager)
+    spec = JobSpec.model_validate({
+        "name": "interrupt-tombstone",
+        "run": {"command": "run", "resume_command": "resume"},
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+    persist_job_spec(manager.config.registry.path, "job-1", spec)
+    update_job_checkpoint(
+        manager.config.registry.path,
+        "job-1",
+        "periodic-00000001",
+        committed_at="2026-07-29T12:00:00+00:00",
+    )
+    update_job_interrupt_intent(
+        manager.config.registry.path,
+        "job-1",
+        "a" * 64,
+        summary={
+            "state": "suspending",
+            "done": False,
+            "interrupt_requested": True,
+            "resume_available": False,
+        },
+    )
+
+    await driver.release_ordinary_for_interrupt(
+        "worker-a",
+        "job-1",
+        0,
+        collected=True,
+        collection_error=None,
+    )
+
+    retained = await manager.registry.get("worker-a")
+    assert retained is not None
+    assert retained.status == NodeStatus.TERMINATED
+    assert retained.metadata["interrupt_cleanup_proof"] == {
+        "schema": 1,
+        "job_id": "job-1",
+        "worker_id": "worker-a",
+        "instance_id": "worker-a",
+        "shard_index": 0,
+        "collection_attempted": True,
+        "collected": True,
+        "collection_error": None,
+    }
+    assert manager.removed_nodes == []
+
+    update_job_state(
+        manager.config.registry.path,
+        "job-1",
+        "suspended",
+        summary={
+            "state": "suspended",
+            "done": True,
+            "cleanup_pending": 0,
+            "interrupt_requested": True,
+            "resume_available": True,
+            "resume_generation": "periodic-00000001",
+            "resume_committed_at": "2026-07-29T12:00:00+00:00",
+        },
+    )
+    await driver.finalize_interrupt_tombstones(
+        "job-1",
+        ["worker-a"],
+    )
+    assert await manager.registry.get("worker-a") is None
+    assert manager.removed_nodes == ["worker-a"]
+
+
+async def test_interrupt_tombstone_refuses_other_job_identity(tmp_path):
+    manager = FakeManager(tmp_path)
+    driver = ManagerFleetDriver(manager)
+
+    with pytest.raises(RuntimeError, match="Job/shard ownership"):
+        await driver.release_ordinary_for_interrupt(
+            "worker-a",
+            "job-other",
+            0,
+            collected=True,
+            collection_error=None,
+        )
+
+    assert await manager.registry.get("worker-a") is not None
+    assert manager.scale_in_calls == []
+    assert manager.removed_nodes == []
+
+
+async def test_bound_interrupt_proof_is_durable_before_release(tmp_path):
+    manager = FakeManager(tmp_path)
+    lease = SimpleNamespace(
+        lease_id="lease-1",
+        account_id="account-1",
+        job_id="job-1",
+        slot=0,
+        worker_id="worker-a",
+        recovery_collection_attempted=False,
+    )
+    updates = []
+
+    class LeaseStore:
+        async def get_lease(self, lease_id):
+            assert lease_id == "lease-1"
+            return lease
+
+        async def update_lease(self, lease_id, **fields):
+            updates.append((lease_id, fields))
+            for name, value in fields.items():
+                setattr(lease, name, value)
+            return lease
+
+    manager.account_binding_store = LeaseStore()
+    assignment = SimpleNamespace(
+        lease_id="lease-1",
+        account_id="account-1",
+        job_id="job-1",
+        slot=0,
+    )
+
+    await ManagerFleetDriver(manager).record_bound_interrupt_proof(
+        assignment,
+        "worker-a",
+        collected=False,
+        collection_error="checkpoint upload failed",
+    )
+
+    assert updates == [(
+        "lease-1",
+        {
+            "recovery_collection_attempted": True,
+            "recovery_collected": False,
+            "recovery_collection_error": "checkpoint upload failed",
+        },
+    )]
+    assert lease.recovery_collection_attempted is True
 
 
 @pytest.mark.parametrize(

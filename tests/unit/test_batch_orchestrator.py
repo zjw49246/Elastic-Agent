@@ -31,12 +31,20 @@ class FakeDriver:
         self.scale_in_calls = 0
         self.scale_in_failures = 0
         self.stopped: list[tuple[str, str, str]] = []
+        self.stop_options: list[tuple[str, bool]] = []
         self.collected: list = []
         self._account_seq = 0
         self._bound_worker_seq = 0
         self.events: list[tuple] = []
         self.bound_requested: list[str] = []
         self.bound_released: list[tuple[str, str | None]] = []
+        self.bound_interrupt_proofs: list[
+            tuple[str, str | None, bool, str | None]
+        ] = []
+        self.interrupt_tombstones: set[str] = set()
+        self.finalized_interrupt_tombstones: list[
+            tuple[str, list[str]]
+        ] = []
         self.bound_reserve_fail_slot: int | None = None
         self.bound_attach_ok = True
         self.scale_tags: list[dict[str, str]] = []
@@ -111,6 +119,26 @@ class FakeDriver:
         self.events.append(("release", worker_id, assignment.lease_id))
         self.bound_released.append((assignment.lease_id, worker_id))
 
+    async def record_bound_interrupt_proof(
+        self,
+        assignment,
+        worker_id,
+        *,
+        collected,
+        collection_error,
+    ):
+        self.events.append((
+            "bound_interrupt_proof",
+            worker_id,
+            assignment.lease_id,
+        ))
+        self.bound_interrupt_proofs.append((
+            assignment.lease_id,
+            worker_id,
+            collected,
+            collection_error,
+        ))
+
     async def hostname_of(self, worker_id):
         return f"host-{worker_id}"
 
@@ -178,8 +206,20 @@ class FakeDriver:
             raise RuntimeError("collect transient")
         self.collected.append((worker_id, job_id))
 
-    async def stop_command(self, worker_id, task_id, signal="SIGTERM"):
+    async def stop_command(
+        self,
+        worker_id,
+        task_id,
+        signal="SIGTERM",
+        *,
+        scope="group",
+        escalate=True,
+    ):
         self.stopped.append((worker_id, task_id, signal))
+        self.stop_options.append((scope, escalate))
+
+    async def quiesce_recovered_worker(self, worker_id, job_id, spec):
+        self.events.append(("quiesce", worker_id, job_id))
 
     async def scale_in(self, worker_ids):
         self.scale_in_calls += 1
@@ -188,6 +228,32 @@ class FakeDriver:
             self.scale_in_failures -= 1
             raise RuntimeError("scale-in transient")
         self.scaled_in.extend(worker_ids)
+
+    async def release_ordinary_for_interrupt(
+        self,
+        worker_id,
+        job_id,
+        shard_index,
+        *,
+        collected,
+        collection_error,
+    ):
+        self.events.append((
+            "interrupt_cleanup_proof",
+            worker_id,
+            job_id,
+            shard_index,
+            collected,
+            collection_error,
+        ))
+        await self.scale_in([worker_id])
+        self.interrupt_tombstones.add(worker_id)
+
+    async def finalize_interrupt_tombstones(self, job_id, worker_ids):
+        self.finalized_interrupt_tombstones.append(
+            (job_id, list(worker_ids))
+        )
+        self.interrupt_tombstones.difference_update(worker_ids)
 
 
 def _spec(**kw):
@@ -1001,6 +1067,54 @@ class TestEipBoundLaunch:
         assert run.phase == WorkerPhase.FAILED
         assert not any(e[0] == "provision" for e in d.events)
         assert d.bound_released == [("lease-0", run.worker_id)]
+
+    async def test_cold_interrupt_persists_bound_proof_before_release(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+            cleanup_retry_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={
+                "workers": 1,
+                "region": "ap-northeast-1",
+                "shard_by": "shard_index",
+            },
+            account={"binding": "eip", "ids": ["acct-1"]},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        run = next(iter(job.runs.values()))
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            run.exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        assert await orch.interrupt_job(job.job_id) is True
+
+        assert d.bound_interrupt_proofs == [
+            (run.lease_id, run.worker_id, True, None)
+        ]
+        proof_index = next(
+            index
+            for index, event in enumerate(d.events)
+            if event[0] == "bound_interrupt_proof"
+        )
+        release_index = next(
+            index
+            for index, event in enumerate(d.events)
+            if event[0] == "release"
+        )
+        assert proof_index < release_index
+        assert job.summary()["state"] == "suspended"
 
 
 class TestRotation:
@@ -1922,6 +2036,556 @@ class TestCompletion:
         ]
         assert states[-1][1]["done"] is True
 
+    async def test_cold_interrupt_commits_intent_quiesces_and_suspends(self):
+        d = FakeDriver(workers=2)
+        states: list[tuple[str, dict | None]] = []
+
+        async def record(_job_id, state, summary):
+            states.append((state, summary))
+
+        orch = BatchOrchestrator(
+            d,
+            job_state_hook=record,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 2, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        original_stop = d.stop_command
+        original_collect = d.collect
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            d.events.append(("signal", worker_id, signal))
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        async def collect_and_publish(worker_id, spec, job_id):
+            await original_collect(worker_id, spec, job_id)
+            if len(d.collected) == 2:
+                job.latest_checkpoint_generation = "terminal-00000002-00001"
+                job.latest_checkpoint_committed_at = (
+                    "2026-07-29T12:00:00+00:00"
+                )
+
+        d.stop_command = stop_and_confirm
+        d.collect = collect_and_publish
+
+        assert await orch.interrupt_job(job.job_id, "save progress") is True
+
+        summary = job.summary()
+        assert summary["state"] == "suspended"
+        assert summary["resume_available"] is True
+        assert (
+            summary["resume_generation"]
+            == "terminal-00000002-00001"
+        )
+        assert summary["cleanup_pending"] == 0
+        assert {signal for _wid, _task, signal in d.stopped} == {"SIGINT"}
+        assert d.stop_options == [
+            ("group", False),
+            ("group", False),
+        ]
+        assert len([
+            event for event in d.events if event[0] == "quiesce"
+        ]) == 2
+        assert max(
+            index
+            for index, event in enumerate(d.events)
+            if event[0] == "quiesce"
+        ) < min(
+            index
+            for index, event in enumerate(d.events)
+            if event[0] == "collect"
+        )
+        assert [state for state, _summary in states][-2:] == [
+            "suspending",
+            "suspended",
+        ]
+
+    async def test_cold_interrupt_uses_previous_complete_set_on_final_failure(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        d.collect_failures = 3
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000007"
+        job.latest_checkpoint_committed_at = "2026-07-29T11:00:00+00:00"
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+
+        assert await orch.interrupt_job(job.job_id) is True
+        summary = job.summary()
+        assert summary["state"] == "suspended"
+        assert summary["resume_generation"] == "periodic-00000007"
+        assert "previous complete generation" in summary["suspend_warning"]
+        assert summary["cleanup_pending"] == 0
+
+    async def test_cold_interrupt_without_complete_set_fails_closed(self):
+        d = FakeDriver(workers=1)
+        d.collect_failures = 3
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+
+        assert await orch.interrupt_job(job.job_id) is False
+        summary = job.summary()
+        assert summary["state"] == "failed"
+        assert summary["resume_available"] is False
+        assert summary["resume_generation"] is None
+        assert summary["cleanup_pending"] == 0
+
+    async def test_start_interrupt_is_fast_and_idempotent_after_intent(self):
+        d = FakeDriver(workers=1)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        states: list[str] = []
+
+        async def record(_job_id, state, _summary):
+            states.append(state)
+
+        async def blocking_quiesce(worker_id, job_id, spec):
+            d.events.append(("quiesce", worker_id, job_id))
+            entered.set()
+            await release.wait()
+
+        d.quiesce_recovered_worker = blocking_quiesce
+        orch = BatchOrchestrator(
+            d,
+            job_state_hook=record,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        first = await orch.start_interrupt_job(job.job_id)
+        owned = first._interrupt_task
+        assert first is job
+        assert states[-1] == "suspending"
+        assert job.summary()["state"] == "suspending"
+        second = await orch.start_interrupt_job(job.job_id)
+        assert second is job
+        assert job._interrupt_task is owned
+
+        await entered.wait()
+        release.set()
+        await owned
+        assert len(d.stopped) == 1
+        assert job.summary()["state"] == "suspended"
+
+    async def test_interrupt_intent_failure_has_no_live_side_effects_and_rebinds(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        intent_entered = asyncio.Event()
+        release_intent = asyncio.Event()
+        committed_digests: list[str] = []
+        attempts = 0
+
+        async def commit_intent(_job_id, digest, _summary):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                intent_entered.set()
+                await release_intent.wait()
+                raise RuntimeError("injected intent fsync failure")
+            committed_digests.append(digest)
+
+        orch = BatchOrchestrator(
+            d,
+            interrupt_intent_hook=commit_intent,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+
+        first = asyncio.create_task(orch.start_interrupt_job(
+            job.job_id,
+            idempotency_digest="a" * 64,
+        ))
+        await intent_entered.wait()
+        stale_running_write = asyncio.create_task(
+            orch._record_job_state(job, "running")
+        )
+        await asyncio.sleep(0)
+
+        assert job.interrupt_requested is False
+        assert job.stop_requested is False
+        assert job.interrupt_idempotency_digest == ""
+        assert job.summary()["state"] == "running"
+        assert job.summary()["interrupt_available"] is True
+        assert d.stopped == []
+        assert stale_running_write.done() is False
+
+        release_intent.set()
+        with pytest.raises(RuntimeError, match="intent fsync failure"):
+            await first
+        await stale_running_write
+        assert job.interrupt_requested is False
+        assert job.persisted_state == "running"
+        assert d.stopped == []
+
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        rebound = await orch.start_interrupt_job(
+            job.job_id,
+            idempotency_digest="b" * 64,
+        )
+        assert rebound is job
+        assert committed_digests == ["b" * 64]
+        assert job.interrupt_idempotency_digest == "b" * 64
+        with pytest.raises(ValueError, match="another Idempotency-Key"):
+            await orch.start_interrupt_job(
+                job.job_id,
+                idempotency_digest="c" * 64,
+            )
+        assert rebound._interrupt_task is not None
+        await rebound._interrupt_task
+        assert job.summary()["state"] == "suspended"
+
+    async def test_cancelled_interrupt_request_completes_owned_handoff(self):
+        d = FakeDriver(workers=1)
+        intent_entered = asyncio.Event()
+        release_intent = asyncio.Event()
+
+        async def commit_intent(_job_id, _digest, _summary):
+            intent_entered.set()
+            await release_intent.wait()
+
+        orch = BatchOrchestrator(
+            d,
+            interrupt_intent_hook=commit_intent,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        request = asyncio.create_task(orch.start_interrupt_job(
+            job.job_id,
+            idempotency_digest="f" * 64,
+        ))
+        await intent_entered.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+        assert request.done() is False
+        assert job.interrupt_requested is False
+
+        release_intent.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert job.interrupt_requested is True
+        assert job.interrupt_idempotency_digest == "f" * 64
+        owned = job._interrupt_task
+        assert owned is not None
+        await owned
+        assert job.summary()["state"] == "suspended"
+
+    async def test_cancel_joins_committed_interrupt_before_background_lock(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        original_interrupt = orch._run_interrupt_job
+        background_entered = asyncio.Event()
+        release_background = asyncio.Event()
+
+        async def delayed_interrupt(target_job):
+            background_entered.set()
+            await release_background.wait()
+            await original_interrupt(target_job)
+
+        orch._run_interrupt_job = delayed_interrupt
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        await orch.start_interrupt_job(job.job_id)
+        await background_entered.wait()
+        cancelling = asyncio.create_task(
+            orch.cancel_job(job.job_id, "late cancel")
+        )
+        await asyncio.sleep(0)
+
+        assert cancelling.done() is False
+        assert job.cancel_requested is False
+        assert job.cancel_reason is None
+        assert job.error is None
+        release_background.set()
+        assert await cancelling is True
+        assert job.cancel_requested is False
+        assert job.summary()["state"] == "suspended"
+
+    async def test_interrupt_rejects_exit_confirmed_or_cleanup_only_job(self):
+        d = FakeDriver(workers=1)
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        run = next(iter(job.runs.values()))
+        run.exit_event.set()
+
+        assert job.summary()["interrupt_available"] is False
+        with pytest.raises(RuntimeError, match="no active task"):
+            await orch.start_interrupt_job(job.job_id)
+        assert job.interrupt_requested is False
+
+        run.phase = WorkerPhase.DONE
+        run.cleaned_up = False
+        job.resources_released = False
+        assert job.summary()["done"] is False
+        assert job.summary()["interrupt_available"] is False
+        with pytest.raises(RuntimeError, match="no active task"):
+            await orch.start_interrupt_job(job.job_id)
+        assert job.interrupt_requested is False
+
+    async def test_natural_finalizer_wins_before_interrupt_intent_commit(self):
+        d = FakeDriver(workers=1)
+        committed = []
+
+        async def commit_intent(*args):
+            committed.append(args)
+
+        orch = BatchOrchestrator(
+            d,
+            interrupt_intent_hook=commit_intent,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        run = next(iter(job.runs.values()))
+        await run._finalize_lock.acquire()
+        try:
+            request = asyncio.create_task(orch.start_interrupt_job(
+                job.job_id,
+                idempotency_digest="1" * 64,
+            ))
+            await asyncio.sleep(0)
+            assert request.done() is False
+
+            # Model PROCESS_EXIT/final cleanup crossing its decision boundary
+            # after the API's optimistic availability read but before the
+            # interrupt can acquire the per-run transaction fence.
+            run.exit_event.set()
+            run.phase = WorkerPhase.DONE
+            run.final_collected = True
+            run.infrastructure_released = True
+            run.cleaned_up = True
+            job.resources_released = True
+        finally:
+            run._finalize_lock.release()
+
+        with pytest.raises(RuntimeError, match="no active task"):
+            await request
+        assert committed == []
+        assert job.interrupt_requested is False
+
+    async def test_interrupt_can_retry_after_unexpected_finalizer_failure(self):
+        d = FakeDriver(workers=1)
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+            cleanup_retry_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        original_finalize = orch._finalize_terminal_run
+        attempts = 0
+
+        async def fail_once(target_job, run):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected finalizer failure")
+            await original_finalize(target_job, run)
+
+        orch._finalize_terminal_run = fail_once
+        await orch.start_interrupt_job(job.job_id)
+        first_task = job._interrupt_task
+        with pytest.raises(RuntimeError, match="injected finalizer failure"):
+            await first_task
+        assert job.interrupt_transaction_settled is False
+        assert job.summary()["state"] == "suspending"
+
+        retry_task = job._interrupt_task
+        assert retry_task is not None
+        await retry_task
+        assert job.summary()["state"] == "suspended"
+        assert job.summary()["cleanup_pending"] == 0
+        assert job.interrupt_retry_error is None
+
+    async def test_cancel_racing_interrupt_waits_and_preserves_suspended_result(
+        self,
+    ):
+        d = FakeDriver(workers=1)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_quiesce(worker_id, job_id, spec):
+            entered.set()
+            await release.wait()
+
+        d.quiesce_recovered_worker = blocking_quiesce
+        orch = BatchOrchestrator(
+            d,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            job.runs[worker_id].exit_event.set()
+
+        d.stop_command = stop_and_confirm
+        await orch.start_interrupt_job(job.job_id)
+        await entered.wait()
+        cancelling = asyncio.create_task(
+            orch.cancel_job(job.job_id, "force cancel")
+        )
+        await asyncio.sleep(0)
+        assert cancelling.done() is False
+
+        release.set()
+        assert await cancelling is True
+        assert job.summary()["state"] == "suspended"
+        assert job.summary()["cleanup_pending"] == 0
+        assert job.cancel_requested is False
+
+    async def test_queued_checkpoint_job_is_not_interrupt_available(self):
+        orch = BatchOrchestrator(FakeDriver(workers=1))
+        job = orch.prepare(_spec(
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+
+        assert job.summary()["interrupt_available"] is False
+
     async def test_disconnect_past_legacy_grace_keeps_supervised_task(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d, disconnect_grace_seconds=0.01)
@@ -2258,6 +2922,96 @@ class TestAccountRelease:
 
 
 class TestShutdown:
+    @pytest.mark.parametrize("retry_state", ["sleeping", "exhausted"])
+    async def test_shutdown_synchronously_settles_committed_eip_interrupt(
+        self,
+        retry_state,
+    ):
+        driver = FakeDriver()
+        orch = BatchOrchestrator(
+            driver,
+            cleanup_retry_seconds=60,
+            cancel_grace_seconds=0.01,
+            cancel_kill_grace_seconds=0.01,
+        )
+        job = await orch.launch(_spec(
+            fanout={
+                "workers": 1,
+                "region": "ap-northeast-1",
+                "shard_by": "shard_index",
+            },
+            account={"binding": "eip", "ids": ["acct-1"]},
+            run={"command": "run", "resume_command": "resume"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        job.latest_checkpoint_generation = "periodic-00000001"
+        job.latest_checkpoint_committed_at = "2026-07-29T10:00:00+00:00"
+        run = next(iter(job.runs.values()))
+        original_stop = driver.stop_command
+
+        async def stop_and_confirm(
+            worker_id, task_id, signal="SIGTERM", **kwargs,
+        ):
+            await original_stop(worker_id, task_id, signal, **kwargs)
+            run.exit_event.set()
+
+        driver.stop_command = stop_and_confirm
+        original_finalize = orch._finalize_terminal_run
+        attempts = 0
+
+        async def fail_once(target_job, target_run):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected first interrupt failure")
+            await original_finalize(target_job, target_run)
+
+        orch._finalize_terminal_run = fail_once
+        await orch.start_interrupt_job(job.job_id)
+        first = job._interrupt_task
+        assert first is not None
+        with pytest.raises(
+            RuntimeError,
+            match="injected first interrupt failure",
+        ):
+            await first
+        await asyncio.sleep(0)
+        retry = job._interrupt_task
+        assert retry is not None
+        if retry_state == "exhausted":
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            job.interrupt_retry_attempts = 5
+            assert job._interrupt_task is None
+
+        await orch.shutdown(timeout=1)
+
+        assert job.interrupt_transaction_settled is True
+        assert job.summary()["state"] == "suspended"
+        assert run.cleaned_up is True
+        assert driver.bound_interrupt_proofs
+        proof_index = next(
+            index
+            for index, event in enumerate(driver.events)
+            if event[0] == "bound_interrupt_proof"
+        )
+        release_index = next(
+            index
+            for index, event in enumerate(driver.events)
+            if event[0] == "release"
+        )
+        collect_index = max(
+            index
+            for index, event in enumerate(driver.events)
+            if event[0] == "collect"
+        )
+        quiesce_index = max(
+            index
+            for index, event in enumerate(driver.events[:collect_index])
+            if event[0] == "quiesce"
+        )
+        assert quiesce_index < collect_index < proof_index < release_index
+
     async def test_running_bound_workers_are_collected_and_released(self):
         driver = FakeDriver()
         orch = BatchOrchestrator(driver)

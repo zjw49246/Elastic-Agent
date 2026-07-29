@@ -74,10 +74,26 @@ class TestManagerToWorkerMessages:
         assert isinstance(restored, StopMessage)
         assert restored.task_id == "t-1"
         assert restored.signal == "SIGKILL"
+        assert restored.scope == "group"
+        assert restored.escalate is True
 
     def test_stop_default_signal(self):
         msg = StopMessage(task_id="t-1")
         assert msg.signal == "SIGTERM"
+        assert msg.scope == "group"
+        assert msg.escalate is True
+
+    def test_stop_cooperative_process_scope_roundtrip(self):
+        msg = StopMessage(
+            task_id="t-1",
+            signal="SIGINT",
+            scope="process",
+            escalate=False,
+        )
+        restored = parse_message(msg.model_dump_json())
+        assert isinstance(restored, StopMessage)
+        assert restored.scope == "process"
+        assert restored.escalate is False
 
     def test_reliable_event_ack_roundtrip(self):
         msg = EventAckMessage(event_id="event-123")

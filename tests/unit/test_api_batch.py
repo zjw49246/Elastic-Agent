@@ -59,11 +59,16 @@ class InMemoryProvider(CloudProvider):
 class FakeBatch:
     """Stand-in orchestrator so route logic is tested without live workers."""
 
-    def __init__(self, persist_spec_hook=None):
+    def __init__(
+        self,
+        persist_spec_hook=None,
+        interrupt_intent_hook=None,
+    ):
         self._jobs = {}
         self.started: list[str] = []
         self.before_start = None
         self.persist_spec_hook = persist_spec_hook
+        self.interrupt_intent_hook = interrupt_intent_hook
 
     def prepare(self, spec):
         from elastic_agent.core.batch_orchestrator import BatchJob
@@ -85,11 +90,19 @@ class FakeBatch:
 
         if self.persist_spec_hook is not None:
             try:
-                await self.persist_spec_hook(
+                lineage = await self.persist_spec_hook(
                     job.job_id,
                     job.spec,
                     job.request_fingerprint,
                 )
+                if isinstance(lineage, dict):
+                    job.resumed_from_job_id = str(
+                        lineage.get("resumed_from_job_id") or ""
+                    )
+                    job.root_job_id = str(
+                        lineage.get("root_job_id") or job.job_id
+                    )
+                    job.attempt_no = int(lineage.get("attempt_no") or 1)
             except Exception as exc:  # noqa: BLE001
                 raise JobSpecPersistenceError(
                     f"failed to persist JobSpec before launch: {exc}"
@@ -127,6 +140,43 @@ class FakeBatch:
             run.phase = WorkerPhase.CANCELLED
             run.error = reason
         return True
+
+    async def start_interrupt_job(
+        self,
+        job_id,
+        reason="job interrupted by administrator",
+        *,
+        idempotency_digest=None,
+    ):
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if (
+            not job.spec.collect.checkpoint
+            or not job.spec.collect.paths
+            or not job.spec.run.resume_command
+        ):
+            raise ValueError(
+                "cold interrupt requires collect.checkpoint, collect.paths, "
+                "and run.resume_command"
+            )
+        if job.summary()["done"]:
+            if job.interrupt_requested:
+                return job
+            raise RuntimeError("completed Job cannot be interrupted")
+        if job.cancel_requested:
+            raise RuntimeError("Job cancellation is already in progress")
+        job.interrupt_requested = True
+        job.interrupt_reason = reason
+        job.interrupt_idempotency_digest = idempotency_digest or ""
+        if self.interrupt_intent_hook is not None:
+            await self.interrupt_intent_hook(
+                job_id,
+                job.interrupt_idempotency_digest,
+                job.summary(),
+            )
+        job.persisted_state = "suspending"
+        return job
 
     async def shutdown(self):
         return None
@@ -283,7 +333,8 @@ async def client(manager):
     ) as ac:
         await manager.start()
         manager._batch = FakeBatch(
-            manager._persist_batch_job_spec
+            manager._persist_batch_job_spec,
+            manager._update_batch_interrupt_intent,
         )  # inject fake orchestrator with the production persistence boundary
         yield ac
         await manager.stop()
@@ -1483,6 +1534,19 @@ class TestJobsAPI:
         "account": {"mode": "none"},
     }
 
+    @classmethod
+    def _interrupt_spec(cls) -> dict:
+        spec = copy.deepcopy(cls._SPEC)
+        spec["run"]["resume_command"] = (
+            "uv run bench --shard {{shard_index}} --resume"
+        )
+        spec["collect"] = {
+            "paths": ["results"],
+            "checkpoint": True,
+        }
+        spec["fanout"]["shard_by"] = "shard_index"
+        return spec
+
     @staticmethod
     def _idempotent_job_id(key: str) -> str:
         return "job-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
@@ -1914,6 +1978,754 @@ class TestJobsAPI:
             worker["phase"] == "cancelled"
             for worker in first.json()["workers_detail"]
         )
+
+    @pytest.mark.asyncio
+    async def test_interrupt_is_fast_durable_and_idempotency_key_is_bound(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        spec = {
+            **self._SPEC,
+            "run": {
+                **self._SPEC["run"],
+                "resume_command": (
+                    "uv run bench --shard {{shard_index}} --resume"
+                ),
+            },
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+            },
+            "fanout": {
+                **self._SPEC["fanout"],
+                "shard_by": "shard_index",
+            },
+        }
+        first_job = (await client.post("/api/jobs", json=spec)).json()
+        key = "interrupt-one"
+        headers = {"Idempotency-Key": key}
+
+        accepted = await client.post(
+            f"/api/jobs/{first_job['job_id']}/interrupt",
+            headers=headers,
+        )
+        replay = await client.post(
+            f"/api/jobs/{first_job['job_id']}/interrupt",
+            headers=headers,
+        )
+
+        assert accepted.status_code == 202, accepted.text
+        assert accepted.json()["state"] == "suspending"
+        assert accepted.json()["interrupt_requested"] is True
+        assert accepted.json()["resume_available"] is False
+        assert accepted.json()["checkpoint_recovery_available"] is False
+        assert replay.status_code == 202
+        assert replay.json()["idempotent_replay"] is True
+
+        action_path = (
+            Path(manager.config.registry.path).with_name("job-actions")
+            / (
+                "interrupt-"
+                + hashlib.sha256(key.encode()).hexdigest()
+                + ".json"
+            )
+        )
+        assert stat.S_IMODE(action_path.stat().st_mode) == 0o600
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        first_journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{first_job['job_id']}.json"
+        )
+        journal_payload = json.loads(first_journal.read_text())
+        assert journal_payload["submission_state"] == "suspending"
+        assert journal_payload["interrupt_intent"] == {
+            "schema": 1,
+            "idempotency_digest": digest,
+            "requested_at": None,
+        }
+        assert digest not in accepted.text
+        assert digest not in replay.text
+
+        second_job = (await client.post("/api/jobs", json=spec)).json()
+        conflict = await client.post(
+            f"/api/jobs/{second_job['job_id']}/interrupt",
+            headers=headers,
+        )
+        assert conflict.status_code == 409
+        assert "another Job action" in conflict.text
+
+        # Crash after the atomic journal commit but before the rebuildable
+        # digest→Job sidecar: a different Job still cannot claim this key.
+        action_path.unlink()
+        for attribute in (
+            "_api_interrupt_intent_index",
+            "_api_interrupt_intent_index_loaded",
+        ):
+            if hasattr(manager, attribute):
+                delattr(manager, attribute)
+        missing_sidecar_conflict = await client.post(
+            f"/api/jobs/{second_job['job_id']}/interrupt",
+            headers=headers,
+        )
+        assert missing_sidecar_conflict.status_code == 409
+
+        # The exact replay treats the private journal as authority and rebuilds
+        # the absent cache after a Manager restart.
+        for attribute in (
+            "_api_interrupt_intent_index",
+            "_api_interrupt_intent_index_loaded",
+        ):
+            if hasattr(manager, attribute):
+                delattr(manager, attribute)
+        manager.batch._jobs.pop(first_job["job_id"])
+        restart_replay = await client.post(
+            f"/api/jobs/{first_job['job_id']}/interrupt",
+            headers=headers,
+        )
+        assert restart_replay.status_code == 202
+        assert restart_replay.json()["state"] == "suspending"
+        assert restart_replay.json()["idempotent_replay"] is True
+        assert action_path.is_file()
+
+        # A corrupt cache cannot block a replay whose private Job journal is
+        # authoritative; the successful replay repairs the cache.
+        action_path.write_text("{not-json", encoding="utf-8")
+        corrupt_cache_replay = await client.post(
+            f"/api/jobs/{first_job['job_id']}/interrupt",
+            headers=headers,
+        )
+        assert corrupt_cache_replay.status_code == 202
+        repaired = json.loads(action_path.read_text(encoding="utf-8"))
+        assert repaired["job_id"] == first_job["job_id"]
+        assert repaired["key_digest"] == digest
+
+    @pytest.mark.asyncio
+    async def test_interrupt_scan_and_commit_are_one_manager_transaction(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        spec = self._interrupt_spec()
+        first = (await client.post("/api/jobs", json=spec)).json()
+        second = (await client.post("/api/jobs", json=spec)).json()
+        original_start = manager.batch.start_interrupt_job
+        first_entered = asyncio.Event()
+        allow_first = asyncio.Event()
+        calls: list[str] = []
+
+        async def gated_start(job_id, *args, **kwargs):
+            calls.append(job_id)
+            if job_id == first["job_id"]:
+                first_entered.set()
+                await allow_first.wait()
+            return await original_start(job_id, *args, **kwargs)
+
+        monkeypatch.setattr(
+            manager.batch,
+            "start_interrupt_job",
+            gated_start,
+        )
+        headers = {"Idempotency-Key": "simultaneous-interrupt-key"}
+        first_request = asyncio.create_task(client.post(
+            f"/api/jobs/{first['job_id']}/interrupt",
+            headers=headers,
+        ))
+        await asyncio.wait_for(first_entered.wait(), timeout=1)
+        second_request = asyncio.create_task(client.post(
+            f"/api/jobs/{second['job_id']}/interrupt",
+            headers=headers,
+        ))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert calls == [first["job_id"]]
+        assert second_request.done() is False
+
+        allow_first.set()
+        first_response, second_response = await asyncio.gather(
+            first_request,
+            second_request,
+        )
+
+        assert first_response.status_code == 202
+        assert second_response.status_code == 409
+        assert calls == [first["job_id"]]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_interrupt_http_waits_for_commit_and_key_stays_bound(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        spec = self._interrupt_spec()
+        first = (await client.post("/api/jobs", json=spec)).json()
+        second = (await client.post("/api/jobs", json=spec)).json()
+        original_start = manager.batch.start_interrupt_job
+        committed = asyncio.Event()
+        allow_settle = asyncio.Event()
+
+        async def committed_then_gated(job_id, *args, **kwargs):
+            result = await original_start(job_id, *args, **kwargs)
+            committed.set()
+            await allow_settle.wait()
+            return result
+
+        def unavailable_cache(*_args, **_kwargs):
+            raise OSError("simulated cache publication outage")
+
+        monkeypatch.setattr(
+            manager.batch,
+            "start_interrupt_job",
+            committed_then_gated,
+        )
+        monkeypatch.setattr(
+            jobs_route,
+            "_write_job_action_index",
+            unavailable_cache,
+        )
+        key = "cancel-after-authoritative-commit"
+        headers = {"Idempotency-Key": key}
+        request = asyncio.create_task(client.post(
+            f"/api/jobs/{first['job_id']}/interrupt",
+            headers=headers,
+        ))
+        await asyncio.wait_for(committed.wait(), timeout=1)
+        request.cancel()
+        await asyncio.sleep(0)
+
+        # Caller cancellation cannot release the Manager transaction while the
+        # owned core action is still settling.
+        assert request.done() is False
+        allow_settle.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        action_path = (
+            Path(manager.config.registry.path).with_name("job-actions")
+            / f"interrupt-{digest}.json"
+        )
+        assert action_path.exists() is False
+
+        conflict = await client.post(
+            f"/api/jobs/{second['job_id']}/interrupt",
+            headers=headers,
+        )
+        assert conflict.status_code == 409
+        assert "another Job action" in conflict.text
+
+    @pytest.mark.asyncio
+    async def test_interrupt_authority_scan_has_no_job_count_cutoff(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        submitted = (
+            await client.post("/api/jobs", json=self._interrupt_spec())
+        ).json()
+        specs_dir = Path(manager.config.registry.path).with_name("specs")
+        for index in range(10_001):
+            padding_job_id = f"job-padding-{index:05d}"
+            (specs_dir / f"{padding_job_id}.json").write_text(
+                json.dumps({
+                    "job_id": padding_job_id,
+                    "spec": {},
+                    "submission_state": "prepared",
+                }),
+                encoding="utf-8",
+            )
+
+        response = await client.post(
+            f"/api/jobs/{submitted['job_id']}/interrupt",
+            headers={"Idempotency-Key": "after-ten-thousand-jobs"},
+        )
+
+        assert response.status_code == 202, response.text
+
+    @pytest.mark.asyncio
+    async def test_interrupt_authority_scan_fails_closed_on_invalid_job_journal(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        submitted = (
+            await client.post("/api/jobs", json=self._interrupt_spec())
+        ).json()
+        specs_dir = Path(manager.config.registry.path).with_name("specs")
+        (specs_dir / "job-concealed-authority.json").write_bytes(b"")
+
+        response = await client.post(
+            f"/api/jobs/{submitted['job_id']}/interrupt",
+            headers={"Idempotency-Key": "must-not-bypass-invalid-journal"},
+        )
+
+        assert response.status_code == 503
+        journal = json.loads(
+            (specs_dir / f"{submitted['job_id']}.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert journal["submission_state"] == "prepared"
+        assert "interrupt_intent" not in journal
+
+    @pytest.mark.asyncio
+    async def test_owned_job_action_preserves_success_when_cancel_races_completion(
+        self, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        async def completed_action():
+            return "committed"
+
+        async def cancellation_after_completion(task):
+            await task
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(
+            jobs_route.asyncio,
+            "shield",
+            cancellation_after_completion,
+        )
+
+        result, cancellation = await jobs_route._settle_owned_job_action(
+            completed_action()
+        )
+
+        assert result == "committed"
+        assert isinstance(cancellation, asyncio.CancelledError)
+
+    @pytest.mark.asyncio
+    async def test_interrupt_sidecar_without_journal_intent_is_not_accepted(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes.jobs import _write_job_action_index
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        spec = {
+            **self._SPEC,
+            "run": {
+                **self._SPEC["run"],
+                "resume_command": "uv run bench --resume results",
+            },
+            "collect": {"paths": ["results"], "checkpoint": True},
+            "fanout": {
+                **self._SPEC["fanout"],
+                "shard_by": "shard_index",
+            },
+        }
+        submitted = (await client.post("/api/jobs", json=spec)).json()
+        key = "stale-sidecar-before-intent"
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        _write_job_action_index(
+            manager,
+            operation="interrupt",
+            digest=digest,
+            job_id=submitted["job_id"],
+        )
+        manager.batch._jobs.pop(submitted["job_id"])
+        for attribute in (
+            "_api_interrupt_intent_index",
+            "_api_interrupt_intent_index_loaded",
+        ):
+            if hasattr(manager, attribute):
+                delattr(manager, attribute)
+
+        replay = await client.post(
+            f"/api/jobs/{submitted['job_id']}/interrupt",
+            headers={"Idempotency-Key": key},
+        )
+        journal = json.loads(
+            (
+                Path(manager.config.registry.path).with_name("specs")
+                / f"{submitted['job_id']}.json"
+            ).read_text()
+        )
+
+        assert replay.status_code == 409
+        assert "does not contain a committed interrupt intent" in replay.text
+        assert journal["submission_state"] == "prepared"
+        assert "interrupt_intent" not in journal
+
+    @pytest.mark.asyncio
+    async def test_duplicate_authoritative_interrupt_journals_fail_closed(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes.jobs import _write_job_action_index
+        from elastic_agent.core.job_spec_store import (
+            update_job_interrupt_intent,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        spec = {
+            **self._SPEC,
+            "run": {
+                **self._SPEC["run"],
+                "resume_command": "uv run bench --resume results",
+            },
+            "collect": {"paths": ["results"], "checkpoint": True},
+            "fanout": {
+                **self._SPEC["fanout"],
+                "shard_by": "shard_index",
+            },
+        }
+        first = (await client.post("/api/jobs", json=spec)).json()
+        second = (await client.post("/api/jobs", json=spec)).json()
+        key = "duplicate-authoritative-interrupt"
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        summary = {
+            "state": "suspending",
+            "done": False,
+            "cleanup_pending": 0,
+            "interrupt_requested": True,
+            "interrupt_requested_at": "2026-07-29T12:00:00+00:00",
+            "resume_available": False,
+        }
+        for job_id in (first["job_id"], second["job_id"]):
+            update_job_interrupt_intent(
+                manager.config.registry.path,
+                job_id,
+                digest,
+                summary=summary,
+            )
+            manager.batch._jobs.pop(job_id)
+        _write_job_action_index(
+            manager,
+            operation="interrupt",
+            digest=digest,
+            job_id=first["job_id"],
+        )
+        for attribute in (
+            "_api_interrupt_intent_index",
+            "_api_interrupt_intent_index_loaded",
+        ):
+            if hasattr(manager, attribute):
+                delattr(manager, attribute)
+
+        response = await client.post(
+            f"/api/jobs/{second['job_id']}/interrupt",
+            headers={"Idempotency-Key": key},
+        )
+
+        assert response.status_code == 503
+        assert "cannot be verified safely" in response.text
+        assert digest not in response.text
+
+    @pytest.mark.asyncio
+    async def test_interrupt_requires_key_and_resumable_job_contract(
+        self, client,
+    ):
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+
+        missing_key = await client.post(
+            f"/api/jobs/{submitted['job_id']}/interrupt",
+        )
+        unavailable = await client.post(
+            f"/api/jobs/{submitted['job_id']}/interrupt",
+            headers={"Idempotency-Key": "not-resumable"},
+        )
+
+        assert missing_key.status_code == 400
+        assert "Idempotency-Key is required" in missing_key.text
+        assert unavailable.status_code == 409
+        assert "run.resume_command" in unavailable.text
+
+    @pytest.mark.asyncio
+    async def test_resume_requires_verified_exact_suspend_and_keeps_lineage(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_checkpoint,
+            update_job_interrupt_intent,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        source_id = "job-suspended-source"
+        generation = "interrupt-00000001"
+        committed_at = "2026-07-29T10:00:00+00:00"
+        source_spec = JobSpec.model_validate({
+            "name": "suspended-source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "f" * 40,
+            },
+            "run": {
+                "command": "capture --initial",
+                "resume_command": "capture --resume",
+            },
+            "account": {"mode": "none"},
+            "rotation": {
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "--resume results/legacy",
+            },
+            "fanout": {"shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+        })
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            source_spec,
+        )
+        update_job_checkpoint(
+            manager.config.registry.path,
+            source_id,
+            generation,
+            committed_at=committed_at,
+        )
+        update_job_interrupt_intent(
+            manager.config.registry.path,
+            source_id,
+            "a" * 64,
+            summary={
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "interrupt_requested_at": (
+                    "2026-07-29T09:59:00+00:00"
+                ),
+                "resume_available": False,
+            },
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "suspended",
+            summary={
+                "state": "suspended",
+                "done": True,
+                "cleanup_pending": 0,
+                "workers": 1,
+                "phases": {"cancelled": 1},
+                "interrupt_requested": True,
+                "interrupt_reason": "operator requested",
+                "resume_available": True,
+                "resume_generation": generation,
+                "resume_committed_at": committed_at,
+                "latest_checkpoint_generation": generation,
+            },
+        )
+
+        missing_key = await client.post(
+            f"/api/jobs/{source_id}/resume",
+            json={"resume_generation": generation},
+        )
+        wrong_generation = await client.post(
+            f"/api/jobs/{source_id}/resume",
+            json={"resume_generation": "interrupt-00000000"},
+            headers={"Idempotency-Key": "wrong-generation"},
+        )
+        headers = {"Idempotency-Key": "resume-suspended-source"}
+        resumed = await client.post(
+            f"/api/jobs/{source_id}/resume",
+            json={"resume_generation": generation},
+            headers=headers,
+        )
+        replay = await client.post(
+            f"/api/jobs/{source_id}/resume",
+            json={"resume_generation": generation},
+            headers=headers,
+        )
+
+        assert missing_key.status_code == 400
+        assert wrong_generation.status_code == 409
+        assert resumed.status_code == 201, resumed.text
+        body = resumed.json()
+        assert body["spec"]["run"]["command"] == "capture --resume"
+        assert body["spec"]["run"]["resume_command"] == "capture --resume"
+        assert body["spec"]["rotation"] == {
+            "strategy": "on_exhaust_restart_resume",
+            "resume_args": "",
+            "max_rotations": 20,
+        }
+        assert body["spec"]["recovery"] == {
+            "policy": "checkpoint",
+            "source_job_id": source_id,
+            "paths": ["results"],
+            "generation": generation,
+        }
+        assert body["resumed_from_job_id"] == source_id
+        assert body["source_job_id"] == source_id
+        assert body["root_job_id"] == source_id
+        assert body["attempt_no"] == 2
+        assert replay.status_code == 201
+        assert replay.json()["job_id"] == body["job_id"]
+        assert replay.json()["idempotent_replay"] is True
+
+        target_journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{body['job_id']}.json"
+        )
+        assert json.loads(target_journal.read_text())["lineage"] == {
+            "resumed_from_job_id": source_id,
+            "root_job_id": source_id,
+            "attempt_no": 2,
+        }
+
+        second_generation = "interrupt-00000002"
+        second_committed_at = "2026-07-29T11:00:00+00:00"
+        manager.batch._jobs.pop(body["job_id"])
+        update_job_checkpoint(
+            manager.config.registry.path,
+            body["job_id"],
+            second_generation,
+            committed_at=second_committed_at,
+        )
+        update_job_interrupt_intent(
+            manager.config.registry.path,
+            body["job_id"],
+            "b" * 64,
+            summary={
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "interrupt_requested_at": (
+                    "2026-07-29T10:59:00+00:00"
+                ),
+                "resume_available": False,
+            },
+        )
+        update_job_state(
+            manager.config.registry.path,
+            body["job_id"],
+            "suspended",
+            summary={
+                "state": "suspended",
+                "done": True,
+                "cleanup_pending": 0,
+                "workers": 1,
+                "phases": {"cancelled": 1},
+                "interrupt_requested": True,
+                "resume_available": True,
+                "resume_generation": second_generation,
+                "resume_committed_at": second_committed_at,
+                "latest_checkpoint_generation": second_generation,
+                "resumed_from_job_id": source_id,
+                "root_job_id": source_id,
+                "attempt_no": 2,
+            },
+        )
+        third_attempt = await client.post(
+            f"/api/jobs/{body['job_id']}/resume",
+            json={"resume_generation": second_generation},
+            headers={"Idempotency-Key": "resume-third-attempt"},
+        )
+
+        assert third_attempt.status_code == 201, third_attempt.text
+        assert third_attempt.json()["resumed_from_job_id"] == body["job_id"]
+        assert third_attempt.json()["root_job_id"] == source_id
+        assert third_attempt.json()["attempt_no"] == 3
+
+    @pytest.mark.asyncio
+    async def test_resume_rejects_checkpoint_enabled_but_not_suspended(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_checkpoint,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            "results-bucket",
+        )
+        source_id = "job-failed-with-checkpoint"
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            JobSpec.model_validate({
+                "name": "failed-source",
+                "run": {
+                    "command": "capture",
+                    "resume_command": "capture --resume",
+                },
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
+        update_job_checkpoint(
+            manager.config.registry.path,
+            source_id,
+            "periodic-00000001",
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+            summary={
+                "workers": 1,
+                "phases": {"failed": 1},
+                "checkpoint_recovery_available": True,
+            },
+        )
+
+        detail = await client.get(f"/api/jobs/{source_id}")
+        rejected = await client.post(
+            f"/api/jobs/{source_id}/resume",
+            json={"resume_generation": "periodic-00000001"},
+            headers={"Idempotency-Key": "failed-not-suspended"},
+        )
+
+        assert detail.json()["checkpoint_recovery_available"] is True
+        assert detail.json()["resume_available"] is False
+        assert rejected.status_code == 409
+        assert "not suspended" in rejected.text
+
+    @pytest.mark.parametrize(
+        ("state", "done", "cleanup_pending", "generation", "expected"),
+        [
+            ("failed", True, 0, "periodic-00000001", True),
+            ("running", False, 0, "periodic-00000001", False),
+            ("failed", True, 1, "periodic-00000001", False),
+            ("failed", True, 0, None, False),
+            ("suspended", True, 0, "interrupt-00000001", False),
+        ],
+    )
+    def test_manual_checkpoint_action_requires_pinned_quiescent_terminal_source(
+        self,
+        state,
+        done,
+        cleanup_pending,
+        generation,
+        expected,
+    ):
+        from elastic_agent.api.routes.jobs import (
+            _verified_checkpoint_recovery_available,
+        )
+
+        assert _verified_checkpoint_recovery_available(
+            state=state,
+            done=done,
+            cleanup_pending=cleanup_pending,
+            latest_generation=generation,
+            advertised=True,
+        ) is expected
 
     @pytest.mark.asyncio
     async def test_submit_fsyncs_spec_before_starting_job(self, client, manager, monkeypatch):
@@ -3619,7 +4431,7 @@ class TestJobsAPI:
         detail = await client.get(f"/api/jobs/{source_id}")
         assert detail.status_code == 200
         assert detail.json()["latest_checkpoint_generation"] is None
-        assert detail.json()["checkpoint_recovery_available"] is True
+        assert detail.json()["checkpoint_recovery_available"] is False
 
         listed = await client.get("/api/jobs")
         row = next(
@@ -3628,8 +4440,11 @@ class TestJobsAPI:
             if item["job_id"] == source_id
         )
         assert row["latest_checkpoint_generation"] is None
-        assert row["checkpoint_recovery_available"] is True
+        assert row["checkpoint_recovery_available"] is False
 
+        # The explicit/manual API may still ask S3 to resolve its latest
+        # complete set. The list flag stays false because it cannot prove a
+        # pinned generation cheaply enough to advertise a UI action.
         recovered = await client.post(
             "/api/jobs/recover",
             json={"source_job_id": source_id},

@@ -37,6 +37,23 @@ checkpoint mode:
 }
 ```
 
+For one-click operator interruption, also configure an explicit application
+resume command:
+
+```json
+{
+  "run": {
+    "command": "uv run ai4sci-bench run --output-dir results/run-{{shard_id}}",
+    "resume_command": "uv run ai4sci-bench run --output-dir results/run-{{shard_id}} --resume results/run-{{shard_id}}"
+  }
+}
+```
+
+`run.resume_command` is optional for ordinary/manual checkpoint recovery. It is
+required only when Elastic must offer the live **中断并保存进度** action and
+later construct a one-click continuation without guessing how an opaque
+command resumes.
+
 Checkpoint mode requires `ELASTIC_AGENT_RESULTS_S3_BUCKET`. It always stages a
 Manager-side exact snapshot; Worker-direct mutable uploads are not used as
 recovery proof.
@@ -64,6 +81,73 @@ same-directory temporary file, file `fsync`, atomic rename, and directory
 marker. A checkpoint taken while several related files are being rewritten is
 file-integrity safe, but cannot invent an application-level transaction across
 arbitrary files.
+
+## Operator interrupt and one-click continuation
+
+The Batch page exposes **中断并保存进度** only for a live checkpoint Job with
+non-empty collection paths, an explicit `run.resume_command`, every expected
+shard materialized, and at least one task whose exit has not been confirmed.
+Queued/bootstrap-only Jobs, Jobs whose tasks have all exited, and Jobs already
+in cleanup are rejected so a late interrupt cannot rewrite their natural
+terminal outcome. The API form requires a caller-stable key:
+
+```http
+POST /api/jobs/job-source/interrupt
+Idempotency-Key: interrupt-job-source-20260729
+```
+
+Acceptance is a durable transaction, not a cosmetic state change:
+
+1. The Manager atomically journals `suspending` together with the hashed
+   idempotency identity before it sends a signal or mutates cloud/account
+   resources.
+2. It sends a non-escalating `SIGINT` to the task process group. This lets a
+   cooperative harness stop scheduling new units, but active child processes
+   receive the signal too and may stop before finishing.
+3. If the reliable terminal event does not arrive within the bounded grace
+   periods, the Manager sends non-escalating group `SIGTERM`, then group
+   `SIGKILL`.
+4. It runtime-masks the task/runtime units, stops containers and their runtime,
+   scans for escaped writers, and refuses to collect from any shard whose
+   quiescence cannot be proven. This proof requires the configured Job/runtime
+   user to be non-root; a root runtime user fails closed.
+5. It attempts a coordinated final checkpoint, destroys the temporary compute,
+   releases the exact account claim/lease, and persists the terminal result.
+
+The Job is `suspended` only when cleanup is zero and its resumable generation
+and timestamp exactly match the latest complete checkpoint pointer. If no
+complete set exists, it becomes `failed` and one-click continuation remains
+disabled. If the final attempt fails but an older complete periodic set exists,
+the Job is `suspended` with a warning and resumes from that older set. Files
+newer than that set—including an active AI4Sci instance without its atomic
+`status: completed` marker—are rerun.
+
+Repeated interrupt requests with the same key are safe. The private Job journal
+is authoritative across a Manager crash; the separate action index is only a
+rebuildable cross-Job conflict cache. Cancellation remains a different action:
+whichever terminal transaction acquires the Job first owns cleanup, so a
+concurrent cancel does not rewrite a completed `suspended` outcome.
+
+To continue, send the exact generation returned by the suspended Job:
+
+```http
+POST /api/jobs/job-source/resume
+Idempotency-Key: resume-job-source-attempt-2
+Content-Type: application/json
+
+{
+  "resume_generation": "terminal-00000002-00001"
+}
+```
+
+This endpoint never restarts the old Job in place. It creates a new attempt
+through the normal preflight, immutable checkpoint staging, account allocation,
+and durable submit path, replaces only `run.command` with the source journal's
+private `run.resume_command`, and records `resumed_from_job_id`, `root_job_id`,
+and the next `attempt_no` on that direct source lineage. Two parallel branches
+from the same source can therefore have the same attempt number. The generation
+must still match the source's exact verified suspended pointer; stale UI data
+returns `409`.
 
 ## Resuming on replacement Workers
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import functools
+import hmac
 import logging
 import time
 import uuid
@@ -42,8 +43,15 @@ from elastic_agent.harness.generic import build_execute, resolve_harness
 
 logger = logging.getLogger(__name__)
 
-PersistSpecHook = Callable[[str, JobSpec, str | None], Awaitable[None]]
+PersistSpecHook = Callable[
+    [str, JobSpec, str | None],
+    Awaitable[dict[str, Any] | None],
+]
 JobStateHook = Callable[[str, str, dict[str, Any] | None], Awaitable[None]]
+InterruptIntentHook = Callable[
+    [str, str, dict[str, Any]],
+    Awaitable[None],
+]
 
 
 class JobSpecPersistenceError(RuntimeError):
@@ -207,6 +215,9 @@ class BatchJob:
     # from that endpoint. It is journaled atomically with the prepared spec so
     # exact replay remains possible across JobSpec schema upgrades.
     request_fingerprint: str | None = None
+    resumed_from_job_id: str = ""
+    root_job_id: str = ""
+    attempt_no: int = 1
     runs: dict[str, WorkerRun] = field(default_factory=dict)
     # Reservations that never reached a usable WorkerRun still need durable
     # lease/account cleanup (for example, one shard failed before scale-out or
@@ -218,6 +229,31 @@ class BatchJob:
     cancel_requested: bool = False
     cancel_reason: str | None = None
     cancel_as_failure: bool = False
+    # A cold interrupt is a durable, resumable terminal transaction rather
+    # than an ordinary cancellation.  It reuses the same process-quiescence and
+    # infrastructure cleanup machinery, but has its own persisted intent and
+    # outcome so crash recovery and the API never confuse it with cancellation
+    # or the legacy "Manager restarted during execution" failure.
+    interrupt_requested: bool = False
+    interrupt_reason: str | None = None
+    interrupt_requested_at: str = ""
+    # Private digest of the first HTTP Idempotency-Key. It is persisted in a
+    # top-level journal envelope, never projected through ``summary()``.
+    interrupt_idempotency_digest: str = ""
+    interrupt_checkpoint_generation_before: str = ""
+    interrupt_checkpoint_committed_at_before: str = ""
+    resume_generation: str = ""
+    resume_committed_at: str = ""
+    suspend_warning: str | None = None
+    interrupt_retry_error: str | None = None
+    interrupt_retry_attempts: int = 0
+    # Final collectors are fenced until every shard's command exit and
+    # host-wide writer scan have settled.  ``True`` releases the fence even
+    # when a shard failed proof; that shard is marked non-collectable and the
+    # transaction can safely fall back to an older complete checkpoint.
+    interrupt_quiescence_settled: bool = False
+    interrupt_transaction_settled: bool = False
+    interrupt_tombstones_released: bool = False
     resources_released: bool = False
     release_workers_on_complete: bool = True
     accounts_released: bool = False
@@ -238,10 +274,29 @@ class BatchJob:
     _finish_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _cancel_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _interrupt_task: asyncio.Task | None = field(default=None, repr=False)
 
     @property
     def config_dir(self) -> str:
         return self.spec.account.config_dir
+
+    @property
+    def stop_requested(self) -> bool:
+        """Whether launch/run activity must stop at its next safe boundary."""
+
+        return self.cancel_requested or self.interrupt_requested
+
+    @property
+    def stop_reason(self) -> str | None:
+        return (
+            self.interrupt_reason
+            if self.interrupt_requested
+            else self.cancel_reason
+        )
+
+    @property
+    def stop_as_failure(self) -> bool:
+        return self.cancel_as_failure and not self.interrupt_requested
 
     def summary(self) -> dict[str, Any]:
         by_phase: dict[str, int] = {}
@@ -276,7 +331,38 @@ class BatchJob:
             and terminal
             and cleanup_pending == 0
         )
-        if done and self.cancel_requested and not self.cancel_as_failure:
+        resume_available = bool(
+            done
+            and cleanup_pending == 0
+            and self.interrupt_requested
+            and self.resume_generation
+            and self.resume_committed_at
+            and self.resume_generation
+            == self.latest_checkpoint_generation
+            and self.resume_committed_at
+            == self.latest_checkpoint_committed_at
+        )
+        interrupt_available = bool(
+            not done
+            and not self.stop_requested
+            and self.spec.collect.checkpoint
+            and self.spec.collect.paths
+            and self.spec.run.resume_command
+            and not self.recovery_staging
+            and len(self.runs) == self.spec.fanout.workers
+            and not self.pending_cleanup
+            and any(
+                run.phase not in TERMINAL_WORKER_PHASES
+                and bool(run.task_id)
+                and not run.exit_event.is_set()
+                for run in self.runs.values()
+            )
+        )
+        if done and self.interrupt_requested and resume_available:
+            state = "suspended"
+        elif done and self.interrupt_requested:
+            state = "failed"
+        elif done and self.cancel_requested and not self.cancel_as_failure:
             state = "cancelled"
         elif done and (
             self.error or any(r.phase == WorkerPhase.FAILED for r in self.runs.values())
@@ -284,6 +370,8 @@ class BatchJob:
             state = "failed"
         elif done:
             state = "succeeded"
+        elif self.interrupt_requested:
+            state = "suspending"
         elif self.cancel_requested:
             state = "cancelling"
         elif not self.runs:
@@ -295,12 +383,19 @@ class BatchJob:
         return {
             "job_id": self.job_id,
             "name": self.spec.name,
+            "resumed_from_job_id": self.resumed_from_job_id or None,
+            "root_job_id": self.root_job_id or self.job_id,
+            "attempt_no": self.attempt_no,
             "workers": len(self.runs),
             "phases": by_phase,
             "done": done,
             "state": state,
             "cleanup_pending": cleanup_pending,
-            "error": self.error or "; ".join(run_errors[:3]) or None,
+            "error": (
+                None
+                if state == "suspended"
+                else self.error or "; ".join(run_errors[:3]) or None
+            ),
             # Persisted only as part of the bounded terminal summary.  This is
             # enough for post-restart diagnosis and archived-log selection
             # without storing account secrets or the full JobSpec twice.
@@ -328,6 +423,21 @@ class BatchJob:
             ],
             "cancel_requested": self.cancel_requested,
             "cancel_reason": self.cancel_reason,
+            "interrupt_requested": self.interrupt_requested,
+            "interrupt_reason": self.interrupt_reason,
+            "interrupt_requested_at": self.interrupt_requested_at or None,
+            "interrupt_checkpoint_generation_before": (
+                self.interrupt_checkpoint_generation_before or None
+            ),
+            "interrupt_checkpoint_committed_at_before": (
+                self.interrupt_checkpoint_committed_at_before or None
+            ),
+            "interrupt_available": interrupt_available,
+            "resume_available": resume_available,
+            "resume_generation": self.resume_generation or None,
+            "resume_committed_at": self.resume_committed_at or None,
+            "suspend_warning": self.suspend_warning,
+            "interrupt_retry_error": self.interrupt_retry_error,
             "latest_checkpoint_generation": (
                 self.latest_checkpoint_generation or None
             ),
@@ -379,6 +489,17 @@ class FleetDriver(Protocol):
         self, assignment: WorkerAssignment, worker_id: str | None,
     ) -> None:
         """Detach EIP, force-terminate worker (if any), and free lease/claim."""
+        ...
+
+    async def record_bound_interrupt_proof(
+        self,
+        assignment: WorkerAssignment,
+        worker_id: str | None,
+        *,
+        collected: bool,
+        collection_error: str | None,
+    ) -> None:
+        """Persist final collection outcome before destroying a bound Worker."""
         ...
 
     async def hostname_of(self, worker_id: str) -> str:
@@ -435,9 +556,24 @@ class FleetDriver(Protocol):
         ...
 
     async def stop_command(
-        self, worker_id: str, task_id: str, signal: str = "SIGTERM"
+        self,
+        worker_id: str,
+        task_id: str,
+        signal: str = "SIGTERM",
+        *,
+        scope: str = "group",
+        escalate: bool = True,
     ) -> None:
         """Stop one active command before collection and worker teardown."""
+        ...
+
+    async def quiesce_recovered_worker(
+        self,
+        worker_id: str,
+        job_id: str,
+        spec: JobSpec,
+    ) -> None:
+        """Prove runtime, supervisors, containers, and escaped writers stopped."""
         ...
 
     async def collect(self, worker_id: str, spec: JobSpec, job_id: str) -> None:
@@ -446,6 +582,26 @@ class FleetDriver(Protocol):
 
     async def scale_in(self, worker_ids: list[str]) -> None:
         """Tear down workers (idle scale-in)."""
+        ...
+
+    async def release_ordinary_for_interrupt(
+        self,
+        worker_id: str,
+        job_id: str,
+        shard_index: int,
+        *,
+        collected: bool,
+        collection_error: str | None,
+    ) -> None:
+        """Terminate one ordinary Worker while retaining a durable tombstone."""
+        ...
+
+    async def finalize_interrupt_tombstones(
+        self,
+        job_id: str,
+        worker_ids: list[str],
+    ) -> None:
+        """Forget retained terminal rows after the Job journal is terminal."""
         ...
 
 
@@ -522,6 +678,7 @@ class BatchOrchestrator:
         worker_concurrency: int = 8,
         persist_spec_hook: PersistSpecHook | None = None,
         job_state_hook: JobStateHook | None = None,
+        interrupt_intent_hook: InterruptIntentHook | None = None,
         cancel_grace_seconds: float = 20.0,
         cancel_kill_grace_seconds: float = 5.0,
         status_reconcile_grace_seconds: float = 60.0,
@@ -535,6 +692,7 @@ class BatchOrchestrator:
         self._cleanup_retry_seconds = max(0.01, cleanup_retry_seconds)
         self._persist_spec_hook = persist_spec_hook
         self._job_state_hook = job_state_hook
+        self._interrupt_intent_hook = interrupt_intent_hook
         self._cancel_grace_seconds = max(0.01, cancel_grace_seconds)
         self._cancel_kill_grace_seconds = max(0.01, cancel_kill_grace_seconds)
         self._status_reconcile_grace_seconds = max(
@@ -605,11 +763,144 @@ class BatchOrchestrator:
         async with job._state_lock:
             if job.terminal_state_persisted:
                 return
+            if job.interrupt_requested:
+                # A launch/dispatch caller may have decided which state to
+                # write before waiting behind the atomic interrupt intent.
+                # Once that intent commits, stale lifecycle writes must never
+                # move the journal back out of ``suspending`` or publish a
+                # pre-interrupt terminal summary.
+                if state in {
+                    "prepared",
+                    "launching",
+                    "running",
+                    "succeeded",
+                    "cancelled",
+                }:
+                    return
+                if (
+                    state == "failed"
+                    and (
+                        not isinstance(summary, dict)
+                        or summary.get("interrupt_requested") is not True
+                    )
+                ):
+                    return
             if self._job_state_hook is not None:
                 await self._job_state_hook(job.job_id, state, summary)
             job.persisted_state = state
-            if state in {"succeeded", "failed", "cancelled"}:
+            if state in {"succeeded", "failed", "cancelled", "suspended"}:
                 job.terminal_state_persisted = True
+                if job.interrupt_requested:
+                    job.interrupt_transaction_settled = True
+
+    async def _record_interrupt_intent(
+        self,
+        job: BatchJob,
+        idempotency_digest: str,
+        *,
+        reason: str,
+        requested_at: str,
+        checkpoint_generation_before: str,
+        checkpoint_committed_at_before: str,
+    ) -> None:
+        """Commit intent first, then atomically publish its in-memory effects."""
+
+        async with job._state_lock:
+            if job.interrupt_requested:
+                if not hmac.compare_digest(
+                    job.interrupt_idempotency_digest,
+                    idempotency_digest,
+                ):
+                    raise ValueError(
+                        "Job interrupt is already bound to another "
+                        "Idempotency-Key"
+                    )
+                return
+            if job.terminal_state_persisted or job.summary()["done"]:
+                raise RuntimeError("completed Job cannot be interrupted")
+
+            # Build the durable candidate without changing the live Job.
+            # Until the hook returns successfully, launch/exit paths continue
+            # to observe the original running state and may not signal, collect
+            # or release anything on behalf of this request.
+            summary = job.summary()
+            summary.update({
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "interrupt_reason": reason,
+                "interrupt_requested_at": requested_at,
+                "interrupt_checkpoint_generation_before": (
+                    checkpoint_generation_before or None
+                ),
+                "interrupt_checkpoint_committed_at_before": (
+                    checkpoint_committed_at_before or None
+                ),
+                "interrupt_available": False,
+                "resume_available": False,
+                "resume_generation": None,
+                "resume_committed_at": None,
+                "suspend_warning": None,
+                "interrupt_retry_error": None,
+            })
+            if self._interrupt_intent_hook is not None:
+                await self._interrupt_intent_hook(
+                    job.job_id,
+                    idempotency_digest,
+                    summary,
+                )
+            elif self._job_state_hook is not None:
+                # Unit/custom drivers without an HTTP idempotency store retain
+                # the durable lifecycle boundary, but production wiring always
+                # supplies the private-envelope hook below.
+                await self._job_state_hook(
+                    job.job_id,
+                    "suspending",
+                    summary,
+                )
+
+            # This publication is deliberately inside the same state lock as
+            # the journal write. Waiting lifecycle writers therefore either
+            # see no interrupt (write failed) or the complete committed intent.
+            job.interrupt_requested = True
+            job.interrupt_reason = reason
+            job.interrupt_requested_at = requested_at
+            job.interrupt_idempotency_digest = idempotency_digest
+            job.interrupt_checkpoint_generation_before = (
+                checkpoint_generation_before
+            )
+            job.interrupt_checkpoint_committed_at_before = (
+                checkpoint_committed_at_before
+            )
+            job.interrupt_quiescence_settled = False
+            job.interrupt_transaction_settled = False
+            job.interrupt_tombstones_released = False
+            job.interrupt_retry_error = None
+            job.interrupt_retry_attempts = 0
+            # A cold interrupt always relinquishes compute after the checkpoint
+            # transaction, even when normal completion retains workers.
+            job.release_workers_on_complete = True
+            job.persisted_state = "suspending"
+
+    async def _validate_interrupt_identity(
+        self,
+        job: BatchJob,
+        idempotency_digest: str,
+    ) -> None:
+        """Require every live replay to use the first committed identity."""
+
+        async with job._state_lock:
+            if (
+                job.interrupt_requested
+                and not hmac.compare_digest(
+                    job.interrupt_idempotency_digest,
+                    idempotency_digest,
+                )
+            ):
+                raise ValueError(
+                    "Job interrupt is already bound to another "
+                    "Idempotency-Key"
+                )
 
     async def handle_exhausted(
         self, worker_id: str, *, task_id: str | None = None,
@@ -856,11 +1147,25 @@ class BatchOrchestrator:
             raise ValueError(f"job {job.job_id!r} is already registered")
         if self._persist_spec_hook is not None:
             try:
-                await self._persist_spec_hook(
+                lineage = await self._persist_spec_hook(
                     job.job_id,
                     job.spec,
                     job.request_fingerprint,
                 )
+                if isinstance(lineage, dict):
+                    job.resumed_from_job_id = str(
+                        lineage.get("resumed_from_job_id") or ""
+                    )
+                    job.root_job_id = str(
+                        lineage.get("root_job_id") or job.job_id
+                    )
+                    attempt_no = lineage.get("attempt_no", 1)
+                    if (
+                        isinstance(attempt_no, int)
+                        and not isinstance(attempt_no, bool)
+                        and attempt_no >= 1
+                    ):
+                        job.attempt_no = attempt_no
             except Exception as exc:  # noqa: BLE001
                 raise JobSpecPersistenceError(
                     f"failed to persist JobSpec for {job.job_id!r} before launch: {exc}"
@@ -983,6 +1288,11 @@ class BatchOrchestrator:
                         job.error = job.error or "manager shutting down"
 
             async def settle_run(job: BatchJob, run: WorkerRun) -> None:
+                if (
+                    job.interrupt_requested
+                    and not job.interrupt_transaction_settled
+                ):
+                    return
                 if not self._is_eip_bound(job.spec) or run.cleaned_up:
                     return
                 async with run._finalize_lock:
@@ -1026,6 +1336,11 @@ class BatchOrchestrator:
             async def settle_pending(
                 job: BatchJob, assignment: WorkerAssignment
             ) -> None:
+                if (
+                    job.interrupt_requested
+                    and not job.interrupt_transaction_settled
+                ):
+                    return
                 try:
                     await self._driver.release_bound(assignment, None)
                 except Exception as exc:  # noqa: BLE001
@@ -1060,6 +1375,10 @@ class BatchOrchestrator:
                     self._is_eip_bound(job.spec)
                     or not job.release_workers_on_complete
                     or job.resources_released
+                    or (
+                        job.interrupt_requested
+                        and not job.interrupt_transaction_settled
+                    )
                 ):
                     continue
                 for attempt in range(1, 4):
@@ -1106,10 +1425,10 @@ class BatchOrchestrator:
                         "fleet driver does not support checkpoint recovery"
                     )
                 recovery_attempted = True
-                if job.cancel_requested:
+                if job.stop_requested:
                     raise RuntimeError(
-                        job.cancel_reason
-                        or "job cancelled before recovery staging"
+                        job.stop_reason
+                        or "job stopped before recovery staging"
                     )
                 # Validate and stage before scale_out/reserve so a missing or
                 # corrupt checkpoint cannot create a billable worker.
@@ -1121,10 +1440,10 @@ class BatchOrchestrator:
                     raise RuntimeError(
                         "manager shutting down after recovery staging"
                     )
-                if job.cancel_requested:
+                if job.stop_requested:
                     raise RuntimeError(
-                        job.cancel_reason
-                        or "job cancelled after recovery staging"
+                        job.stop_reason
+                        or "job stopped after recovery staging"
                     )
             # ``prepared`` deliberately includes recovery staging: staging is
             # pre-account and pre-cloud, and is safe to rebuild after a crash.
@@ -1163,7 +1482,7 @@ class BatchOrchestrator:
             # concurrent cancel owns a stricter STOP -> PROCESS_EXIT -> collect
             # sequence; do not let cancellation of a DISPATCHING bring-up make
             # this launch-finally collect/terminate before that sequence runs.
-            if not job.cancel_requested:
+            if not job.stop_requested:
                 await self._maybe_finish(job)
 
     async def _bring_up_unbound_all(self, job: BatchJob) -> None:
@@ -1194,10 +1513,10 @@ class BatchOrchestrator:
                 ctx=ctx,
                 phase=(
                     WorkerPhase.CANCELLED
-                    if job.cancel_requested
+                    if job.stop_requested
                     else WorkerPhase.PENDING
                 ),
-                error=job.cancel_reason if job.cancel_requested else None,
+                error=job.stop_reason if job.stop_requested else None,
             )
             self._worker_index[wid] = job.job_id
 
@@ -1227,7 +1546,7 @@ class BatchOrchestrator:
             else:
                 job.runs[wid].ctx.hostname = hostname
 
-        if job.cancel_requested:
+        if job.stop_requested:
             return
         await asyncio.gather(
             *(self._bring_up_limited(job, wid) for wid in job.runs),
@@ -1300,7 +1619,7 @@ class BatchOrchestrator:
                 ).__name__
                 job.error = job.error or f"EIP reservation rollback failed: {detail}"
 
-        if self._shutting_down or job.cancel_requested:
+        if self._shutting_down or job.stop_requested:
             reservation_error = RuntimeError("manager shutting down")
         else:
             # Start every reservation before awaiting any one of them.  The
@@ -1351,9 +1670,9 @@ class BatchOrchestrator:
                         "invalid assignment result count"
                     )
 
-        if job.cancel_requested and reservation_error is None:
+        if job.stop_requested and reservation_error is None:
             reservation_error = RuntimeError(
-                job.cancel_reason or "job cancelled"
+                job.stop_reason or "job stopped"
             )
 
         if cancellation is not None:
@@ -1399,8 +1718,8 @@ class BatchOrchestrator:
         # Cancellation may arrive while the capacity hold itself is being
         # released.  It still changes a successful reservation transaction into
         # rollback, and cleanup must settle before cancellation is re-raised.
-        if job.cancel_requested and not rolled_back:
-            job.error = job.error or job.cancel_reason or "job cancelled"
+        if job.stop_requested and not rolled_back:
+            job.error = job.error or job.stop_reason or "job stopped"
             await rollback_assignments()
         if cancellation is not None and not rolled_back:
             job.error = "EIP reservation cancelled"
@@ -1408,7 +1727,7 @@ class BatchOrchestrator:
 
         if cancellation is not None:
             raise cancellation
-        if job.cancel_requested or job.error is not None:
+        if job.stop_requested or job.error is not None:
             if not rolled_back:
                 await rollback_assignments()
             return
@@ -1487,7 +1806,7 @@ class BatchOrchestrator:
         worker_id: str | None = None
         run: WorkerRun | None = None
         try:
-            if job.cancel_requested or self._shutting_down:
+            if job.stop_requested or self._shutting_down:
                 await self._release_unattached(job, assignment)
                 return
             prefix = spec.fanout.name_prefix or spec.name
@@ -1502,14 +1821,14 @@ class BatchOrchestrator:
                     f"bound scale_out returned {len(worker_ids)} workers for one lease"
                 )
             worker_id = worker_ids[0]
-            if self._shutting_down or job.cancel_requested:
+            if self._shutting_down or job.stop_requested:
                 raise RuntimeError(
-                    job.cancel_reason or "manager shutting down"
+                    job.stop_reason or "manager shutting down"
                 )
             assignment = await self._driver.attach_bound(worker_id, assignment)
-            if self._shutting_down or job.cancel_requested:
+            if self._shutting_down or job.stop_requested:
                 raise RuntimeError(
-                    job.cancel_reason or "manager shutting down"
+                    job.stop_reason or "manager shutting down"
                 )
             ctx.hostname = await self._driver.hostname_of(worker_id)
 
@@ -1563,9 +1882,9 @@ class BatchOrchestrator:
                 job.cleanup_errors.pop(assignment.lease_id, None)
                 self._worker_index[worker_id] = job.job_id
             elif run is not None:
-                if job.cancel_requested and not job.cancel_as_failure:
+                if job.stop_requested and not job.stop_as_failure:
                     run.phase = WorkerPhase.CANCELLED
-                    run.error = job.cancel_reason or "job cancelled"
+                    run.error = job.stop_reason or "job stopped"
                 else:
                     self._fail(run, detail)
 
@@ -1600,9 +1919,9 @@ class BatchOrchestrator:
         current_task = asyncio.current_task()
         run.bringup_task = current_task
         try:
-            if job.cancel_requested:
+            if job.stop_requested:
                 run.phase = WorkerPhase.CANCELLED
-                run.error = job.cancel_reason or "job cancelled"
+                run.error = job.stop_reason or "job stopped"
                 return
             run.phase = WorkerPhase.BOOTSTRAPPING
             if not await self._driver.provision(worker_id, job.harness, spec):
@@ -1624,9 +1943,9 @@ class BatchOrchestrator:
                 )
             if self._shutting_down:
                 return self._fail(run, "manager shutting down")
-            if job.cancel_requested:
+            if job.stop_requested:
                 run.phase = WorkerPhase.CANCELLED
-                run.error = job.cancel_reason or "job cancelled"
+                run.error = job.stop_reason or "job stopped"
                 return
             if run.phase in TERMINAL_WORKER_PHASES:
                 return
@@ -1678,22 +1997,22 @@ class BatchOrchestrator:
             if self._shutting_down:
                 return self._fail(run, "manager shutting down")
 
-            if job.cancel_requested:
+            if job.stop_requested:
                 run.phase = WorkerPhase.CANCELLED
-                run.error = job.cancel_reason or "job cancelled"
+                run.error = job.stop_reason or "job stopped"
                 return
             if run.phase in TERMINAL_WORKER_PHASES:
                 return
 
             await self._dispatch(job, run, resume=False)
         except asyncio.CancelledError:
-            if job.cancel_requested and not job.cancel_as_failure:
+            if job.stop_requested and not job.stop_as_failure:
                 run.phase = WorkerPhase.CANCELLED
-                run.error = job.cancel_reason or "job cancelled"
+                run.error = job.stop_reason or "job stopped"
             else:
                 self._fail(
                     run,
-                    job.cancel_reason or "manager shutting down",
+                    job.stop_reason or "manager shutting down",
                 )
             raise
         except Exception as exc:  # pragma: no cover - defensive
@@ -1759,13 +2078,13 @@ class BatchOrchestrator:
             # but it must never redirect the identity selected and configured
             # by the Manager.
             ex["env"][credential_env] = run.config_dir
-        if job.cancel_requested:
+        if job.stop_requested:
             run.phase = (
                 WorkerPhase.FAILED
-                if job.cancel_as_failure
+                if job.stop_as_failure
                 else WorkerPhase.CANCELLED
             )
-            run.error = job.cancel_reason or "job cancelled"
+            run.error = job.stop_reason or "job stopped"
             return
         run.task_id = f"{job.job_id}:{run.worker_id}:{uuid.uuid4().hex[:6]}"
         run.task_account_id = run.account_id
@@ -2011,7 +2330,7 @@ class BatchOrchestrator:
         if (
             run.phase != WorkerPhase.RUNNING
             or (task_id is not None and task_id != run.task_id)
-            or job.cancel_requested
+            or job.stop_requested
         ):
             return None
 
@@ -2091,13 +2410,13 @@ class BatchOrchestrator:
             logger.exception(
                 "rotation failed unexpectedly for worker %s", run.worker_id
             )
-            if job.cancel_requested:
+            if job.stop_requested:
                 run.phase = (
                     WorkerPhase.FAILED
-                    if job.cancel_as_failure
+                    if job.stop_as_failure
                     else WorkerPhase.CANCELLED
                 )
-                run.error = job.cancel_reason or "job cancelled"
+                run.error = job.stop_reason or "job stopped"
             else:
                 self._fail(run, f"rotation failed: {exc}")
             await self._finalize_terminal_run(job, run)
@@ -2228,13 +2547,13 @@ class BatchOrchestrator:
             return
         if run.phase == WorkerPhase.ROTATING:
             return
-        if job.cancel_requested:
+        if job.stop_requested:
             run.phase = (
                 WorkerPhase.FAILED
-                if job.cancel_as_failure
+                if job.stop_as_failure
                 else WorkerPhase.CANCELLED
             )
-            run.error = job.cancel_reason or "job cancelled"
+            run.error = job.stop_reason or "job stopped"
         elif exit_code == job.spec.completion.on_process_exit:
             run.phase = WorkerPhase.DONE
             run.error = None
@@ -2292,12 +2611,312 @@ class BatchOrchestrator:
             return False
         return await self._cancel_job_impl(job, reason=reason)
 
+    async def start_interrupt_job(
+        self,
+        job_id: str,
+        reason: str = "job interrupted by administrator",
+        *,
+        idempotency_digest: str | None = None,
+    ) -> BatchJob | None:
+        """Own the intent-to-background-task handoff across caller cancel."""
+
+        result, error, cancellation = await _settle_owned_awaitable(
+            self._start_interrupt_job_transaction(
+                job_id,
+                reason=reason,
+                idempotency_digest=idempotency_digest,
+            )
+        )
+        if error is not None:
+            raise error
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _start_interrupt_job_transaction(
+        self,
+        job_id: str,
+        reason: str = "job interrupted by administrator",
+        *,
+        idempotency_digest: str | None = None,
+    ) -> BatchJob | None:
+        """Durably request a cold interrupt and start its owned transaction.
+
+        The ``suspending`` journal write is awaited before this method returns,
+        so an API can safely respond with HTTP 202 without leaving an
+        unjournaled background stop. Repeated requests reuse the same task.
+        """
+
+        if self._shutting_down:
+            return None
+        if idempotency_digest is not None and (
+            len(idempotency_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in idempotency_digest
+            )
+        ):
+            raise ValueError("invalid interrupt idempotency digest")
+        if (
+            self._interrupt_intent_hook is not None
+            and idempotency_digest is None
+        ):
+            raise ValueError("interrupt idempotency digest is required")
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if (
+            not job.spec.collect.checkpoint
+            or not job.spec.collect.paths
+            or not job.spec.run.resume_command
+        ):
+            raise ValueError(
+                "cold interrupt requires collect.checkpoint, collect.paths, "
+                "and run.resume_command"
+            )
+        if (
+            not job.interrupt_requested
+            and not job.summary()["interrupt_available"]
+        ):
+            raise RuntimeError(
+                "Job has no active task to interrupt"
+            )
+
+        # A committed replay must remain a fast status operation even while the
+        # owned interrupt task holds ``_cancel_lock`` for a long checkpoint.
+        # Request identity is protected independently by ``_state_lock``.
+        if job.interrupt_requested:
+            await self._validate_interrupt_identity(
+                job,
+                idempotency_digest or "",
+            )
+            existing = job._interrupt_task
+            if existing is not None and not existing.done():
+                return job
+            if job.interrupt_transaction_settled or job.summary()["done"]:
+                return job
+
+        async with job._cancel_lock:
+            normalized_digest = idempotency_digest or ""
+            if job.interrupt_requested:
+                await self._validate_interrupt_identity(
+                    job,
+                    normalized_digest,
+                )
+            if job.summary()["done"]:
+                if job.interrupt_requested:
+                    return job
+                raise RuntimeError("completed Job cannot be interrupted")
+            if job.cancel_requested:
+                raise RuntimeError("Job cancellation is already in progress")
+            existing = job._interrupt_task
+            if existing is not None and not existing.done():
+                return job
+            if (
+                job.interrupt_requested
+                and job.interrupt_transaction_settled
+            ):
+                # The owned stop/checkpoint pass settled; any remaining work is
+                # an independently owned infrastructure/claim cleanup retry.
+                return job
+
+            if not job.interrupt_requested:
+                # Serialize against every natural PROCESS_EXIT finalizer. A
+                # shard that already crossed its destructive cleanup decision
+                # finishes first and its released proof is captured in the
+                # intent summary; otherwise it waits and observes the committed
+                # interrupt before choosing the tombstone-preserving path.
+                acquired_finalizers: list[asyncio.Lock] = []
+                try:
+                    for run in sorted(
+                        job.runs.values(),
+                        key=lambda item: item.worker_id,
+                    ):
+                        await run._finalize_lock.acquire()
+                        acquired_finalizers.append(run._finalize_lock)
+                    if not job.summary()["interrupt_available"]:
+                        raise RuntimeError(
+                            "Job has no active task to interrupt"
+                        )
+                    # This is the intent commit: no signal, task cancellation,
+                    # cloud call, or account mutation is allowed before it
+                    # succeeds.
+                    await self._record_interrupt_intent(
+                        job,
+                        normalized_digest,
+                        reason=reason,
+                        requested_at=datetime.now(timezone.utc).isoformat(),
+                        checkpoint_generation_before=(
+                            job.latest_checkpoint_generation
+                        ),
+                        checkpoint_committed_at_before=(
+                            job.latest_checkpoint_committed_at
+                        ),
+                    )
+                finally:
+                    for finalizer_lock in reversed(acquired_finalizers):
+                        finalizer_lock.release()
+            else:
+                # An explicit same-key replay after bounded automatic retries
+                # gets a fresh bounded retry budget.
+                job.interrupt_retry_attempts = 0
+                job.interrupt_retry_error = None
+
+            task = asyncio.create_task(self._run_interrupt_job(job))
+            job._interrupt_task = task
+            self._lifecycle_tasks.add(task)
+
+            def finished(done: asyncio.Task) -> None:
+                self._lifecycle_tasks.discard(done)
+                if job._interrupt_task is done:
+                    job._interrupt_task = None
+                if done.cancelled():
+                    return
+                error = done.exception()
+                if error is not None:
+                    job.interrupt_retry_error = (
+                        str(error) or type(error).__name__
+                    )[:2_000]
+                    logger.error(
+                        "cold interrupt transaction failed for %s",
+                        job.job_id,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                    self._schedule_interrupt_retry(job)
+
+            task.add_done_callback(finished)
+            return job
+
+    def _schedule_interrupt_retry(self, job: BatchJob) -> None:
+        """Retry a committed interrupt a bounded number of times server-side."""
+
+        key = f"interrupt:{job.job_id}"
+        existing = self._cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        if self._shutting_down or job.interrupt_transaction_settled:
+            return
+
+        async def retry() -> None:
+            try:
+                while (
+                    not self._shutting_down
+                    and not job.interrupt_transaction_settled
+                    and job.interrupt_retry_attempts < 5
+                ):
+                    job.interrupt_retry_attempts += 1
+                    try:
+                        await self._record_job_state(
+                            job,
+                            "suspending",
+                            job.summary(),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "failed to persist interrupt retry status for %s",
+                            job.job_id,
+                            exc_info=True,
+                        )
+                    delay = min(
+                        self._cleanup_retry_seconds
+                        * (2 ** (job.interrupt_retry_attempts - 1)),
+                        60.0,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=delay,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    try:
+                        await self._run_interrupt_job(job)
+                    except Exception as exc:  # noqa: BLE001
+                        job.interrupt_retry_error = (
+                            str(exc) or type(exc).__name__
+                        )[:2_000]
+                        logger.exception(
+                            "automatic cold interrupt retry %s/5 failed for %s",
+                            job.interrupt_retry_attempts,
+                            job.job_id,
+                        )
+                    else:
+                        job.interrupt_retry_error = None
+                        return
+                if not job.interrupt_transaction_settled:
+                    try:
+                        await self._record_job_state(
+                            job,
+                            "suspending",
+                            job.summary(),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "failed to persist exhausted interrupt retry "
+                            "status for %s",
+                            job.job_id,
+                            exc_info=True,
+                        )
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._cleanup_tasks.pop(key, None)
+                if job._interrupt_task is asyncio.current_task():
+                    job._interrupt_task = None
+
+        retry_task = asyncio.create_task(retry())
+        job._interrupt_task = retry_task
+        self._cleanup_tasks[key] = retry_task
+        self._lifecycle_tasks.add(retry_task)
+        retry_task.add_done_callback(self._lifecycle_tasks.discard)
+
+    async def interrupt_job(
+        self,
+        job_id: str,
+        reason: str = "job interrupted by administrator",
+        *,
+        idempotency_digest: str | None = None,
+    ) -> bool:
+        """Request and await an idempotent cold-interrupt transaction."""
+
+        job = await self.start_interrupt_job(
+            job_id,
+            reason=reason,
+            idempotency_digest=idempotency_digest,
+        )
+        if job is None:
+            return False
+        task = job._interrupt_task
+        if task is None:
+            return job.summary()["state"] == "suspended"
+        _result, error, cancellation = await _settle_owned_awaitable(task)
+        if error is not None:
+            raise error
+        if cancellation is not None:
+            raise cancellation
+        return job.summary()["state"] == "suspended"
+
+    async def _run_interrupt_job(self, job: BatchJob) -> None:
+        async with job._cancel_lock:
+            if job.summary()["done"]:
+                return
+            await self._stop_job_after_intent_locked(
+                job,
+                reason=job.interrupt_reason
+                or "job interrupted by administrator",
+                as_failure=False,
+                initial_signal="SIGINT",
+                require_host_quiescence=True,
+            )
+
     async def _stop_run_for_cancel(
         self,
         run: WorkerRun,
         *,
         term_grace: float,
         kill_grace: float,
+        initial_signal: str = "SIGTERM",
     ) -> bool:
         """Wait for the matching reliable exit before result collection."""
         # Cancelling a bring-up can mark DISPATCHING terminal while the EXECUTE
@@ -2309,22 +2928,51 @@ class BatchOrchestrator:
         if run.exit_event.is_set():
             await self._wait_for_exit_archive(run)
             return True
+        graceful_signals = (
+            ("SIGINT", "SIGTERM")
+            if initial_signal == "SIGINT"
+            else ("SIGTERM",)
+        )
+        for signal in graceful_signals:
+            try:
+                if initial_signal == "SIGINT":
+                    await self._driver.stop_command(
+                        run.worker_id,
+                        run.task_id,
+                        signal,
+                        scope="group",
+                        escalate=False,
+                    )
+                else:
+                    await self._driver.stop_command(
+                        run.worker_id, run.task_id, signal
+                    )
+            except Exception:
+                logger.exception(
+                    "failed to %s task %s", signal, run.task_id
+                )
+            try:
+                await asyncio.wait_for(
+                    run.exit_event.wait(),
+                    timeout=term_grace,
+                )
+                await self._wait_for_exit_archive(run)
+                return True
+            except asyncio.TimeoutError:
+                pass
         try:
-            await self._driver.stop_command(
-                run.worker_id, run.task_id, "SIGTERM"
-            )
-        except Exception:
-            logger.exception("failed to SIGTERM task %s", run.task_id)
-        try:
-            await asyncio.wait_for(run.exit_event.wait(), timeout=term_grace)
-            await self._wait_for_exit_archive(run)
-            return True
-        except asyncio.TimeoutError:
-            pass
-        try:
-            await self._driver.stop_command(
-                run.worker_id, run.task_id, "SIGKILL"
-            )
+            if initial_signal == "SIGINT":
+                await self._driver.stop_command(
+                    run.worker_id,
+                    run.task_id,
+                    "SIGKILL",
+                    scope="group",
+                    escalate=False,
+                )
+            else:
+                await self._driver.stop_command(
+                    run.worker_id, run.task_id, "SIGKILL"
+                )
         except Exception:
             logger.exception("failed to SIGKILL task %s", run.task_id)
         try:
@@ -2364,94 +3012,215 @@ class BatchOrchestrator:
         term_grace: float | None = None,
         kill_grace: float | None = None,
     ) -> bool:
+        interrupt_task: asyncio.Task | None = None
         async with job._cancel_lock:
             # Never rewrite an already-completed historical outcome merely
             # because an administrator retries the cancel endpoint.
             if job.summary()["done"]:
                 return True
+            if job.interrupt_requested:
+                # A committed cold-interrupt intent owns the terminal
+                # transaction. In particular, cancel must not win the short
+                # scheduling window between create_task() and that task taking
+                # this lock: doing so would publish contradictory cancellation
+                # metadata and return before the quiescence fence settled.
+                interrupt_task = job._interrupt_task
+                if interrupt_task is None and not self._shutting_down:
+                    raise RuntimeError(
+                        "Job cold interrupt is already in progress; retry the "
+                        "interrupt operation"
+                    )
+            else:
+                job.cancel_requested = True
+                job.cancel_reason = reason
+                job.cancel_as_failure = as_failure
+                job.error = job.error or reason
 
-            job.cancel_requested = True
-            job.cancel_reason = reason
-            job.cancel_as_failure = as_failure
-            job.error = job.error or reason
+                return await self._stop_job_after_intent_locked(
+                    job,
+                    reason=reason,
+                    as_failure=as_failure,
+                    term_grace=term_grace,
+                    kill_grace=kill_grace,
+                )
 
-            # Provision/login is part of the launch task.  Cancelling the exact
-            # per-worker task invokes LoginCoordinator's correlated cleanup and
-            # waits for ACCOUNT_LOGIN_CANCELLED instead of leaving Chrome/CLI
-            # running for the remainder of its 3600-second login timeout.
-            owned_run_tasks = {
-                task
-                for run in job.runs.values()
-                for task in (run.bringup_task, run.rotation_task)
-                if task is not None and not task.done()
-            }
-            for task in owned_run_tasks:
-                task.cancel()
-            if owned_run_tasks:
-                await asyncio.gather(*owned_run_tasks, return_exceptions=True)
-
-            launch_task = job.launch_task
-            if (
-                launch_task is not None
-                and launch_task is not asyncio.current_task()
-                and not launch_task.done()
-            ):
-                # Recovery staging owns no cloud/account resources yet. Stop
-                # its cooperative S3 restore promptly instead of waiting for
-                # the full staging deadline. Once scale-out begins, preserve
-                # the transaction-boundary behavior below.
-                if job.recovery_staging:
-                    launch_task.cancel()
-                # EIP reservation has no WorkerRun yet; the flag above makes its
-                # transaction roll back after all in-flight cloud calls settle.
-                await asyncio.gather(launch_task, return_exceptions=True)
-                if launch_task.cancelled() and not job.launch_complete:
-                    # The task may have been cancelled before its coroutine ran
-                    # and therefore before its finally block could commit this.
-                    job.recovery_staging = False
-                    job.launch_complete = True
-
-            stopping_runs = list(job.runs.values())
-            quiescent_results = await asyncio.gather(*(
-                self._stop_run_for_cancel(
-                    run,
-                    term_grace=(
-                        self._cancel_grace_seconds
-                        if term_grace is None else max(0.01, term_grace)
-                    ),
-                    kill_grace=(
-                        self._cancel_kill_grace_seconds
-                        if kill_grace is None else max(0.01, kill_grace)
+        # Join outside ``_cancel_lock``: the owned interrupt task needs that
+        # lock before it can quiesce and finalize the Job.
+        if interrupt_task is not None:
+            _result, error, cancellation = await _settle_owned_awaitable(
+                interrupt_task
+            )
+            if error is not None and not self._shutting_down:
+                raise error
+            if error is not None:
+                logger.warning(
+                    "committed interrupt task failed during shutdown for %s; "
+                    "running one synchronous settlement pass",
+                    job.job_id,
+                    exc_info=(
+                        type(error),
+                        error,
+                        error.__traceback__,
                     ),
                 )
-                for run in stopping_runs
-            ))
-            for run, quiescent in zip(
-                stopping_runs, quiescent_results, strict=True,
-            ):
-                if not quiescent and run.task_id:
-                    # A live writer cannot produce a coherent terminal
-                    # snapshot. Preserve the last complete periodic checkpoint
-                    # and proceed with bounded teardown instead.
-                    run.final_collected = True
-                    run.collection_error = (
-                        "task exit was not confirmed; skipped non-quiescent "
-                        "final collection"
-                    )
+            if cancellation is not None and not self._shutting_down:
+                raise cancellation
+        if (
+            self._shutting_down
+            and job.interrupt_requested
+            and not job.interrupt_transaction_settled
+        ):
+            try:
+                await self._run_interrupt_job(job)
+            except Exception:
+                # Do not downgrade to ordinary shutdown collection/teardown:
+                # an unproven writer must remain represented by its durable
+                # lease/registry row for the next Manager's startup recovery.
+                logger.exception(
+                    "synchronous shutdown interrupt settlement failed for %s; "
+                    "preserving durable worker ownership",
+                    job.job_id,
+                )
+        return job.summary()["done"]
 
-            for run in job.runs.values():
-                if run.phase not in TERMINAL_WORKER_PHASES:
-                    run.phase = (
-                        WorkerPhase.FAILED if as_failure else WorkerPhase.CANCELLED
+    async def _stop_job_after_intent_locked(
+        self,
+        job: BatchJob,
+        *,
+        reason: str,
+        as_failure: bool,
+        term_grace: float | None = None,
+        kill_grace: float | None = None,
+        initial_signal: str = "SIGTERM",
+        require_host_quiescence: bool = False,
+    ) -> bool:
+        """Settle all writers, checkpoint, and destroy resources.
+
+        The caller owns ``job._cancel_lock`` and has already committed either a
+        cancellation flag or the durable ``suspending`` intent.
+        """
+
+        # Provision/login is part of the launch task. Cancelling the exact task
+        # invokes LoginCoordinator's correlated credential cleanup.
+        owned_run_tasks = {
+            task
+            for run in job.runs.values()
+            for task in (run.bringup_task, run.rotation_task)
+            if task is not None and not task.done()
+        }
+        for task in owned_run_tasks:
+            task.cancel()
+        if owned_run_tasks:
+            await asyncio.gather(*owned_run_tasks, return_exceptions=True)
+
+        launch_task = job.launch_task
+        if (
+            launch_task is not None
+            and launch_task is not asyncio.current_task()
+            and not launch_task.done()
+        ):
+            if job.recovery_staging:
+                launch_task.cancel()
+            await asyncio.gather(launch_task, return_exceptions=True)
+            if launch_task.cancelled() and not job.launch_complete:
+                job.recovery_staging = False
+                job.launch_complete = True
+
+        stopping_runs = list(job.runs.values())
+        resolved_term_grace = (
+            self._cancel_grace_seconds
+            if term_grace is None else max(0.01, term_grace)
+        )
+        resolved_kill_grace = (
+            self._cancel_kill_grace_seconds
+            if kill_grace is None else max(0.01, kill_grace)
+        )
+        process_quiescent = await asyncio.gather(*(
+            self._stop_run_for_cancel(
+                run,
+                term_grace=resolved_term_grace,
+                kill_grace=resolved_kill_grace,
+                initial_signal=initial_signal,
+            )
+            for run in stopping_runs
+        ))
+
+        host_quiescent: list[bool] = [True] * len(stopping_runs)
+        host_errors: list[str | None] = [None] * len(stopping_runs)
+        if require_host_quiescence:
+            quiesce = getattr(
+                self._driver,
+                "quiesce_recovered_worker",
+                None,
+            )
+            if not callable(quiesce):
+                host_quiescent = [False] * len(stopping_runs)
+                host_errors = [
+                    "fleet driver does not support host writer quiescence"
+                ] * len(stopping_runs)
+            else:
+                async def quiesce_run(run: WorkerRun) -> None:
+                    # A natural PROCESS_EXIT may have entered its finalizer just
+                    # before the suspending intent committed. Cross that exact
+                    # per-run fence before stopping the host so collection and
+                    # infrastructure teardown cannot overlap this writer scan.
+                    async with run._finalize_lock:
+                        if run.cleaned_up:
+                            return
+                        await quiesce(
+                            run.worker_id,
+                            job.job_id,
+                            job.spec,
+                        )
+
+                results = await asyncio.gather(*(
+                    quiesce_run(run) for run in stopping_runs
+                ), return_exceptions=True)
+                for index, result in enumerate(results):
+                    if isinstance(result, BaseException):
+                        host_quiescent[index] = False
+                        host_errors[index] = (
+                            str(result) or type(result).__name__
+                        )
+            # Release the final-collection fence only after every host scan has
+            # returned. Failed proofs are marked non-collectable below.
+            job.interrupt_quiescence_settled = True
+
+        for index, run in enumerate(stopping_runs):
+            failures: list[str] = []
+            if not process_quiescent[index] and run.task_id:
+                failures.append("task exit was not confirmed")
+            if not host_quiescent[index]:
+                failures.append(
+                    "host writer quiescence failed"
+                    + (
+                        f": {host_errors[index]}"
+                        if host_errors[index]
+                        else ""
                     )
-                    run.error = reason
-            await asyncio.gather(*(
-                self._finalize_terminal_run(job, run)
-                for run in job.runs.values()
-                if run.phase in TERMINAL_WORKER_PHASES
-            ))
-            await self._maybe_finish(job)
-            return True
+                )
+            if failures:
+                # Never snapshot a filesystem with an unproven writer. An older
+                # complete generation remains eligible for a safe resume.
+                run.final_collected = True
+                run.collection_error = (
+                    "; ".join(failures)
+                    + "; skipped non-quiescent final collection"
+                )
+
+        for run in job.runs.values():
+            if run.phase not in TERMINAL_WORKER_PHASES:
+                run.phase = (
+                    WorkerPhase.FAILED if as_failure else WorkerPhase.CANCELLED
+                )
+                run.error = reason
+        await asyncio.gather(*(
+            self._finalize_terminal_run(job, run)
+            for run in job.runs.values()
+            if run.phase in TERMINAL_WORKER_PHASES
+        ))
+        await self._maybe_finish(job)
+        return True
 
     async def _finalize_terminal_run(self, job: BatchJob, run: WorkerRun) -> None:
         """Collect once, then compensate EIP-bound infrastructure once.
@@ -2461,6 +3230,15 @@ class BatchOrchestrator:
         routes to the worker.
         """
         if run.phase not in TERMINAL_WORKER_PHASES:
+            return
+        if (
+            job.interrupt_requested
+            and not job.interrupt_quiescence_settled
+        ):
+            # PROCESS_EXIT can race the interrupt coordinator.  It may account
+            # the process, but must not snapshot or tear down this host until the
+            # coordinator has also stopped the runtime/container stack and
+            # completed the escaped-writer scan for every shard.
             return
         async with run._finalize_lock:
             await self._wait_for_exit_archive(run)
@@ -2529,6 +3307,26 @@ class BatchOrchestrator:
             ):
                 try:
                     run.cleanup_attempts += 1
+                    if job.interrupt_requested:
+                        record_proof = getattr(
+                            self._driver,
+                            "record_bound_interrupt_proof",
+                            None,
+                        )
+                        if not callable(record_proof):
+                            raise RuntimeError(
+                                "fleet driver cannot persist bound interrupt "
+                                "cleanup proof"
+                            )
+                        await record_proof(
+                            run.assignment,
+                            run.worker_id,
+                            collected=(
+                                run.final_collected
+                                and not run.collection_error
+                            ),
+                            collection_error=run.collection_error,
+                        )
                     await self._driver.release_bound(run.assignment, run.worker_id)
                 except Exception as exc:  # noqa: BLE001
                     run.cleanup_error = str(exc)
@@ -2577,7 +3375,29 @@ class BatchOrchestrator:
         try:
             if not run.infrastructure_released:
                 run.cleanup_attempts += 1
-                await self._driver.scale_in([run.worker_id])
+                if job.interrupt_requested:
+                    release_for_interrupt = getattr(
+                        self._driver,
+                        "release_ordinary_for_interrupt",
+                        None,
+                    )
+                    if not callable(release_for_interrupt):
+                        raise RuntimeError(
+                            "fleet driver cannot retain ordinary interrupt "
+                            "cleanup proof"
+                        )
+                    await release_for_interrupt(
+                        run.worker_id,
+                        job.job_id,
+                        run.ctx.shard_index,
+                        collected=(
+                            run.final_collected
+                            and not run.collection_error
+                        ),
+                        collection_error=run.collection_error,
+                    )
+                else:
+                    await self._driver.scale_in([run.worker_id])
                 run.infrastructure_released = True
 
             allocator = getattr(self, "_allocator", None)
@@ -2669,6 +3489,26 @@ class BatchOrchestrator:
                             return
                         try:
                             run.cleanup_attempts += 1
+                            if job.interrupt_requested:
+                                record_proof = getattr(
+                                    self._driver,
+                                    "record_bound_interrupt_proof",
+                                    None,
+                                )
+                                if not callable(record_proof):
+                                    raise RuntimeError(
+                                        "fleet driver cannot persist bound "
+                                        "interrupt cleanup proof"
+                                    )
+                                await record_proof(
+                                    run.assignment,
+                                    run.worker_id,
+                                    collected=(
+                                        run.final_collected
+                                        and not run.collection_error
+                                    ),
+                                    collection_error=run.collection_error,
+                                )
                             await self._driver.release_bound(
                                 run.assignment, run.worker_id
                             )
@@ -2704,6 +3544,11 @@ class BatchOrchestrator:
             try:
                 while not (
                     job.summary()["done"] and job.terminal_state_persisted
+                    and (
+                        not job.interrupt_requested
+                        or self._is_eip_bound(job.spec)
+                        or job.interrupt_tombstones_released
+                    )
                 ):
                     try:
                         await asyncio.wait_for(
@@ -2791,6 +3636,40 @@ class BatchOrchestrator:
                             return
                 job.accounts_released = True
 
+            if job.interrupt_requested and not job.resume_generation:
+                generation = job.latest_checkpoint_generation
+                committed_at = job.latest_checkpoint_committed_at
+                if generation and committed_at:
+                    try:
+                        committed_time = datetime.fromisoformat(
+                            committed_at.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        committed_time = None
+                    if (
+                        committed_time is not None
+                        and committed_time.tzinfo is not None
+                    ):
+                        job.resume_generation = generation
+                        job.resume_committed_at = committed_at
+                        if (
+                            generation
+                            == job.interrupt_checkpoint_generation_before
+                            and committed_at
+                            == job.interrupt_checkpoint_committed_at_before
+                        ):
+                            job.suspend_warning = (
+                                "the final interrupt checkpoint did not commit; "
+                                "resume will use the previous complete "
+                                f"generation {generation}"
+                            )
+                if not job.resume_generation:
+                    job.suspend_warning = (
+                        "no complete checkpoint set is available; this "
+                        "interrupted Job cannot be resumed"
+                    )
+                    job.error = job.error or job.suspend_warning
+
             if job.completed_at is None:
                 job.completed_at = datetime.now(timezone.utc)
             ttl_task = self._ttl_tasks.pop(job.job_id, None)
@@ -2798,7 +3677,12 @@ class BatchOrchestrator:
                 ttl_task.cancel()
 
             terminal_state = job.summary()["state"]
-            if terminal_state in {"succeeded", "failed", "cancelled"}:
+            if terminal_state in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "suspended",
+            }:
                 try:
                     await self._record_job_state(
                         job, terminal_state, job.summary()
@@ -2811,6 +3695,41 @@ class BatchOrchestrator:
                         "failed to persist terminal state for job %s", job.job_id
                     )
                     self._schedule_finish_retry(job)
+                    return
+
+                if job.interrupt_requested:
+                    if self._is_eip_bound(job.spec):
+                        # The released durable lease is the EIP cleanup
+                        # tombstone and remains available to startup recovery.
+                        job.interrupt_tombstones_released = True
+                    elif not job.interrupt_tombstones_released:
+                        finalize_tombstones = getattr(
+                            self._driver,
+                            "finalize_interrupt_tombstones",
+                            None,
+                        )
+                        if not callable(finalize_tombstones):
+                            logger.error(
+                                "fleet driver cannot finalize interrupt "
+                                "tombstones for job %s",
+                                job.job_id,
+                            )
+                            self._schedule_finish_retry(job)
+                            return
+                        try:
+                            await finalize_tombstones(
+                                job.job_id,
+                                list(job.runs),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "failed to finalize interrupt tombstones for "
+                                "job %s",
+                                job.job_id,
+                            )
+                            self._schedule_finish_retry(job)
+                            return
+                        job.interrupt_tombstones_released = True
 
     # -- helpers -----------------------------------------------------------
 

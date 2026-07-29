@@ -468,8 +468,24 @@ class WorkerConnectionManager:
             watch_exhaustion=watch_exhaustion,
         ))
 
-    async def stop_process(self, worker_id: str, task_id: str, sig: str = "SIGTERM") -> None:
-        await self.send_command(worker_id, StopMessage(task_id=task_id, signal=sig))
+    async def stop_process(
+        self,
+        worker_id: str,
+        task_id: str,
+        sig: str = "SIGTERM",
+        *,
+        scope: str = "group",
+        escalate: bool = True,
+    ) -> None:
+        await self.send_command(
+            worker_id,
+            StopMessage(
+                task_id=task_id,
+                signal=sig,
+                scope=scope,
+                escalate=escalate,
+            ),
+        )
 
     async def read_file(self, worker_id: str, request_id: str, path: str, encoding: str = "utf-8") -> None:
         await self.send_command(worker_id, ReadFileMessage(

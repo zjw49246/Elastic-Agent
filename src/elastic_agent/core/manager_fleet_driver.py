@@ -63,7 +63,13 @@ from elastic_agent.worker.recovery_transaction import (
 logger = logging.getLogger(__name__)
 
 _COLLECTION_MANIFEST = "_elastic_agent/collection.json"
-_TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled"})
+_INTERRUPT_CLEANUP_PROOF_SCHEMA = 1
+_TERMINAL_JOB_STATES = frozenset({
+    "succeeded",
+    "failed",
+    "cancelled",
+    "suspended",
+})
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _DEFAULT_MAX_RECOVERY_STAGING_BYTES = 20 * 1024 * 1024 * 1024
 _DEFAULT_MAX_RECOVERY_STAGING_OBJECTS = 500_000
@@ -563,6 +569,63 @@ class ManagerFleetDriver:
         self, assignment: WorkerAssignment, worker_id: str | None,
     ) -> None:
         await self._bound_release(assignment, worker_id)
+
+    async def record_bound_interrupt_proof(
+        self,
+        assignment: WorkerAssignment,
+        worker_id: str | None,
+        *,
+        collected: bool,
+        collection_error: str | None,
+    ) -> None:
+        """Fence EIP destruction behind a durable per-shard result proof."""
+
+        store = getattr(self._mgr, "account_binding_store", None)
+        if store is None:
+            raise RuntimeError(
+                "bound interrupt cleanup requires a durable lease store"
+            )
+        lease = await store.get_lease(assignment.lease_id)
+        if lease is None:
+            raise RuntimeError(
+                f"durable lease {assignment.lease_id!r} disappeared before "
+                "interrupt cleanup proof"
+            )
+        if (
+            lease.account_id != assignment.account_id
+            or lease.job_id != assignment.job_id
+            or lease.slot != assignment.slot
+            or (
+                worker_id
+                and lease.worker_id
+                and lease.worker_id != worker_id
+            )
+        ):
+            raise RuntimeError(
+                "bound interrupt cleanup proof conflicts with durable lease "
+                "identity"
+            )
+        updated = await store.update_lease(
+            assignment.lease_id,
+            recovery_collection_attempted=True,
+            recovery_collected=bool(collected),
+            recovery_collection_error=(
+                str(collection_error)[:2_000]
+                if collection_error
+                else None
+            ),
+        )
+        if (
+            updated is None
+            or updated.lease_id != assignment.lease_id
+            or updated.account_id != assignment.account_id
+            or updated.job_id != assignment.job_id
+            or updated.slot != assignment.slot
+            or not updated.recovery_collection_attempted
+        ):
+            raise RuntimeError(
+                "durable lease did not confirm bound interrupt cleanup proof"
+            )
 
     async def hostname_of(self, worker_id: str) -> str:
         node = await self._mgr.registry.get(worker_id)
@@ -3199,13 +3262,47 @@ raise SystemExit(code)
                         generation,
                     )
                 except ValueError as exc:
+                    async with guard:
+                        state = states.get(state_key)
+                        if state is not None:
+                            state["publishing"] = False
                     raise RuntimeError(
                         "checkpoint set returned an invalid committed_at"
                     ) from exc
                 if checkpoint_order[0].tzinfo is None:
+                    async with guard:
+                        state = states.get(state_key)
+                        if state is not None:
+                            state["publishing"] = False
                     raise RuntimeError(
                         "checkpoint set committed_at has no timezone"
                     )
+
+                # S3 COMMITTED and the Manager-local pointer form one
+                # publication transaction for lifecycle decisions. Never
+                # expose this generation to BatchJob/_maybe_finish, nor mark
+                # the attempt complete, until the private journal has durably
+                # recorded the exact set pointer. A retry can safely republish
+                # the immutable S3 set and repeat this pointer write.
+                persist_checkpoint = getattr(
+                    self._mgr,
+                    "_update_batch_checkpoint_generation",
+                    None,
+                )
+                try:
+                    if callable(persist_checkpoint):
+                        await persist_checkpoint(
+                            job_id,
+                            generation,
+                            committed_at,
+                        )
+                except BaseException:
+                    async with guard:
+                        state = states.get(state_key)
+                        if state is not None:
+                            state["publishing"] = False
+                    raise
+
                 async with guard:
                     states.pop(state_key, None)
                     completed.add(state_key)
@@ -3247,29 +3344,6 @@ raise SystemExit(code)
                     if current_order is None or checkpoint_order > current_order:
                         job.latest_checkpoint_generation = generation
                         job.latest_checkpoint_committed_at = committed_at
-                persist_checkpoint = getattr(
-                    self._mgr,
-                    "_update_batch_checkpoint_generation",
-                    None,
-                )
-                if callable(persist_checkpoint):
-                    try:
-                        await persist_checkpoint(
-                            job_id,
-                            generation,
-                            committed_at,
-                        )
-                    except Exception:
-                        # S3 COMMITTED is authoritative. Keep the checkpoint
-                        # usable even if the local discovery pointer needs
-                        # startup/API reconstruction.
-                        logger.warning(
-                            "durable checkpoint pointer update deferred for "
-                            "job %s generation %s",
-                            job_id,
-                            generation,
-                            exc_info=True,
-                        )
                 return True
 
     async def login(
@@ -3312,12 +3386,27 @@ raise SystemExit(code)
         return await resolve_aws_secret_env(secret_env)
 
     async def stop_command(
-        self, worker_id: str, task_id: str, signal: str = "SIGTERM",
+        self,
+        worker_id: str,
+        task_id: str,
+        signal: str = "SIGTERM",
+        *,
+        scope: str = "group",
+        escalate: bool = True,
     ) -> None:
         """Stop the exact process owned by a Job cancellation request."""
-        await self._mgr.connection_manager.stop_process(
-            worker_id, task_id, sig=signal,
-        )
+        if scope == "group" and escalate:
+            await self._mgr.connection_manager.stop_process(
+                worker_id, task_id, sig=signal,
+            )
+        else:
+            await self._mgr.connection_manager.stop_process(
+                worker_id,
+                task_id,
+                sig=signal,
+                scope=scope,
+                escalate=escalate,
+            )
 
     async def quiesce_recovered_worker(
         self,
@@ -4049,7 +4138,148 @@ sleep 1
                     f"Manager S3 collect failed for job {job_id!r}: {exc}"
                 ) from exc
 
-    async def scale_in(self, worker_ids: list[str]) -> None:
+    async def release_ordinary_for_interrupt(
+        self,
+        worker_id: str,
+        job_id: str,
+        shard_index: int,
+        *,
+        collected: bool,
+        collection_error: str | None,
+    ) -> None:
+        """Terminate one ordinary Worker but retain its crash tombstone."""
+
+        from elastic_agent.core.registry import NodeStatus
+
+        if _SAFE_JOB_ID.fullmatch(job_id) is None:
+            raise ValueError("invalid interrupt cleanup Job id")
+        if (
+            isinstance(shard_index, bool)
+            or not isinstance(shard_index, int)
+            or shard_index < 0
+        ):
+            raise ValueError("invalid interrupt cleanup shard index")
+        node = await self._mgr.registry.get(worker_id)
+        if node is None:
+            raise RuntimeError(
+                f"interrupt cleanup worker {worker_id!r} is missing"
+            )
+        metadata = dict(node.metadata)
+        if (
+            str(metadata.get("job_id") or "") != job_id
+            or metadata.get("shard_index") != shard_index
+            or metadata.get("lease_id")
+        ):
+            raise RuntimeError(
+                "interrupt cleanup worker does not match ordinary Job/shard "
+                "ownership"
+            )
+        proof = {
+            "schema": _INTERRUPT_CLEANUP_PROOF_SCHEMA,
+            "job_id": job_id,
+            "worker_id": worker_id,
+            "instance_id": node.instance_id,
+            "shard_index": shard_index,
+            "collection_attempted": True,
+            "collected": bool(collected),
+            "collection_error": (
+                str(collection_error)[:2_000]
+                if collection_error
+                else None
+            ),
+        }
+        metadata["interrupt_cleanup_proof"] = proof
+        updated = await self._mgr.registry.update(
+            worker_id,
+            metadata=metadata,
+        )
+        if (
+            updated is None
+            or updated.instance_id != node.instance_id
+            or updated.metadata.get("interrupt_cleanup_proof") != proof
+        ):
+            raise RuntimeError(
+                "interrupt cleanup tombstone intent was not persisted"
+            )
+
+        await self.scale_in([worker_id], retain_tombstones=True)
+        terminal = await self._mgr.registry.get(worker_id)
+        if (
+            terminal is None
+            or terminal.instance_id != node.instance_id
+            or terminal.status != NodeStatus.TERMINATED
+            or terminal.metadata.get("interrupt_cleanup_proof") != proof
+        ):
+            raise RuntimeError(
+                "interrupt cleanup did not retain exact terminal proof"
+            )
+
+    async def finalize_interrupt_tombstones(
+        self,
+        job_id: str,
+        worker_ids: list[str],
+    ) -> None:
+        """Remove only exact cold-interrupt tombstones after terminal commit."""
+
+        from elastic_agent.core.registry import NodeStatus
+
+        payload = await asyncio.to_thread(
+            load_job_spec_journal,
+            self._mgr.config.registry.path,
+            job_id,
+        )
+        summary = payload.get("terminal_summary")
+        intent = payload.get("interrupt_intent")
+        if (
+            payload.get("submission_state") not in {"suspended", "failed"}
+            or not isinstance(summary, dict)
+            or summary.get("done") is not True
+            or summary.get("cleanup_pending") != 0
+            or summary.get("interrupt_requested") is not True
+            or not isinstance(intent, dict)
+            or intent.get("schema") != 1
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(intent.get("idempotency_digest") or ""),
+            )
+            is None
+        ):
+            raise RuntimeError(
+                "interrupt tombstones require an exact terminal Job journal"
+            )
+
+        for worker_id in dict.fromkeys(worker_ids):
+            node = await self._mgr.registry.get(worker_id)
+            if node is None:
+                continue
+            proof = node.metadata.get("interrupt_cleanup_proof")
+            if (
+                node.status != NodeStatus.TERMINATED
+                or str(node.metadata.get("job_id") or "") != job_id
+                or not isinstance(proof, dict)
+                or proof.get("schema") != _INTERRUPT_CLEANUP_PROOF_SCHEMA
+                or proof.get("job_id") != job_id
+                or proof.get("worker_id") != worker_id
+                or proof.get("instance_id") != node.instance_id
+                or proof.get("shard_index")
+                != node.metadata.get("shard_index")
+            ):
+                raise RuntimeError(
+                    f"refusing to remove mismatched interrupt tombstone "
+                    f"{worker_id!r}"
+                )
+            await self._mgr.remove_terminated_node_record(worker_id)
+            if await self._mgr.registry.get(worker_id) is not None:
+                raise RuntimeError(
+                    f"interrupt tombstone {worker_id!r} was not removed"
+                )
+
+    async def scale_in(
+        self,
+        worker_ids: list[str],
+        *,
+        retain_tombstones: bool = False,
+    ) -> None:
         requested = list(dict.fromkeys(worker_ids))
         if not requested:
             return
@@ -4120,28 +4350,27 @@ sleep 1
                         )
                     self._proven_terminated_workers.update(pending)
 
-                # Job workers are disposable implementation details, not fleet
-                # history. Remove records only after every requested instance has
-                # an exact termination proof. Track each successful removal
-                # independently: if worker B's registry fsync fails after worker
-                # A was removed, the retry must not re-enter A's non-idempotent
-                # removal path.
-                for worker_id in active_requested:
-                    if worker_id in self._proven_removed_workers:
-                        continue
-                    removed = await self._mgr.remove_node(worker_id)
-                    remaining = await self._mgr.registry.get(worker_id)
-                    if remaining is not None:
-                        raise RuntimeError(
-                            "Manager did not provide registry-removal proof for "
-                            f"worker {worker_id!r} (remove_node returned "
-                            f"{removed!r})"
-                        )
-                    # Absence is the authoritative postcondition.  In a narrow
-                    # concurrent-removal race Manager may return False because
-                    # another cleanup removed the row first; the exact readback
-                    # still proves the desired state.
-                    self._proven_removed_workers.add(worker_id)
+                if not retain_tombstones:
+                    # Job workers are disposable implementation details, not
+                    # fleet history. Remove records only after every requested
+                    # instance has an exact termination proof. Cold interrupt
+                    # is the exception: its TERMINATED rows remain until the
+                    # terminal Job journal commits.
+                    for worker_id in active_requested:
+                        if worker_id in self._proven_removed_workers:
+                            continue
+                        removed = await self._mgr.remove_node(worker_id)
+                        remaining = await self._mgr.registry.get(worker_id)
+                        if remaining is not None:
+                            raise RuntimeError(
+                                "Manager did not provide registry-removal "
+                                f"proof for worker {worker_id!r} "
+                                f"(remove_node returned {removed!r})"
+                            )
+                        # Absence is the authoritative postcondition. In a
+                        # narrow concurrent-removal race Manager may return
+                        # False because another cleanup removed the row first.
+                        self._proven_removed_workers.add(worker_id)
 
                 self._proven_terminated_workers.difference_update(
                     active_requested

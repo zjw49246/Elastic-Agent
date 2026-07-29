@@ -55,6 +55,13 @@ class StopMessage(Message):
     type: Literal["STOP"] = "STOP"
     task_id: str
     signal: str = "SIGTERM"
+    # Default preserves the historical "stop the whole process group and
+    # escalate inside the Worker" behavior. Cold checkpoint interruption uses
+    # a non-escalating group signal because shell/uv wrappers may sit above the
+    # actual coordinator; the Manager owns later TERM/KILL deadlines. Process
+    # scope remains available to callers that own a verified bare PID.
+    scope: Literal["process", "group"] = "group"
+    escalate: bool = True
 
 
 class EventAckMessage(Message):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -159,6 +160,504 @@ async def _wait_for_binding_recovery(
 
 
 class TestManagerLifecycle:
+    @pytest.mark.asyncio
+    async def test_interrupt_journal_thread_keeps_lock_through_cancellation(
+        self,
+        manager,
+        monkeypatch,
+    ):
+        from elastic_agent.core import job_spec_store
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = "job-cancelled-intent-thread"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "cancelled-intent-thread",
+                "run": {"command": "run", "resume_command": "resume"},
+                "fanout": {
+                    "workers": 1,
+                    "shard_by": "shard_index",
+                },
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        checkpoint_entered = threading.Event()
+        original_intent = job_spec_store.update_job_interrupt_intent
+        original_checkpoint = job_spec_store.update_job_checkpoint
+
+        def gated_intent(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original_intent(*args, **kwargs)
+
+        def observed_checkpoint(*args, **kwargs):
+            checkpoint_entered.set()
+            return original_checkpoint(*args, **kwargs)
+
+        monkeypatch.setattr(
+            job_spec_store,
+            "update_job_interrupt_intent",
+            gated_intent,
+        )
+        monkeypatch.setattr(
+            job_spec_store,
+            "update_job_checkpoint",
+            observed_checkpoint,
+        )
+        intent = asyncio.create_task(
+            manager._update_batch_interrupt_intent(
+                job_id,
+                "e" * 64,
+                {
+                    "state": "suspending",
+                    "done": False,
+                    "interrupt_requested": True,
+                    "resume_available": False,
+                },
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        intent.cancel()
+        checkpoint = asyncio.create_task(
+            manager._update_batch_checkpoint_generation(
+                job_id,
+                "periodic-00000001",
+                "2026-07-29T12:00:00+00:00",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert checkpoint_entered.is_set() is False
+        assert intent.done() is False
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await intent
+        await checkpoint
+
+        payload = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        assert payload["submission_state"] == "suspending"
+        assert payload["interrupt_intent"]["idempotency_digest"] == "e" * 64
+        assert payload["latest_checkpoint_generation"] == (
+            "periodic-00000001"
+        )
+
+    @pytest.mark.asyncio
+    async def test_startup_merge_finishes_suspending_intent_only_after_cleanup(
+        self, manager,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = "job-suspending-recovery"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "suspending-recovery",
+                "run": {
+                    "command": "run",
+                    "resume_command": "resume",
+                },
+                "fanout": {
+                    "workers": 2,
+                    "shard_by": "shard_index",
+                },
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            }),
+        )
+        committed_at = "2026-07-29T12:00:00+00:00"
+        await manager._update_batch_checkpoint_generation(
+            job_id,
+            "periodic-00000005",
+            committed_at,
+        )
+        await manager._update_batch_interrupt_intent(
+            job_id,
+            "a" * 64,
+            {
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "interrupt_reason": "save progress",
+                "interrupt_requested_at": committed_at,
+                "interrupt_checkpoint_generation_before": (
+                    "periodic-00000005"
+                ),
+                "interrupt_checkpoint_committed_at_before": committed_at,
+                "resume_available": False,
+            },
+        )
+
+        assert await manager._merge_recovered_terminal_worker(
+            job_id=job_id,
+            worker_id="worker-0",
+            shard_index=0,
+            collected=False,
+            collection_error="final copy failed",
+            worker_released=True,
+        )
+        partial = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        assert partial["submission_state"] == "suspending"
+        assert partial["terminal_summary"]["cleanup_pending"] == 1
+        assert partial["terminal_summary"]["resume_available"] is False
+
+        assert await manager._merge_recovered_terminal_worker(
+            job_id=job_id,
+            worker_id="worker-1",
+            shard_index=1,
+            collected=False,
+            collection_error="final copy failed",
+            worker_released=True,
+        )
+        terminal = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        summary = terminal["terminal_summary"]
+        assert terminal["submission_state"] == "suspended"
+        assert summary["state"] == "suspended"
+        assert summary["done"] is True
+        assert summary["cleanup_pending"] == 0
+        assert summary["resume_available"] is True
+        assert summary["resume_generation"] == "periodic-00000005"
+        assert "previous complete generation" in summary["suspend_warning"]
+        assert summary["phases"] == {"suspended": 2}
+        assert {
+            worker["phase"] for worker in summary["terminal_workers"]
+        } == {"suspended"}
+
+    @pytest.mark.asyncio
+    async def test_startup_merge_without_complete_checkpoint_fails_closed(
+        self, manager,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = "job-suspending-no-checkpoint"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "suspending-no-checkpoint",
+                "run": {
+                    "command": "run",
+                    "resume_command": "resume",
+                },
+                "fanout": {
+                    "workers": 1,
+                    "shard_by": "shard_index",
+                },
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            }),
+        )
+        await manager._update_batch_interrupt_intent(
+            job_id,
+            "b" * 64,
+            {
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "resume_available": False,
+            },
+        )
+
+        await manager._merge_recovered_terminal_worker(
+            job_id=job_id,
+            worker_id="worker-0",
+            shard_index=0,
+            collected=False,
+            collection_error="no checkpoint",
+            worker_released=True,
+        )
+        terminal = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        summary = terminal["terminal_summary"]
+        assert terminal["submission_state"] == "failed"
+        assert summary["state"] == "failed"
+        assert summary["done"] is True
+        assert summary["cleanup_pending"] == 0
+        assert summary["resume_available"] is False
+        assert summary["resume_generation"] is None
+
+    @pytest.mark.asyncio
+    async def test_startup_corrupt_interrupt_summary_cannot_create_resume(
+        self,
+        manager,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = "job-corrupt-interrupt-summary"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "corrupt-interrupt",
+                "run": {"command": "run", "resume_command": "resume"},
+                "fanout": {
+                    "workers": 1,
+                    "shard_by": "shard_index",
+                },
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
+        await manager._update_batch_checkpoint_generation(
+            job_id,
+            "periodic-00000001",
+            "2026-07-29T12:00:00+00:00",
+        )
+        await manager._update_batch_interrupt_intent(
+            job_id,
+            "2" * 64,
+            {
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "resume_available": False,
+            },
+        )
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+        corrupt = json.loads(journal.read_text(encoding="utf-8"))
+        corrupt["terminal_summary"]["interrupt_requested"] = False
+        journal.write_text(json.dumps(corrupt), encoding="utf-8")
+
+        await manager._merge_recovered_terminal_worker(
+            job_id=job_id,
+            worker_id="worker-corrupt",
+            shard_index=0,
+            collected=True,
+            collection_error=None,
+            worker_released=True,
+        )
+
+        payload = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        assert payload["submission_state"] == "failed"
+        assert payload["terminal_summary"]["resume_available"] is False
+        assert payload["terminal_summary"]["interrupt_requested"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("with_checkpoint", "expected_state"),
+        [(True, "suspended"), (False, "failed")],
+    )
+    async def test_startup_terminal_interrupt_tombstone_closes_crash_gap(
+        self,
+        manager,
+        with_checkpoint,
+        expected_state,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = f"job-interrupt-tombstone-{expected_state}"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "interrupt-tombstone",
+                "run": {
+                    "command": "run",
+                    "resume_command": "resume",
+                },
+                "fanout": {
+                    "workers": 1,
+                    "shard_by": "shard_index",
+                },
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            }),
+        )
+        committed_at = "2026-07-29T12:00:00+00:00"
+        if with_checkpoint:
+            await manager._update_batch_checkpoint_generation(
+                job_id,
+                "periodic-00000009",
+                committed_at,
+            )
+        await manager._update_batch_interrupt_intent(
+            job_id,
+            "c" * 64,
+            {
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "interrupt_reason": "save",
+                "interrupt_requested_at": committed_at,
+                "interrupt_checkpoint_generation_before": (
+                    "periodic-00000009" if with_checkpoint else None
+                ),
+                "interrupt_checkpoint_committed_at_before": (
+                    committed_at if with_checkpoint else None
+                ),
+                "resume_available": False,
+                "terminal_workers": [],
+            },
+        )
+        worker_id = f"dryrun:i-{expected_state}-tombstone"
+        proof = {
+            "schema": 1,
+            "job_id": job_id,
+            "worker_id": worker_id,
+            "instance_id": worker_id,
+            "shard_index": 0,
+            "collection_attempted": True,
+            "collected": with_checkpoint,
+            "collection_error": (
+                None if with_checkpoint else "final checkpoint failed"
+            ),
+        }
+        await manager.registry.add(NodeRecord(
+            node_id=worker_id,
+            instance_id=worker_id,
+            platform="dryrun",
+            status=NodeStatus.TERMINATED,
+            metadata={
+                "job_id": job_id,
+                "controller_id": (
+                    manager.account_binding_store.controller_id
+                ),
+                "shard_index": 0,
+                "interrupt_cleanup_proof": proof,
+            },
+        ))
+
+        # Exact crash point: EC2 termination and TERMINATED registry fsync
+        # committed, but the live orchestrator had not written its terminal
+        # suspended/failed Job state or removed the tombstone.
+        await manager._initialize_binding_recovery()
+
+        payload = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        summary = payload["terminal_summary"]
+        assert payload["submission_state"] == expected_state
+        assert summary["state"] == expected_state
+        assert summary["done"] is True
+        assert summary["cleanup_pending"] == 0
+        assert summary["interrupt_requested"] is True
+        assert summary["resume_available"] is with_checkpoint
+        assert payload["interrupt_intent"]["idempotency_digest"] == "c" * 64
+        assert await manager.registry.get(worker_id) is None
+
+    @pytest.mark.asyncio
+    async def test_startup_failed_interrupt_tombstone_replay_preserves_identity(
+        self,
+        manager,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+
+        job_id = "job-failed-interrupt-tombstone"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "failed-interrupt",
+                "run": {
+                    "command": "run",
+                    "resume_command": "resume",
+                },
+                "fanout": {
+                    "workers": 1,
+                    "shard_by": "shard_index",
+                },
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            }),
+        )
+        await manager._update_batch_interrupt_intent(
+            job_id,
+            "d" * 64,
+            {
+                "state": "suspending",
+                "done": False,
+                "interrupt_requested": True,
+                "resume_available": False,
+            },
+        )
+        failed_summary = {
+            "job_id": job_id,
+            "state": "failed",
+            "done": True,
+            "cleanup_pending": 0,
+            "interrupt_requested": True,
+            "resume_available": False,
+            "resume_generation": None,
+            "resume_committed_at": None,
+            "terminal_workers": [{
+                "worker_id": "dryrun:i-failed-terminal",
+                "shard_index": 0,
+                "phase": "failed",
+                "task_id": "",
+                "error": "no checkpoint",
+                "final_collected": False,
+                "collection_error": "no checkpoint",
+                "cleanup_error": None,
+                "worker_released": True,
+            }],
+        }
+        await manager._update_batch_job_state(
+            job_id,
+            "failed",
+            failed_summary,
+        )
+        worker_id = "dryrun:i-failed-terminal"
+        await manager.registry.add(NodeRecord(
+            node_id=worker_id,
+            instance_id=worker_id,
+            platform="dryrun",
+            status=NodeStatus.TERMINATED,
+            metadata={
+                "job_id": job_id,
+                "shard_index": 0,
+                "interrupt_cleanup_proof": {
+                    "schema": 1,
+                    "job_id": job_id,
+                    "worker_id": worker_id,
+                    "instance_id": worker_id,
+                    "shard_index": 0,
+                    "collection_attempted": True,
+                    "collected": False,
+                    "collection_error": "no checkpoint",
+                },
+            },
+        ))
+
+        await manager._initialize_binding_recovery()
+
+        payload = load_job_spec_journal(
+            manager.config.registry.path,
+            job_id,
+        )
+        assert payload["submission_state"] == "failed"
+        assert payload["terminal_summary"] == failed_summary
+        assert payload["interrupt_intent"]["idempotency_digest"] == "d" * 64
+        assert await manager.registry.get(worker_id) is None
+
     @pytest.mark.asyncio
     async def test_startup_long_recovery_runs_after_manager_is_ready(
         self, tmp_config, provider,
@@ -382,6 +881,21 @@ class TestManagerLifecycle:
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 
         job_id = "job-startup-checkpoint-order"
+        await manager._persist_batch_job_spec(
+            "job-checkpoint-source",
+            JobSpec.model_validate({
+                "name": "checkpoint-source",
+                "setup": {
+                    "repo": "https://github.com/example/bench.git",
+                    "target_dir": "/srv/checkpoint-source",
+                    "resolved_commit": "a" * 40,
+                },
+                "run": {"command": "capture"},
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
         spec = JobSpec.model_validate({
             "name": "startup-checkpoint-order",
             "setup": {
@@ -477,6 +991,24 @@ class TestManagerLifecycle:
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
 
         job_id = "job-unproven-checkpoint-install"
+        await manager._persist_batch_job_spec(
+            "job-checkpoint-source",
+            JobSpec.model_validate({
+                "name": "checkpoint-source",
+                "setup": {
+                    "repo": "https://github.com/example/bench.git",
+                    "target_dir": "/srv/checkpoint-source",
+                    "resolved_commit": "b" * 40,
+                },
+                "run": {"command": "capture"},
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            }),
+        )
         await manager._persist_batch_job_spec(
             job_id,
             JobSpec.model_validate({

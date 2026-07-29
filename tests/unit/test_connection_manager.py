@@ -518,6 +518,19 @@ class TestSendCommand:
         assert parsed["type"] == "STOP"
         assert parsed["task_id"] == "task-1"
         assert parsed["signal"] == "SIGINT"
+        assert parsed["scope"] == "group"
+        assert parsed["escalate"] is True
+
+        await manager.stop_process(
+            "worker-1",
+            "task-2",
+            "SIGINT",
+            scope="process",
+            escalate=False,
+        )
+        cooperative = json.loads(ws.sent[1])
+        assert cooperative["scope"] == "process"
+        assert cooperative["escalate"] is False
 
     @pytest.mark.asyncio
     async def test_read_file_command(self, manager):

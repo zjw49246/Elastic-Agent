@@ -1432,6 +1432,31 @@ class TestExhaustionWatch:
 
 class TestStopProcess:
     @pytest.mark.asyncio
+    async def test_cooperative_stop_policy_reaches_task_supervisor(
+        self,
+        runtime,
+    ):
+        from elastic_agent.core.protocols.messages import StopMessage
+
+        runtime._supervised_tasks["task-cooperative"] = MagicMock()
+        runtime._task_supervisor = MagicMock()
+        runtime._task_supervisor.signal = AsyncMock(return_value=True)
+
+        await runtime._handle_stop(StopMessage(
+            task_id="task-cooperative",
+            signal="SIGINT",
+            scope="process",
+            escalate=False,
+        ))
+
+        runtime._task_supervisor.signal.assert_awaited_once_with(
+            "task-cooperative",
+            signal_name="SIGINT",
+            scope="process",
+            escalate=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_stop_running_process(self, runtime, tmp_path):
         """Test that STOP sends signal and process exits."""
         from elastic_agent.core.protocols.messages import ExecuteMessage, StopMessage

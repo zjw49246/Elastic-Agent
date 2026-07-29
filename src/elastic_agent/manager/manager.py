@@ -11,6 +11,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from elastic_agent.core.agent_type import AgentType
@@ -586,14 +587,35 @@ class ElasticAgentManager:
                 and not isinstance(shard_index, bool)
             ):
                 try:
-                    await self._merge_recovered_terminal_worker(
+                    collected, collection_error, is_interrupt_tombstone = (
+                        self._interrupt_cleanup_outcome(
+                            node,
+                            job_id=job_id,
+                            shard_index=shard_index,
+                        )
+                    )
+                    merged = await self._merge_recovered_terminal_worker(
                         job_id=job_id,
                         worker_id=node.node_id,
                         shard_index=shard_index,
-                        collected=None,
-                        collection_error=None,
+                        collected=collected,
+                        collection_error=collection_error,
                         worker_released=True,
                     )
+                    if merged and is_interrupt_tombstone:
+                        current = await self.registry.get(node.node_id)
+                        if (
+                            current is not None
+                            and current.instance_id == node.instance_id
+                            and current.status == NodeStatus.TERMINATED
+                            and current.metadata.get(
+                                "interrupt_cleanup_proof"
+                            )
+                            == node.metadata.get("interrupt_cleanup_proof")
+                        ):
+                            await self.remove_terminated_node_record(
+                                node.node_id
+                            )
                 except FileNotFoundError:
                     pass
                 except Exception:  # noqa: BLE001
@@ -1020,6 +1042,60 @@ class ElasticAgentManager:
                                         node_id,
                                     )
                                 else:
+                                    shard_index = node.metadata.get(
+                                        "shard_index"
+                                    )
+                                    job_id = str(
+                                        node.metadata.get("job_id") or ""
+                                    )
+                                    if (
+                                        job_id
+                                        and isinstance(shard_index, int)
+                                        and not isinstance(
+                                            shard_index, bool
+                                        )
+                                    ):
+                                        (
+                                            collected,
+                                            collection_error,
+                                            is_interrupt_tombstone,
+                                        ) = self._interrupt_cleanup_outcome(
+                                            node,
+                                            job_id=job_id,
+                                            shard_index=shard_index,
+                                        )
+                                        if is_interrupt_tombstone:
+                                            try:
+                                                merged = await (
+                                                    self
+                                                    ._merge_recovered_terminal_worker(
+                                                        job_id=job_id,
+                                                        worker_id=node_id,
+                                                        shard_index=shard_index,
+                                                        collected=collected,
+                                                        collection_error=(
+                                                            collection_error
+                                                        ),
+                                                        worker_released=True,
+                                                    )
+                                                )
+                                                if merged:
+                                                    await (
+                                                        self
+                                                        .remove_terminated_node_record(
+                                                            node_id
+                                                        )
+                                                    )
+                                            except Exception:  # noqa: BLE001
+                                                self._recovery_unbound_registry_scans[
+                                                    node_id
+                                                ] = 1
+                                                logger.exception(
+                                                    "Cannot reconcile missing "
+                                                    "interrupt worker %s",
+                                                    node_id,
+                                                )
+                                                continue
                                     self._recovery_unbound_registry_scans.pop(
                                         node_id, None
                                     )
@@ -1068,14 +1144,46 @@ class ElasticAgentManager:
                             and not isinstance(shard_index, bool)
                         ):
                             try:
-                                await self._merge_recovered_terminal_worker(
+                                current_node = await self.registry.get(
+                                    node_id
+                                )
+                                collected = None
+                                collection_error = None
+                                is_interrupt_tombstone = False
+                                if current_node is not None:
+                                    (
+                                        collected,
+                                        collection_error,
+                                        is_interrupt_tombstone,
+                                    ) = self._interrupt_cleanup_outcome(
+                                        current_node,
+                                        job_id=job_id,
+                                        shard_index=shard_index,
+                                    )
+                                merged = (
+                                    await self._merge_recovered_terminal_worker(
                                     job_id=job_id,
                                     worker_id=node_id,
                                     shard_index=shard_index,
-                                    collected=None,
-                                    collection_error=None,
+                                    collected=collected,
+                                    collection_error=collection_error,
                                     worker_released=True,
+                                    )
                                 )
+                                if merged and is_interrupt_tombstone:
+                                    current_node = await self.registry.get(
+                                        node_id
+                                    )
+                                    if (
+                                        current_node is not None
+                                        and current_node.instance_id
+                                        == node.instance_id
+                                        and current_node.status
+                                        == NodeStatus.TERMINATED
+                                    ):
+                                        await self.remove_terminated_node_record(
+                                            node_id
+                                        )
                             except FileNotFoundError:
                                 pass
                             except Exception:  # noqa: BLE001
@@ -1671,6 +1779,35 @@ class ElasticAgentManager:
         self._binding_recovery_ready = False
         self._ensure_binding_recovery_task()
 
+    @staticmethod
+    def _interrupt_cleanup_outcome(
+        node: NodeRecord,
+        *,
+        job_id: str,
+        shard_index: int,
+    ) -> tuple[bool | None, str | None, bool]:
+        """Validate one ordinary cold-interrupt registry tombstone."""
+
+        proof = node.metadata.get("interrupt_cleanup_proof")
+        valid = bool(
+            isinstance(proof, dict)
+            and proof.get("schema") == 1
+            and proof.get("job_id") == job_id
+            and proof.get("worker_id") == node.node_id
+            and proof.get("instance_id") == node.instance_id
+            and proof.get("shard_index") == shard_index
+            and proof.get("collection_attempted") is True
+            and isinstance(proof.get("collected"), bool)
+        )
+        if not valid:
+            return None, None, False
+        error = proof.get("collection_error")
+        return (
+            proof["collected"],
+            str(error)[:2_000] if error else None,
+            True,
+        )
+
     async def _merge_recovered_terminal_worker(
         self,
         *,
@@ -1710,6 +1847,33 @@ class ElasticAgentManager:
             payload = load_job_spec_journal(
                 self.config.registry.path, job_id,
             )
+            persisted_summary = payload.get("terminal_summary")
+            persisted_intent = payload.get("interrupt_intent")
+            terminal_interrupt = bool(
+                isinstance(persisted_summary, dict)
+                and persisted_summary.get("done") is True
+                and persisted_summary.get("cleanup_pending") == 0
+                and persisted_summary.get("interrupt_requested") is True
+                and persisted_summary.get("state")
+                in {"suspended", "failed"}
+                and isinstance(persisted_intent, dict)
+                and persisted_intent.get("schema") == 1
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(
+                        persisted_intent.get("idempotency_digest")
+                        or ""
+                    ),
+                )
+                is not None
+                and payload.get("submission_state")
+                == persisted_summary.get("state")
+            )
+            if terminal_interrupt:
+                # A prior recovery pass already committed the exact checkpoint
+                # (or fail-closed absence) and zero-cleanup proof. Reliable
+                # cleanup/tombstone replays are no-ops.
+                return True
             recovery_spec = _load_recovery_collection_spec(payload["spec"])
             expected_workers = recovery_spec.fanout.workers
             if shard_index >= expected_workers:
@@ -1854,25 +2018,155 @@ class ElasticAgentManager:
                 for worker in terminal_workers
                 if worker["collection_error"]
             ]
+            raw_interrupt_intent = payload.get("interrupt_intent")
+            interrupt_intent_valid = bool(
+                isinstance(raw_interrupt_intent, dict)
+                and raw_interrupt_intent.get("schema") == 1
+                and isinstance(
+                    raw_interrupt_intent.get("idempotency_digest"),
+                    str,
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    raw_interrupt_intent["idempotency_digest"],
+                )
+                is not None
+            )
+            # A generic/corrupt terminal summary is not authority to create a
+            # resumable outcome. Only the dedicated atomic private envelope
+            # can identify a cold-interrupt transaction on startup.
+            suspending = (
+                payload.get("submission_state") == "suspending"
+                and interrupt_intent_valid
+                and summary.get("state") == "suspending"
+                and summary.get("interrupt_requested") is True
+                and summary.get("resume_available") is False
+            )
+            checkpoint_generation = str(
+                payload.get("latest_checkpoint_generation") or ""
+            )
+            checkpoint_committed_at = str(
+                payload.get("checkpoint_committed_at") or ""
+            )
+            checkpoint_valid = False
+            if checkpoint_generation and checkpoint_committed_at:
+                try:
+                    checkpoint_time = datetime.fromisoformat(
+                        checkpoint_committed_at.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    checkpoint_time = None
+                checkpoint_valid = bool(
+                    checkpoint_time is not None
+                    and checkpoint_time.tzinfo is not None
+                )
+            if suspending and complete and checkpoint_valid:
+                recovered_state = "suspended"
+            elif suspending and not complete:
+                recovered_state = "suspending"
+            else:
+                recovered_state = "failed"
+
+            suspend_warning: str | None = None
+            if recovered_state == "suspended":
+                if (
+                    checkpoint_generation
+                    == summary.get(
+                        "interrupt_checkpoint_generation_before"
+                    )
+                    and checkpoint_committed_at
+                    == summary.get(
+                        "interrupt_checkpoint_committed_at_before"
+                    )
+                ):
+                    suspend_warning = (
+                        "the restart-time final checkpoint did not commit; "
+                        "resume will use the previous complete generation "
+                        f"{checkpoint_generation}"
+                    )
+                elif failures:
+                    suspend_warning = (
+                        "some restart-time final collections failed; the "
+                        "committed checkpoint set remains resumable"
+                    )
+            elif suspending and complete:
+                suspend_warning = (
+                    "no complete checkpoint set is available; this interrupted "
+                    "Job cannot be resumed"
+                )
+
+            raw_lineage = payload.get("lineage")
+            lineage = raw_lineage if isinstance(raw_lineage, dict) else {}
+            if recovered_state == "suspended":
+                for worker in terminal_workers:
+                    worker["phase"] = "suspended"
             rebuilt = {
                 "job_id": job_id,
                 "name": recovery_spec.name,
-                "state": "failed",
+                "state": recovered_state,
                 "done": complete,
                 "workers": expected_workers,
-                "phases": {"failed": len(terminal_workers)},
+                "phases": {
+                    (
+                        "suspended"
+                        if recovered_state == "suspended"
+                        else "failed"
+                    ): len(terminal_workers)
+                },
                 "cleanup_pending": cleanup_pending,
                 "error": (
-                    "Manager restarted during execution; "
-                    + (
-                        "final recovery collection failed: "
-                        + "; ".join(failures[:3])
-                        if failures
-                        else "recovered workers were collected and terminated"
+                    None
+                    if recovered_state == "suspended"
+                    else (
+                        suspend_warning
+                        if suspending and complete
+                        else (
+                            "Manager restarted during execution; "
+                            + (
+                                "final recovery collection failed: "
+                                + "; ".join(failures[:3])
+                                if failures
+                                else (
+                                    "recovered workers were collected and "
+                                    "terminated"
+                                )
+                            )
+                        )
                     )
                 ),
                 "terminal_workers": terminal_workers,
                 "startup_recovered": True,
+                "interrupt_requested": suspending,
+                "interrupt_reason": summary.get("interrupt_reason"),
+                "interrupt_requested_at": summary.get(
+                    "interrupt_requested_at"
+                ),
+                "interrupt_available": False,
+                "resume_available": (
+                    recovered_state == "suspended"
+                    and complete
+                    and cleanup_pending == 0
+                    and checkpoint_valid
+                ),
+                "resume_generation": (
+                    checkpoint_generation
+                    if recovered_state == "suspended"
+                    else None
+                ),
+                "resume_committed_at": (
+                    checkpoint_committed_at
+                    if recovered_state == "suspended"
+                    else None
+                ),
+                "latest_checkpoint_generation": (
+                    checkpoint_generation or None
+                ),
+                "suspend_warning": suspend_warning,
+                "resumed_from_job_id": lineage.get(
+                    "resumed_from_job_id"
+                ),
+                "root_job_id": lineage.get("root_job_id") or job_id,
+                "attempt_no": lineage.get("attempt_no", 1),
             }
             for key in (
                 "cancel_requested",
@@ -1880,14 +2174,15 @@ class ElasticAgentManager:
                 "created_at",
                 "started_at",
                 "completed_at",
-                "latest_checkpoint_generation",
+                "interrupt_checkpoint_generation_before",
+                "interrupt_checkpoint_committed_at_before",
             ):
                 if key in summary:
                     rebuilt[key] = summary[key]
             update_job_state(
                 self.config.registry.path,
                 job_id,
-                "failed",
+                recovered_state,
                 summary=rebuilt,
             )
             return True
@@ -2224,10 +2519,13 @@ class ElasticAgentManager:
         job_id: str,
         spec,
         request_fingerprint: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Journal a JobSpec before the orchestrator can reserve or scale."""
 
-        from elastic_agent.core.job_spec_store import persist_job_spec
+        from elastic_agent.core.job_spec_store import (
+            load_job_spec_journal,
+            persist_job_spec,
+        )
 
         async with self._job_state_lock:
             await asyncio.to_thread(
@@ -2237,6 +2535,13 @@ class ElasticAgentManager:
                 spec,
                 request_fingerprint,
             )
+            payload = await asyncio.to_thread(
+                load_job_spec_journal,
+                self.config.registry.path,
+                job_id,
+            )
+            lineage = payload.get("lineage")
+            return lineage if isinstance(lineage, dict) else None
 
     async def _update_batch_job_state(
         self, job_id: str, state: str, summary: dict | None = None,
@@ -2245,14 +2550,41 @@ class ElasticAgentManager:
 
         from elastic_agent.core.job_spec_store import update_job_state
 
-        async with self._job_state_lock:
-            await asyncio.to_thread(
-                update_job_state,
-                self.config.registry.path,
-                job_id,
-                state,
-                summary=summary,
-            )
+        async def commit() -> None:
+            async with self._job_state_lock:
+                await asyncio.to_thread(
+                    update_job_state,
+                    self.config.registry.path,
+                    job_id,
+                    state,
+                    summary=summary,
+                )
+
+        await self._await_owned_task(asyncio.create_task(commit()))
+
+    async def _update_batch_interrupt_intent(
+        self,
+        job_id: str,
+        idempotency_digest: str,
+        summary: dict,
+    ) -> None:
+        """Commit private request identity and suspending state together."""
+
+        from elastic_agent.core.job_spec_store import (
+            update_job_interrupt_intent,
+        )
+
+        async def commit() -> None:
+            async with self._job_state_lock:
+                await asyncio.to_thread(
+                    update_job_interrupt_intent,
+                    self.config.registry.path,
+                    job_id,
+                    idempotency_digest,
+                    summary=summary,
+                )
+
+        await self._await_owned_task(asyncio.create_task(commit()))
 
     async def _update_batch_checkpoint_generation(
         self,
@@ -2264,14 +2596,17 @@ class ElasticAgentManager:
 
         from elastic_agent.core.job_spec_store import update_job_checkpoint
 
-        async with self._job_state_lock:
-            await asyncio.to_thread(
-                update_job_checkpoint,
-                self.config.registry.path,
-                job_id,
-                generation,
-                committed_at=committed_at,
-            )
+        async def commit() -> None:
+            async with self._job_state_lock:
+                await asyncio.to_thread(
+                    update_job_checkpoint,
+                    self.config.registry.path,
+                    job_id,
+                    generation,
+                    committed_at=committed_at,
+                )
+
+        await self._await_owned_task(asyncio.create_task(commit()))
 
     @property
     def account_allocator(self):
@@ -2368,6 +2703,7 @@ class ElasticAgentManager:
             scale_in_on_complete=scale_in_on_complete,
             persist_spec_hook=self._persist_batch_job_spec,
             job_state_hook=self._update_batch_job_state,
+            interrupt_intent_hook=self._update_batch_interrupt_intent,
         )
         self._batch._allocator = allocator
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import stat
 import time
 from datetime import datetime
@@ -28,14 +29,92 @@ _SAFE_REQUEST_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _SAFE_CHECKPOINT_GENERATION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
-_JOB_STATES = {"prepared", "launching", "running", "succeeded", "failed", "cancelled"}
+_JOB_STATES = {
+    "prepared",
+    "launching",
+    "running",
+    "suspending",
+    "suspended",
+    "succeeded",
+    "failed",
+    "cancelled",
+}
 JOB_REQUEST_FINGERPRINT_SCHEMA = 1
 JOB_REQUEST_FINGERPRINT_ALGORITHM = "sha256"
+JOB_INTERRUPT_INTENT_SCHEMA = 1
 _UNBOUND_LAUNCH_INTENTS_VERSION = 1
 _MAX_UNBOUND_LAUNCH_JOBS = 10_000
 _MAX_UNBOUND_LAUNCHES_PER_JOB = 1_000
 _MAX_UNBOUND_LAUNCH_INTENTS_BYTES = 2 * 1024 * 1024
 _MAX_JOB_SPEC_JOURNAL_BYTES = 32 * 1024 * 1024
+
+
+def _valid_interrupt_intent(payload: dict) -> dict | None:
+    """Return the trusted private interrupt envelope, if one is present."""
+
+    intent = payload.get("interrupt_intent")
+    if (
+        not isinstance(intent, dict)
+        or intent.get("schema") != JOB_INTERRUPT_INTENT_SCHEMA
+        or not isinstance(intent.get("idempotency_digest"), str)
+        or _SAFE_REQUEST_FINGERPRINT.fullmatch(
+            intent["idempotency_digest"]
+        )
+        is None
+    ):
+        return None
+    return intent
+
+
+def _derive_job_lineage(
+    registry_path: str | Path,
+    job_id: str,
+    spec: JobSpec,
+) -> dict[str, str | int | None]:
+    """Build trusted attempt lineage from the persisted direct source."""
+
+    source_job_id = (
+        spec.recovery.source_job_id
+        if spec.recovery.policy != "none"
+        else ""
+    )
+    if not source_job_id:
+        return {
+            "resumed_from_job_id": None,
+            "root_job_id": job_id,
+            "attempt_no": 1,
+        }
+    if (
+        source_job_id == job_id
+        or _SAFE_JOB_ID.fullmatch(source_job_id) is None
+    ):
+        raise ValueError("invalid recovery source Job id for lineage")
+
+    source_payload = load_job_spec_journal(
+        registry_path,
+        source_job_id,
+    )
+    source_lineage: dict = {}
+    raw_lineage = source_payload.get("lineage")
+    if isinstance(raw_lineage, dict):
+        source_lineage = raw_lineage
+    root_job_id = str(
+        source_lineage.get("root_job_id") or source_job_id
+    )
+    source_attempt = source_lineage.get("attempt_no", 1)
+    if (
+        _SAFE_JOB_ID.fullmatch(root_job_id) is None
+        or isinstance(source_attempt, bool)
+        or not isinstance(source_attempt, int)
+        or source_attempt < 1
+        or source_attempt >= 1_000_000
+    ):
+        raise ValueError("invalid persisted recovery Job lineage")
+    return {
+        "resumed_from_job_id": source_job_id,
+        "root_job_id": root_job_id,
+        "attempt_no": source_attempt + 1,
+    }
 
 
 def job_specs_dir(registry_path: str | Path) -> Path:
@@ -82,6 +161,7 @@ def persist_job_spec(
         "submission_state": "prepared",
         "state_updated_at": time.time(),
         "spec": spec.model_dump(),
+        "lineage": _derive_job_lineage(registry_path, job_id, spec),
     }
     if request_fingerprint is not None:
         # Keep the fingerprint in the same atomic/fsynced write as the first
@@ -166,15 +246,117 @@ def update_job_state(
     if state not in _JOB_STATES:
         raise ValueError(f"invalid persisted job state: {state!r}")
     destination = job_specs_dir(registry_path) / f"{job_id}.json"
-    if not destination.is_file():
-        raise FileNotFoundError(f"JobSpec journal not found: {job_id}")
-    payload = json.loads(destination.read_text(encoding="utf-8"))
-    if payload.get("job_id") != job_id or not isinstance(payload.get("spec"), dict):
-        raise ValueError(f"invalid JobSpec journal for {job_id!r}")
+    payload = load_job_spec_journal(registry_path, job_id)
+    if state == "suspending":
+        if (
+            not isinstance(summary, dict)
+            or summary.get("state") != "suspending"
+            or summary.get("interrupt_requested") is not True
+            or summary.get("resume_available") is not False
+        ):
+            raise ValueError(
+                "suspending state requires a non-resumable interrupt intent"
+            )
+        if _valid_interrupt_intent(payload) is None:
+            raise ValueError(
+                "suspending state requires a private interrupt intent"
+            )
+    if state == "suspended":
+        if not isinstance(summary, dict):
+            raise ValueError("suspended state requires a terminal summary")
+        generation = summary.get("resume_generation")
+        committed_at = summary.get("resume_committed_at")
+        if (
+            summary.get("state") != "suspended"
+            or summary.get("done") is not True
+            or summary.get("cleanup_pending") != 0
+            or summary.get("resume_available") is not True
+            or not isinstance(generation, str)
+            or _SAFE_CHECKPOINT_GENERATION.fullmatch(generation) is None
+            or not isinstance(committed_at, str)
+            or generation != payload.get("latest_checkpoint_generation")
+            or committed_at != payload.get("checkpoint_committed_at")
+        ):
+            raise ValueError(
+                "suspended state requires exact committed checkpoint and "
+                "zero pending cleanup"
+            )
+        if _valid_interrupt_intent(payload) is None:
+            raise ValueError(
+                "suspended state requires a private interrupt intent"
+            )
+        try:
+            commit_time = datetime.fromisoformat(
+                committed_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "suspended checkpoint committed_at is invalid"
+            ) from exc
+        if commit_time.tzinfo is None:
+            raise ValueError(
+                "suspended checkpoint committed_at must include a timezone"
+            )
     payload["submission_state"] = state
     payload["state_updated_at"] = time.time()
     if summary is not None:
         payload["terminal_summary"] = summary
+    return atomic_write_private(
+        destination,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+def update_job_interrupt_intent(
+    registry_path: str | Path,
+    job_id: str,
+    idempotency_digest: str,
+    *,
+    summary: dict,
+) -> Path:
+    """Atomically bind the private request digest to ``suspending`` state."""
+
+    if _SAFE_JOB_ID.fullmatch(job_id) is None:
+        raise ValueError(f"invalid job id for interrupt intent: {job_id!r}")
+    if _SAFE_REQUEST_FINGERPRINT.fullmatch(idempotency_digest) is None:
+        raise ValueError("invalid interrupt idempotency digest")
+    if (
+        not isinstance(summary, dict)
+        or summary.get("state") != "suspending"
+        or summary.get("interrupt_requested") is not True
+        or summary.get("resume_available") is not False
+    ):
+        raise ValueError(
+            "interrupt intent requires a non-resumable suspending summary"
+        )
+    destination = job_specs_dir(registry_path) / f"{job_id}.json"
+    payload = load_job_spec_journal(registry_path, job_id)
+    if payload.get("submission_state") in {
+        "suspended",
+        "succeeded",
+        "failed",
+        "cancelled",
+    }:
+        raise ValueError("completed Job cannot accept an interrupt intent")
+    existing = payload.get("interrupt_intent")
+    if existing is not None:
+        if (
+            _valid_interrupt_intent(payload) is None
+            or not secrets.compare_digest(
+                str(existing.get("idempotency_digest") or ""),
+                idempotency_digest,
+            )
+        ):
+            raise ValueError("interrupt intent identity conflicts with journal")
+    payload["submission_state"] = "suspending"
+    payload["state_updated_at"] = time.time()
+    payload["terminal_summary"] = summary
+    if existing is None:
+        payload["interrupt_intent"] = {
+            "schema": JOB_INTERRUPT_INTENT_SCHEMA,
+            "idempotency_digest": idempotency_digest,
+            "requested_at": summary.get("interrupt_requested_at"),
+        }
     return atomic_write_private(
         destination,
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -204,13 +386,7 @@ def update_job_checkpoint(
     if committed_time.tzinfo is None:
         raise ValueError("checkpoint committed_at must include a timezone")
     destination = job_specs_dir(registry_path) / f"{job_id}.json"
-    if not destination.is_file():
-        raise FileNotFoundError(f"JobSpec journal not found: {job_id}")
-    payload = json.loads(destination.read_text(encoding="utf-8"))
-    if payload.get("job_id") != job_id or not isinstance(
-        payload.get("spec"), dict,
-    ):
-        raise ValueError(f"invalid JobSpec journal for {job_id!r}")
+    payload = load_job_spec_journal(registry_path, job_id)
     current_generation = payload.get("latest_checkpoint_generation")
     current_committed_at = payload.get("checkpoint_committed_at")
     if current_generation and current_committed_at:

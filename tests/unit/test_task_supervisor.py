@@ -345,6 +345,71 @@ async def test_stdin_and_explicit_stop_survive_socket_boundary(supervisor):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signalling only")
+async def test_cooperative_process_signal_does_not_escalate_or_hit_child(
+    supervisor,
+    tmp_path,
+):
+    _server, client, _state_dir, _log_dir = supervisor
+    marker = tmp_path / "leader-signalled"
+    child_pid_path = tmp_path / "child.pid"
+    code = f"""
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+marker = pathlib.Path({str(marker)!r})
+child_path = pathlib.Path({str(child_pid_path)!r})
+signal.signal(signal.SIGINT, lambda *_: marker.write_text("SIGINT"))
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+child_path.write_text(str(child.pid))
+while True:
+    time.sleep(0.1)
+"""
+    await client.launch(SupervisedTaskLaunch(
+        task_id="cooperative-stop",
+        command=[sys.executable, "-u", "-c", code],
+        cwd=os.getcwd(),
+        env=dict(os.environ),
+        timeout_seconds=120,
+    ))
+    async with asyncio.timeout(5):
+        while not child_pid_path.exists():
+            await asyncio.sleep(0.02)
+
+    started = asyncio.get_running_loop().time()
+    assert await client.signal(
+        "cooperative-stop",
+        signal_name="SIGINT",
+        scope="process",
+        escalate=False,
+    )
+    assert asyncio.get_running_loop().time() - started < 1
+    async with asyncio.timeout(5):
+        while not marker.exists():
+            await asyncio.sleep(0.02)
+    child_pid = int(child_pid_path.read_text())
+    os.kill(child_pid, 0)
+    assert "cooperative-stop" in (
+        descriptor.task_id for descriptor in await client.list_tasks()
+    )
+
+    assert await client.signal(
+        "cooperative-stop",
+        signal_name="SIGKILL",
+        scope="group",
+        escalate=False,
+    )
+    _records, terminal = await _wait_for_terminal(
+        client,
+        "cooperative-stop",
+    )
+    assert terminal["exit_code"] != 0
+
+
+@pytest.mark.asyncio
 async def test_pending_exhaustion_is_durable_and_acknowledged_separately(
     supervisor,
 ):

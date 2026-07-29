@@ -70,11 +70,19 @@ from elastic_agent.core.secure_store import (
 router = APIRouter(tags=["jobs"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
 _submit_lock = asyncio.Lock()
+_job_action_locks_guard = threading.Lock()
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SAFE_RESUME_GENERATION = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
 _PERSISTED_JOB_STATES = {
-    "prepared", "launching", "running", "succeeded", "failed", "cancelled",
+    "prepared", "launching", "running", "suspending", "suspended",
+    "succeeded", "failed", "cancelled",
 }
-_TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
+_TERMINAL_JOB_STATES = {"suspended", "succeeded", "failed", "cancelled"}
+_JOB_ACTION_IDEMPOTENCY_SCHEMA = 1
+_JOB_ACTION_IDEMPOTENCY_MAX_BYTES = 4 * 1024
+_JOB_INTERRUPT_INTENT_SCHEMA = 1
 
 # Results endpoints must remain bounded even when an S3 prefix or local results
 # directory contains unexpectedly many files.  Listing has a higher ceiling;
@@ -266,6 +274,18 @@ class RecoveryJobRequest(BaseModel):
     ttl_seconds: int | None = Field(default=None, ge=300, le=2_592_000)
 
 
+class ResumeJobRequest(BaseModel):
+    """One-click continuation of one verified suspended checkpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resume_generation: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+
+
 def _acquire_result_operation(
     admission: _ResultOperationAdmission,
     *,
@@ -335,6 +355,302 @@ def _specs_dir(mgr) -> Path:
     return secure_state_directory(
         Path(mgr.config.registry.path).expanduser().with_name("specs")
     )
+
+
+def _job_actions_dir(mgr) -> Path:
+    """Private durable identities for non-creating Job actions."""
+
+    return secure_state_directory(
+        Path(mgr.config.registry.path).expanduser().with_name("job-actions")
+    )
+
+
+def _manager_job_action_lock(mgr) -> asyncio.Lock:
+    """Return the one action transaction lock owned by this Manager.
+
+    The lock covers the authoritative journal scan and the interrupt-intent
+    commit.  Creating it under a synchronous guard avoids two first requests
+    installing different locks before either one reaches its first await.
+    """
+
+    with _job_action_locks_guard:
+        lock = getattr(mgr, "_api_job_action_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(mgr, "_api_job_action_lock", lock)
+        if not isinstance(lock, asyncio.Lock):
+            raise RuntimeError("Manager Job action lock is invalid")
+        return lock
+
+
+async def _settle_owned_job_action(action):
+    """Let an authoritative action settle even if its HTTP caller disconnects.
+
+    ``asyncio.shield`` alone is insufficient because it immediately unwinds
+    the surrounding transaction lock.  This helper remembers caller
+    cancellation, keeps awaiting the owned task, and hands the cancellation
+    back only after the caller has verified the resulting journal.
+    """
+
+    task = asyncio.create_task(action)
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            return result, cancellation
+        except asyncio.CancelledError as exc:
+            if task.done():
+                if task.cancelled():
+                    if cancellation is not None:
+                        raise cancellation
+                    raise
+                # The caller's cancellation can race with a successful owned
+                # commit.  Preserve that result so the endpoint can verify the
+                # journal and publish its rebuildable cache before handing
+                # cancellation back to the HTTP stack.
+                try:
+                    return task.result(), cancellation or exc
+                except Exception:
+                    logger.exception(
+                        "owned Job action failed as its HTTP caller cancelled"
+                    )
+                    raise cancellation or exc
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            if cancellation is not None:
+                logger.exception(
+                    "owned Job action failed after its HTTP caller cancelled"
+                )
+                raise cancellation
+            raise
+
+
+def _normalize_idempotency_key(
+    value: str | None,
+    *,
+    required: bool = False,
+) -> str | None:
+    if value is None:
+        if required:
+            raise HTTPException(400, "Idempotency-Key is required")
+        return None
+    value = value.strip()
+    if not value or len(value) > 200 or any(
+        ord(char) < 0x20 for char in value
+    ):
+        raise HTTPException(400, "invalid Idempotency-Key")
+    return value
+
+
+def _job_action_index_path(
+    mgr,
+    *,
+    operation: str,
+    digest: str,
+) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("invalid Job action digest")
+    return _job_actions_dir(mgr) / f"{operation}-{digest}.json"
+
+
+def _read_job_action_index(
+    mgr,
+    *,
+    operation: str,
+    digest: str,
+) -> str | None:
+    """Read the optional digest→Job cache without treating it as authority."""
+
+    path = _job_action_index_path(
+        mgr,
+        operation=operation,
+        digest=digest,
+    )
+    if not (path.exists() or path.is_symlink()):
+        return None
+    try:
+        payload, _consumed = _read_bounded_json_file(
+            path,
+            max_bytes=_JOB_ACTION_IDEMPOTENCY_MAX_BYTES,
+        )
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RecursionError,
+        RuntimeError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            500,
+            "persisted Job action index is unavailable",
+        ) from exc
+    expected = {
+        "schema": _JOB_ACTION_IDEMPOTENCY_SCHEMA,
+        "operation": operation,
+        "key_digest": digest,
+    }
+    if not isinstance(payload.get("job_id"), str):
+        raise HTTPException(500, "persisted Job action index is invalid")
+    comparable = {key: payload.get(key) for key in expected}
+    if not hmac.compare_digest(
+        json.dumps(
+            comparable,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        json.dumps(
+            expected,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+    ):
+        raise HTTPException(500, "persisted Job action index is invalid")
+    owner = payload["job_id"]
+    if _SAFE_JOB_ID.fullmatch(owner) is None:
+        raise HTTPException(500, "persisted Job action index is invalid")
+    return owner
+
+
+def _write_job_action_index(
+    mgr,
+    *,
+    operation: str,
+    digest: str,
+    job_id: str,
+) -> None:
+    """Publish a rebuildable cache only after the Job journal is authoritative."""
+
+    path = _job_action_index_path(
+        mgr,
+        operation=operation,
+        digest=digest,
+    )
+    expected = {
+        "schema": _JOB_ACTION_IDEMPOTENCY_SCHEMA,
+        "operation": operation,
+        "key_digest": digest,
+        "job_id": job_id,
+    }
+    atomic_write_private(
+        path,
+        json.dumps(expected, ensure_ascii=False, indent=2),
+    )
+
+
+def _authoritative_interrupt_digest(payload: dict) -> str | None:
+    """Read the private digest only when its atomic intent is committed."""
+
+    intent = payload.get("interrupt_intent")
+    if intent is None:
+        return None
+    if not isinstance(intent, dict):
+        raise ValueError("invalid persisted interrupt intent")
+    digest = intent.get("idempotency_digest")
+    if (
+        intent.get("schema") != _JOB_INTERRUPT_INTENT_SCHEMA
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise ValueError("invalid persisted interrupt intent")
+    summary = payload.get("terminal_summary")
+    state = payload.get("submission_state")
+    if (
+        not isinstance(summary, dict)
+        or summary.get("interrupt_requested") is not True
+        or (
+            state == "suspending"
+            and summary.get("state") != "suspending"
+        )
+        or state not in {
+            "suspending",
+            "suspended",
+            "failed",
+            "cancelled",
+        }
+    ):
+        raise ValueError("interrupt intent is not bound to a durable state")
+    return digest
+
+
+def _read_interrupt_intent_index(mgr) -> dict[str, str]:
+    """Rebuild the authority index from the current private Job journals.
+
+    Sidecars are written after the atomic journal commit, so a Manager can
+    crash or an HTTP coroutine can be cancelled with a committed intent but no
+    sidecar.  A loaded-once cache is therefore unsafe: every action transaction
+    fully validates every individually bounded journal and only then replaces
+    the non-authoritative memory cache.
+
+    There is intentionally no total-file cutoff.  A fixed journal-count limit
+    would permanently make interrupts unavailable once enough historical Jobs
+    exist.  Each individual journal read remains bounded.
+    """
+
+    directory = _specs_dir(mgr)
+    index: dict[str, str] = {}
+    try:
+        entries = os.scandir(directory)
+    except FileNotFoundError:
+        setattr(mgr, "_api_interrupt_intent_index", {})
+        return {}
+    with entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            job_id = entry.name[:-5]
+            if _SAFE_JOB_ID.fullmatch(job_id) is None:
+                continue
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size < 1
+                    or metadata.st_size > JOB_JOURNAL_MAX_BYTES
+                ):
+                    raise ValueError(
+                        f"unsafe Job journal while indexing {job_id!r}"
+                    )
+                # This scan is the idempotency authority, not a best-effort
+                # history listing.  Parse every validly named journal so a
+                # malformed/unreadable file cannot conceal a committed digest
+                # and permit the same key to bind a second Job.
+                payload = _read_job_journal(
+                    Path(entry.path),
+                    job_id,
+                )
+            except (
+                json.JSONDecodeError,
+                OSError,
+                RecursionError,
+                RuntimeError,
+                UnicodeDecodeError,
+                ValueError,
+            ) as exc:
+                raise RuntimeError(
+                    f"cannot verify interrupt identity journal {job_id!r}"
+                ) from exc
+            authoritative = _authoritative_interrupt_digest(payload)
+            if authoritative is None:
+                continue
+            previous = index.get(authoritative)
+            if previous is not None and previous != job_id:
+                raise ValueError(
+                    "interrupt Idempotency-Key is bound to multiple Jobs"
+                )
+            index[authoritative] = job_id
+    setattr(mgr, "_api_interrupt_intent_index", index)
+    return index
+
+
+def _load_interrupt_journal_optional(mgr, job_id: str) -> dict | None:
+    path = _job_spec_path(mgr, job_id)
+    if not _job_journal_exists(path):
+        return None
+    return _read_job_journal(path, job_id)
 
 
 def _validate_job_id(job_id: str) -> str:
@@ -591,6 +907,129 @@ def _journal_state(payload: dict) -> str:
     return state if state in _PERSISTED_JOB_STATES else "unknown"
 
 
+def _recovery_source_job_id(spec: JobSpec | dict | None) -> str | None:
+    """Return the direct checkpoint source without exposing any other spec."""
+
+    if isinstance(spec, JobSpec):
+        recovery = spec.recovery
+        if recovery.policy != "checkpoint":
+            return None
+        source = recovery.source_job_id
+    elif isinstance(spec, dict):
+        recovery = spec.get("recovery")
+        if (
+            not isinstance(recovery, dict)
+            or recovery.get("policy") != "checkpoint"
+        ):
+            return None
+        source = recovery.get("source_job_id")
+    else:
+        return None
+    if not isinstance(source, str) or _SAFE_JOB_ID.fullmatch(source) is None:
+        return None
+    return source
+
+
+def _lineage_fields(
+    job_id: str,
+    spec: JobSpec | dict | None,
+    metadata: dict | None = None,
+) -> dict:
+    """Project a compact, non-secret direct recovery lineage.
+
+    Newer journals may carry an exact root/attempt calculated by the lifecycle
+    layer. Direct recovery lineage remains derivable from JobSpec for rolling
+    upgrades and old records.
+    """
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source = metadata.get("resumed_from_job_id")
+    if not isinstance(source, str) or _SAFE_JOB_ID.fullmatch(source) is None:
+        source = _recovery_source_job_id(spec)
+    root = metadata.get("root_job_id")
+    if not isinstance(root, str) or _SAFE_JOB_ID.fullmatch(root) is None:
+        root = source or job_id
+    raw_attempt = metadata.get("attempt_no")
+    try:
+        attempt = int(raw_attempt)
+    except (TypeError, ValueError):
+        attempt = 2 if source else 1
+    if attempt < 1 or attempt > 1_000_000:
+        attempt = 2 if source else 1
+    return {
+        "source_job_id": source,
+        "resumed_from_job_id": source,
+        "root_job_id": root,
+        "attempt_no": attempt,
+    }
+
+
+def _verified_resume_fields(
+    *,
+    state: str,
+    cleanup_pending: int,
+    latest_generation: object,
+    latest_committed_at: object,
+    metadata: dict | None,
+) -> dict:
+    """Fail closed unless the suspended snapshot and local pointer agree."""
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    generation = metadata.get("resume_generation")
+    if not isinstance(generation, str) or (
+        _SAFE_RESUME_GENERATION.fullmatch(generation) is None
+    ):
+        generation = None
+    latest = latest_generation if isinstance(latest_generation, str) else None
+    committed_at = metadata.get("resume_committed_at")
+    if not isinstance(committed_at, str) or not committed_at:
+        committed_at = None
+    latest_commit = (
+        latest_committed_at
+        if isinstance(latest_committed_at, str)
+        else None
+    )
+    available = bool(
+        state == "suspended"
+        and metadata.get("state") == "suspended"
+        and metadata.get("done") is True
+        and cleanup_pending == 0
+        and metadata.get("resume_available") is True
+        and generation
+        and latest == generation
+        and committed_at
+        and latest_commit == committed_at
+    )
+    return {
+        "resume_available": available,
+        "resume_generation": generation,
+        "resume_committed_at": committed_at,
+        "suspend_warning": metadata.get("suspend_warning"),
+        "interrupt_requested": bool(metadata.get("interrupt_requested")),
+        "interrupt_reason": metadata.get("interrupt_reason"),
+    }
+
+
+def _verified_checkpoint_recovery_available(
+    *,
+    state: str,
+    done: bool,
+    cleanup_pending: int,
+    latest_generation: object,
+    advertised: bool,
+) -> bool:
+    """Expose manual recovery only for a quiescent, pinned terminal source."""
+
+    return bool(
+        advertised
+        and state in {"succeeded", "failed", "cancelled"}
+        and done
+        and cleanup_pending == 0
+        and isinstance(latest_generation, str)
+        and _SAFE_RESUME_GENERATION.fullmatch(latest_generation) is not None
+    )
+
+
 def _persisted_job_view(
     job_id: str,
     payload: dict,
@@ -684,12 +1123,47 @@ def _persisted_job_view(
         raw_spec.get("collect")
         if isinstance(raw_spec, dict) else None
     )
-    checkpoint_recovery_available = bool(
+    checkpoint_recovery_advertised = bool(
         payload.get("checkpoint_recovery_available") is True
         or (
             isinstance(raw_collect, dict)
             and raw_collect.get("checkpoint") is True
         )
+    )
+    latest_checkpoint_generation = payload.get(
+        "latest_checkpoint_generation"
+    ) or terminal_summary.get("latest_checkpoint_generation")
+    done = terminal and cleanup_pending == 0
+    checkpoint_recovery_available = (
+        _verified_checkpoint_recovery_available(
+            state=state,
+            done=done,
+            cleanup_pending=cleanup_pending,
+            latest_generation=latest_checkpoint_generation,
+            advertised=checkpoint_recovery_advertised,
+        )
+    )
+    lineage_metadata = payload.get("lineage")
+    if not isinstance(lineage_metadata, dict):
+        lineage_metadata = {}
+    lineage_metadata = {
+        **lineage_metadata,
+        **{
+            key: terminal_summary[key]
+            for key in (
+                "resumed_from_job_id",
+                "root_job_id",
+                "attempt_no",
+            )
+            if key in terminal_summary
+        },
+    }
+    resume = _verified_resume_fields(
+        state=state,
+        cleanup_pending=cleanup_pending,
+        latest_generation=latest_checkpoint_generation,
+        latest_committed_at=payload.get("checkpoint_committed_at"),
+        metadata=terminal_summary,
     )
 
     view = {
@@ -699,7 +1173,7 @@ def _persisted_job_view(
         "phases": terminal_summary.get("phases", {}),
         "state": state,
         "submission_state": submission_state,
-        "done": terminal and cleanup_pending == 0,
+        "done": done,
         "cleanup_pending": cleanup_pending,
         "error": "; ".join(errors) or None,
         "cancel_requested": bool(terminal_summary.get("cancel_requested")),
@@ -711,10 +1185,14 @@ def _persisted_job_view(
         # checkpoint's committed_at timestamp.  A terminal summary can be
         # written later from a stale in-memory snapshot, so it is only a
         # compatibility fallback for journals that predate that pointer.
-        "latest_checkpoint_generation": payload.get(
-            "latest_checkpoint_generation"
-        ) or terminal_summary.get("latest_checkpoint_generation"),
+        "latest_checkpoint_generation": latest_checkpoint_generation,
         "checkpoint_recovery_available": checkpoint_recovery_available,
+        **resume,
+        **_lineage_fields(
+            job_id,
+            raw_spec,
+            lineage_metadata,
+        ),
         "in_memory": False,
         "workers_detail": terminal_workers,
         "recovery_leases": [lease.model_dump() for lease in recovered],
@@ -1130,6 +1608,31 @@ def _job_detail(
             for assignment in job.pending_cleanup.values()
         ],
     }
+    detail.update(_lineage_fields(job.job_id, job.spec, summary))
+    detail["checkpoint_recovery_available"] = (
+        _verified_checkpoint_recovery_available(
+            state=str(detail.get("state") or ""),
+            done=detail.get("done") is True,
+            cleanup_pending=int(detail.get("cleanup_pending") or 0),
+            latest_generation=detail.get(
+                "latest_checkpoint_generation"
+            ),
+            advertised=(
+                detail.get("checkpoint_recovery_available") is True
+            ),
+        )
+    )
+    detail.update(_verified_resume_fields(
+        state=str(detail.get("state") or ""),
+        cleanup_pending=int(detail.get("cleanup_pending") or 0),
+        latest_generation=detail.get("latest_checkpoint_generation"),
+        latest_committed_at=getattr(
+            job,
+            "latest_checkpoint_committed_at",
+            None,
+        ),
+        metadata=summary,
+    ))
     if include_spec:
         detail["spec"] = _redacted_spec(job.spec)
     return detail
@@ -1735,12 +2238,7 @@ async def _submit_job_payload(
         raise HTTPException(422, "invalid Job JSON request body") from exc
 
     mgr = _mgr()
-    if idempotency_key is not None:
-        idempotency_key = idempotency_key.strip()
-        if not idempotency_key or len(idempotency_key) > 200 or any(
-            ord(char) < 0x20 for char in idempotency_key
-        ):
-            raise HTTPException(400, "invalid Idempotency-Key")
+    idempotency_key = _normalize_idempotency_key(idempotency_key)
 
     # Unkeyed submissions have no shared identity to serialize. Keep their
     # potentially slow account/model/capacity probes outside the idempotency
@@ -2008,6 +2506,97 @@ def _checkpoint_recovery_request_identity(
     }
 
 
+def _build_suspended_resume_spec(
+    source_job_id: str,
+    source_payload: dict,
+    request: ResumeJobRequest,
+) -> dict[str, object]:
+    """Build a continuation only from the exact verified suspend generation."""
+
+    terminal_summary = source_payload.get("terminal_summary")
+    if not isinstance(terminal_summary, dict):
+        terminal_summary = {}
+    state = source_payload.get("submission_state")
+    latest_generation = source_payload.get(
+        "latest_checkpoint_generation"
+    ) or terminal_summary.get("latest_checkpoint_generation")
+    resume = _verified_resume_fields(
+        state=str(state or ""),
+        cleanup_pending=int(terminal_summary.get("cleanup_pending") or 0),
+        latest_generation=latest_generation,
+        latest_committed_at=source_payload.get("checkpoint_committed_at"),
+        metadata=terminal_summary,
+    )
+    if state != "suspended":
+        raise HTTPException(
+            409,
+            f"source Job {source_job_id} is not suspended",
+        )
+    if not resume["resume_available"]:
+        raise HTTPException(
+            409,
+            "source Job has no verified resumable checkpoint",
+        )
+    if not hmac.compare_digest(
+        request.resume_generation,
+        str(resume["resume_generation"]),
+    ):
+        raise HTTPException(
+            409,
+            "resume_generation does not match the source Job's verified "
+            "suspend generation",
+        )
+    try:
+        source_spec = JobSpec.model_validate(source_payload["spec"])
+    except (
+        KeyError,
+        RecursionError,
+        TypeError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            422,
+            "persisted source JobSpec is incompatible with suspended resume",
+        ) from exc
+    resume_command = source_spec.run.resume_command
+    if not isinstance(resume_command, str) or not resume_command.strip():
+        raise HTTPException(
+            422,
+            "source Job did not configure run.resume_command; it cannot be "
+            "resumed automatically",
+        )
+    recovery_request = RecoveryJobRequest(
+        source_job_id=source_job_id,
+        generation=request.resume_generation,
+        run=RecoveryRunOverrides(command=resume_command),
+    )
+    target = _build_checkpoint_recovery_spec(
+        source_job_id,
+        source_payload,
+        recovery_request,
+    )
+    # The resumed attempt's base command is already the application's complete
+    # resume command. A later credential rotation must rerun that same base,
+    # not append the source attempt's legacy resume_args a second time.
+    rotation = target.get("rotation")
+    if isinstance(rotation, dict):
+        rotation["resume_args"] = ""
+    return target
+
+
+def _suspended_resume_request_identity(
+    source_job_id: str,
+    request: ResumeJobRequest,
+) -> dict[str, object]:
+    return {
+        "request_kind": "suspended-job-resume",
+        "schema_version": 1,
+        "source_job_id": source_job_id,
+        "resume_generation": request.resume_generation,
+    }
+
+
 @router.post("/jobs/recover", status_code=201)
 async def create_recovery_job(
     request: RecoveryJobRequest,
@@ -2046,6 +2635,285 @@ async def create_recovery_job(
         identity_request=identity_request,
         raw_request_factory=build_target,
     )
+
+
+@router.post("/jobs/{job_id}/resume", status_code=201)
+async def resume_suspended_job(
+    job_id: str,
+    request: ResumeJobRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key"
+    ),
+) -> dict:
+    """Create a new attempt from one exact, verified suspend checkpoint."""
+
+    source_job_id = _validate_job_id(job_id)
+    idempotency_key = _normalize_idempotency_key(
+        idempotency_key,
+        required=True,
+    )
+    assert idempotency_key is not None
+    mgr = _mgr()
+    identity_request = _suspended_resume_request_identity(
+        source_job_id,
+        request,
+    )
+
+    async def build_target() -> dict[str, object]:
+        source_payload = await _load_private_recovery_source(
+            mgr,
+            source_job_id,
+        )
+        return _build_suspended_resume_spec(
+            source_job_id,
+            source_payload,
+            request,
+        )
+
+    return await _submit_job_payload(
+        None,
+        idempotency_key,
+        identity_request=identity_request,
+        raw_request_factory=build_target,
+    )
+
+
+@router.post("/jobs/{job_id}/interrupt", status_code=202)
+async def interrupt_job(
+    job_id: str,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key"
+    ),
+) -> dict:
+    """Start a durable graceful interrupt and return after intent persistence."""
+
+    job_id = _validate_job_id(job_id)
+    idempotency_key = _normalize_idempotency_key(
+        idempotency_key,
+        required=True,
+    )
+    assert idempotency_key is not None
+    idempotency_digest = hashlib.sha256(
+        idempotency_key.encode("utf-8")
+    ).hexdigest()
+    mgr = _mgr()
+    job = mgr.batch.get_job(job_id)
+    request_cancellation: asyncio.CancelledError | None = None
+    start_interrupt = getattr(mgr.batch, "start_interrupt_job", None)
+    if job is not None and not callable(start_interrupt):
+        raise HTTPException(
+            503,
+            "graceful Job interruption is unavailable on this Manager",
+        )
+
+    async with _manager_job_action_lock(mgr):
+        try:
+            target_payload = await asyncio.to_thread(
+                _load_interrupt_journal_optional,
+                mgr,
+                job_id,
+            )
+            target_digest = (
+                _authoritative_interrupt_digest(target_payload)
+                if target_payload is not None
+                else None
+            )
+            try:
+                sidecar_owner = await asyncio.to_thread(
+                    _read_job_action_index,
+                    mgr,
+                    operation="interrupt",
+                    digest=idempotency_digest,
+                )
+            except (
+                HTTPException,
+                json.JSONDecodeError,
+                OSError,
+                RecursionError,
+                RuntimeError,
+                UnicodeDecodeError,
+                ValueError,
+            ):
+                # This file is only a rebuildable accelerator.  A malformed,
+                # stale, or unreadable cache must never override a valid Job
+                # journal or make an exact authoritative replay unavailable.
+                sidecar_owner = None
+            authoritative_owners: set[str] = set()
+
+            if target_digest is not None:
+                if not hmac.compare_digest(
+                    target_digest,
+                    idempotency_digest,
+                ):
+                    raise HTTPException(
+                        409,
+                        "Job interrupt is already bound to another "
+                        "Idempotency-Key",
+                    )
+                authoritative_owners.add(job_id)
+
+            intent_index = await asyncio.to_thread(
+                _read_interrupt_intent_index,
+                mgr,
+            )
+            indexed_owner = intent_index.get(idempotency_digest)
+            if indexed_owner is not None:
+                authoritative_owners.add(indexed_owner)
+            if len(authoritative_owners) > 1:
+                raise HTTPException(
+                    503,
+                    "interrupt Idempotency-Key has conflicting authoritative "
+                    "Job journals",
+                )
+            authoritative_owner = next(
+                iter(authoritative_owners),
+                None,
+            )
+            if authoritative_owner is not None and authoritative_owner != job_id:
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key was already used for another Job action",
+                )
+        except HTTPException:
+            raise
+        except (
+            json.JSONDecodeError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(
+                503,
+                "interrupt request identity cannot be verified safely",
+            ) from exc
+
+        replay = target_digest == idempotency_digest
+        if job is not None:
+            assert callable(start_interrupt)
+            pending_digest = str(
+                getattr(job, "interrupt_idempotency_digest", "") or ""
+            )
+            if pending_digest and not hmac.compare_digest(
+                pending_digest,
+                idempotency_digest,
+            ):
+                raise HTTPException(
+                    409,
+                    "Job interrupt is already bound to another "
+                    "Idempotency-Key",
+                )
+            try:
+                (
+                    interrupted,
+                    request_cancellation,
+                ) = await _settle_owned_job_action(
+                    start_interrupt(
+                        job_id,
+                        reason="interrupted by administrator",
+                        idempotency_digest=idempotency_digest,
+                    )
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            committed_payload = await asyncio.to_thread(
+                _load_interrupt_journal_optional,
+                mgr,
+                job_id,
+            )
+            committed_digest = (
+                _authoritative_interrupt_digest(committed_payload)
+                if committed_payload is not None
+                else None
+            )
+            if (
+                committed_digest is None
+                or not hmac.compare_digest(
+                    committed_digest,
+                    idempotency_digest,
+                )
+            ):
+                raise HTTPException(
+                    500,
+                    "interrupt intent was not committed atomically",
+                )
+            target_payload = committed_payload
+        else:
+            interrupted = None
+            if not replay:
+                if sidecar_owner is not None:
+                    raise HTTPException(
+                        409,
+                        "interrupt action cache exists, but the Job journal "
+                        "does not contain a committed interrupt intent",
+                    )
+                if target_payload is None:
+                    raise HTTPException(
+                        404,
+                        f"Job {job_id} not found or no longer live",
+                    )
+                raise HTTPException(
+                    409,
+                    "Job has no committed interrupt request for this "
+                    "Idempotency-Key",
+                )
+
+        intent_index[idempotency_digest] = job_id
+        try:
+            await asyncio.to_thread(
+                _write_job_action_index,
+                mgr,
+                operation="interrupt",
+                digest=idempotency_digest,
+                job_id=job_id,
+            )
+        except (
+            json.JSONDecodeError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
+            # The atomic Job journal is already authoritative.  Cache
+            # publication failure is recoverable by the next full scan and
+            # must not turn an accepted interrupt into an HTTP failure.
+            logger.warning(
+                "could not publish rebuildable interrupt action cache for %s",
+                job_id,
+                exc_info=True,
+            )
+        if request_cancellation is not None:
+            raise request_cancellation
+
+    if job is None:
+        assert target_payload is not None
+        leases = await mgr.account_binding_store.list_leases(
+            job_ids={job_id},
+            limit=JOB_DETAIL_MAX_RECOVERY_LEASES + 1,
+        )
+        detail = _persisted_job_view(
+            job_id,
+            target_payload,
+            leases[:JOB_DETAIL_MAX_RECOVERY_LEASES],
+            include_spec=True,
+            recovery_leases_truncated=(
+                len(leases) > JOB_DETAIL_MAX_RECOVERY_LEASES
+            ),
+        )
+        detail["idempotent_replay"] = True
+        return detail
+
+    if interrupted is None:
+        raise HTTPException(
+            409,
+            f"Job {job_id} could not enter graceful interruption",
+        )
+    detail = _job_detail(interrupted)
+    if replay:
+        detail["idempotent_replay"] = True
+    return detail
 
 
 @router.post("/jobs/{job_id}/cancel")

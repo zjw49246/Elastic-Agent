@@ -2059,14 +2059,28 @@ class WorkerRuntime:
             except Exception:
                 logger.exception("Failed to stop PTY task %s", msg.task_id)
             return
-        await self._stop_process(msg.task_id, sig_name)
+        await self._stop_process(
+            msg.task_id,
+            sig_name,
+            scope=msg.scope,
+            escalate=msg.escalate,
+        )
 
-    async def _stop_process(self, task_id: str, sig_name: str) -> None:
+    async def _stop_process(
+        self,
+        task_id: str,
+        sig_name: str,
+        *,
+        scope: str = "group",
+        escalate: bool = True,
+    ) -> None:
         if task_id in self._supervised_tasks:
             try:
                 await self._task_supervisor.signal(
                     task_id,
                     signal_name=sig_name,
+                    scope=scope,
+                    escalate=escalate,
                 )
             except Exception as exc:
                 logger.error(
@@ -2091,6 +2105,8 @@ class WorkerRuntime:
                 task_id,
                 proc,
                 initial_signal=sig,
+                scope=scope,
+                escalate=escalate,
             )
             return
 
@@ -2107,6 +2123,8 @@ class WorkerRuntime:
                 )
             except ProcessLookupError:
                 return
+        if not escalate:
+            return
         if sig == signal.SIGKILL or await self._wait_process_exit(proc, 10):
             return
         try:
@@ -2152,6 +2170,8 @@ class WorkerRuntime:
         proc: asyncio.subprocess.Process,
         *,
         initial_signal: signal.Signals,
+        scope: str = "group",
+        escalate: bool = True,
     ) -> None:
         """Terminate exactly the POSIX group created for ``task_id``.
 
@@ -2175,6 +2195,7 @@ class WorkerRuntime:
         async with lock:
             if not self._process_group_exists(pgid):
                 return
+            leader_verified = False
             if proc.returncode is None:
                 try:
                     if os.getpgid(proc.pid) != pgid:
@@ -2185,18 +2206,34 @@ class WorkerRuntime:
                             task_id,
                         )
                         return
+                    leader_verified = True
                 except ProcessLookupError:
                     # The leader exited between returncode observation and the
                     # check. Any remaining members still reserve this pgid.
-                    pass
+                    if scope == "process":
+                        return
+            elif scope == "process":
+                # Never send a process-scoped signal to a numeric PID after its
+                # owned Process object became terminal; the PID may be reused
+                # while descendants still retain the original process group.
+                return
 
-            async def send(sig: signal.Signals) -> bool:
+            async def send(
+                sig: signal.Signals,
+                target: str = "group",
+            ) -> bool:
                 try:
-                    os.killpg(pgid, sig)
+                    if target == "process":
+                        if not leader_verified:
+                            return False
+                        os.kill(proc.pid, sig)
+                    else:
+                        os.killpg(pgid, sig)
                     logger.info(
-                        "Sent %s to task %s process group %d",
+                        "Sent %s to task %s %s %d",
                         sig.name,
                         task_id,
+                        target,
                         pgid,
                     )
                     return True
@@ -2211,7 +2248,9 @@ class WorkerRuntime:
                     )
                     return False
 
-            if not await send(initial_signal):
+            if not await send(initial_signal, scope):
+                return
+            if not escalate:
                 return
             first_grace = 5.0 if initial_signal == signal.SIGKILL else 10.0
             if await self._wait_process_group_exit(pgid, first_grace):

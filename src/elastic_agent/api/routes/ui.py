@@ -492,8 +492,11 @@ _BATCH_HTML = """\
   .b-failed { background:rgba(239,68,68,.2); color:var(--red); }
   .b-rotating { background:rgba(249,115,22,.2); color:var(--orange); }
   .b-pending, .b-preparing, .b-provisioning, .b-bootstrapping, .b-logging_in,
-  .b-recovered, .b-interrupted { background:rgba(100,116,139,.14); color:var(--muted); }
+  .b-recovered, .b-interrupted, .b-suspending {
+    background:rgba(100,116,139,.14); color:var(--muted);
+  }
   .b-succeeded { background:rgba(34,197,94,.16); color:var(--green); }
+  .b-suspended { background:rgba(249,115,22,.18); color:var(--orange); }
   .b-cancelled { background:rgba(100,116,139,.14); color:var(--muted); }
   .muted { color:var(--muted); font-size:.8rem; }
   .toast { position:fixed; bottom:20px; right:20px; background:var(--surface);
@@ -976,8 +979,25 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       <p class="section-intro">这是每台 Worker 真正执行的命令。模板变量会在分发时解析，Shell 变量留给 Worker。</p>
       <div class="field"><label for="jRun">运行命令<span class="required-mark">必填</span> <span class="field-code">run.command</span></label>
         <textarea id="jRun" class="textarea-command" required aria-describedby="jRunHelp"
+                  oninput="updateResumeCommandSuggestion()"
                   placeholder='uv run ai4sci-bench run --output-dir "results/opus48_shard-{{shard_id}}_seed128"'></textarea>
         <div class="field-help" id="jRunHelp">支持稳定的 Manager 模板 <code>{{shard_id}}</code>/<code>{{shard_index}}</code>/<code>{{num_shards}}</code>。启用 checkpoint 时禁止 hostname 派生路径，因为替换 Worker 的 hostname 会变化。</div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label for="jRunResumeCommand">中断后续跑命令 <span class="field-code">run.resume_command</span></label>
+        <textarea id="jRunResumeCommand" class="textarea-compact"
+                  aria-describedby="jRunResumeCommandHelp"
+                  oninput="markResumeCommandTouched()"
+                  placeholder='与运行命令使用相同 --output-dir，并追加 --resume "<同一目录>"'></textarea>
+        <div class="field-help" id="jRunResumeCommandHelp">
+          只有配置此命令且发布了完整原子检查点，Job 中断完成后才会开放“一键续跑”。
+          AI4Sci Bench 命令包含稳定 <code>--output-dir</code> 时会自动生成同目录的
+          <code>--resume &lt;output-dir&gt;</code> 命令，你仍可手工修改。
+        </div>
+        <button type="button" class="btn btn-ghost" id="jAi4SciRecoveryPreset"
+                style="margin-top:7px" onclick="applyAi4SciRecoveryPreset()">
+          应用 AI4Sci 长任务可恢复预设
+        </button>
       </div>
       <div class="form-grid" style="margin-top:10px">
         <div class="field"><label for="jCwd">命令工作目录 <span class="field-code">run.cwd</span></label>
@@ -1184,6 +1204,7 @@ const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'a
                         : {'Content-Type':'application/json'};
 {const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet';}
 let eipBindingTouched = false;
+let resumeCommandTouched = false;
 let providerType = '';
 let providerDefaultsReady;
 let latestJobs = [];
@@ -2027,14 +2048,78 @@ function updateSourceUI() {
     : '当前未填写 Repo，分支、标签和 Commit SHA 不会生效；'
       + 'AI4Sci Bench 填写 Repo 后默认走已锁定归档分支。';
 }
+function ai4sciResumeCommand(command) {
+  const value = String(command || '').trim();
+  if (
+    !/\\bai4sci-bench\\s+(?:run|batch-run|codex-run|codex-replay-run)\\b/
+      .test(value)
+  ) return '';
+  const output = value.match(
+    /(?:^|\\s)--output-dir(?:=|\\s+)("[^"]+"|'[^']+'|[^\\s]+)/
+  );
+  const outputToken = output && output[1];
+  const outputDir = outputToken
+    && /^(['"]).*\\1$/.test(outputToken)
+    ? outputToken.slice(1, -1)
+    : outputToken;
+  if (!outputDir || /\\{\\{\\s*hostname\\s*\\}\\}/.test(outputDir)) return '';
+  if (
+    /(?:^|\\s)--resume(?:=|\\s+)("[^"]+"|'[^']+'|(?!-)[^\\s]+)/.test(value)
+  ) return value;
+  if (/(?:^|\\s)--resume(?=\\s|$)/.test(value)) {
+    return value.replace(
+      /(^|\\s)--resume(?=\\s|$)/,
+      (_match, prefix) => `${prefix}--resume ${outputToken}`
+    );
+  }
+  return value + ' --resume ' + outputToken;
+}
+function updateResumeCommandSuggestion() {
+  if (resumeCommandTouched) return;
+  const target = document.getElementById('jRunResumeCommand');
+  target.value = ai4sciResumeCommand(
+    document.getElementById('jRun').value
+  );
+  updateCollectUI();
+}
+function markResumeCommandTouched() {
+  resumeCommandTouched = true;
+  updateCollectUI();
+}
+function applyAi4SciRecoveryPreset() {
+  const repo = document.getElementById('jRepo').value.trim();
+  if (repo && !/Agent-AI4Sci-Bench(?:\\.git)?(?:$|[?#])/i.test(repo)) {
+    if (!window.confirm('当前 Repo 看起来不是 Agent-AI4Sci-Bench，仍应用预设？')) {
+      return;
+    }
+  }
+  document.getElementById('jShard').value = 'shard_index';
+  document.getElementById('jCollectCheckpoint').value = 'true';
+  document.getElementById('jCollectInterval').value = '120';
+  const collect = document.getElementById('jCollect');
+  const paths = lines('jCollect');
+  if (!paths.includes('results')) {
+    collect.value = [...paths, 'results'].join('\\n');
+  }
+  resumeCommandTouched = false;
+  updateResumeCommandSuggestion();
+  updateCollectUI();
+  toast('已应用 AI4Sci 可恢复预设；请确认运行命令与续跑命令使用同一 output-dir。');
+}
 function updateCollectUI() {
   const value = parseInt(document.getElementById('jCollectInterval').value) || 0;
   const checkpoint = document.getElementById('jCollectCheckpoint').value === 'true';
+  const hasResumeCommand = Boolean(
+    document.getElementById('jRunResumeCommand').value.trim()
+  );
   document.getElementById('jCollectIntervalHelp').textContent = value > 0
     ? `运行期间每 ${value} 秒收集一次；下载按钮读取最近一次已完成的快照。`
     : '0 表示只在成功、失败或取消时做最终收集。';
   document.getElementById('jCollectCheckpointHelp').textContent = checkpoint
-    ? '每次成功收集都会先校验文件；全部分片齐备后才发布完整 set。相同文件按 SHA-256 去重。'
+    ? '每次成功收集都会先校验文件；全部分片齐备后才发布完整 set。'
+      + (hasResumeCommand
+        ? ' 已配置中断续跑命令，运行中可使用“中断并保存进度”。'
+        : ' 未配置 run.resume_command：仍可手动恢复检查点，但不会开放一键中断续跑。')
     : '当前只维护普通结果副本；它可以下载，但不能作为强校验的自动续跑检查点。';
   document.getElementById('jCheckpointRetention').disabled = !checkpoint;
   if (
@@ -2299,6 +2384,8 @@ function buildJobSpec() {
     environment: {profile: document.getElementById('jProfile').value},
     setup: setup,
     run: {command: document.getElementById('jRun').value.trim(),
+          resume_command:
+            document.getElementById('jRunResumeCommand').value.trim(),
           cwd: document.getElementById('jCwd').value.trim() || '.', env: buildEnv(),
           secret_env: buildSecretEnv(),
           timeout: parseInt(document.getElementById('jRunTimeout').value) || 86400,
@@ -2588,6 +2675,159 @@ async function recoverJob(rawSourceJobId, rawLatestGeneration) {
   }
 }
 
+function newIdempotencyKey() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : String(Date.now()) + '-' + Math.random();
+}
+
+function interruptPendingStorageKey(jobId) {
+  return 'ea_job_interrupt_pending_v1_' + String(jobId || '');
+}
+function hasPendingInterruptRequest(jobId) {
+  try {
+    return Boolean(
+      sessionStorage.getItem(interruptPendingStorageKey(jobId))
+    );
+  } catch(error) {
+    return false;
+  }
+}
+function reconcileInterruptRequestKeys(jobs) {
+  for (const job of jobs || []) {
+    const state = String(job?.state || '').toLowerCase();
+    if (job?.done !== true || !['suspended', 'failed'].includes(state)) continue;
+    try {
+      sessionStorage.removeItem(interruptPendingStorageKey(job.job_id));
+    } catch(error) {
+      // A disabled session store already prevents action submission; rendering
+      // the durable server state must still continue.
+    }
+  }
+}
+
+async function interruptJob(rawJobId) {
+  const jobId = String(rawJobId || '');
+  const pendingKey = interruptPendingStorageKey(jobId);
+  let idempotencyKey = '';
+  try {
+    idempotencyKey = sessionStorage.getItem(pendingKey) || '';
+  } catch(error) {
+    toast('浏览器无法读取中断操作的 Idempotency-Key，已取消操作。', 'error');
+    return;
+  }
+  const retrying = Boolean(idempotencyKey);
+  if (!window.confirm(
+    retrying
+      ? `重试 Job ${jobId} 的同一次中断请求？`
+      : `中断 Job ${jobId} 并保存进度？\\n\\n`
+        + '系统会停止新工作并中断进程组，确认写入静止后尝试发布完整检查点，'
+        + '然后销毁 Worker。提交失败时会回退到上一个完整版本；没有旧版本则不可续跑。'
+        + '检查点后未完成的单元会重新执行。'
+  )) return;
+  if (!idempotencyKey) {
+    idempotencyKey = newIdempotencyKey();
+    try {
+      sessionStorage.setItem(pendingKey, idempotencyKey);
+    } catch(error) {
+      toast('浏览器无法保存中断操作的 Idempotency-Key，已取消操作。', 'error');
+      return;
+    }
+  }
+  try {
+    await api(
+      'POST',
+      '/jobs/' + encodeURIComponent(jobId) + '/interrupt',
+      {},
+      {'Idempotency-Key': idempotencyKey}
+    );
+    toast('已开始中断并保存进度：' + jobId + '；重试标识会保留到事务终态。');
+    refreshJobs();
+    refreshAccounts(true);
+  } catch(error) {
+    toast(
+      '中断请求失败：' + (error.message || error)
+      + (Number(error?.status) === 409
+        ? ''
+        : '。结果不确定时再次点击会使用同一 Idempotency-Key 安全重试。'),
+      'error'
+    );
+  }
+}
+
+async function resumeJob(rawSourceJobId, rawResumeGeneration) {
+  const sourceJobId = String(rawSourceJobId || '');
+  const resumeGeneration = String(rawResumeGeneration || '');
+  if (!resumeGeneration) {
+    toast('服务器没有提供已校验的中断检查点，不能一键续跑。', 'error');
+    return;
+  }
+  const pendingKey = 'ea_suspended_resume_pending_v1_' + sourceJobId;
+  let pending = null;
+  try {
+    pending = JSON.parse(sessionStorage.getItem(pendingKey) || 'null');
+  } catch(error) {
+    sessionStorage.removeItem(pendingKey);
+  }
+  if (
+    pending
+    && (
+      pending.source_job_id !== sourceJobId
+      || pending.resume_generation !== resumeGeneration
+    )
+  ) {
+    toast(
+      '这个 Job 的可续跑版本已经变化；请先刷新页面并确认新的检查点。',
+      'error'
+    );
+    return;
+  }
+  if (!pending) {
+    if (!window.confirm(
+      `从 Job ${sourceJobId} 的中断检查点 ${resumeGeneration} 创建新 attempt？\\n\\n`
+      + '已提交的原 Job、日志和配置不会被覆盖；检查点之后尚未发布的工作会重新执行。'
+    )) return;
+    pending = {
+      source_job_id: sourceJobId,
+      resume_generation: resumeGeneration,
+      idempotency_key: newIdempotencyKey(),
+    };
+    try {
+      sessionStorage.setItem(pendingKey, JSON.stringify(pending));
+    } catch(error) {
+      toast('浏览器无法保存续跑操作的 Idempotency-Key，已取消操作。', 'error');
+      return;
+    }
+  } else if (!window.confirm(
+    '检测到一次响应不确定的续跑提交。使用原 Idempotency-Key 安全重试？'
+  )) {
+    return;
+  }
+  try {
+    const resumed = await api(
+      'POST',
+      '/jobs/' + encodeURIComponent(sourceJobId) + '/resume',
+      {resume_generation: pending.resume_generation},
+      {'Idempotency-Key': pending.idempotency_key}
+    );
+    sessionStorage.removeItem(pendingKey);
+    toast('已创建续跑 Job ' + resumed.job_id);
+    refreshJobs();
+    refreshAccounts(true);
+  } catch(error) {
+    if (Number(error?.status) === 409) {
+      sessionStorage.removeItem(pendingKey);
+    }
+    toast(
+      '续跑提交失败：' + (error.message || error)
+      + (Number(error?.status) === 409
+        ? ''
+        : '。结果不确定时再次点击会使用同一 Idempotency-Key 安全重试。'),
+      'error'
+    );
+  }
+}
+
 // ---- Jobs monitor ----
 function badge(p) {
   const label = String(p || 'unknown');
@@ -2623,6 +2863,7 @@ function workerResourceHtml(worker) {
 function jobStateLabel(state) {
   return ({
     preparing:'准备中', prepared:'已准备', launching:'启动中', running:'运行中',
+    suspending:'正在中断并保存', suspended:'已中断，可续跑',
     succeeded:'成功', failed:'失败', cancelled:'已取消', interrupted:'中断',
     recovered:'旧记录', unknown:'状态未知'
   })[String(state || '').toLowerCase()] || String(state || '未知');
@@ -3192,21 +3433,41 @@ function jobRowHtml(j, r) {
     ? r.scores.map(s => `${esc(s.task_id)} ${esc(s.prompt_level)}: <b>${Number(s.final_score||0).toFixed(1)}</b>`).join(' · ')
     : '';
   const dlBtn = jobResultActionHtml(j, r);
-  const cancelBtn = !j.done && j.in_memory !== false
+  const cancelBtn = !j.done && j.in_memory !== false && state !== 'suspending'
     ? `<button class="btn btn-danger" data-job-focus="job-cancel"
         onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
     : '';
-  const recoveryAvailable = Boolean(
-    j.latest_checkpoint_generation
-    || j.checkpoint_recovery_available
-  );
-  const recoveryBtn = recoveryAvailable
+  const interruptRetry = state === 'suspending'
+    && hasPendingInterruptRequest(j.job_id);
+  const interruptBtn = (
+      j.interrupt_available === true || interruptRetry
+    ) && !j.done && j.in_memory !== false
+    ? `<button class="btn btn-ghost" data-job-focus="job-interrupt"
+        title="${interruptRetry
+          ? '使用已保存的 Idempotency-Key 查询或重试同一次中断'
+          : '优雅停止任务，等待写入静止，发布完整检查点后销毁 Worker'}"
+        onclick="interruptJob(${jsArg(j.job_id)})">${interruptRetry
+          ? '↻ 重试同一次中断'
+          : '⏸ 中断并保存进度'}</button>`
+    : '';
+  const resumeAvailable = j.resume_available === true
+    && Boolean(j.resume_generation);
+  const resumeBtn = resumeAvailable
+    ? `<button class="btn" data-job-focus="job-resume"
+        title="从已校验的中断检查点创建一个新的 Job attempt"
+        onclick="resumeJob(${jsArg(j.job_id)},${jsArg(j.resume_generation)})">▶ 一键续跑</button>`
+    : '';
+  const manualRecoveryAvailable = j.checkpoint_recovery_available === true
+    && j.done
+    && !resumeAvailable
+    && ['failed','cancelled','succeeded'].includes(state);
+  const recoveryBtn = manualRecoveryAvailable
     ? `<button class="btn btn-ghost" data-job-focus="job-recover"
         title="服务端复制私有原始配置，并从完整 S3 检查点创建新 Job"
-        onclick="recoverJob(${jsArg(j.job_id)},${jsArg(j.latest_checkpoint_generation || '')})">↻ 从检查点恢复</button>`
+        onclick="recoverJob(${jsArg(j.job_id)},${jsArg(j.latest_checkpoint_generation || '')})">↻ 手动检查点恢复</button>`
     : '';
   const errors = [...new Set([
-    j.error, j.note, j.cancel_reason,
+    j.error, j.note, j.cancel_reason, j.suspend_warning,
     ...wd.map(worker => worker.error),
     ...wd.map(worker => worker.collection_error),
     ...wd.map(worker => worker.cleanup_error),
@@ -3217,6 +3478,11 @@ function jobRowHtml(j, r) {
   const phases = Object.entries(j.phases || {})
     .map(([phase,count]) => badge(phase)+' '+(Number(count)||0)).join(' ');
   const created = formatWhen(j.created_at);
+  const attemptNo = Math.max(1, Number(j.attempt_no) || 1);
+  const resumedFrom = j.resumed_from_job_id || j.source_job_id || '';
+  const lineage = resumedFrom
+    ? ` · attempt ${attemptNo} · 续跑自 ${esc(resumedFrom)}`
+    : ` · attempt ${attemptNo}`;
   return `
   <details id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}"
       data-job-id="${esc(j.job_id)}">
@@ -3227,6 +3493,7 @@ function jobRowHtml(j, r) {
           <span class="job-otp-summary-badge" hidden></span></span>
         <span class="job-summary-meta muted" style="margin-top:5px">${phases || jobStateLabel(state)}
           ${created ? ` · 提交 ${esc(created)}` : ''}
+          ${lineage}
           · ${recordedWorkers} 条 Worker 执行记录</span>
       </span>
       <span class="job-summary-toggle" aria-hidden="true">
@@ -3240,7 +3507,7 @@ function jobRowHtml(j, r) {
         <div class="job-actions">
           <button class="${outputClass}" data-job-focus="job-output"
             onclick="showJobLogs(${jsArg(j.job_id)},'')">${outputLabel}</button>
-          ${dlBtn}${recoveryBtn}${cancelBtn}
+          ${dlBtn}${resumeBtn}${recoveryBtn}${interruptBtn}${cancelBtn}
         </div>
       </div>
       ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
@@ -3256,6 +3523,9 @@ function jobRowHtml(j, r) {
       ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
       ${j.latest_checkpoint_generation
         ? `<div class="muted" style="font-size:.72rem">最新完整 checkpoint set: ${esc(j.latest_checkpoint_generation)}</div>`
+        : ''}
+      ${j.resume_available === true && j.resume_generation
+        ? `<div class="muted" style="font-size:.72rem">已校验续跑 checkpoint: ${esc(j.resume_generation)}</div>`
         : ''}
       ${jobConfigHtml(j)}
       <div class="worker-records-title muted">${recordedWorkers} 条 Worker 执行记录</div>
@@ -3475,6 +3745,7 @@ async function refreshJobs() {
   try {
     const data = await api('GET', '/jobs');
     latestJobs = data.jobs || [];
+    reconcileInterruptRequestKeys(latestJobs);
     const jobs = visibleJobs(latestJobs);
     reconcileJobCards(jobs);
     document.getElementById('jobsRefresh').textContent =

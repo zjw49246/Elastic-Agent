@@ -623,6 +623,49 @@ class TestRenderResumeCommand:
         cmd = spec.render_resume_command(WorkerContext(shard_index=5))
         assert cmd == ["bash", "-lc", "bench --resume out_5"]
 
+    def test_renders_explicit_checkpoint_recovery_command(self):
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(
+                command="bench --out out_{{shard_id}}",
+                resume_command=(
+                    "bench --out out_{{shard_id}} "
+                    "--resume out_{{shard_id}}"
+                ),
+            ),
+        )
+
+        assert spec.render_recovery_command(
+            WorkerContext(shard_index=5),
+        ) == [
+            "bash",
+            "-lc",
+            "bench --out out_00005 --resume out_00005",
+        ]
+
+    def test_checkpoint_recovery_command_is_optional_but_fail_closed_when_used(self):
+        spec = JobSpec(name="j", run=RunSpec(command="bench"))
+
+        with pytest.raises(ValueError, match="run.resume_command"):
+            spec.render_recovery_command(WorkerContext())
+
+    def test_checkpoint_rejects_hostname_derived_recovery_command(self):
+        with pytest.raises(
+            ValidationError,
+            match="hostname-derived workload paths",
+        ):
+            JobSpec(
+                name="j",
+                run=RunSpec(
+                    command="bench --out results/{{shard_id}}",
+                    resume_command=(
+                        "bench --resume results/$(hostname -s)"
+                    ),
+                ),
+                fanout={"shard_by": "shard_index"},
+                collect={"paths": ["results"], "checkpoint": True},
+            )
+
 
 class TestRenderEnv:
     def test_passes_env_through_with_templating(self):
@@ -868,6 +911,7 @@ class TestJobSpecDefaults:
         assert spec.account.login_timeout_seconds == 900
         assert spec.rotation.strategy == "none"
         assert spec.run.shell is True
+        assert spec.run.resume_command == ""
         assert spec.run.timeout == DEFAULT_RUN_TIMEOUT_SECONDS
         assert spec.ttl_seconds == DEFAULT_JOB_TTL_SECONDS
         assert spec.environment.profile == "ubuntu-agent-v1"

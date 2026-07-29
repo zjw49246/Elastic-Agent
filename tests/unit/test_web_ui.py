@@ -102,7 +102,13 @@ class TestDashboardEndpoint:
             "compute": ("jWorkers", "jInstanceType", "jDiskGb"),
             "source": ("jRepo", "jDeliver", "jSetup", "jS3"),
             "account": ("jAcctMode", "jAgentType", "jAcctBinding", "jAcctIds"),
-            "run": ("jRun", "jCwd", "jRunTimeout", "jTtl"),
+            "run": (
+                "jRun",
+                "jRunResumeCommand",
+                "jCwd",
+                "jRunTimeout",
+                "jTtl",
+            ),
             "results": (
                 "jCollect",
                 "jCollectInterval",
@@ -142,6 +148,8 @@ class TestDashboardEndpoint:
             "jNeedsDocker",
             "jS3",
             "jRun",
+            "jRunResumeCommand",
+            "jAi4SciRecoveryPreset",
             "jCwd",
             "jShard",
             "jShell",
@@ -203,6 +211,7 @@ class TestDashboardEndpoint:
             "jName",
             "jProfile",
             "jRun",
+            "jRunResumeCommand",
             "jCwd",
             "jRunTimeout",
             "jShell",
@@ -263,6 +272,8 @@ class TestDashboardEndpoint:
         assert "resume_args: rotationEnabled" in build_spec
         assert "max_rotations: rotationEnabled" in build_spec
         assert "const recoveryEnabled =" in build_spec
+        assert "resume_command:" in build_spec
+        assert "document.getElementById('jRunResumeCommand')" in build_spec
         assert "source_job_id: recoveryEnabled" in build_spec
         assert "generation: recoveryPolicy === 'checkpoint'" in build_spec
         assert "旧 Job 的最终收集（兼容模式）" not in html
@@ -368,6 +379,74 @@ process.stdout.write(JSON.stringify(results));
         assert "其他仓库请改成实际分支或标签" in html
 
     @pytest.mark.asyncio
+    async def test_ai4sci_recovery_preset_uses_stable_output_and_resume_command(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        suggestion = _javascript_function(html, "ai4sciResumeCommand")
+        preset = _javascript_function(html, "applyAi4SciRecoveryPreset")
+
+        results = _run_node_json(
+            suggestion
+            + """
+const commands = [
+  'uv run ai4sci-bench run --output-dir "results/shard-{{shard_id}}"',
+  'uv run ai4sci-bench run --output-dir results/shard-{{shard_index}} --resume',
+  'uv run ai4sci-bench batch-run --agent codex_cli:{} --output-dir results/batch',
+  'uv run ai4sci-bench codex-run --output-dir results/codex',
+  'uv run ai4sci-bench codex-replay-run --output-dir results/replay --replay-resume',
+  'uv run ai4sci-bench run --output-dir "results/{{hostname}}"',
+  'uv run ai4sci-bench list --output-dir results/list',
+  'python other.py --output-dir results/x',
+];
+process.stdout.write(JSON.stringify(commands.map(ai4sciResumeCommand)));
+"""
+        )
+
+        assert results == [
+            (
+                'uv run ai4sci-bench run --output-dir '
+                '"results/shard-{{shard_id}}" '
+                '--resume "results/shard-{{shard_id}}"'
+            ),
+            (
+                "uv run ai4sci-bench run --output-dir "
+                "results/shard-{{shard_index}} "
+                "--resume results/shard-{{shard_index}}"
+            ),
+            (
+                "uv run ai4sci-bench batch-run --agent codex_cli:{} "
+                "--output-dir results/batch --resume results/batch"
+            ),
+            (
+                "uv run ai4sci-bench codex-run --output-dir results/codex "
+                "--resume results/codex"
+            ),
+            (
+                "uv run ai4sci-bench codex-replay-run "
+                "--output-dir results/replay --replay-resume "
+                "--resume results/replay"
+            ),
+            "",
+            "",
+            "",
+        ]
+        assert "document.getElementById('jShard').value = 'shard_index'" in preset
+        assert (
+            "document.getElementById('jCollectCheckpoint').value = 'true'"
+            in preset
+        )
+        assert (
+            "document.getElementById('jCollectInterval').value = '120'"
+            in preset
+        )
+        assert "paths.includes('results')" in preset
+        assert "updateResumeCommandSuggestion()" in preset
+        assert "updateCollectUI()" in preset
+        assert "应用 AI4Sci 长任务可恢复预设" in html
+
+    @pytest.mark.asyncio
     async def test_submit_job_form_has_accessible_labels_and_contextual_help(
         self, ui_client
     ):
@@ -388,6 +467,7 @@ process.stdout.write(JSON.stringify(results));
             "jDiskGb",
             "jRepo",
             "jRun",
+            "jRunResumeCommand",
             "jRunTimeout",
             "jTtl",
             "jCollect",
@@ -518,7 +598,13 @@ process.stdout.write(JSON.stringify(results));
         html = (await client.get("/batch")).text
         validation = _javascript_function(html, "validateJobForm")
 
-        for control_id in ("jRun", "jSetupSteps", "jTtl", "jRunTimeout", "jS3"):
+        for control_id in (
+            "jRun",
+            "jSetupSteps",
+            "jTtl",
+            "jRunTimeout",
+            "jS3",
+        ):
             assert f"document.getElementById('{control_id}')" in validation
         assert "run.value.trim()" in validation
         assert validation.count(".setCustomValidity(") >= 3
@@ -526,6 +612,9 @@ process.stdout.write(JSON.stringify(results));
         assert "error instanceof SyntaxError" in validation
         assert "Number(ttl.value) < Number(runTimeout.value)" in validation
         assert "parseS3Datasets()" in validation
+        assert "checkpoint && !resumeCommand.value.trim()" not in validation
+        assert "run.resume_command" in html
+        assert "仍可手动恢复检查点" in html
         assert "control.closest('details')" in validation
         assert "details.open = true" in validation
         assert "control.reportValidity()" in validation
@@ -895,6 +984,72 @@ process.stdout.write(JSON.stringify(Object.fromEntries(
         assert "Idempotency-Key" in html
         assert "downloadResults" in html
         assert "/cancel" in html
+
+    @pytest.mark.asyncio
+    async def test_job_monitor_exposes_verified_interrupt_and_resume_actions(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        row = _javascript_function(html, "jobRowHtml")
+        interrupt = _javascript_function(html, "interruptJob")
+        interrupt_key = _javascript_function(
+            html,
+            "interruptPendingStorageKey",
+        )
+        reconcile_interrupt = _javascript_function(
+            html,
+            "reconcileInterruptRequestKeys",
+        )
+        resume = _javascript_function(html, "resumeJob")
+        labels = _javascript_function(html, "jobStateLabel")
+
+        assert "j.interrupt_available === true" in row
+        assert "中断并保存进度" in row
+        assert "state === 'suspending'" in row
+        assert "hasPendingInterruptRequest(j.job_id)" in row
+        assert "重试同一次中断" in row
+        assert "state !== 'suspending'" in row
+        assert "j.resume_available === true" in row
+        assert "Boolean(j.resume_generation)" in row
+        assert "一键续跑" in row
+        resume_branch = row[
+            row.index("const resumeAvailable"):
+            row.index("const manualRecoveryAvailable")
+        ]
+        assert "checkpoint_recovery_available" not in resume_branch
+        assert "j.latest_checkpoint_generation" not in row[
+            row.index("const resumeAvailable"):
+            row.index("const manualRecoveryAvailable")
+        ]
+        assert "j.checkpoint_recovery_available === true" in row
+        assert "['failed','cancelled','succeeded'].includes(state)" in row
+        assert "手动检查点恢复" in row
+        assert "j.resumed_from_job_id || j.source_job_id" in row
+        assert "attempt_no" in row
+        assert "续跑自" in row
+
+        assert "'Idempotency-Key': idempotencyKey" in interrupt
+        assert "/interrupt" in interrupt
+        assert "interruptPendingStorageKey(jobId)" in interrupt
+        assert "sessionStorage.removeItem(pendingKey)" not in interrupt
+        assert "尝试发布完整检查点" in interrupt
+        assert "回退到上一个完整版本" in interrupt
+        assert "没有旧版本则不可续跑" in interrupt
+        assert "未完成的单元会重新执行" in interrupt
+        assert "refreshJobs()" in interrupt
+        assert "ea_job_interrupt_pending_v1_" in interrupt_key
+        assert "['suspended', 'failed'].includes(state)" in reconcile_interrupt
+        assert "sessionStorage.removeItem" in reconcile_interrupt
+        assert "'Idempotency-Key': pending.idempotency_key" in resume
+        assert "/resume" in resume
+        assert "resume_generation: pending.resume_generation" in resume
+        assert "ea_suspended_resume_pending_v1_" in resume
+
+        assert "suspending:'正在中断并保存'" in labels
+        assert "suspended:'已中断，可续跑'" in labels
+        assert ".b-suspending" in html
+        assert ".b-suspended" in html
 
     @pytest.mark.asyncio
     async def test_batch_console_distinguishes_worker_history_from_live_resources(
