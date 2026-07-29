@@ -9,15 +9,66 @@ import os
 import re
 import shutil
 import stat
+import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SUPPORTED_CHECKPOINT_SCHEMAS = frozenset({1, _SCHEMA_VERSION})
+_CHECKPOINT_SET_SCHEMA_VERSION = 1
 _READ_CHUNK = 1024 * 1024
+_S3_DELETE_BATCH = 1_000
+
+
+class _ReadWriteLock:
+    """Writer-preferring lock shared by stores addressing the same Job."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self) -> Iterator[None]:
+        with self._condition:
+            while self._writer or self._waiting_writers:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write(self) -> Iterator[None]:
+        with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._condition.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
+
+
+_JOB_LOCKS_GUARD = threading.Lock()
+_JOB_LOCKS: dict[tuple[str, str, str], _ReadWriteLock] = {}
 
 
 class CheckpointError(RuntimeError):
@@ -25,14 +76,15 @@ class CheckpointError(RuntimeError):
 
 
 def _safe_component(value: str, *, label: str) -> str:
-    if _SAFE_COMPONENT.fullmatch(value) is None:
+    if not isinstance(value, str) or _SAFE_COMPONENT.fullmatch(value) is None:
         raise CheckpointError(f"invalid {label}")
     return value
 
 
 def _safe_relative_path(value: str, *, label: str) -> str:
     if (
-        not value
+        not isinstance(value, str)
+        or not value
         or len(value) > 4_096
         or value.startswith("/")
         or "\\" in value
@@ -72,11 +124,46 @@ def _sha256_stream(stream: BinaryIO) -> str:
     return digest.hexdigest()
 
 
+def _new_generation() -> str:
+    return (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + "-"
+        + uuid.uuid4().hex
+    )
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    if isinstance(exc, KeyError):
+        return True
+    response = getattr(exc, "response", {})
+    error = response.get("Error", {}) if isinstance(response, dict) else {}
+    code = str(error.get("Code") or "")
+    status = (
+        response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if isinstance(response, dict)
+        else None
+    )
+    return code in {"404", "NoSuchKey", "NotFound"} or status == 404
+
+
+def _is_precondition_failed(exc: BaseException) -> bool:
+    response = getattr(exc, "response", {})
+    error = response.get("Error", {}) if isinstance(response, dict) else {}
+    code = str(error.get("Code") or "")
+    status = (
+        response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if isinstance(response, dict)
+        else None
+    )
+    return code in {"PreconditionFailed", "412"} or status == 412
+
+
 class S3CheckpointStore:
     """Commit local result trees and stage trusted prior Job results.
 
-    File blobs are immutable and content addressed. ``COMMITTED.json`` is
-    uploaded last, so a generation is either absent or fully discoverable.
+    V2 blobs are immutable, content addressed, and shared by every shard
+    generation of one Job. A shard ``COMMITTED.json`` and a Job-level
+    checkpoint-set ``COMMITTED.json`` are conditionally uploaded last.
     """
 
     def __init__(
@@ -89,10 +176,20 @@ class S3CheckpointStore:
         max_objects: int = 100_000,
         max_total_bytes: int = 20 * 1024 * 1024 * 1024,
         max_manifest_bytes: int = 16 * 1024 * 1024,
+        max_generations: int = 10_000,
+        max_checkpoint_sets: int = 1_000,
+        max_gc_objects: int = 1_000_000,
     ) -> None:
         if not bucket.strip():
             raise ValueError("checkpoint bucket cannot be empty")
-        if min(max_objects, max_total_bytes, max_manifest_bytes) <= 0:
+        if min(
+            max_objects,
+            max_total_bytes,
+            max_manifest_bytes,
+            max_generations,
+            max_checkpoint_sets,
+            max_gc_objects,
+        ) <= 0:
             raise ValueError("checkpoint limits must be positive")
         self._bucket = bucket.strip()
         self._prefix = prefix.strip("/")
@@ -101,45 +198,50 @@ class S3CheckpointStore:
         self._max_objects = max_objects
         self._max_total_bytes = max_total_bytes
         self._max_manifest_bytes = max_manifest_bytes
+        self._max_generations = max_generations
+        self._max_checkpoint_sets = max_checkpoint_sets
+        self._max_gc_objects = max_gc_objects
 
     def _s3(self):
         if self._client is None:
             import boto3
+            from botocore.config import Config
 
-            self._client = boto3.client("s3", region_name=self._region)
+            self._client = boto3.client(
+                "s3",
+                region_name=self._region,
+                config=Config(
+                    connect_timeout=5,
+                    read_timeout=60,
+                    retries={"max_attempts": 5, "mode": "adaptive"},
+                    tcp_keepalive=True,
+                ),
+            )
         return self._client
 
-    def _assert_generation_uncommitted(self, key: str) -> None:
-        try:
-            self._s3().head_object(Bucket=self._bucket, Key=key)
-        except KeyError:
-            return
-        except Exception as exc:  # noqa: BLE001
-            response = getattr(exc, "response", {})
-            error = response.get("Error", {}) if isinstance(response, dict) else {}
-            code = str(error.get("Code") or "")
-            status = (
-                response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                if isinstance(response, dict)
-                else None
-            )
-            if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
-                return
-            raise CheckpointError(
-                "cannot verify checkpoint generation immutability"
-            ) from exc
-        raise CheckpointError("checkpoint generation is already committed")
+    def _job_root(self, job_id: str) -> str:
+        job_id = _safe_component(job_id, label="job id")
+        return f"{self._prefix}/{job_id}" if self._prefix else job_id
 
     def _worker_root(self, job_id: str, worker_namespace: str) -> str:
-        job_id = _safe_component(job_id, label="job id")
         worker_namespace = _safe_component(
             worker_namespace, label="worker namespace",
         )
-        base = f"{self._prefix}/{job_id}" if self._prefix else job_id
-        return f"{base}/workers/{worker_namespace}"
+        return f"{self._job_root(job_id)}/workers/{worker_namespace}"
 
-    @staticmethod
-    def _normalize_paths(paths: list[str]) -> list[str]:
+    def _job_lock(self, job_id: str) -> _ReadWriteLock:
+        safe_job_id = _safe_component(job_id, label="job id")
+        key = (self._bucket, self._prefix, safe_job_id)
+        with _JOB_LOCKS_GUARD:
+            lock = _JOB_LOCKS.get(key)
+            if lock is None:
+                lock = _ReadWriteLock()
+                _JOB_LOCKS[key] = lock
+            return lock
+
+    def _normalize_paths(self, paths: list[str]) -> list[str]:
+        if not isinstance(paths, list) or len(paths) > self._max_objects:
+            raise CheckpointError("checkpoint path limit exceeded")
         normalized = [
             _safe_relative_path(path, label="checkpoint path")
             for path in paths
@@ -148,16 +250,40 @@ class S3CheckpointStore:
             raise CheckpointError("checkpoint paths cannot be empty")
         if len(set(normalized)) != len(normalized):
             raise CheckpointError("checkpoint paths must be unique")
-        for index, path in enumerate(normalized):
-            if any(
-                other.startswith(path.rstrip("/") + "/")
-                or path.startswith(other.rstrip("/") + "/")
-                for other in normalized[index + 1 :]
-            ):
+        ordered = sorted(normalized)
+        for path, other in zip(ordered, ordered[1:], strict=False):
+            if other.startswith(path.rstrip("/") + "/"):
                 raise CheckpointError(
                     "checkpoint paths must not overlap"
                 )
         return normalized
+
+    def _normalize_excludes(self, patterns: list[str] | None) -> list[str]:
+        normalized = list(patterns or [])
+        if len(normalized) > self._max_objects:
+            raise CheckpointError("checkpoint exclude pattern limit exceeded")
+        for pattern in normalized:
+            if (
+                not isinstance(pattern, str)
+                or not pattern
+                or len(pattern) > 4_096
+                or "\x00" in pattern
+                or any(ord(character) < 0x20 for character in pattern)
+            ):
+                raise CheckpointError("invalid checkpoint exclude pattern")
+        return normalized
+
+    @staticmethod
+    def _normalize_metadata(
+        metadata: dict[str, Any] | None,
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise CheckpointError(f"{label} metadata must be an object")
+        return dict(metadata)
 
     @staticmethod
     def _excluded(relative: str, patterns: list[str]) -> bool:
@@ -167,20 +293,37 @@ class S3CheckpointStore:
             for pattern in patterns
         )
 
-    def _safe_files(
+    def _safe_entries(
         self,
         source_root: Path,
         paths: list[str],
         exclude: list[str],
-    ):
-        root = source_root.resolve(strict=True)
+    ) -> Iterator[tuple[str, Path, Path, str, os.stat_result]]:
+        try:
+            root = source_root.resolve(strict=True)
+        except OSError as exc:
+            raise CheckpointError(
+                "checkpoint source root is missing"
+            ) from exc
+        if not root.is_dir():
+            raise CheckpointError("checkpoint source root is not a directory")
         for relative_root in paths:
             traversal_root = root / relative_root
             try:
-                traversal_root.relative_to(root)
+                traversal_root.resolve(strict=True).relative_to(root)
             except ValueError as exc:
                 raise CheckpointError("checkpoint path escaped source root") from exc
-            if not traversal_root.is_dir():
+            except OSError as exc:
+                raise CheckpointError(
+                    f"checkpoint path is missing: {relative_root!r}"
+                ) from exc
+            try:
+                traversal_stat = os.lstat(traversal_root)
+            except OSError as exc:
+                raise CheckpointError(
+                    f"checkpoint path is missing: {relative_root!r}"
+                ) from exc
+            if not stat.S_ISDIR(traversal_stat.st_mode):
                 raise CheckpointError(
                     f"checkpoint path is missing or not a directory: "
                     f"{relative_root!r}"
@@ -189,15 +332,37 @@ class S3CheckpointStore:
                 traversal_root, topdown=True, followlinks=False,
             ):
                 directory = Path(dirpath)
+                try:
+                    directory.resolve(strict=True).relative_to(root)
+                    directory_stat = os.lstat(directory)
+                except (OSError, ValueError) as exc:
+                    raise CheckpointError(
+                        "checkpoint directory changed while traversing"
+                    ) from exc
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise CheckpointError(
+                        "checkpoint directory changed while traversing"
+                    )
+                directory_relative = directory.relative_to(root).as_posix()
+                yield (
+                    "directory",
+                    root,
+                    directory,
+                    directory_relative,
+                    directory_stat,
+                )
                 safe_dirs: list[str] = []
                 for name in sorted(dirnames):
                     candidate = directory / name
                     try:
-                        mode = os.lstat(candidate).st_mode
+                        candidate_stat = os.lstat(candidate)
                     except OSError:
                         continue
                     relative = candidate.relative_to(root).as_posix()
-                    if stat.S_ISDIR(mode) and not self._excluded(relative, exclude):
+                    if (
+                        stat.S_ISDIR(candidate_stat.st_mode)
+                        and not self._excluded(relative, exclude)
+                    ):
                         safe_dirs.append(name)
                 dirnames[:] = safe_dirs
                 for name in sorted(filenames):
@@ -211,7 +376,7 @@ class S3CheckpointStore:
                         continue
                     if not stat.S_ISREG(file_stat.st_mode):
                         continue
-                    yield root, candidate, relative
+                    yield "file", root, candidate, relative, file_stat
 
     @staticmethod
     def _open_validated(root: Path, path: Path) -> tuple[BinaryIO, os.stat_result]:
@@ -234,6 +399,174 @@ class S3CheckpointStore:
             os.close(descriptor)
             raise
 
+    def _snapshot_file(
+        self,
+        *,
+        root: Path,
+        path: Path,
+        relative: str,
+        snapshot_root: Path,
+        remaining_bytes: int,
+    ) -> tuple[Path, int, str, int]:
+        """Copy a live file into a private, fsynced, read-only local snapshot."""
+
+        source, opened_stat = self._open_validated(root, path)
+        snapshot = snapshot_root / uuid.uuid4().hex
+        descriptor = -1
+        try:
+            if opened_stat.st_size > remaining_bytes:
+                raise CheckpointError("checkpoint byte limit exceeded")
+            descriptor = os.open(
+                snapshot,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            digest = hashlib.sha256()
+            copied = 0
+            with source, os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
+                before = _stable_identity(opened_stat)
+                while chunk := source.read(_READ_CHUNK):
+                    copied += len(chunk)
+                    if copied > remaining_bytes:
+                        raise CheckpointError("checkpoint byte limit exceeded")
+                    output.write(chunk)
+                    digest.update(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+                after = os.fstat(source.fileno())
+                if (
+                    _stable_identity(after) != before
+                    or copied != opened_stat.st_size
+                ):
+                    raise CheckpointError(
+                        f"checkpoint file changed while snapshotting: {relative}"
+                    )
+            os.chmod(snapshot, 0o400)
+            return (
+                snapshot,
+                copied,
+                digest.hexdigest(),
+                stat.S_IMODE(opened_stat.st_mode) & 0o777,
+            )
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                snapshot.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _head_blob(self, key: str) -> dict[str, Any] | None:
+        try:
+            return self._s3().head_object(Bucket=self._bucket, Key=key)
+        except Exception as exc:  # noqa: BLE001
+            if _is_not_found(exc):
+                return None
+            raise CheckpointError(
+                f"cannot verify checkpoint blob: {key}"
+            ) from exc
+
+    @staticmethod
+    def _validate_blob_head(
+        response: dict[str, Any],
+        *,
+        key: str,
+        size: int,
+        digest: str,
+    ) -> None:
+        try:
+            content_length = int(response.get("ContentLength"))
+        except (TypeError, ValueError) as exc:
+            raise CheckpointError(
+                f"checkpoint blob metadata is invalid: {key}"
+            ) from exc
+        metadata = response.get("Metadata")
+        if (
+            content_length != size
+            or not isinstance(metadata, dict)
+            or metadata.get("sha256") != digest
+        ):
+            raise CheckpointError(
+                f"checkpoint blob identity mismatch: {key}"
+            )
+
+    def _ensure_blob(
+        self,
+        *,
+        key: str,
+        snapshot: Path,
+        size: int,
+        digest: str,
+    ) -> bool:
+        """Upload a new stable blob or prove the existing blob is identical."""
+
+        existing = self._head_blob(key)
+        if existing is not None:
+            self._validate_blob_head(
+                existing, key=key, size=size, digest=digest,
+            )
+            return False
+        with snapshot.open("rb") as stream:
+            self._s3().upload_fileobj(
+                stream,
+                self._bucket,
+                key,
+                ExtraArgs={
+                    "ContentType": "application/octet-stream",
+                    "Metadata": {"sha256": digest},
+                },
+            )
+        uploaded = self._head_blob(key)
+        if uploaded is None:
+            raise CheckpointError(
+                f"checkpoint blob disappeared after upload: {key}"
+            )
+        self._validate_blob_head(
+            uploaded, key=key, size=size, digest=digest,
+        )
+        return True
+
+    def _json_payload(self, value: dict[str, Any], *, label: str) -> bytes:
+        try:
+            payload = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise CheckpointError(f"{label} is not JSON serializable") from exc
+        if len(payload) > self._max_manifest_bytes:
+            raise CheckpointError(f"{label} limit exceeded")
+        return payload
+
+    def _put_committed(
+        self,
+        *,
+        key: str,
+        payload: bytes,
+        duplicate_message: str,
+        allow_existing: bool = False,
+    ) -> bool:
+        try:
+            self._s3().put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=payload,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _is_precondition_failed(exc):
+                if allow_existing:
+                    return False
+                raise CheckpointError(duplicate_message) from exc
+            raise CheckpointError(
+                f"cannot atomically publish checkpoint manifest: {key}"
+            ) from exc
+        return True
+
     def commit(
         self,
         *,
@@ -248,92 +581,161 @@ class S3CheckpointStore:
         """Upload all blobs, then atomically publish one generation manifest."""
 
         normalized_paths = self._normalize_paths(paths)
-        generation = generation or (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            + "-"
-            + uuid.uuid4().hex
+        normalized_exclude = self._normalize_excludes(exclude)
+        normalized_metadata = self._normalize_metadata(
+            metadata, label="checkpoint",
         )
+        generation = generation or _new_generation()
         generation = _safe_component(generation, label="checkpoint generation")
         worker_root = self._worker_root(job_id, worker_namespace)
         committed_key = (
             f"{worker_root}/checkpoints/{generation}/COMMITTED.json"
         )
-        self._assert_generation_uncommitted(committed_key)
-        # Blobs live inside their generation. A failed live-file validation can
-        # therefore leave only unreachable objects; it can never overwrite a
-        # blob already referenced by an older committed generation.
-        blob_root = f"{worker_root}/checkpoints/{generation}/blobs"
-        files: list[dict[str, Any]] = []
-        total_bytes = 0
+        blob_root = f"{self._job_root(job_id)}/checkpoint-blobs"
 
-        for root, path, relative in self._safe_files(
-            Path(source_root), normalized_paths, list(exclude or []),
-        ):
-            if len(files) >= self._max_objects:
-                raise CheckpointError("checkpoint object limit exceeded")
-            stream, opened_stat = self._open_validated(root, path)
-            with stream:
-                before = _stable_identity(opened_stat)
-                digest = _sha256_stream(stream)
-                size = opened_stat.st_size
-                total_bytes += size
-                if total_bytes > self._max_total_bytes:
-                    raise CheckpointError("checkpoint byte limit exceeded")
-                object_key = f"{blob_root}/{digest}"
-                duplicate = os.dup(stream.fileno())
-                with os.fdopen(duplicate, "rb") as upload:
-                    upload.seek(0)
-                    self._s3().upload_fileobj(
-                        upload, self._bucket, object_key,
+        with self._job_lock(job_id).read():
+            generation_exists = self._head_blob(committed_key) is not None
+            files: list[dict[str, Any]] = []
+            directories: list[dict[str, Any]] = []
+            total_bytes = 0
+            with tempfile.TemporaryDirectory(
+                prefix=".elastic-checkpoint-",
+            ) as temporary:
+                snapshot_root = Path(temporary)
+                os.chmod(snapshot_root, 0o700)
+                for kind, root, path, relative, entry_stat in self._safe_entries(
+                    Path(source_root), normalized_paths, normalized_exclude,
+                ):
+                    if len(files) + len(directories) >= self._max_objects:
+                        raise CheckpointError(
+                            "checkpoint object limit exceeded"
+                        )
+                    if kind == "directory":
+                        directories.append({
+                            "path": relative,
+                            "mode": stat.S_IMODE(entry_stat.st_mode) & 0o777,
+                        })
+                        continue
+                    snapshot, size, digest, mode = self._snapshot_file(
+                        root=root,
+                        path=path,
+                        relative=relative,
+                        snapshot_root=snapshot_root,
+                        remaining_bytes=self._max_total_bytes - total_bytes,
                     )
-                after_stat = os.fstat(stream.fileno())
-                after_digest = _sha256_stream(stream)
-                if (
-                    _stable_identity(after_stat) != before
-                    or after_digest != digest
+                    total_bytes += size
+                    object_key = f"{blob_root}/{digest}"
+                    try:
+                        if not generation_exists:
+                            self._ensure_blob(
+                                key=object_key,
+                                snapshot=snapshot,
+                                size=size,
+                                digest=digest,
+                            )
+                    finally:
+                        try:
+                            snapshot.unlink()
+                        except FileNotFoundError:
+                            pass
+                    files.append({
+                        "path": relative,
+                        "size": size,
+                        "sha256": digest,
+                        "object_key": object_key,
+                        "mode": mode,
+                    })
+
+            manifest: dict[str, Any] = {
+                "schema_version": _SCHEMA_VERSION,
+                "job_id": job_id,
+                "worker_namespace": worker_namespace,
+                "generation": generation,
+                "paths": normalized_paths,
+                "directories": directories,
+                "files": files,
+                "total_bytes": total_bytes,
+                "committed_at": datetime.now(timezone.utc).isoformat(),
+                "metadata": normalized_metadata,
+            }
+            payload = self._json_payload(
+                manifest, label="checkpoint manifest",
+            )
+            if generation_exists:
+                existing, _manifest_sha256 = self._committed_manifest(
+                    source_job_id=job_id,
+                    worker_namespace=worker_namespace,
+                    generation=generation,
+                )
+                comparable_keys = (
+                    "schema_version",
+                    "job_id",
+                    "worker_namespace",
+                    "generation",
+                    "paths",
+                    "directories",
+                    "files",
+                    "total_bytes",
+                    "metadata",
+                )
+                if any(
+                    existing.get(key) != manifest.get(key)
+                    for key in comparable_keys
                 ):
                     raise CheckpointError(
-                        f"checkpoint file changed while uploading: {relative}"
+                        "checkpoint generation is already committed "
+                        "with different content"
                     )
-            files.append({
-                "path": relative,
-                "size": size,
-                "sha256": digest,
-                "object_key": object_key,
-            })
-
-        manifest: dict[str, Any] = {
-            "schema_version": _SCHEMA_VERSION,
-            "job_id": job_id,
-            "worker_namespace": worker_namespace,
-            "generation": generation,
-            "paths": normalized_paths,
-            "files": files,
-            "total_bytes": total_bytes,
-            "committed_at": datetime.now(timezone.utc).isoformat(),
-            "metadata": dict(metadata or {}),
-        }
-        payload = json.dumps(
-            manifest,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > self._max_manifest_bytes:
-            raise CheckpointError("checkpoint manifest limit exceeded")
-        self._s3().put_object(
-            Bucket=self._bucket,
-            Key=committed_key,
-            Body=payload,
-            ContentType="application/json",
-        )
-        return manifest
+                return existing
+            published = self._put_committed(
+                key=committed_key,
+                payload=payload,
+                duplicate_message=(
+                    "checkpoint generation is already committed"
+                ),
+                allow_existing=True,
+            )
+            if not published:
+                existing, _manifest_sha256 = self._committed_manifest(
+                    source_job_id=job_id,
+                    worker_namespace=worker_namespace,
+                    generation=generation,
+                )
+                comparable_keys = (
+                    "schema_version",
+                    "job_id",
+                    "worker_namespace",
+                    "generation",
+                    "paths",
+                    "directories",
+                    "files",
+                    "total_bytes",
+                    "metadata",
+                )
+                if any(
+                    existing.get(key) != manifest.get(key)
+                    for key in comparable_keys
+                ):
+                    raise CheckpointError(
+                        "checkpoint generation is already committed "
+                        "with different content"
+                    )
+                return existing
+            return manifest
 
     def _read_object_limited(self, key: str, *, limit: int) -> bytes:
-        response = self._s3().get_object(Bucket=self._bucket, Key=key)
-        declared = int(response.get("ContentLength") or 0)
-        if declared > limit:
+        try:
+            response = self._s3().get_object(
+                Bucket=self._bucket, Key=key,
+            )
+            declared = int(response.get("ContentLength"))
+            body = response["Body"]
+        except Exception as exc:  # noqa: BLE001
+            raise CheckpointError(
+                f"cannot read checkpoint object: {key}"
+            ) from exc
+        if declared < 0 or declared > limit:
             raise CheckpointError(f"S3 object exceeds read limit: {key}")
-        body = response["Body"]
         chunks: list[bytes] = []
         consumed = 0
         try:
@@ -348,7 +750,60 @@ class S3CheckpointStore:
             close = getattr(body, "close", None)
             if callable(close):
                 close()
+        if consumed != declared:
+            raise CheckpointError(f"S3 object size changed while reading: {key}")
         return b"".join(chunks)
+
+    def _list_matching_keys(
+        self,
+        *,
+        prefix: str,
+        matcher: Any,
+        label: str,
+        limit: int | None = None,
+    ) -> list[str]:
+        listing_limit = self._max_objects if limit is None else limit
+        keys: list[str] = []
+        seen: set[str] = set()
+        try:
+            pages = self._s3().get_paginator("list_objects_v2").paginate(
+                Bucket=self._bucket,
+                Prefix=prefix,
+            )
+            for page in pages:
+                for item in page.get("Contents") or []:
+                    key = str(item.get("Key") or "")
+                    if not matcher(key):
+                        continue
+                    if key in seen:
+                        raise CheckpointError(
+                            f"duplicate key in {label} listing"
+                        )
+                    seen.add(key)
+                    keys.append(key)
+                    if len(keys) > listing_limit:
+                        raise CheckpointError(f"{label} listing limit exceeded")
+        except CheckpointError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise CheckpointError(f"cannot list {label}") from exc
+        return keys
+
+    def _decode_json_object(self, key: str, *, label: str) -> tuple[
+        dict[str, Any], bytes, str
+    ]:
+        try:
+            raw = self._read_object_limited(
+                key, limit=self._max_manifest_bytes,
+            )
+            value = json.loads(raw.decode("utf-8"))
+        except CheckpointError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise CheckpointError(f"invalid {label}") from exc
+        if not isinstance(value, dict):
+            raise CheckpointError(f"invalid {label}")
+        return value, raw, hashlib.sha256(raw).hexdigest()
 
     def _committed_manifest(
         self,
@@ -356,7 +811,8 @@ class S3CheckpointStore:
         source_job_id: str,
         worker_namespace: str,
         generation: str,
-    ) -> dict[str, Any]:
+        expected_sha256: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
         worker_root = self._worker_root(source_job_id, worker_namespace)
         if generation:
             selected = _safe_component(
@@ -367,71 +823,805 @@ class S3CheckpointStore:
             )
         else:
             prefix = f"{worker_root}/checkpoints/"
-            candidates: list[str] = []
-            for page in self._s3().get_paginator("list_objects_v2").paginate(
-                Bucket=self._bucket,
-                Prefix=prefix,
-            ):
-                for item in page.get("Contents") or []:
-                    key_value = str(item.get("Key") or "")
-                    suffix = key_value.removeprefix(prefix)
-                    parts = suffix.split("/")
-                    if (
-                        len(parts) == 2
-                        and parts[1] == "COMMITTED.json"
-                        and _SAFE_COMPONENT.fullmatch(parts[0])
-                    ):
-                        candidates.append(key_value)
-                        if len(candidates) > self._max_objects:
-                            raise CheckpointError(
-                                "checkpoint generation listing limit exceeded"
-                            )
+            def matches(key_value: str) -> bool:
+                suffix = key_value.removeprefix(prefix)
+                parts = suffix.split("/")
+                return (
+                    key_value.startswith(prefix)
+                    and len(parts) == 2
+                    and parts[1] == "COMMITTED.json"
+                    and _SAFE_COMPONENT.fullmatch(parts[0]) is not None
+                )
+
+            candidates = self._list_matching_keys(
+                prefix=prefix,
+                matcher=matches,
+                label="checkpoint generation",
+                limit=self._max_generations,
+            )
             if not candidates:
                 raise CheckpointError("no committed checkpoint generation found")
             key = max(candidates)
             selected = key.removeprefix(prefix).split("/", 1)[0]
-        try:
-            raw = self._read_object_limited(
-                key, limit=self._max_manifest_bytes,
-            )
-            manifest = json.loads(raw.decode("utf-8"))
-        except CheckpointError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise CheckpointError("invalid checkpoint manifest") from exc
-        if not isinstance(manifest, dict):
-            raise CheckpointError("invalid checkpoint manifest")
+        if expected_sha256 is not None and _SHA256.fullmatch(
+            expected_sha256
+        ) is None:
+            raise CheckpointError("invalid expected checkpoint manifest hash")
+        manifest, _raw, manifest_sha256 = self._decode_json_object(
+            key, label="checkpoint manifest",
+        )
         if manifest.get("generation") != selected:
             raise CheckpointError(
                 "checkpoint generation identity mismatch"
             )
-        return manifest
+        if (
+            expected_sha256 is not None
+            and manifest_sha256 != expected_sha256
+        ):
+            raise CheckpointError("checkpoint manifest checksum mismatch")
+        return manifest, manifest_sha256
 
-    @staticmethod
     def _validate_manifest_identity(
+        self,
         manifest: dict[str, Any],
         *,
         source_job_id: str,
         worker_namespace: str,
-        paths: list[str],
+        paths: list[str] | None = None,
         expected_metadata: dict[str, Any] | None = None,
     ) -> None:
+        schema_version = manifest.get("schema_version")
         if (
-            manifest.get("schema_version") != _SCHEMA_VERSION
+            schema_version not in _SUPPORTED_CHECKPOINT_SCHEMAS
             or manifest.get("job_id") != source_job_id
             or manifest.get("worker_namespace") != worker_namespace
-            or manifest.get("paths") != paths
             or not isinstance(manifest.get("files"), list)
         ):
             raise CheckpointError("checkpoint manifest identity mismatch")
+        manifest_paths = manifest.get("paths")
+        if not isinstance(manifest_paths, list):
+            raise CheckpointError("checkpoint manifest identity mismatch")
+        try:
+            normalized_manifest_paths = self._normalize_paths(manifest_paths)
+        except CheckpointError as exc:
+            raise CheckpointError(
+                "checkpoint manifest paths are invalid"
+            ) from exc
+        if normalized_manifest_paths != manifest_paths:
+            raise CheckpointError("checkpoint manifest paths are invalid")
+        if paths is not None and manifest_paths != paths:
+            raise CheckpointError("checkpoint manifest identity mismatch")
+        self._parse_committed_at(
+            manifest.get("committed_at"),
+            label="checkpoint manifest",
+        )
         metadata = manifest.get("metadata")
         if not isinstance(metadata, dict):
             raise CheckpointError("checkpoint manifest metadata is invalid")
+        if expected_metadata is not None and not isinstance(
+            expected_metadata, dict,
+        ):
+            raise CheckpointError(
+                "expected checkpoint metadata must be an object"
+            )
         for key, expected in (expected_metadata or {}).items():
             if metadata.get(key) != expected:
                 raise CheckpointError(
                     f"checkpoint metadata mismatch: {key}"
                 )
+
+    @staticmethod
+    def _parse_committed_at(value: Any, *, label: str) -> datetime:
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise CheckpointError(f"{label} committed_at is invalid")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise CheckpointError(
+                f"{label} committed_at is invalid"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise CheckpointError(f"{label} committed_at is invalid")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _entry_mode(value: Any, *, label: str) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > 0o777
+        ):
+            raise CheckpointError(f"invalid checkpoint {label} mode")
+        return value
+
+    def _validated_manifest_entries(
+        self,
+        manifest: dict[str, Any],
+        *,
+        source_job_id: str,
+        worker_namespace: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+        """Validate every path/key/size before restore or garbage collection."""
+
+        schema_version = int(manifest["schema_version"])
+        paths = list(manifest["paths"])
+        raw_directories = manifest.get("directories", [])
+        if schema_version == _SCHEMA_VERSION and not isinstance(
+            raw_directories, list,
+        ):
+            raise CheckpointError("invalid checkpoint directory entries")
+        if schema_version == 1:
+            raw_directories = []
+        files = manifest["files"]
+        if len(files) + len(raw_directories) > self._max_objects:
+            raise CheckpointError("checkpoint object limit exceeded")
+
+        seen: set[str] = set()
+        directories: list[dict[str, Any]] = []
+        for raw in raw_directories:
+            if not isinstance(raw, dict):
+                raise CheckpointError("invalid checkpoint directory entry")
+            relative = _safe_relative_path(
+                raw.get("path"), label="checkpoint path",
+            )
+            if relative in seen or not _under_any_path(relative, paths):
+                raise CheckpointError("invalid checkpoint directory entry")
+            seen.add(relative)
+            directories.append({
+                "path": relative,
+                "mode": self._entry_mode(
+                    raw.get("mode"), label="directory",
+                ),
+            })
+
+        if schema_version == _SCHEMA_VERSION:
+            directory_paths = {entry["path"] for entry in directories}
+            if not set(paths).issubset(directory_paths):
+                raise CheckpointError(
+                    "checkpoint manifest is missing requested directories"
+                )
+            for relative in directory_paths:
+                parent = PurePosixPath(relative).parent
+                while parent != PurePosixPath("."):
+                    parent_text = parent.as_posix()
+                    if _under_any_path(parent_text, paths):
+                        if parent_text not in directory_paths:
+                            raise CheckpointError(
+                                "checkpoint manifest is missing a parent directory"
+                            )
+                    parent = parent.parent
+        else:
+            directory_paths = set()
+
+        worker_root = self._worker_root(
+            source_job_id, worker_namespace,
+        )
+        if schema_version == 1:
+            generation = _safe_component(
+                manifest.get("generation"),
+                label="checkpoint generation",
+            )
+            blob_root = (
+                f"{worker_root}/checkpoints/{generation}/blobs/"
+            )
+        else:
+            blob_root = f"{self._job_root(source_job_id)}/checkpoint-blobs/"
+
+        validated_files: list[dict[str, Any]] = []
+        blob_keys: set[str] = set()
+        total = 0
+        for raw in files:
+            if not isinstance(raw, dict):
+                raise CheckpointError("invalid checkpoint file entry")
+            relative = _safe_relative_path(
+                raw.get("path"), label="checkpoint path",
+            )
+            if relative in seen:
+                raise CheckpointError("duplicate checkpoint entry path")
+            seen.add(relative)
+            if not _under_any_path(relative, paths):
+                raise CheckpointError(
+                    f"checkpoint path is outside requested roots: {relative}"
+                )
+            digest = raw.get("sha256")
+            key = raw.get("object_key")
+            size = raw.get("size")
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+                or key != f"{blob_root}{digest}"
+            ):
+                raise CheckpointError("invalid checkpoint file entry")
+            mode = (
+                0o600
+                if schema_version == 1
+                else self._entry_mode(raw.get("mode"), label="file")
+            )
+            if schema_version == _SCHEMA_VERSION:
+                parent = PurePosixPath(relative).parent
+                while parent != PurePosixPath("."):
+                    parent_text = parent.as_posix()
+                    if _under_any_path(parent_text, paths):
+                        if parent_text not in directory_paths:
+                            raise CheckpointError(
+                                "checkpoint manifest is missing a parent directory"
+                            )
+                    parent = parent.parent
+            total += size
+            if total > self._max_total_bytes:
+                raise CheckpointError("checkpoint byte limit exceeded")
+            validated_files.append({
+                "path": relative,
+                "size": size,
+                "sha256": digest,
+                "object_key": key,
+                "mode": mode,
+            })
+            blob_keys.add(key)
+        manifest_total = manifest.get("total_bytes")
+        if (
+            isinstance(manifest_total, bool)
+            or not isinstance(manifest_total, int)
+            or manifest_total != total
+        ):
+            raise CheckpointError("checkpoint total size mismatch")
+        return directories, validated_files, blob_keys
+
+    def _checkpoint_set_key(self, job_id: str, generation: str) -> str:
+        generation = _safe_component(
+            generation, label="checkpoint set generation",
+        )
+        return (
+            f"{self._job_root(job_id)}/checkpoint-sets/"
+            f"{generation}/COMMITTED.json"
+        )
+
+    def _validate_checkpoint_set_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        source_job_id: str,
+        generation: str,
+    ) -> list[dict[str, Any]]:
+        shards = manifest.get("shards")
+        metadata = manifest.get("metadata")
+        if (
+            manifest.get("schema_version") != _CHECKPOINT_SET_SCHEMA_VERSION
+            or manifest.get("kind") != "checkpoint-set"
+            or manifest.get("job_id") != source_job_id
+            or manifest.get("generation") != generation
+            or not isinstance(shards, list)
+            or not shards
+            or len(shards) > self._max_objects
+            or not isinstance(metadata, dict)
+            or not isinstance(manifest.get("committed_at"), str)
+            or not manifest["committed_at"]
+        ):
+            raise CheckpointError("checkpoint set identity mismatch")
+        self._parse_committed_at(
+            manifest["committed_at"], label="checkpoint set manifest",
+        )
+        seen: set[str] = set()
+        validated: list[dict[str, Any]] = []
+        total = 0
+        for raw in shards:
+            if not isinstance(raw, dict):
+                raise CheckpointError("invalid checkpoint set shard entry")
+            namespace = _safe_component(
+                raw.get("worker_namespace"), label="worker namespace",
+            )
+            shard_generation = _safe_component(
+                raw.get("generation"), label="checkpoint generation",
+            )
+            manifest_sha256 = raw.get("manifest_sha256")
+            shard_bytes = raw.get("total_bytes")
+            if (
+                namespace in seen
+                or not isinstance(manifest_sha256, str)
+                or _SHA256.fullmatch(manifest_sha256) is None
+                or isinstance(shard_bytes, bool)
+                or not isinstance(shard_bytes, int)
+                or shard_bytes < 0
+                or shard_bytes > self._max_total_bytes
+            ):
+                raise CheckpointError("invalid checkpoint set shard entry")
+            seen.add(namespace)
+            total += shard_bytes
+            validated.append({
+                "worker_namespace": namespace,
+                "generation": shard_generation,
+                "manifest_sha256": manifest_sha256,
+                "total_bytes": shard_bytes,
+            })
+        declared_total = manifest.get("total_bytes")
+        if (
+            isinstance(declared_total, bool)
+            or not isinstance(declared_total, int)
+            or declared_total != total
+        ):
+            raise CheckpointError("checkpoint set total size mismatch")
+        return validated
+
+    def _checkpoint_set_records(
+        self,
+        source_job_id: str,
+    ) -> list[dict[str, Any]]:
+        prefix = f"{self._job_root(source_job_id)}/checkpoint-sets/"
+
+        def matches(key: str) -> bool:
+            suffix = key.removeprefix(prefix)
+            parts = suffix.split("/")
+            return (
+                key.startswith(prefix)
+                and len(parts) == 2
+                and parts[1] == "COMMITTED.json"
+                and _SAFE_COMPONENT.fullmatch(parts[0]) is not None
+            )
+
+        keys = self._list_matching_keys(
+            prefix=prefix,
+            matcher=matches,
+            label="checkpoint set",
+            limit=self._max_checkpoint_sets,
+        )
+        records: list[dict[str, Any]] = []
+        for key in keys:
+            generation = key.removeprefix(prefix).split("/", 1)[0]
+            manifest, _raw, manifest_sha256 = self._decode_json_object(
+                key, label="checkpoint set manifest",
+            )
+            shards = self._validate_checkpoint_set_manifest(
+                manifest,
+                source_job_id=source_job_id,
+                generation=generation,
+            )
+            records.append({
+                "key": key,
+                "generation": generation,
+                "manifest": manifest,
+                "manifest_sha256": manifest_sha256,
+                "shards": shards,
+            })
+        return records
+
+    def _resolve_checkpoint_set_unlocked(
+        self,
+        *,
+        source_job_id: str,
+        generation: str,
+    ) -> dict[str, Any]:
+        records = self._checkpoint_set_records(source_job_id)
+        if generation:
+            selected = _safe_component(
+                generation, label="checkpoint set generation",
+            )
+            matches = [
+                record for record in records
+                if record["generation"] == selected
+            ]
+            if not matches:
+                raise CheckpointError("checkpoint set generation not found")
+            return matches[0]["manifest"]
+        if not records:
+            raise CheckpointError("no committed checkpoint set found")
+        selected_record = max(
+            records,
+            key=lambda record: (
+                record["manifest"]["committed_at"],
+                record["generation"],
+            ),
+        )
+        return selected_record["manifest"]
+
+    def resolve_checkpoint_set(
+        self,
+        *,
+        source_job_id: str,
+        generation: str = "",
+    ) -> dict[str, Any]:
+        """Return the complete latest or explicitly selected Job checkpoint set."""
+
+        with self._job_lock(source_job_id).read():
+            return self._resolve_checkpoint_set_unlocked(
+                source_job_id=source_job_id,
+                generation=generation,
+            )
+
+    def _shard_manifest_inventory(
+        self,
+        job_id: str,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        prefix = f"{self._job_root(job_id)}/workers/"
+
+        def matches(key: str) -> bool:
+            suffix = key.removeprefix(prefix)
+            parts = suffix.split("/")
+            return (
+                key.startswith(prefix)
+                and len(parts) == 4
+                and parts[1] == "checkpoints"
+                and parts[3] == "COMMITTED.json"
+                and _SAFE_COMPONENT.fullmatch(parts[0]) is not None
+                and _SAFE_COMPONENT.fullmatch(parts[2]) is not None
+            )
+
+        keys = self._list_matching_keys(
+            prefix=prefix,
+            matcher=matches,
+            label="checkpoint shard manifest",
+            limit=self._max_generations,
+        )
+        inventory: dict[tuple[str, str], dict[str, Any]] = {}
+        for key in keys:
+            parts = key.removeprefix(prefix).split("/")
+            namespace, generation = parts[0], parts[2]
+            manifest, _raw, manifest_sha256 = self._decode_json_object(
+                key, label="checkpoint manifest",
+            )
+            self._validate_manifest_identity(
+                manifest,
+                source_job_id=job_id,
+                worker_namespace=namespace,
+            )
+            _directories, _files, blob_keys = (
+                self._validated_manifest_entries(
+                    manifest,
+                    source_job_id=job_id,
+                    worker_namespace=namespace,
+                )
+            )
+            if manifest.get("generation") != generation:
+                raise CheckpointError(
+                    "checkpoint generation identity mismatch"
+                )
+            reference = (namespace, generation)
+            if reference in inventory:
+                raise CheckpointError("duplicate checkpoint shard manifest")
+            inventory[reference] = {
+                "key": key,
+                "manifest": manifest,
+                "manifest_sha256": manifest_sha256,
+                "blob_keys": blob_keys,
+            }
+        return inventory
+
+    @staticmethod
+    def _verify_set_references(
+        records: list[dict[str, Any]],
+        inventory: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        for record in records:
+            for shard in record["shards"]:
+                reference = (
+                    shard["worker_namespace"],
+                    shard["generation"],
+                )
+                stored = inventory.get(reference)
+                if (
+                    stored is None
+                    or stored["manifest_sha256"]
+                    != shard["manifest_sha256"]
+                    or stored["manifest"].get("total_bytes")
+                    != shard["total_bytes"]
+                ):
+                    raise CheckpointError(
+                        "checkpoint set references a missing or changed "
+                        "shard manifest"
+                    )
+
+    def _stable_blob_keys(self, job_id: str) -> list[str]:
+        prefix = f"{self._job_root(job_id)}/checkpoint-blobs/"
+
+        def matches(key: str) -> bool:
+            suffix = key.removeprefix(prefix)
+            return (
+                key.startswith(prefix)
+                and "/" not in suffix
+                and _SHA256.fullmatch(suffix) is not None
+            )
+
+        return self._list_matching_keys(
+            prefix=prefix,
+            matcher=matches,
+            label="checkpoint blob",
+            limit=self._max_gc_objects,
+        )
+
+    def _delete_keys(self, keys: set[str] | list[str]) -> None:
+        ordered = sorted(set(keys))
+        if len(ordered) > self._max_gc_objects:
+            raise CheckpointError("checkpoint garbage collection limit exceeded")
+        for start in range(0, len(ordered), _S3_DELETE_BATCH):
+            batch = ordered[start : start + _S3_DELETE_BATCH]
+            if not batch:
+                continue
+            try:
+                response = self._s3().delete_objects(
+                    Bucket=self._bucket,
+                    Delete={
+                        "Objects": [{"Key": key} for key in batch],
+                        "Quiet": True,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise CheckpointError(
+                    "checkpoint garbage collection failed"
+                ) from exc
+            errors = response.get("Errors") if isinstance(response, dict) else None
+            if errors:
+                raise CheckpointError(
+                    "checkpoint garbage collection was incomplete"
+                )
+
+    def _apply_retention(
+        self,
+        *,
+        job_id: str,
+        current_generation: str,
+        keep_last_n: int,
+        records: list[dict[str, Any]],
+        inventory: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        ordered = sorted(
+            records,
+            key=lambda record: (
+                record["manifest"]["committed_at"],
+                record["generation"],
+            ),
+        )
+        retained = ordered[-keep_last_n:]
+        if not any(
+            record["generation"] == current_generation
+            for record in retained
+        ):
+            retained = (
+                retained[-(keep_last_n - 1) :] if keep_last_n > 1 else []
+            )
+            retained.append(next(
+                record for record in records
+                if record["generation"] == current_generation
+            ))
+        retained_generations = {
+            record["generation"] for record in retained
+        }
+        pruned = [
+            record for record in records
+            if record["generation"] not in retained_generations
+        ]
+        retained_references = {
+            (
+                shard["worker_namespace"],
+                shard["generation"],
+            )
+            for record in retained
+            for shard in record["shards"]
+        }
+        pruned_references = {
+            (
+                shard["worker_namespace"],
+                shard["generation"],
+            )
+            for record in pruned
+            for shard in record["shards"]
+        }
+        all_set_references = retained_references | pruned_references
+        orphan_references = set(inventory) - all_set_references
+        current_record = next(
+            record for record in records
+            if record["generation"] == current_generation
+        )
+        current_committed_at = self._parse_committed_at(
+            current_record["manifest"]["committed_at"],
+            label="checkpoint set manifest",
+        )
+        protected_orphans: set[tuple[str, str]] = set()
+        older_orphans: dict[str, list[tuple[str, str]]] = {}
+        for reference in orphan_references:
+            manifest = inventory[reference]["manifest"]
+            committed_at = self._parse_committed_at(
+                manifest.get("committed_at"),
+                label="checkpoint manifest",
+            )
+            if committed_at > current_committed_at:
+                # A separate producer may have completed this shard after the
+                # set snapshot. Never collect a provably future generation.
+                protected_orphans.add(reference)
+            else:
+                older_orphans.setdefault(reference[0], []).append(reference)
+        for references in older_orphans.values():
+            protected_orphans.add(max(
+                references,
+                key=lambda reference: (
+                    self._parse_committed_at(
+                        inventory[reference]["manifest"].get("committed_at"),
+                        label="checkpoint manifest",
+                    ),
+                    reference[1],
+                ),
+            ))
+        stale_orphans = orphan_references - protected_orphans
+        removed_references = (
+            (pruned_references - retained_references) | stale_orphans
+        )
+        surviving_inventory = {
+            reference: value
+            for reference, value in inventory.items()
+            if reference not in removed_references
+        }
+        protected_blobs = {
+            blob_key
+            for value in surviving_inventory.values()
+            for blob_key in value["blob_keys"]
+        }
+        candidate_blobs = {
+            blob_key
+            for reference in removed_references
+            for blob_key in inventory[reference]["blob_keys"]
+            if blob_key not in protected_blobs
+        }
+        stable_orphans = set(
+            self._stable_blob_keys(job_id)
+        ) - protected_blobs
+        # Remove discoverability before data. A crash can leak bytes, but can
+        # never leave a visible retained set pointing at deleted data.
+        self._delete_keys({record["key"] for record in pruned})
+        self._delete_keys({
+            inventory[reference]["key"]
+            for reference in removed_references
+        })
+        self._delete_keys(candidate_blobs | stable_orphans)
+
+    def publish_checkpoint_set(
+        self,
+        *,
+        job_id: str,
+        shard_generations: dict[str, str],
+        generation: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        keep_last_n: int = 3,
+    ) -> dict[str, Any]:
+        """Atomically publish a complete Job-level selection of shard manifests."""
+
+        if (
+            isinstance(keep_last_n, bool)
+            or not isinstance(keep_last_n, int)
+            or keep_last_n <= 0
+            or keep_last_n > self._max_checkpoint_sets
+        ):
+            raise CheckpointError("invalid checkpoint set retention")
+        if (
+            not isinstance(shard_generations, dict)
+            or not shard_generations
+            or len(shard_generations) > self._max_objects
+        ):
+            raise CheckpointError("invalid checkpoint set shard mapping")
+        generation = _safe_component(
+            generation or _new_generation(),
+            label="checkpoint set generation",
+        )
+        normalized_shards = sorted(
+            (
+                _safe_component(namespace, label="worker namespace"),
+                _safe_component(
+                    shard_generation, label="checkpoint generation",
+                ),
+            )
+            for namespace, shard_generation in shard_generations.items()
+        )
+        normalized_metadata = self._normalize_metadata(
+            metadata, label="checkpoint set",
+        )
+
+        with self._job_lock(job_id).write():
+            existing_records = self._checkpoint_set_records(job_id)
+            if (
+                len(existing_records) >= self._max_checkpoint_sets
+                and keep_last_n >= self._max_checkpoint_sets
+            ):
+                raise CheckpointError("checkpoint set listing limit exceeded")
+            inventory = self._shard_manifest_inventory(job_id)
+            self._verify_set_references(existing_records, inventory)
+            shards: list[dict[str, Any]] = []
+            total_bytes = 0
+            for namespace, shard_generation in normalized_shards:
+                reference = (namespace, shard_generation)
+                stored = inventory.get(reference)
+                if stored is None:
+                    raise CheckpointError(
+                        "checkpoint set references an uncommitted shard"
+                    )
+                shard_bytes = stored["manifest"].get("total_bytes")
+                if (
+                    isinstance(shard_bytes, bool)
+                    or not isinstance(shard_bytes, int)
+                    or shard_bytes < 0
+                    or shard_bytes > self._max_total_bytes
+                ):
+                    raise CheckpointError(
+                        "checkpoint shard total size is invalid"
+                    )
+                total_bytes += shard_bytes
+                shards.append({
+                    "worker_namespace": namespace,
+                    "generation": shard_generation,
+                    "manifest_sha256": stored["manifest_sha256"],
+                    "total_bytes": shard_bytes,
+                })
+            manifest: dict[str, Any] = {
+                "schema_version": _CHECKPOINT_SET_SCHEMA_VERSION,
+                "kind": "checkpoint-set",
+                "job_id": job_id,
+                "generation": generation,
+                "shards": shards,
+                "total_bytes": total_bytes,
+                "committed_at": datetime.now(timezone.utc).isoformat(),
+                "metadata": normalized_metadata,
+            }
+            payload = self._json_payload(
+                manifest, label="checkpoint set manifest",
+            )
+            key = self._checkpoint_set_key(job_id, generation)
+            published = self._put_committed(
+                key=key,
+                payload=payload,
+                duplicate_message=(
+                    "checkpoint set generation is already committed"
+                ),
+                allow_existing=True,
+            )
+            if published:
+                record = {
+                    "key": key,
+                    "generation": generation,
+                    "manifest": manifest,
+                    "manifest_sha256": hashlib.sha256(payload).hexdigest(),
+                    "shards": shards,
+                }
+                records = [*existing_records, record]
+                returned_manifest = manifest
+            else:
+                matches = [
+                    record for record in existing_records
+                    if record["generation"] == generation
+                ]
+                if len(matches) != 1:
+                    raise CheckpointError(
+                        "checkpoint set generation appeared concurrently; "
+                        "retry resolution is required"
+                    )
+                record = matches[0]
+                comparable_keys = (
+                    "schema_version",
+                    "kind",
+                    "job_id",
+                    "generation",
+                    "shards",
+                    "total_bytes",
+                    "metadata",
+                )
+                if any(
+                    record["manifest"].get(field) != manifest.get(field)
+                    for field in comparable_keys
+                ):
+                    raise CheckpointError(
+                        "checkpoint set generation is already committed "
+                        "with different content"
+                    )
+                records = existing_records
+                returned_manifest = record["manifest"]
+            self._verify_set_references(records, inventory)
+            self._apply_retention(
+                job_id=job_id,
+                current_generation=generation,
+                keep_last_n=keep_last_n,
+                records=records,
+                inventory=inventory,
+            )
+            return returned_manifest
 
     def _write_restored_object(
         self,
@@ -440,9 +1630,18 @@ class S3CheckpointStore:
         destination: Path,
         expected_size: int,
         expected_sha256: str | None,
+        mode: int = 0o600,
     ) -> None:
-        response = self._s3().get_object(Bucket=self._bucket, Key=key)
-        declared = int(response.get("ContentLength") or 0)
+        try:
+            response = self._s3().get_object(
+                Bucket=self._bucket, Key=key,
+            )
+            declared = int(response.get("ContentLength"))
+            body = response["Body"]
+        except Exception as exc:  # noqa: BLE001
+            raise CheckpointError(
+                f"cannot read checkpoint object: {key}"
+            ) from exc
         if declared != expected_size:
             raise CheckpointError(f"checkpoint object size mismatch: {key}")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -451,7 +1650,6 @@ class S3CheckpointStore:
         )
         digest = hashlib.sha256()
         consumed = 0
-        body = response["Body"]
         try:
             descriptor = os.open(
                 temporary,
@@ -485,6 +1683,7 @@ class S3CheckpointStore:
                 raise CheckpointError(
                     f"checkpoint object checksum mismatch: {key}"
                 )
+            os.chmod(temporary, mode)
             os.replace(temporary, destination)
         finally:
             close = getattr(body, "close", None)
@@ -495,6 +1694,21 @@ class S3CheckpointStore:
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _remove_partial_restore(
+        destination: Path,
+        original: BaseException,
+    ) -> None:
+        try:
+            shutil.rmtree(destination)
+        except FileNotFoundError:
+            return
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "checkpoint restore failed and partial-tree cleanup failed",
+                [original, cleanup],
+            )
+
     def restore_checkpoint(
         self,
         *,
@@ -504,6 +1718,8 @@ class S3CheckpointStore:
         paths: list[str],
         generation: str = "",
         expected_metadata: dict[str, Any] | None = None,
+        expected_manifest_sha256: str | None = None,
+        checkpoint_set_generation: str | None = None,
     ) -> dict[str, Any]:
         """Restore one committed generation into a new private staging tree."""
 
@@ -511,13 +1727,45 @@ class S3CheckpointStore:
         destination = Path(destination)
         if destination.exists():
             raise CheckpointError("checkpoint restore destination already exists")
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        destination.mkdir(mode=0o700)
-        try:
-            manifest = self._committed_manifest(
+        with self._job_lock(source_job_id).read():
+            selected_generation = generation
+            selected_sha256 = expected_manifest_sha256
+            if checkpoint_set_generation is not None:
+                checkpoint_set = self._resolve_checkpoint_set_unlocked(
+                    source_job_id=source_job_id,
+                    generation=checkpoint_set_generation,
+                )
+                matching = [
+                    shard for shard in checkpoint_set["shards"]
+                    if shard["worker_namespace"] == worker_namespace
+                ]
+                if len(matching) != 1:
+                    raise CheckpointError(
+                        "checkpoint set does not contain the requested shard"
+                    )
+                shard = matching[0]
+                if (
+                    selected_generation
+                    and selected_generation != shard["generation"]
+                ):
+                    raise CheckpointError(
+                        "checkpoint set shard generation mismatch"
+                    )
+                if (
+                    selected_sha256 is not None
+                    and selected_sha256 != shard["manifest_sha256"]
+                ):
+                    raise CheckpointError(
+                        "checkpoint set shard hash mismatch"
+                    )
+                selected_generation = shard["generation"]
+                selected_sha256 = shard["manifest_sha256"]
+
+            manifest, _manifest_sha256 = self._committed_manifest(
                 source_job_id=source_job_id,
                 worker_namespace=worker_namespace,
-                generation=generation,
+                generation=selected_generation,
+                expected_sha256=selected_sha256,
             )
             self._validate_manifest_identity(
                 manifest,
@@ -526,70 +1774,70 @@ class S3CheckpointStore:
                 paths=normalized_paths,
                 expected_metadata=expected_metadata,
             )
-            files = manifest["files"]
-            if len(files) > self._max_objects:
-                raise CheckpointError("checkpoint object limit exceeded")
-            total = 0
-            worker_root = self._worker_root(
-                source_job_id, worker_namespace,
+            directories, files, _blob_keys = (
+                self._validated_manifest_entries(
+                    manifest,
+                    source_job_id=source_job_id,
+                    worker_namespace=worker_namespace,
+                )
             )
             manifest_generation = _safe_component(
-                str(manifest.get("generation") or ""),
+                manifest.get("generation"),
                 label="checkpoint generation",
             )
-            if generation and manifest_generation != generation:
+            if (
+                selected_generation
+                and manifest_generation != selected_generation
+            ):
                 raise CheckpointError(
                     "checkpoint generation identity mismatch"
                 )
-            blob_root = (
-                f"{worker_root}/checkpoints/{manifest_generation}/blobs/"
-            )
-            restored_paths: set[str] = set()
-            for raw in files:
-                if not isinstance(raw, dict):
-                    raise CheckpointError("invalid checkpoint file entry")
-                relative = _safe_relative_path(
-                    str(raw.get("path") or ""),
-                    label="checkpoint path",
+
+            created = False
+            try:
+                destination.parent.mkdir(
+                    parents=True, exist_ok=True, mode=0o700,
                 )
-                if relative in restored_paths:
-                    raise CheckpointError(
-                        "duplicate checkpoint file path"
+                destination.mkdir(mode=0o700)
+                created = True
+                for requested in normalized_paths:
+                    (destination / requested).mkdir(
+                        parents=True, exist_ok=True, mode=0o700,
                     )
-                restored_paths.add(relative)
-                if not _under_any_path(relative, normalized_paths):
-                    raise CheckpointError(
-                        f"checkpoint path is outside requested roots: {relative}"
-                    )
-                digest = str(raw.get("sha256") or "")
-                key = str(raw.get("object_key") or "")
-                try:
-                    size = int(raw.get("size"))
-                except (TypeError, ValueError) as exc:
-                    raise CheckpointError(
-                        "invalid checkpoint file size"
-                    ) from exc
-                if (
-                    size < 0
-                    or _SHA256.fullmatch(digest) is None
-                    or key != f"{blob_root}{digest}"
+                for directory in sorted(
+                    directories,
+                    key=lambda entry: (
+                        len(PurePosixPath(entry["path"]).parts),
+                        entry["path"],
+                    ),
                 ):
-                    raise CheckpointError("invalid checkpoint file entry")
-                total += size
-                if total > self._max_total_bytes:
-                    raise CheckpointError("checkpoint byte limit exceeded")
-                self._write_restored_object(
-                    key=key,
-                    destination=destination / relative,
-                    expected_size=size,
-                    expected_sha256=digest,
-                )
-            if int(manifest.get("total_bytes") or 0) != total:
-                raise CheckpointError("checkpoint total size mismatch")
-            return manifest
-        except BaseException:
-            shutil.rmtree(destination, ignore_errors=True)
-            raise
+                    (destination / directory["path"]).mkdir(
+                        parents=True, exist_ok=True, mode=0o700,
+                    )
+                for entry in files:
+                    self._write_restored_object(
+                        key=entry["object_key"],
+                        destination=destination / entry["path"],
+                        expected_size=entry["size"],
+                        expected_sha256=entry["sha256"],
+                        mode=entry["mode"],
+                    )
+                for directory in sorted(
+                    directories,
+                    key=lambda entry: (
+                        -len(PurePosixPath(entry["path"]).parts),
+                        entry["path"],
+                    ),
+                ):
+                    os.chmod(
+                        destination / directory["path"],
+                        directory["mode"],
+                    )
+                return manifest
+            except BaseException as exc:
+                if created:
+                    self._remove_partial_restore(destination, exc)
+                raise
 
     def restore_legacy_collection(
         self,
@@ -671,6 +1919,6 @@ class S3CheckpointStore:
                             expected_sha256=None,
                         )
             return manifest
-        except BaseException:
-            shutil.rmtree(destination, ignore_errors=True)
+        except BaseException as exc:
+            self._remove_partial_restore(destination, exc)
             raise
