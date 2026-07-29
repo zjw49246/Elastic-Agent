@@ -23,7 +23,7 @@ ExecStartPost=/bin/sh -c 'for attempt in $(seq 1 240); do /usr/bin/curl -fsS htt
 Restart=always
 RestartSec=5
 TimeoutStartSec=300
-TimeoutStopSec=1200
+TimeoutStopSec=32400
 UMask=0077
 
 # The Manager needs network access and one state directory, but it does not

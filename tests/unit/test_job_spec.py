@@ -117,6 +117,7 @@ class TestCheckpointRecovery:
         [
             ["results", "results"],
             ["results", "results/nested"],
+            ["results", "results-old", "results/nested"],
         ],
     )
     def test_checkpoint_collection_rejects_duplicate_or_overlapping_paths(
@@ -185,21 +186,26 @@ class TestCheckpointRecovery:
             )
 
     def test_recovery_rejects_overlapping_paths(self):
-        with pytest.raises(ValidationError, match="must not overlap"):
-            JobSpec(
-                name="resume",
-                run=RunSpec(command="bench --resume"),
-                recovery={
-                    "policy": "checkpoint",
-                    "source_job_id": "job-0123456789abcdef",
-                    "paths": ["results", "results/nested"],
-                },
-            )
+        for paths in (
+            ["results", "results/nested"],
+            ["results", "results-old", "results/nested"],
+        ):
+            with pytest.raises(ValidationError, match="must not overlap"):
+                JobSpec(
+                    name="resume",
+                    run=RunSpec(command="bench --resume"),
+                    recovery={
+                        "policy": "checkpoint",
+                        "source_job_id": "job-0123456789abcdef",
+                        "paths": paths,
+                    },
+                )
 
     def test_checkpoint_and_legacy_recovery_are_explicit(self):
         checkpoint = JobSpec(
             name="resume",
             run=RunSpec(command="bench --resume"),
+            fanout={"shard_by": "shard_index"},
             collect={
                 "paths": ["results"],
                 "checkpoint": True,
@@ -222,6 +228,7 @@ class TestCheckpointRecovery:
         )
 
         assert checkpoint.collect.checkpoint is True
+        assert checkpoint.collect.checkpoint_keep_generations == 3
         assert checkpoint.collect.exclude == ["**/core", "*.tmp"]
         assert checkpoint.recovery.policy == "checkpoint"
         assert legacy.recovery.policy == "legacy_final_collection"
@@ -240,6 +247,128 @@ class TestCheckpointRecovery:
                     "exclude": [pattern],
                 },
             )
+
+    def test_checkpoint_list_and_retention_limits_are_bounded(self):
+        with pytest.raises(ValidationError):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={"paths": [f"p{i}" for i in range(33)]},
+            )
+        with pytest.raises(ValidationError):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={
+                    "paths": ["results"],
+                    "checkpoint": True,
+                    "checkpoint_keep_generations": 101,
+                },
+            )
+
+    def test_checkpoint_retention_leaves_inventory_room_for_next_generation(
+        self,
+    ):
+        valid = JobSpec(
+            name="checkpoint-boundary",
+            run=RunSpec(command="bench"),
+            fanout={"workers": 100, "shard_by": "shard_index"},
+            collect={
+                "paths": ["results"],
+                "checkpoint": True,
+                "checkpoint_keep_generations": 91,
+            },
+        )
+        assert valid.collect.checkpoint_keep_generations == 91
+
+        with pytest.raises(
+            ValidationError, match="10000-manifest checkpoint retention budget",
+        ):
+            JobSpec(
+                name="checkpoint-overflow",
+                run=RunSpec(command="bench"),
+                fanout={"workers": 100, "shard_by": "shard_index"},
+                collect={
+                    "paths": ["results"],
+                    "checkpoint": True,
+                    "checkpoint_keep_generations": 92,
+                },
+            )
+
+    def test_checkpoint_requires_stable_shard_index(self):
+        with pytest.raises(
+            ValidationError,
+            match="fanout.shard_by='shard_index'",
+        ):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+            )
+
+    @pytest.mark.parametrize(
+        ("command", "resume_args"),
+        [
+            ('bench --output "results/$(hostname -s)"', ""),
+            ('bench --output "results/$HOSTNAME"', ""),
+            ('bench --output "results/${HOSTNAME}"', ""),
+            ('bench --output "results/{{hostname}}"', ""),
+            ("bench", '--resume "results/$(hostname -s)"'),
+        ],
+    )
+    def test_checkpoint_rejects_hostname_derived_recovery_paths(
+        self, command, resume_args,
+    ):
+        with pytest.raises(
+            ValidationError,
+            match="replacement Workers have different hostnames",
+        ):
+            JobSpec(
+                name="checkpoint-hostname",
+                run=RunSpec(command=command),
+                rotation={"resume_args": resume_args},
+                fanout={"shard_by": "shard_index"},
+                collect={"paths": ["results"], "checkpoint": True},
+            )
+
+    def test_checkpoint_accepts_stable_shard_id_paths(self):
+        spec = JobSpec(
+            name="checkpoint-shard",
+            run=RunSpec(
+                command='bench --output "results/shard-{{shard_id}}"',
+            ),
+            rotation={
+                "resume_args": '--resume "results/shard-{{shard_id}}"',
+            },
+            fanout={"workers": 2, "shard_by": "shard_index"},
+            collect={"paths": ["results"], "checkpoint": True},
+        )
+
+        first, second = spec.worker_contexts()
+        assert "shard-00000" in spec.render_command(first)[2]
+        assert "shard-00001" in spec.render_command(second)[2]
+
+    def test_non_checkpoint_collection_paths_must_also_be_disjoint(self):
+        with pytest.raises(ValidationError, match="must not overlap"):
+            JobSpec(
+                name="ordinary-overlap",
+                run=RunSpec(command="bench"),
+                collect={"paths": ["results", "results/nested"]},
+            )
+
+        spec = JobSpec(
+            name="checkpoint",
+            run=RunSpec(command="bench"),
+            fanout={"shard_by": "shard_index"},
+            collect={
+                "paths": ["results"],
+                "checkpoint": True,
+            },
+        )
+        assert spec.fanout.shard_by == "shard_index"
 
 
 class TestEnvironmentAndSetup:

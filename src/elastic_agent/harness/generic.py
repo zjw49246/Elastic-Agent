@@ -216,6 +216,7 @@ def compile_bootstrap_steps(
     pty_package: str | None = None,
     runtime_from_src: bool = False,
     run_as: str = "ubuntu",
+    include_s3_cli: bool = False,
 ) -> list[BootstrapStep]:
     """Full bootstrap sequence for a declarative job.
 
@@ -236,6 +237,8 @@ def compile_bootstrap_steps(
     include_claude_pty = include_pty and spec.account.agent_type == "claude"
     profile = spec.environment.manifest()
     common_packages = system_packages or list(profile["system_packages"])
+    if include_s3_cli and "awscli" not in common_packages:
+        common_packages.append("awscli")
 
     steps: list[BootstrapStep] = []
     if spec.account.binding == "eip":

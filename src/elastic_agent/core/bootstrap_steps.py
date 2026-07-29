@@ -90,11 +90,6 @@ def system_init_step(
     package_names = list(packages or [
         "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
     ])
-    # S3 dataset staging and worker-direct result collection run after the
-    # runtime has started.  Install their CLI dependency here so those paths
-    # never invoke apt while a user task is live.
-    if "awscli" not in package_names:
-        package_names.append("awscli")
     pkg_list = shlex.join(package_names)
     fallback = (
         "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
@@ -155,6 +150,7 @@ def host_update_hardening_step(timeout: int = 300) -> BootstrapStep:
             "unless ref($nrconf{blacklist_rc}) eq 'ARRAY';\n"
             "push @{$nrconf{blacklist_rc}}, "
             "qr/^(?:ea-runtime|elastic-agent-runtime|"
+            "ea-task-supervisor|elastic-agent-task-supervisor|"
             "ea-task@.+|elastic-agent-task@.+)\\.service$/;\n"
             "NEEDRESTART\n"
             "chmod 0644 /etc/needrestart/conf.d/99-elastic-agent.conf\n"

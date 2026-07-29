@@ -120,6 +120,7 @@
             "ManagedBy",
             "Name",
             "ElasticAgentJob",
+            "ElasticAgentShardIndex",
             "ElasticAgentController",
             "ElasticAgentLease",
             "ElasticAgentAccount",
@@ -152,6 +153,7 @@
             "ManagedBy",
             "Name",
             "ElasticAgentJob",
+            "ElasticAgentShardIndex",
             "ElasticAgentController",
             "ElasticAgentLease",
             "ElasticAgentAccount",
@@ -336,6 +338,12 @@
         "s3:AbortMultipartUpload"
       ],
       "Resource": "arn:aws:s3:::elastic-agent-results-297645381734/jobs/*"
+    },
+    {
+      "Sid": "DeleteInternalCheckpointHistory",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::elastic-agent-results-297645381734/jobs/.elastic-agent-checkpoints/*"
     },
     {
       "Sid": "ReadNamedJobSecrets",

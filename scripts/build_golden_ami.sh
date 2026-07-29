@@ -312,7 +312,7 @@ cat > /etc/needrestart/conf.d/99-elastic-agent.conf <<'NEEDRESTART'
 $nrconf{restart} = 'l';
 $nrconf{blacklist_rc} = [] unless ref($nrconf{blacklist_rc}) eq 'ARRAY';
 push @{$nrconf{blacklist_rc}},
-  qr/^(?:ea-runtime|elastic-agent-runtime|ea-task@.+|elastic-agent-task@.+)\.service$/;
+  qr/^(?:ea-runtime|elastic-agent-runtime|ea-task-supervisor|elastic-agent-task-supervisor|ea-task@.+|elastic-agent-task@.+)\.service$/;
 NEEDRESTART
 chmod 0644 /etc/needrestart/conf.d/99-elastic-agent.conf
 

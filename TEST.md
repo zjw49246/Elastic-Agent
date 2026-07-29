@@ -148,7 +148,7 @@ The focused suite covers:
   reconciler guards that ignore exact fully-released terminated history,
   recover unknown/incomplete leased orphans fail-closed, and quarantine an
   instance claimed by a conflicting active lease without cloud mutation;
-- bounded final collection (three attempts/300 seconds by default), IPv6
+- bounded final collection (three attempts/7200 seconds by default), IPv6
   disablement before login, current-source worker deployment, WSS enforcement,
   forced fresh runtime reconnect, strict request correlation, protected
   credential-home env, exact authenticated-email checks, and successful
@@ -159,6 +159,25 @@ The focused suite covers:
   intervals, awaited Manager-side upload, explicit S3 failures, and
   force-termination plus Node-record removal (not registry-only draining) after
   ordinary Job completion;
+- immutable checkpoint recovery: stable shard-index contracts, per-file
+  snapshot race detection, content-addressed blob deduplication, atomic shard
+  manifests and all-shard Job sets, incomplete-generation rejection,
+  retention/garbage collection, v1 and legacy compatibility, S3-COMMITTED
+  recovery before the local latest pointer exists, pre-prepare generation
+  pinning, exact metadata/shard/aggregate-budget validation, hash/size/mode and
+  empty-directory restore, logical+allocation-block+inode pre-cloud staging,
+  pre-spawn durable rsync journals and unsettled-transfer quarantine,
+  cancellation fences, root-private same-filesystem Worker transactions,
+  Worker-side fsync/re-measure, crash-injected multi-directory roll-forward,
+  installed-marker dispatch/collect gates, and fail-closed rejection of legacy
+  mutable recovery;
+- startup collection quiescence: current/legacy and templated task units are
+  stopped and runtime-masked, Job-user linger/session respawn is disabled, all
+  dedicated-Worker Docker containers are removed, Docker/containerd units and
+  cgroups are proven empty, residual Job-user/worktree processes are fenced,
+  and checkpoint transaction reconcile completes strictly before collect;
+  long startup final collection runs behind a fail-closed background recovery
+  barrier and retries unexpected pass failures without blocking readiness;
 - bounded result metadata and archives: authoritative file counts with
   500-entry preview/serialized-byte budgets, shared Local/S3 score
   attempt/read/entry/scalar limits, inode/ETag plus exact-EOF snapshot checks,
@@ -314,7 +333,9 @@ The focused suite covers:
   plus pre-parse request-body limits for Content-Length and tiny chunk floods.
 - immutable content-addressed Harness upload, exact Idempotency-Key replay
   before mutable preflight, pending UI key/spec recovery without provider
-  default waits, S3 template whitespace/empty-context/object-vs-prefix guards,
+  default waits, server-side checkpoint recovery that preserves private
+  env/secret references while allowing only generation/run/TTL overrides,
+  S3 template whitespace/empty-context/object-vs-prefix guards,
   quoted destination parents, bounded Manager session/cost metadata, and
   historical Job `scandir`/journal-read/response/admission ceilings with
   explicit truncation metadata.

@@ -265,6 +265,7 @@ class TestDashboardEndpoint:
         assert "const recoveryEnabled =" in build_spec
         assert "source_job_id: recoveryEnabled" in build_spec
         assert "generation: recoveryPolicy === 'checkpoint'" in build_spec
+        assert "旧 Job 的最终收集（兼容模式）" not in html
         assert "s3_datasets: parseS3Datasets()" in build_spec
         assert "=== 'true'" in build_spec
         assert "if (ref) spec.harness_ref = ref" in build_spec
@@ -799,6 +800,62 @@ process.stdout.write(JSON.stringify(results));
         assert "spec: currentSerialized" in submit
 
     @pytest.mark.asyncio
+    async def test_checkpoint_recovery_keeps_ambiguous_idempotency_key(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        classifier = _javascript_function(
+            html,
+            "recoverySubmissionDefinitivelyRejected",
+        )
+        recover = _javascript_function(html, "recoverJob")
+
+        classified = _run_node_json(
+            classifier
+            + """
+const statuses = [0, 400, 408, 409, 422, 429, 500, 503];
+process.stdout.write(JSON.stringify(Object.fromEntries(
+  statuses.map(code => [
+    code,
+    recoverySubmissionDefinitivelyRejected(code),
+  ])
+)));
+"""
+        )
+        assert classified == {
+            "0": False,
+            "400": False,
+            "408": False,
+            "409": True,
+            "422": False,
+            "429": False,
+            "500": False,
+            "503": False,
+        }
+        assert "明确丢弃这条待重试记录" in recover
+        assert "换新 Key 可能重复创建 Worker" in recover
+        assert (
+            "if (recoverySubmissionDefinitivelyRejected(error?.status))"
+            in recover
+        )
+        rejection_branch = recover[
+            recover.index(
+                "if (recoverySubmissionDefinitivelyRejected(error?.status))"
+            ):
+            recover.index("} else {", recover.index(
+                "if (recoverySubmissionDefinitivelyRejected(error?.status))"
+            ))
+        ]
+        ambiguous_branch = recover[
+            recover.index("} else {", recover.index(
+                "if (recoverySubmissionDefinitivelyRejected(error?.status))"
+            )):
+        ]
+        assert "sessionStorage.removeItem(pendingKey)" in rejection_branch
+        assert "sessionStorage.removeItem(pendingKey)" not in ambiguous_branch
+
+    @pytest.mark.asyncio
     async def test_account_inputs_declare_browser_side_size_limits(
         self, ui_client,
     ):
@@ -938,8 +995,9 @@ process.stdout.write(JSON.stringify(results));
         assert "[SECRET_REFERENCE]" in card
         assert "命令文本会原样显示" in card
         assert "请勿把密钥直接写进命令" in card
-        assert "可重提 Job 请使用服务端 resubmit" in card
-        assert "旧版配置可能需要按当前规则调整" in card
+        assert "普通重提请使用服务端 resubmit" in card
+        assert "从检查点恢复" in card
+        assert "由服务器复制未回显的私有配置" in card
         assert "${cached.text}" not in card
         assert ".textContent = cached.text" in (
             _javascript_function(html, "hydrateJobConfigNode")

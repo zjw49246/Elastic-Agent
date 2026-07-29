@@ -47,6 +47,13 @@ MAX_JOB_RUNTIME_SECONDS = 2_592_000
 DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
 MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_UNSTABLE_HOSTNAME_RE = re.compile(
+    r"\{\{\s*hostname\s*\}\}"
+    r"|\$\(\s*hostname\b[^)]*\)"
+    r"|\$\{\s*HOSTNAME\s*\}"
+    r"|\$HOSTNAME\b",
+    re.IGNORECASE,
+)
 _ROUTING_PROXY_ENV_KEYS = frozenset({
     "http_proxy",
     "https_proxy",
@@ -656,16 +663,21 @@ class FanoutSpec(StrictSpecModel):
 class CollectSpec(StrictSpecModel):
     """What to pull back from each worker, and how often."""
 
-    paths: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list, max_length=32)
     # Build an immutable, hash-verified S3 generation after each successful
     # Manager-side collection. Checkpoint mode deliberately uses the Manager
     # relay even when direct worker uploads are available: the latter overwrite
     # mutable keys and cannot prove that a live file stayed unchanged.
     checkpoint: bool = False
+    # Keep a small number of complete Job-level recovery sets. Content-addressed
+    # blobs shared by those sets remain reachable; older manifests and
+    # unreferenced blobs are garbage-collected only after a newer complete set
+    # has been published for every shard.
+    checkpoint_keep_generations: int = Field(default=3, ge=1, le=100)
     # Relative glob patterns omitted from both ordinary collection and
     # checkpoint generations. This keeps crash dumps/caches out of durable
     # results without exposing an arbitrary rsync/CLI option surface.
-    exclude: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list, max_length=64)
     # Pull results back periodically WHILE the run is going (seconds), not only
     # on completion — so long runs stream partial results to the Manager → S3 as
     # tasks finish, and a run that quota-outs/fails partway still yields whatever
@@ -715,16 +727,14 @@ class CollectSpec(StrictSpecModel):
 
     @model_validator(mode="after")
     def checkpoint_paths_are_disjoint(self) -> CollectSpec:
-        if not self.checkpoint:
-            return self
-        if len(set(self.paths)) != len(self.paths):
+        ordered = sorted(
+            self.paths,
+            key=lambda value: PurePosixPath(value).parts,
+        )
+        if len(set(ordered)) != len(ordered):
             raise ValueError("checkpoint collect.paths must be unique")
-        for index, path in enumerate(self.paths):
-            if any(
-                other.startswith(path.rstrip("/") + "/")
-                or path.startswith(other.rstrip("/") + "/")
-                for other in self.paths[index + 1 :]
-            ):
+        for parent, child in zip(ordered, ordered[1:]):
+            if child.startswith(parent.rstrip("/") + "/"):
                 raise ValueError(
                     "checkpoint collect.paths must not overlap"
                 )
@@ -734,17 +744,17 @@ class CollectSpec(StrictSpecModel):
 class RecoverySpec(StrictSpecModel):
     """Restore one trusted prior Job shard before dispatching this Job.
 
-    ``checkpoint`` accepts only immutable COMMITTED generations. The explicit
-    ``legacy_final_collection`` escape hatch exists for pre-checkpoint Jobs and
-    is intentionally opt-in because their mutable S3 trees have no hash
-    manifest.
+    ``checkpoint`` accepts only immutable COMMITTED generations. The legacy
+    literal remains parseable solely so old private Job journals can be read;
+    current preflight rejects it because a mutable S3 tree cannot prove file
+    deletions or one complete generation.
     """
 
     policy: Literal[
         "none", "checkpoint", "legacy_final_collection",
     ] = "none"
     source_job_id: str = ""
-    paths: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list, max_length=32)
     generation: str = ""
 
     @field_validator("source_job_id")
@@ -806,14 +816,14 @@ class RecoverySpec(StrictSpecModel):
             raise ValueError(
                 "recovery.generation is supported only for checkpoint recovery"
             )
-        if len(set(self.paths)) != len(self.paths):
+        ordered = sorted(
+            self.paths,
+            key=lambda value: PurePosixPath(value).parts,
+        )
+        if len(set(ordered)) != len(ordered):
             raise ValueError("recovery.paths must be unique")
-        for index, path in enumerate(self.paths):
-            if any(
-                other.startswith(path.rstrip("/") + "/")
-                or path.startswith(other.rstrip("/") + "/")
-                for other in self.paths[index + 1 :]
-            ):
+        for parent, child in zip(ordered, ordered[1:]):
+            if child.startswith(parent.rstrip("/") + "/"):
                 raise ValueError("recovery.paths must not overlap")
         return self
 
@@ -871,6 +881,67 @@ class JobSpec(StrictSpecModel):
             raise ValueError(
                 "checkpoint collection requires collect.paths"
             )
+        if (
+            self.collect.checkpoint
+            and self.fanout.shard_by != "shard_index"
+        ):
+            raise ValueError(
+                "checkpoint collection requires "
+                "fanout.shard_by='shard_index' so a replacement worker "
+                "receives the same logical shard"
+            )
+        if self.collect.checkpoint:
+            recovery_sensitive_values = [
+                self.run.command,
+                self.run.cwd,
+                self.rotation.resume_args,
+                *self.run.env.values(),
+                *self.setup.commands,
+                self.setup.target_dir,
+                *(
+                    value
+                    for step in self.setup.steps
+                    for value in (
+                        step.command,
+                        step.cwd,
+                        *step.env.values(),
+                    )
+                ),
+                *(
+                    value
+                    for dataset in self.setup.s3_datasets
+                    for value in (dataset.uri, dataset.dest)
+                ),
+            ]
+            if any(
+                _UNSTABLE_HOSTNAME_RE.search(str(value))
+                for value in recovery_sensitive_values
+                if value
+            ):
+                raise ValueError(
+                    "checkpoint Jobs cannot use hostname-derived workload "
+                    "paths or inputs because replacement Workers have different "
+                    "hostnames; use {{shard_id}} or {{shard_index}}"
+                )
+            incomplete_window = max(
+                2,
+                min(8, self.collect.checkpoint_keep_generations),
+            )
+            # The checkpoint store intentionally bounds a Job's shard-manifest
+            # inventory at 10,000. Leave room for one in-progress generation
+            # and the incomplete-generation recovery window so retention can
+            # always run before the listing limit is reached.
+            manifest_budget = self.fanout.workers * (
+                self.collect.checkpoint_keep_generations
+                + incomplete_window
+                + 1
+            )
+            if manifest_budget > 10_000:
+                raise ValueError(
+                    "fanout.workers and "
+                    "collect.checkpoint_keep_generations require more than "
+                    "the 10000-manifest checkpoint retention budget"
+                )
         return self
 
     @model_validator(mode="after")

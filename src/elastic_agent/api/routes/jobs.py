@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -43,7 +43,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from elastic_agent.api.auth import require_api_key
 from elastic_agent.api.body_limit import (
@@ -246,6 +246,26 @@ class ResultsSpoolUnavailable(RuntimeError):  # noqa: N818
     """The Manager cannot safely reserve temporary archive disk space."""
 
 
+class RecoveryRunOverrides(BaseModel):
+    """The only run fields an operator may change for checkpoint recovery."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command: str | None = Field(default=None, min_length=1, max_length=65_536)
+    timeout: int | None = Field(default=None, ge=60, le=2_592_000)
+
+
+class RecoveryJobRequest(BaseModel):
+    """Server-side recovery request built from one private persisted JobSpec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_job_id: str = Field(min_length=1, max_length=128)
+    generation: str = Field(default="", max_length=128)
+    run: RecoveryRunOverrides = Field(default_factory=RecoveryRunOverrides)
+    ttl_seconds: int | None = Field(default=None, ge=300, le=2_592_000)
+
+
 def _acquire_result_operation(
     admission: _ResultOperationAdmission,
     *,
@@ -414,6 +434,14 @@ def _read_and_redact_job_config(path: Path, job_id: str) -> tuple[dict, dict]:
     # executor boundary.  Detail rendering needs only lifecycle metadata plus
     # the already-redacted projection.
     raw_spec = payload.pop("spec")
+    raw_collect = (
+        raw_spec.get("collect")
+        if isinstance(raw_spec, dict) else None
+    )
+    payload["checkpoint_recovery_available"] = bool(
+        isinstance(raw_collect, dict)
+        and raw_collect.get("checkpoint") is True
+    )
     return payload, _redacted_spec(raw_spec)
 
 
@@ -651,6 +679,18 @@ def _persisted_job_view(
         state = "recovered"
     else:
         state = submission_state
+    raw_spec = payload.get("spec")
+    raw_collect = (
+        raw_spec.get("collect")
+        if isinstance(raw_spec, dict) else None
+    )
+    checkpoint_recovery_available = bool(
+        payload.get("checkpoint_recovery_available") is True
+        or (
+            isinstance(raw_collect, dict)
+            and raw_collect.get("checkpoint") is True
+        )
+    )
 
     view = {
         "job_id": job_id,
@@ -667,6 +707,14 @@ def _persisted_job_view(
         "created_at": terminal_summary.get("created_at"),
         "started_at": terminal_summary.get("started_at"),
         "completed_at": terminal_summary.get("completed_at"),
+        # The top-level pointer is advanced independently using the
+        # checkpoint's committed_at timestamp.  A terminal summary can be
+        # written later from a stale in-memory snapshot, so it is only a
+        # compatibility fallback for journals that predate that pointer.
+        "latest_checkpoint_generation": payload.get(
+            "latest_checkpoint_generation"
+        ) or terminal_summary.get("latest_checkpoint_generation"),
+        "checkpoint_recovery_available": checkpoint_recovery_available,
         "in_memory": False,
         "workers_detail": terminal_workers,
         "recovery_leases": [lease.model_dump() for lease in recovered],
@@ -1206,6 +1254,13 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
 
     recovery_preview = None
     if spec.recovery.policy != "none":
+        if spec.recovery.policy == "legacy_final_collection":
+            raise HTTPException(
+                422,
+                "legacy mutable result recovery is disabled because it cannot "
+                "prove file deletions or a complete generation; restart the "
+                "workload from the beginning, then enable collect.checkpoint",
+            )
         if not results_bucket:
             raise HTTPException(
                 422,
@@ -1251,22 +1306,63 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 ManagerFleetDriver,
             )
 
+            recovery_driver = ManagerFleetDriver(mgr)
+            source_quiescent = (
+                await recovery_driver._source_recovery_quiescent(
+                    spec.recovery.source_job_id
+                )
+            )
             ManagerFleetDriver._validate_recovery_contract(
                 source_payload,
                 source_spec,
                 spec,
+                source_quiescent=source_quiescent,
             )
-        except (ValidationError, RuntimeError, ValueError) as exc:
+            resolved_checkpoint = None
+            if spec.recovery.policy == "checkpoint":
+                try:
+                    resolved_checkpoint = (
+                        await recovery_driver.resolve_recovery_checkpoint(
+                            source_job_id=spec.recovery.source_job_id,
+                            generation=spec.recovery.generation,
+                            source_spec=source_spec,
+                            target_spec=spec,
+                        )
+                    )
+                except Exception as exc:  # S3 details stay Manager-private
+                    raise HTTPException(
+                        422,
+                        "requested complete checkpoint set is unavailable",
+                    ) from exc
+        except ValidationError as exc:
+            # Detailed Pydantic errors include rejected source values. A
+            # persisted source may contain private environment values and
+            # secret references that must never cross the REST boundary.
+            raise HTTPException(
+                422,
+                "recovery source JobSpec is incompatible with the current schema",
+            ) from exc
+        except RuntimeError as exc:
             raise HTTPException(422, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                422,
+                "recovery source validation failed",
+            ) from exc
         recovery_preview = {
             "policy": spec.recovery.policy,
             "source_job_id": spec.recovery.source_job_id,
             "paths": list(spec.recovery.paths),
             "generation": spec.recovery.generation or "latest",
             "source_state": source_payload["submission_state"],
+            "source_quiescent": source_quiescent,
             "source_resolved_commit": source_spec.setup.resolved_commit,
             "staged_before_cloud_create": True,
         }
+        if resolved_checkpoint is not None:
+            recovery_preview["resolved_generation"] = (
+                resolved_checkpoint.get("generation")
+            )
 
     accounts = await mgr.account_store.list()
     agent_api_store = getattr(mgr, "agent_api_store", None)
@@ -1437,12 +1533,6 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             "results are collected only at process exit; set an interval for "
             "long-running Jobs that need partial-result durability"
         )
-    if spec.recovery.policy == "legacy_final_collection":
-        warnings.append(
-            "legacy_final_collection has no immutable per-file hash manifest; "
-            "use it only for a proven stopped source Job, then enable "
-            "collect.checkpoint on the recovery Job"
-        )
     if (
         provider.type == "aws"
         and spec.account.mode == "worker_local_login"
@@ -1535,6 +1625,46 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
     }
 
 
+def _pin_preflight_checkpoint_generation(
+    spec: JobSpec,
+    plan: dict,
+) -> JobSpec:
+    """Freeze a ``latest`` recovery request to the set preflight resolved.
+
+    The caller's request fingerprint deliberately remains based on the public
+    request (where an empty generation means "resolve once").  The private
+    JobSpec persisted before launch must instead contain that exact immutable
+    generation so staging, crash replay, and idempotent retry cannot drift to a
+    newer set.
+    """
+
+    if (
+        spec.recovery.policy != "checkpoint"
+        or spec.recovery.generation
+    ):
+        return spec
+    recovery = plan.get("recovery")
+    generation = (
+        recovery.get("resolved_generation")
+        if isinstance(recovery, dict)
+        else None
+    )
+    if not isinstance(generation, str) or not generation:
+        raise HTTPException(
+            500,
+            "checkpoint preflight did not return a resolved generation",
+        )
+    payload = spec.model_dump(mode="json")
+    payload["recovery"]["generation"] = generation
+    try:
+        return JobSpec.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            "requested complete checkpoint set is unavailable",
+        ) from exc
+
+
 @router.post("/jobs/plan")
 async def plan_job(spec: JobSpec) -> dict:
     """Validate and preview a Job without persistence/cloud/account mutation."""
@@ -1564,8 +1694,43 @@ async def submit_job(
     """Replay history or validate + launch a new batch Job."""
 
     raw_request = await _read_bounded_job_request(request)
+    return await _submit_job_payload(raw_request, idempotency_key)
+
+
+async def _submit_job_payload(
+    raw_request: dict[str, object] | None,
+    idempotency_key: str | None,
+    *,
+    identity_request: dict[str, object] | None = None,
+    raw_request_factory: (
+        Callable[[], Awaitable[dict[str, object]]] | None
+    ) = None,
+) -> dict:
+    """Run one JobSpec through the canonical submit path.
+
+    ``identity_request`` lets a server-side constructor durably bind an
+    idempotency key to its small public request envelope instead of to the
+    private JobSpec it synthesizes.  The factory remains lazy so an exact
+    replay of an already accepted request can be answered from its journal
+    without loading or revalidating the source Job.
+    """
+
+    if raw_request is None and (
+        raw_request_factory is None or identity_request is None
+    ):
+        raise RuntimeError(
+            "lazy Job submission requires an identity request and factory"
+        )
+    if raw_request is not None and raw_request_factory is not None:
+        raise RuntimeError(
+            "Job submission cannot provide both a request and factory"
+        )
+    fingerprint_request = (
+        identity_request if identity_request is not None else raw_request
+    )
+
     try:
-        fingerprint = _request_fingerprint(raw_request)
+        fingerprint = _request_fingerprint(fingerprint_request)
     except (TypeError, ValueError, RecursionError) as exc:
         raise HTTPException(422, "invalid Job JSON request body") from exc
 
@@ -1582,8 +1747,12 @@ async def submit_job(
     # lock so one provider cannot stall unrelated submitters.
     spec: JobSpec | None = None
     if not idempotency_key:
+        if raw_request is None:
+            assert raw_request_factory is not None
+            raw_request = await raw_request_factory()
         spec = _validated_job_spec(raw_request)
-        await _preflight_job(mgr, spec)
+        plan = await _preflight_job(mgr, spec)
+        spec = _pin_preflight_checkpoint_generation(spec, plan)
 
     async with _submit_lock:
         deterministic_id = None
@@ -1606,7 +1775,7 @@ async def submit_job(
                 try:
                     matches, legacy_journal = _journal_request_match(
                         payload,
-                        raw_request,
+                        fingerprint_request,
                         fingerprint,
                     )
                 except ValueError as exc:
@@ -1630,8 +1799,24 @@ async def submit_job(
                 if submission_state == "prepared":
                     # The durable write won, but scheduling did not.  Reusing
                     # the same deterministic id is the safe continuation; a
-                    # fresh id would violate the idempotency contract.
+                    # fresh id would violate the idempotency contract. The
+                    # persisted private spec is also authoritative: preflight
+                    # may have frozen a mutable "latest" checkpoint selector
+                    # before the crash, and replaying the public request must
+                    # not resolve it again to a different generation.
                     recovered_prepared = True
+                    persisted_spec = payload.get("spec")
+                    if not isinstance(persisted_spec, dict):
+                        raise HTTPException(
+                            500,
+                            f"invalid persisted spec for Job "
+                            f"{deterministic_id}",
+                        )
+                    # This applies equally to direct /jobs submissions and the
+                    # server-side /jobs/recover constructor. The already
+                    # matched public request proves identity; only this exact
+                    # accepted snapshot is eligible for rescheduling.
+                    raw_request = copy.deepcopy(persisted_spec)
                 else:
                     leases = await mgr.account_binding_store.list_leases()
                     detail = _persisted_job_view(
@@ -1649,7 +1834,7 @@ async def submit_job(
                 # equality and otherwise fail closed.
                 matches, _legacy = _journal_request_match(
                     {"spec": live.spec.model_dump(mode="json")},
-                    raw_request,
+                    fingerprint_request,
                     fingerprint,
                 )
                 if not matches:
@@ -1663,8 +1848,12 @@ async def submit_job(
         # launched. New submissions and recovery of a merely prepared journal
         # do require current validation and the complete preflight.
         if spec is None:
+            if raw_request is None:
+                assert raw_request_factory is not None
+                raw_request = await raw_request_factory()
             spec = _validated_job_spec(raw_request)
-            await _preflight_job(mgr, spec)
+            plan = await _preflight_job(mgr, spec)
+            spec = _pin_preflight_checkpoint_generation(spec, plan)
 
         try:
             # The raw request fingerprint is carried into the very first
@@ -1683,6 +1872,180 @@ async def submit_job(
         if recovered_prepared:
             detail["idempotent_replay"] = True
         return detail
+
+
+async def _load_private_recovery_source(mgr, source_job_id: str) -> dict:
+    """Read one raw persisted source spec without exposing it through REST."""
+
+    source_job_id = _validate_job_id(source_job_id)
+    path = _job_spec_path(mgr, source_job_id)
+    if not _job_journal_exists(path):
+        raise HTTPException(
+            404,
+            f"no persisted spec for source Job {source_job_id}",
+        )
+    permit = _acquire_result_operation(
+        _JOB_HISTORY_ADMISSION,
+        operation="recovery source read",
+    )
+    try:
+        return await _run_owned_executor(
+            _JOB_HISTORY_EXECUTOR,
+            _read_job_journal,
+            path,
+            source_job_id,
+        )
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RecursionError,
+        RuntimeError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            500,
+            f"persisted source Job {source_job_id} is unavailable",
+        ) from exc
+    finally:
+        permit.release()
+
+
+def _build_checkpoint_recovery_spec(
+    source_job_id: str,
+    source_payload: dict,
+    request: RecoveryJobRequest,
+) -> dict[str, object]:
+    """Clone the private source spec and apply the narrow recovery whitelist."""
+
+    try:
+        source_spec = JobSpec.model_validate(source_payload["spec"])
+    except (
+        KeyError,
+        RecursionError,
+        TypeError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        # Pydantic's detailed error includes rejected input values. Keep raw
+        # environment values and secret references on the Manager.
+        raise HTTPException(
+            422,
+            "persisted source JobSpec is incompatible with checkpoint recovery",
+        ) from exc
+    if source_spec.harness_ref:
+        raise HTTPException(
+            422,
+            "server-side checkpoint recovery supports declarative Jobs only",
+        )
+    if not source_spec.collect.checkpoint or not source_spec.collect.paths:
+        raise HTTPException(
+            422,
+            "source Job did not enable immutable checkpoint collection",
+        )
+
+    target = source_spec.model_dump(mode="json")
+    target["recovery"] = {
+        "policy": "checkpoint",
+        "source_job_id": source_job_id,
+        "paths": list(source_spec.collect.paths),
+        "generation": request.generation,
+    }
+    run = target["run"]
+    if request.run.command is not None:
+        run["command"] = request.run.command
+    if request.run.timeout is not None:
+        run["timeout"] = request.run.timeout
+    if request.ttl_seconds is not None:
+        target["ttl_seconds"] = request.ttl_seconds
+    try:
+        # Validate the synthesized request before it reaches fingerprinting or
+        # preflight. This also normalizes whitespace in generation/command.
+        normalized = JobSpec.model_validate(target).model_dump(mode="json")
+    except (RecursionError, TypeError, ValidationError, ValueError) as exc:
+        raise HTTPException(
+            422,
+            "checkpoint recovery overrides are incompatible with the source Job",
+        ) from exc
+    try:
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise HTTPException(
+            422,
+            "checkpoint recovery JobSpec cannot be serialized safely",
+        ) from exc
+    if len(encoded) > JOB_SUBMIT_MAX_BODY_BYTES:
+        raise HTTPException(
+            413,
+            "checkpoint recovery JobSpec exceeds the current Job request limit",
+        )
+    return normalized
+
+
+def _checkpoint_recovery_request_identity(
+    source_job_id: str,
+    request: RecoveryJobRequest,
+) -> dict[str, object]:
+    """Return the stable public identity of one recovery submission."""
+
+    command = request.run.command
+    return {
+        "request_kind": "checkpoint-recovery",
+        "schema_version": 1,
+        "source_job_id": source_job_id,
+        "generation": request.generation.strip(),
+        "run": {
+            "command": command.strip() if command is not None else None,
+            "timeout": request.run.timeout,
+        },
+        "ttl_seconds": request.ttl_seconds,
+    }
+
+
+@router.post("/jobs/recover", status_code=201)
+async def create_recovery_job(
+    request: RecoveryJobRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key"
+    ),
+) -> dict:
+    """Create a new Job from a private source spec and an immutable checkpoint.
+
+    Unlike the redacted Job detail response, this path never asks the browser
+    to reconstruct environment values or secret references. They remain in the
+    Manager's private journal and are copied only into the new private journal.
+    """
+
+    mgr = _mgr()
+    source_job_id = _validate_job_id(request.source_job_id)
+    identity_request = _checkpoint_recovery_request_identity(
+        source_job_id,
+        request,
+    )
+
+    async def build_target() -> dict[str, object]:
+        source_payload = await _load_private_recovery_source(
+            mgr,
+            source_job_id,
+        )
+        return _build_checkpoint_recovery_spec(
+            source_job_id,
+            source_payload,
+            request,
+        )
+
+    return await _submit_job_payload(
+        None,
+        idempotency_key,
+        identity_request=identity_request,
+        raw_request_factory=build_target,
+    )
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -1712,7 +2075,8 @@ async def resubmit_job(job_id: str) -> dict:
         spec = JobSpec(**payload["spec"])
     except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(500, f"invalid persisted spec for job {job_id}") from exc
-    await _preflight_job(mgr, spec)
+    plan = await _preflight_job(mgr, spec)
+    spec = _pin_preflight_checkpoint_generation(spec, plan)
     try:
         job = await mgr.batch.submit(spec)
     except JobSpecPersistenceError as exc:
@@ -2162,6 +2526,34 @@ def _is_safe_result_relative_path(relative: str) -> bool:
     )
 
 
+def _is_internal_result_relative_path(relative: str) -> bool:
+    """Hide Manager control state while retaining application dotfiles."""
+
+    parts = PurePosixPath(relative).parts
+    if not parts:
+        return False
+    if "_elastic_agent" in parts:
+        return True
+    if parts[0] in {
+        "checkpoint-blobs",
+        "checkpoint-sets",
+        "_elastic_agent_checkpoints",
+        ".elastic-agent-checkpoints",
+    }:
+        return True
+    if (
+        len(parts) >= 2
+        and parts[0] == "workers"
+        and parts[1].startswith(".")
+    ):
+        return True
+    return (
+        len(parts) >= 3
+        and parts[0] == "workers"
+        and parts[2] == "checkpoints"
+    )
+
+
 def _local_regular_files(
     base: Path,
     *,
@@ -2201,6 +2593,8 @@ def _local_regular_files(
                     raise LocalResultsUnavailable(
                         "local results contain a path that is not valid UTF-8"
                     ) from exc
+                if _is_internal_result_relative_path(rel):
+                    continue
                 metadata_bytes += encoded_path_bytes
                 if metadata_bytes > max_metadata_bytes:
                     raise ResultsLimitExceeded(
@@ -2480,6 +2874,12 @@ def _safe_s3_relative_key(relative: str) -> str:
     return relative
 
 
+def _is_internal_s3_result_key(relative: str) -> bool:
+    """Hide checkpoint/control objects from public result enumeration."""
+
+    return _is_internal_result_relative_path(relative)
+
+
 def _s3_list_job(
     job_id: str,
     *,
@@ -2515,12 +2915,6 @@ def _s3_list_job(
                     "S3 returned an invalid result object listing"
                 )
             for obj in contents:
-                scanned_entries += 1
-                if scanned_entries > RESULT_LIST_MAX_SCANNED_ENTRIES:
-                    raise ResultsLimitExceeded(
-                        "S3 results contain more than "
-                        f"{RESULT_LIST_MAX_SCANNED_ENTRIES} listed entries"
-                    )
                 if not isinstance(obj, dict):
                     raise S3ResultsUnavailable(
                         "S3 returned an invalid result object"
@@ -2533,6 +2927,14 @@ def _s3_list_job(
                 rel = key[len(prefix):]
                 if rel:
                     rel = _safe_s3_relative_key(rel)
+                    if _is_internal_s3_result_key(rel):
+                        continue
+                    scanned_entries += 1
+                    if scanned_entries > RESULT_LIST_MAX_SCANNED_ENTRIES:
+                        raise ResultsLimitExceeded(
+                            "S3 results contain more than "
+                            f"{RESULT_LIST_MAX_SCANNED_ENTRIES} listed entries"
+                        )
                     size = obj.get("Size")
                     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                         raise S3ResultsUnavailable(
@@ -2731,6 +3133,26 @@ def _s3_result_summaries(
     if not bucket:
         return [], set(), 0, 0, False
     root_prefix = f"{_s3_prefix()}/" if _s3_prefix() else ""
+    configured_checkpoint_prefix = os.environ.get(
+        "ELASTIC_AGENT_CHECKPOINT_S3_PREFIX", "",
+    ).strip("/")
+    if not configured_checkpoint_prefix:
+        configured_checkpoint_prefix = (
+            f"{_s3_prefix()}/.elastic-agent-checkpoints"
+            if _s3_prefix()
+            else ".elastic-agent-checkpoints"
+        )
+    reserved_common_prefix = None
+    if configured_checkpoint_prefix.startswith(root_prefix):
+        relative_checkpoint = configured_checkpoint_prefix[
+            len(root_prefix):
+        ].strip("/")
+        if relative_checkpoint:
+            reserved_common_prefix = (
+                root_prefix
+                + relative_checkpoint.split("/", 1)[0]
+                + "/"
+            )
     jobs: list[dict] = []
     seen: set[str] = set()
     object_count = 0
@@ -2777,6 +3199,12 @@ def _s3_result_summaries(
                 if metadata_bytes > max_metadata_bytes:
                     return jobs, seen, object_count, metadata_bytes, True
             for common_prefix in common_prefixes:
+                if (
+                    isinstance(common_prefix, dict)
+                    and common_prefix.get("Prefix")
+                    == reserved_common_prefix
+                ):
+                    continue
                 scanned_entries += 1
                 if scanned_entries > RESULT_SUMMARY_MAX_S3_ROOT_ENTRIES:
                     return jobs, seen, object_count, metadata_bytes, True

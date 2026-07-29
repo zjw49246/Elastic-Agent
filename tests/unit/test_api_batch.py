@@ -187,6 +187,72 @@ class FakeBindingManager:
         return True
 
 
+class FakeAvailableCheckpointStore:
+    """Side-effect-free complete-set proof for API preflight tests."""
+
+    def __init__(self, manager=None):
+        self.manager = manager
+        self.resolve_calls: list[tuple[str, str]] = []
+
+    def resolve_checkpoint_set(
+        self,
+        *,
+        source_job_id,
+        generation="",
+        **_kwargs,
+    ):
+        self.resolve_calls.append((source_job_id, generation))
+        metadata = {}
+        shards = [{
+            "worker_namespace": "shard-00000",
+            "generation": "shard-generation-0001",
+            "manifest_sha256": "0" * 64,
+            "total_bytes": 0,
+            "total_objects": 0,
+        }]
+        if self.manager is not None:
+            from elastic_agent.core.job_spec import JobSpec
+            from elastic_agent.core.job_spec_store import (
+                load_job_spec_journal,
+            )
+            from elastic_agent.core.manager_fleet_driver import (
+                _RECOVERY_CONTRACT_VERSION,
+                ManagerFleetDriver,
+            )
+
+            payload = load_job_spec_journal(
+                self.manager.config.registry.path,
+                source_job_id,
+            )
+            source_spec = JobSpec.model_validate(payload["spec"])
+            metadata = {
+                "resolved_commit": source_spec.setup.resolved_commit,
+                "recovery_contract_version": _RECOVERY_CONTRACT_VERSION,
+                "recovery_contract_sha256": (
+                    ManagerFleetDriver._checkpoint_contract_hash(source_spec)
+                ),
+                "fanout_workers": source_spec.fanout.workers,
+                "shard_by": source_spec.fanout.shard_by,
+                "collect_paths": list(source_spec.collect.paths),
+                "collect_exclude": list(source_spec.collect.exclude),
+            }
+            shards = [
+                {
+                    **shards[0],
+                    "worker_namespace": f"shard-{index:05d}",
+                }
+                for index in range(source_spec.fanout.workers)
+            ]
+        return {
+            "generation": generation or "periodic-00000001",
+            "source_job_id": source_job_id,
+            "total_bytes": 0,
+            "total_objects": 0,
+            "metadata": metadata,
+            "shards": shards,
+        }
+
+
 @pytest.fixture(autouse=True)
 def setup_api_keys(monkeypatch):
     monkeypatch.setenv("ELASTIC_AGENT_EXTERNAL_API_KEYS", API_KEY)
@@ -202,6 +268,7 @@ def manager(tmp_path):
     cfg.provider.type = "aws"
     cfg.provider.aws.region = "us-west-2"
     mgr = ElasticAgentManager(cfg, InMemoryProvider())
+    mgr._checkpoint_store = FakeAvailableCheckpointStore(mgr)
     binding_manager = FakeBindingManager()
     mgr.binding_manager = binding_manager
     return mgr
@@ -2809,6 +2876,7 @@ class TestJobsAPI:
                 "resolved_commit": "a" * 40,
             },
             "run": {"command": "capture"},
+            "fanout": {"shard_by": "shard_index"},
             "collect": {
                 "paths": ["results"],
                 "checkpoint": True,
@@ -2832,6 +2900,7 @@ class TestJobsAPI:
             },
             "run": {"command": "recover --resume"},
             "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
             "collect": {
                 "paths": ["results"],
                 "checkpoint": True,
@@ -2854,13 +2923,724 @@ class TestJobsAPI:
             "paths": ["results"],
             "generation": "latest",
             "source_state": "failed",
+            "source_quiescent": True,
             "source_resolved_commit": "a" * 40,
             "staged_before_cloud_create": True,
+            "resolved_generation": "periodic-00000001",
         }
         assert plan["results"]["mode"] == "manager-relay-s3-checkpoint"
         assert plan["results"]["checkpoint"] is True
         assert plan["results"]["exclude"] == ["**/core"]
         assert manager.provider._n == 0
+
+        class MissingCheckpointStore:
+            def resolve_checkpoint_set(self, **_kwargs):
+                raise RuntimeError("private s3 key must not reach REST")
+
+        manager._checkpoint_store = MissingCheckpointStore()
+        missing = await client.post("/api/jobs/plan", json=target)
+        assert missing.status_code == 422
+        assert missing.json()["detail"] == (
+            "requested complete checkpoint set is unavailable"
+        )
+        assert "private s3 key" not in missing.text
+        assert manager.provider._n == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "invalid_kind",
+        [
+            "metadata",
+            "missing_shard",
+            "total_bytes_ceiling",
+            "total_objects_ceiling",
+            "worker_physical_disk",
+        ],
+    )
+    async def test_recover_rejects_invalid_complete_set_before_prepare(
+        self, client, manager, monkeypatch, invalid_kind,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        class InvalidCompleteSetStore(FakeAvailableCheckpointStore):
+            def resolve_checkpoint_set(self, **kwargs):
+                result = super().resolve_checkpoint_set(**kwargs)
+                if invalid_kind == "metadata":
+                    result["metadata"]["resolved_commit"] = "f" * 40
+                elif invalid_kind == "missing_shard":
+                    result["shards"] = result["shards"][:-1]
+                elif invalid_kind == "total_bytes_ceiling":
+                    for shard in result["shards"]:
+                        shard["total_bytes"] = 1
+                    result["total_bytes"] = len(result["shards"])
+                elif invalid_kind == "total_objects_ceiling":
+                    for shard in result["shards"]:
+                        shard["total_objects"] = 1
+                    result["total_objects"] = len(result["shards"])
+                elif invalid_kind == "worker_physical_disk":
+                    result["shards"][0]["total_objects"] = 300_000
+                    result["total_objects"] = 300_000
+                return result
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        if invalid_kind == "total_bytes_ceiling":
+            monkeypatch.setenv(
+                "ELASTIC_AGENT_MAX_RECOVERY_STAGING_BYTES", "100",
+            )
+            monkeypatch.setenv(
+                "ELASTIC_AGENT_MAX_RECOVERY_STAGING_TOTAL_BYTES", "1",
+            )
+        elif invalid_kind == "total_objects_ceiling":
+            monkeypatch.setenv(
+                "ELASTIC_AGENT_MAX_RECOVERY_STAGING_OBJECTS", "100",
+            )
+            monkeypatch.setenv(
+                "ELASTIC_AGENT_MAX_RECOVERY_STAGING_TOTAL_OBJECTS", "1",
+            )
+        source_id = f"job-invalid-set-{invalid_kind}"
+        source = JobSpec.model_validate({
+            "name": "source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "capture"},
+            "account": {"mode": "none"},
+            "fanout": {
+                "workers": (
+                    1 if invalid_kind == "worker_physical_disk" else 2
+                ),
+                "shard_by": "shard_index",
+                "disk_gb": (
+                    11 if invalid_kind == "worker_physical_disk" else 0
+                ),
+            },
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+            },
+        })
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            source,
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+        )
+        manager._checkpoint_store = InvalidCompleteSetStore(manager)
+
+        response = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": source_id},
+            headers={
+                "Idempotency-Key": f"invalid-complete-set-{invalid_kind}",
+            },
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "requested complete checkpoint set is unavailable"
+        )
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+        specs = (
+            Path(manager.config.registry.path).with_name("specs")
+        )
+        assert sorted(path.name for path in specs.iterdir()) == [
+            f"{source_id}.json",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_legacy_mutable_recovery_is_rejected_before_prepare(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-legacy-mutable-source"
+        source = JobSpec.model_validate({
+            "name": "source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "b" * 40,
+            },
+            "run": {"command": "capture"},
+            "account": {"mode": "none"},
+            "collect": {"paths": ["results"]},
+        })
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            source,
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+        )
+        target = source.model_dump(mode="json")
+        target["name"] = "unsafe-legacy-resume"
+        target["recovery"] = {
+            "policy": "legacy_final_collection",
+            "source_job_id": source_id,
+            "paths": ["results"],
+        }
+
+        response = await client.post(
+            "/api/jobs",
+            json=target,
+            headers={"Idempotency-Key": "unsafe-legacy-resume"},
+        )
+
+        assert response.status_code == 422
+        assert "restart the workload from the beginning" in response.text
+        assert manager.batch.started == []
+        assert manager.provider._n == 0
+        specs = (
+            Path(manager.config.registry.path).with_name("specs")
+        )
+        assert sorted(path.name for path in specs.iterdir()) == [
+            f"{source_id}.json",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_server_side_recovery_preserves_private_source_spec_and_is_idempotent(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-private-checkpoint-source"
+        source = JobSpec.model_validate({
+            "name": "private-source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "b" * 40,
+                "steps": [{
+                    "name": "configure",
+                    "command": "prepare",
+                    "env": {"SETUP_TOKEN": "private-setup-value"},
+                }],
+            },
+            "run": {
+                "command": "capture --initial",
+                "env": {"PRIVATE_VALUE": "private-run-value"},
+                "secret_env": {
+                    "DB_PASSWORD": "aws-ssm:///prod/db/password",
+                },
+                "timeout": 1_000,
+            },
+            "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+                "exclude": ["**/core"],
+            },
+            "ttl_seconds": 2_000,
+        })
+        persist_job_spec(manager.config.registry.path, source_id, source)
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+        )
+        request = {
+            "source_job_id": source_id,
+            "generation": "set-0000042",
+            "run": {
+                "command": "capture --resume",
+                "timeout": 1_200,
+            },
+            "ttl_seconds": 2_400,
+        }
+        headers = {"Idempotency-Key": "private-checkpoint-recovery"}
+
+        first = await client.post(
+            "/api/jobs/recover",
+            json=request,
+            headers=headers,
+        )
+        second = await client.post(
+            "/api/jobs/recover",
+            json=request,
+            headers=headers,
+        )
+
+        assert first.status_code == 201, first.text
+        assert second.status_code == 201, second.text
+        first_body = first.json()
+        assert second.json()["job_id"] == first_body["job_id"]
+        assert second.json()["idempotent_replay"] is True
+        assert manager.batch.started == [first_body["job_id"]]
+        assert first_body["spec"]["recovery"] == {
+            "policy": "checkpoint",
+            "source_job_id": source_id,
+            "paths": ["results"],
+            "generation": "set-0000042",
+        }
+        assert first_body["spec"]["run"]["command"] == "capture --resume"
+        assert first_body["spec"]["run"]["timeout"] == 1_200
+        assert first_body["spec"]["ttl_seconds"] == 2_400
+        for private_value in (
+            "private-setup-value",
+            "private-run-value",
+            "aws-ssm:///prod/db/password",
+        ):
+            assert private_value not in first.text
+            assert private_value not in second.text
+
+        target_journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{first_body['job_id']}.json"
+        )
+        assert stat.S_IMODE(target_journal.stat().st_mode) == 0o600
+        private_target = json.loads(target_journal.read_text())["spec"]
+        assert (
+            private_target["setup"]["steps"][0]["env"]["SETUP_TOKEN"]
+            == "private-setup-value"
+        )
+        assert private_target["run"]["env"]["PRIVATE_VALUE"] == "private-run-value"
+        assert (
+            private_target["run"]["secret_env"]["DB_PASSWORD"]
+            == "aws-ssm:///prod/db/password"
+        )
+
+        # Simulate a Manager crash while recovery staging was still covered by
+        # the durable ``prepared`` state. The accepted private target journal,
+        # rather than the source-to-target builder, must drive rescheduling.
+        manager.batch._jobs.clear()
+        monkeypatch.setattr(
+            jobs_route,
+            "_load_private_recovery_source",
+            AsyncMock(
+                side_effect=AssertionError(
+                    "accepted recovery target must not be rebuilt"
+                )
+            ),
+        )
+        prepared_replay = await client.post(
+            "/api/jobs/recover",
+            json=request,
+            headers=headers,
+        )
+        assert prepared_replay.status_code == 201, prepared_replay.text
+        assert prepared_replay.json()["job_id"] == first_body["job_id"]
+        assert prepared_replay.json()["idempotent_replay"] is True
+        assert manager.batch.started == [
+            first_body["job_id"],
+            first_body["job_id"],
+        ]
+
+        # Once the recovery envelope is accepted, exact historical replay is
+        # an idempotent read. It must not depend on the private source journal
+        # still existing or validating under a future JobSpec schema.
+        update_job_state(
+            manager.config.registry.path,
+            first_body["job_id"],
+            "succeeded",
+            summary={"workers": 1, "phases": {"succeeded": 1}},
+        )
+        manager.batch._jobs.clear()
+        source_journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{source_id}.json"
+        )
+        source_journal.unlink()
+        historical_replay = await client.post(
+            "/api/jobs/recover",
+            json=request,
+            headers=headers,
+        )
+        assert historical_replay.status_code == 201, historical_replay.text
+        assert historical_replay.json()["job_id"] == first_body["job_id"]
+        assert historical_replay.json()["idempotent_replay"] is True
+        assert manager.batch.started == [
+            first_body["job_id"],
+            first_body["job_id"],
+        ]
+
+        conflict = await client.post(
+            "/api/jobs/recover",
+            json={
+                **request,
+                "run": {"command": "different", "timeout": 1_200},
+            },
+            headers=headers,
+        )
+        assert conflict.status_code == 409
+        assert manager.batch.started == [
+            first_body["job_id"],
+            first_body["job_id"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_latest_recovery_is_pinned_before_durable_prepare(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        class MovingLatestStore(FakeAvailableCheckpointStore):
+            def __init__(self, owning_manager):
+                super().__init__(owning_manager)
+                self.latest = "checkpoint-set-a"
+
+            def resolve_checkpoint_set(self, **kwargs):
+                result = super().resolve_checkpoint_set(**kwargs)
+                if not kwargs.get("generation"):
+                    result["generation"] = self.latest
+                return result
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-moving-latest-source"
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            JobSpec.model_validate({
+                "name": "source",
+                "setup": {
+                    "repo": "https://github.com/org/bench.git",
+                    "resolved_commit": "e" * 40,
+                },
+                "run": {"command": "capture"},
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+        )
+        store = MovingLatestStore(manager)
+        manager._checkpoint_store = store
+        headers = {"Idempotency-Key": "moving-latest-recovery"}
+        request = {"source_job_id": source_id}
+
+        first = await client.post(
+            "/api/jobs/recover", json=request, headers=headers,
+        )
+        assert first.status_code == 201, first.text
+        target_id = first.json()["job_id"]
+        assert (
+            first.json()["spec"]["recovery"]["generation"]
+            == "checkpoint-set-a"
+        )
+        target_path = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{target_id}.json"
+        )
+        assert (
+            json.loads(target_path.read_text())["spec"]["recovery"][
+                "generation"
+            ]
+            == "checkpoint-set-a"
+        )
+
+        # A newer set appears after acceptance. Replaying a merely prepared
+        # journal must preflight and stage the already-persisted exact set A.
+        store.latest = "checkpoint-set-b"
+        manager.batch._jobs.clear()
+        replay = await client.post(
+            "/api/jobs/recover", json=request, headers=headers,
+        )
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["job_id"] == target_id
+        assert (
+            replay.json()["spec"]["recovery"]["generation"]
+            == "checkpoint-set-a"
+        )
+        assert store.resolve_calls == [
+            (source_id, ""),
+            (source_id, "checkpoint-set-a"),
+        ]
+
+        # The canonical /jobs endpoint accepts the same recovery policy
+        # directly. Its public body also keeps generation empty, so a crash
+        # replay must use the accepted private snapshot instead of resolving
+        # "latest" a second time.
+        store.resolve_calls.clear()
+        store.latest = "checkpoint-set-a"
+        direct_request = json.loads(target_path.read_text())["spec"]
+        direct_request["name"] = "direct-moving-latest-recovery"
+        direct_request["recovery"]["generation"] = ""
+        direct_headers = {
+            "Idempotency-Key": "direct-moving-latest-recovery",
+        }
+        direct_first = await client.post(
+            "/api/jobs", json=direct_request, headers=direct_headers,
+        )
+        assert direct_first.status_code == 201, direct_first.text
+        direct_id = direct_first.json()["job_id"]
+        assert (
+            direct_first.json()["spec"]["recovery"]["generation"]
+            == "checkpoint-set-a"
+        )
+
+        store.latest = "checkpoint-set-b"
+        manager.batch._jobs.clear()
+        direct_replay = await client.post(
+            "/api/jobs", json=direct_request, headers=direct_headers,
+        )
+        assert direct_replay.status_code == 201, direct_replay.text
+        assert direct_replay.json()["job_id"] == direct_id
+        assert direct_replay.json()["idempotent_replay"] is True
+        assert (
+            direct_replay.json()["spec"]["recovery"]["generation"]
+            == "checkpoint-set-a"
+        )
+        direct_path = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{direct_id}.json"
+        )
+        assert (
+            json.loads(direct_path.read_text())["spec"]["recovery"][
+                "generation"
+            ]
+            == "checkpoint-set-a"
+        )
+        assert store.resolve_calls == [
+            (source_id, ""),
+            (source_id, "checkpoint-set-a"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_server_side_recovery_defaults_command_and_rejects_unsafe_shapes(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_checkpoint,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-checkpoint-default-command"
+        source = JobSpec.model_validate({
+            "name": "source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "c" * 40,
+            },
+            "run": {"command": "original-command"},
+            "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+        })
+        persist_job_spec(manager.config.registry.path, source_id, source)
+        update_job_checkpoint(
+            manager.config.registry.path,
+            source_id,
+            "periodic-00000007",
+            committed_at="2026-07-29T02:00:00+00:00",
+        )
+        update_job_checkpoint(
+            manager.config.registry.path,
+            source_id,
+            "periodic-00000006",
+            committed_at="2026-07-29T01:00:00+00:00",
+        )
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "succeeded",
+            summary={
+                # Simulate a terminal writer holding a stale in-memory
+                # checkpoint pointer after the newer COMMITTED set won.
+                "latest_checkpoint_generation": "periodic-00000006",
+            },
+        )
+
+        historical = await client.get(f"/api/jobs/{source_id}")
+        assert historical.status_code == 200
+        assert (
+            historical.json()["latest_checkpoint_generation"]
+            == "periodic-00000007"
+        )
+        assert historical.json()["checkpoint_recovery_available"] is True
+
+        listed = await client.get("/api/jobs")
+        assert listed.status_code == 200
+        historical_row = next(
+            item
+            for item in listed.json()["jobs"]
+            if item["job_id"] == source_id
+        )
+        assert historical_row["checkpoint_recovery_available"] is True
+
+        created = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": source_id},
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["spec"]["run"]["command"] == "original-command"
+        assert (
+            created.json()["spec"]["recovery"]["generation"]
+            == "periodic-00000001"
+        )
+
+        extra = await client.post(
+            "/api/jobs/recover",
+            json={
+                "source_job_id": source_id,
+                "account": {"ids": ["other-account"]},
+            },
+        )
+        assert extra.status_code == 422
+        invalid_source = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": "../source"},
+        )
+        assert invalid_source.status_code == 400
+
+        non_checkpoint_id = "job-final-collection-only"
+        persist_job_spec(
+            manager.config.registry.path,
+            non_checkpoint_id,
+            JobSpec.model_validate({
+                "name": "legacy",
+                "run": {"command": "true"},
+                "account": {"mode": "none"},
+                "collect": {"paths": ["results"]},
+            }),
+        )
+        update_job_state(
+            manager.config.registry.path,
+            non_checkpoint_id,
+            "failed",
+        )
+        rejected = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": non_checkpoint_id},
+        )
+        assert rejected.status_code == 422
+        assert "did not enable immutable checkpoint" in rejected.text
+
+        corrupt_id = "job-corrupt-private-source"
+        persist_job_spec(
+            manager.config.registry.path,
+            corrupt_id,
+            source.model_copy(
+                update={
+                    "run": source.run.model_copy(
+                        update={
+                            "env": {
+                                "PRIVATE_VALUE": "must-not-leak-from-error",
+                            },
+                        }
+                    ),
+                }
+            ),
+        )
+        corrupt_path = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{corrupt_id}.json"
+        )
+        corrupt_payload = json.loads(corrupt_path.read_text())
+        corrupt_payload["spec"]["unexpected"] = "must-not-leak-from-error"
+        corrupt_path.write_text(json.dumps(corrupt_payload))
+        corrupt = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": corrupt_id},
+        )
+        assert corrupt.status_code == 422
+        assert "must-not-leak-from-error" not in corrupt.text
+
+    @pytest.mark.asyncio
+    async def test_committed_checkpoint_is_recoverable_before_latest_pointer_is_persisted(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-checkpoint-pointer-crash-window"
+        persist_job_spec(
+            manager.config.registry.path,
+            source_id,
+            JobSpec.model_validate({
+                "name": "source",
+                "setup": {
+                    "repo": "https://github.com/org/bench.git",
+                    "resolved_commit": "d" * 40,
+                },
+                "run": {"command": "capture"},
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {"paths": ["results"], "checkpoint": True},
+            }),
+        )
+        # Model a crash after the S3 set's COMMITTED object was published but
+        # before the Manager could persist its local latest-generation pointer.
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+            summary={"workers": 1, "phases": {"failed": 1}},
+        )
+
+        detail = await client.get(f"/api/jobs/{source_id}")
+        assert detail.status_code == 200
+        assert detail.json()["latest_checkpoint_generation"] is None
+        assert detail.json()["checkpoint_recovery_available"] is True
+
+        listed = await client.get("/api/jobs")
+        row = next(
+            item
+            for item in listed.json()["jobs"]
+            if item["job_id"] == source_id
+        )
+        assert row["latest_checkpoint_generation"] is None
+        assert row["checkpoint_recovery_available"] is True
+
+        recovered = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": source_id},
+            headers={"Idempotency-Key": "pointer-crash-window"},
+        )
+        assert recovered.status_code == 201, recovered.text
+        assert (
+            recovered.json()["spec"]["recovery"]["generation"]
+            == "periodic-00000001"
+        )
+        assert len(manager.batch.started) == 1
 
     @pytest.mark.asyncio
     async def test_plan_rejects_nonterminal_recovery_source(
@@ -2879,6 +3659,7 @@ class TestJobsAPI:
                 "resolved_commit": "a" * 40,
             },
             "run": {"command": "capture"},
+            "fanout": {"shard_by": "shard_index"},
             "collect": {
                 "paths": ["results"],
                 "checkpoint": True,
@@ -2898,6 +3679,7 @@ class TestJobsAPI:
             },
             "run": {"command": "recover --resume"},
             "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
             "recovery": {
                 "policy": "checkpoint",
                 "source_job_id": "job-source-running",
@@ -2906,7 +3688,7 @@ class TestJobsAPI:
         })
 
         assert response.status_code == 422
-        assert "durable terminal state" in response.text
+        assert "proven quiescent" in response.text
 
     @pytest.mark.asyncio
     async def test_plan_warns_when_worker_login_bypasses_account_eip(
@@ -3364,24 +4146,42 @@ class TestJobResults:
         (base / "linked-file.json").symlink_to(outside / "stolen.json")
         (base / "linked-directory").symlink_to(outside, target_is_directory=True)
         os.mkfifo(base / "named-pipe")
+        private_attempt = (
+            base / "workers" / ".shard-00000.attempt-interrupted"
+        )
+        private_attempt.mkdir(parents=True)
+        (private_attempt / "partial.txt").write_text("private")
+        internal = base / "workers" / "shard-00000" / "_elastic_agent"
+        internal.mkdir(parents=True)
+        (internal / "collection.json").write_text("{}")
+        (base / "math.foo" / ".application-state").write_text("keep")
 
         listed = await client.get(f"/api/jobs/{jid}/results")
         downloaded = await client.get(f"/api/jobs/{jid}/results/download")
 
         assert listed.status_code == 200
-        assert listed.json()["file_count"] == 2
+        assert listed.json()["file_count"] == 3
         assert listed.json()["scores"][0]["final_score"] == 39.06
         assert all("linked" not in item["path"] for item in listed.json()["files"])
+        assert all(
+            ".attempt-" not in item["path"]
+            and "_elastic_agent" not in item["path"]
+            for item in listed.json()["files"]
+        )
         with tarfile.open(fileobj=io.BytesIO(downloaded.content), mode="r:gz") as archive:
             names = archive.getnames()
-        assert names == [
+        assert set(names) == {
             "job-safe-local/run_metadata.json",
+            "job-safe-local/math.foo/.application-state",
             "job-safe-local/math.foo/res_b1.json",
-        ] or names == [
-            "job-safe-local/math.foo/res_b1.json",
-            "job-safe-local/run_metadata.json",
-        ]
-        assert all("linked" not in name and "named-pipe" not in name for name in names)
+        }
+        assert all(
+            "linked" not in name
+            and "named-pipe" not in name
+            and ".attempt-" not in name
+            and "_elastic_agent" not in name
+            for name in names
+        )
 
     @pytest.mark.asyncio
     async def test_collected_job_symlink_cannot_escape_root(
@@ -4176,6 +4976,47 @@ class TestJobResults:
         }
 
     @pytest.mark.asyncio
+    async def test_global_s3_summary_skips_checkpoint_namespace(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        class RootPaginator:
+            def paginate(self, **kwargs):
+                assert kwargs["Delimiter"] == "/"
+                return [{"CommonPrefixes": [
+                    {"Prefix": "jobs/.elastic-agent-checkpoints/"},
+                    {"Prefix": "jobs/job-visible/"},
+                ]}]
+
+        class RootS3:
+            def get_paginator(self, _name):
+                return RootPaginator()
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(jobs_route, "_s3_client", lambda: RootS3())
+        monkeypatch.setattr(
+            jobs_route,
+            "_s3_list_job",
+            lambda job_id, **_kwargs: (
+                [("result.txt", 1, "jobs/job-visible/result.txt", '"v"')]
+                if job_id == "job-visible"
+                else (_ for _ in ()).throw(
+                    AssertionError("checkpoint namespace must not be listed")
+                )
+            ),
+        )
+
+        response = await client.get("/api/results")
+
+        assert response.status_code == 200
+        assert [job["job_id"] for job in response.json()["jobs"]] == [
+            "job-visible"
+        ]
+
+    @pytest.mark.asyncio
     async def test_global_s3_summary_has_aggregate_object_budget(
         self, client, monkeypatch,
     ):
@@ -4260,6 +5101,115 @@ class TestJobResults:
 
         assert response.status_code == 503
         assert "unsafe object key" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_s3_results_hide_internal_checkpoint_objects(
+        self, client, monkeypatch,
+    ):
+        payload = b"answer"
+        visible_key = (
+            "jobs/job-checkpoint-results/workers/"
+            "shard-00000/results/answer.txt"
+        )
+
+        class CheckpointPaginator:
+            def paginate(self, **kwargs):
+                return [{"Contents": [
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/"
+                            "checkpoint-blobs/deadbeef"
+                        ),
+                        "Size": 100,
+                        "ETag": '"blob"',
+                    },
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/"
+                            "checkpoint-sets/g1/COMMITTED.json"
+                        ),
+                        "Size": 100,
+                        "ETag": '"set"',
+                    },
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/workers/"
+                            "shard-00000/checkpoints/g1/COMMITTED.json"
+                        ),
+                        "Size": 100,
+                        "ETag": '"manifest"',
+                    },
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/workers/"
+                            "shard-00000/_elastic_agent/collection.json"
+                        ),
+                        "Size": 100,
+                        "ETag": '"control"',
+                    },
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/workers/"
+                            ".shard-00000.attempt-interrupted/"
+                            "results/partial.txt"
+                        ),
+                        "Size": 100,
+                        "ETag": '"attempt"',
+                    },
+                    {
+                        "Key": (
+                            "jobs/job-checkpoint-results/workers/"
+                            ".shard-00000.backup/results/old.txt"
+                        ),
+                        "Size": 100,
+                        "ETag": '"backup"',
+                    },
+                    {
+                        "Key": visible_key,
+                        "Size": len(payload),
+                        "ETag": '"visible"',
+                    },
+                ]}]
+
+        class CheckpointS3:
+            def get_paginator(self, _name):
+                return CheckpointPaginator()
+
+            def get_object(self, **kwargs):
+                assert kwargs["Key"] == visible_key
+                return {
+                    "Body": io.BytesIO(payload),
+                    "ContentLength": len(payload),
+                    "ETag": '"visible"',
+                }
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket",
+        )
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.jobs._s3_client",
+            lambda: CheckpointS3(),
+        )
+
+        summary = await client.get(
+            "/api/jobs/job-checkpoint-results/results"
+        )
+        assert summary.status_code == 200
+        assert summary.json()["file_count"] == 1
+        assert summary.json()["files"] == [{
+            "path": "workers/shard-00000/results/answer.txt",
+            "size": len(payload),
+        }]
+
+        download = await client.get(
+            "/api/jobs/job-checkpoint-results/results/download"
+        )
+        assert download.status_code == 200
+        with tarfile.open(fileobj=io.BytesIO(download.content), mode="r:gz") as archive:
+            assert archive.getnames() == [
+                "job-checkpoint-results/workers/"
+                "shard-00000/results/answer.txt"
+            ]
 
     @pytest.mark.asyncio
     async def test_s3_result_without_etag_fails_before_get(
@@ -4841,4 +5791,10 @@ class TestBatchConsoleUI:
         assert 'id="jSpot"' in r.text
         assert 'id="jSecretEnv"' in r.text
         assert "aws-secretsmanager://" in r.text
+        assert "function recoverJob(" in r.text
+        assert "'/jobs/recover'" in r.text
+        assert "从检查点恢复" in r.text
+        assert "ea_checkpoint_recovery_pending_v1" in r.text
+        assert "recoverySubmissionDefinitivelyRejected" in r.text
+        assert "return code === 409" in r.text
         assert "currently not support" not in r.text.lower()

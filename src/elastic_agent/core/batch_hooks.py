@@ -1371,54 +1371,32 @@ def make_provision_hook(
             logger.error("provision: %s never became SSH-ready", worker_id)
             return False
 
-        # EIP, Codex, and Agent-API jobs require this Manager's worker protocol
-        # and identity
-        # checks.  An older PyPI worker neither understands Codex password/OTP
-        # fields nor verifies the selected Codex identity, and could interpret
-        # the message as a legacy Claude login.  Always deliver the currently
-        # running package for these paths.  Do not honor a deployment override:
-        # it could point at an older source tree that accepts request IDs but
-        # lacks the exact-email/smoke-test enforcement.  Other non-EIP jobs may
-        # still opt into a full source tree.
-        framework_src = os.environ.get("ELASTIC_AGENT_FRAMEWORK_SRC")
-        framework_target = "/opt/elastic-agent/framework/src"
-        api_accounts: list[Any] = []
-        api_store = getattr(manager, "agent_api_store", None)
-        if api_store is not None and spec.account.mode != "none":
-            api_accounts = await api_store.list()
-        selected_ids = set(spec.account.ids)
-        uses_agent_api = any(
-            account.enabled
-            and account.supports_agent_type(spec.account.agent_type)
-            and account.supports_model(
-                spec.account.agent_type,
-                spec.account.model,
-            )
-            and (
-                account.id in selected_ids
-                if selected_ids
-                else account.group == spec.account.group
-            )
-            for account in api_accounts
+        # Every declarative Batch Job needs the independent task supervisor,
+        # durable cursors, and current terminal protocol. The legacy PyPI-only
+        # runtime unit cannot preserve an opaque child across ea-runtime
+        # replacement. Always deliver this Manager's exact package and ignore
+        # ELASTIC_AGENT_FRAMEWORK_SRC, which may point at a stale tree.
+        framework_src = str(Path(__file__).resolve().parents[1])
+        framework_target = (
+            "/opt/elastic-agent/framework/src/elastic_agent"
         )
-        agent_api_possible = (
-            api_store is not None
-            and spec.account.mode != "none"
-            and (not selected_ids or uses_agent_api)
-        )
-        protocol_pinned = (
-            spec.account.binding == "eip"
-            or spec.account.agent_type == "codex"
-            or agent_api_possible
-        )
-        if protocol_pinned:
-            framework_src = str(Path(__file__).resolve().parents[1])
-            framework_target += "/elastic_agent"
+        protocol_pinned = True
 
         steps = compile_bootstrap_steps(
             spec, manager_url=manager_url, auth_token=node.auth_token or "",
             worker_id=worker_id, include_pty=include_pty,
             runtime_from_src=bool(framework_src), run_as=ssh_user,
+            include_s3_cli=bool(
+                spec.setup.s3_datasets
+                or (
+                    manager.config.provider.type == "aws"
+                    and manager.config.provider.aws.worker_instance_profile
+                    and os.environ.get(
+                        "ELASTIC_AGENT_RESULTS_S3_BUCKET", "",
+                    ).strip()
+                    and not spec.collect.checkpoint
+                )
+            ),
         )
         if not await runner(worker_id, host, steps, ssh_user, ssh_key):
             return False

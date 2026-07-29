@@ -36,7 +36,14 @@ from elastic_agent.manager.connection import WorkerConnectionManager
 from elastic_agent.worker.file_sync import StorageBackend
 
 if TYPE_CHECKING:
-    from elastic_agent.core.job_spec import CollectSpec, SetupSpec
+    from elastic_agent.core.job_spec import (
+        CollectSpec,
+        FanoutSpec,
+        JobSpec,
+        RecoverySpec,
+        SetupSpec,
+        WorkerContext,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +51,7 @@ RESUME_STOPPING_TIMEOUT_SECONDS = 300
 RESUME_STOPPING_POLL_SECONDS = 10
 BOUND_RECOVERY_RETRY_SECONDS = 30
 BOUND_RECOVERY_SCAN_SECONDS = 10
-BOUND_RECOVERY_COLLECT_TIMEOUT_SECONDS = 30
+BOUND_RECOVERY_COLLECT_TIMEOUT_SECONDS = 7_200
 EIP_ALLOCATION_RECOVERY_STABLE_SCANS = 30
 # AWS documents an eventually-consistent EC2 control plane and recommends
 # bounded exponential/polling retries for newly-created resources.  The only
@@ -61,6 +68,18 @@ class _RecoveryCollectionSpec:
     name: str
     setup: SetupSpec
     collect: CollectSpec
+    fanout: FanoutSpec
+    recovery: RecoverySpec
+    _validated: JobSpec
+
+    def worker_contexts(self) -> list[WorkerContext]:
+        return self._validated.worker_contexts()
+
+    def render_command(self, ctx: WorkerContext) -> list[str]:
+        return self._validated.render_command(ctx)
+
+    def _checkpoint_contract_source(self) -> JobSpec:
+        return self._validated
 
 
 def _load_recovery_collection_spec(raw_spec: object) -> _RecoveryCollectionSpec:
@@ -88,6 +107,9 @@ def _load_recovery_collection_spec(raw_spec: object) -> _RecoveryCollectionSpec:
         name=validated.name,
         setup=validated.setup,
         collect=validated.collect,
+        fanout=validated.fanout,
+        recovery=validated.recovery,
+        _validated=validated,
     )
 
 
@@ -281,20 +303,28 @@ class ElasticAgentManager:
             self.reconciler.set_controller_id(
                 self.account_binding_store.controller_id
             )
+            # Recovery staging is ephemeral and belongs to one Manager process.
+            # With the controller lock held and before the API is ready, any
+            # existing child is proof of an interrupted prior process.
+            from elastic_agent.core.manager_fleet_driver import (
+                ManagerFleetDriver,
+            )
+            await ManagerFleetDriver(self).cleanup_stale_recovery_staging()
             import os as _os
             bucket = _os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET")
+            interval = 120.0
             if bucket:
                 from elastic_agent.core.result_uploader import S3ResultUploader
-                interval = float(_os.environ.get("ELASTIC_AGENT_RESULTS_S3_INTERVAL", "120"))
+                interval = float(
+                    _os.environ.get(
+                        "ELASTIC_AGENT_RESULTS_S3_INTERVAL", "120",
+                    )
+                )
                 self._s3_uploader = S3ResultUploader(
                     bucket, self.collected_root,
                     prefix=_os.environ.get("ELASTIC_AGENT_RESULTS_S3_PREFIX", "jobs"),
                     region=self.config.provider.aws.region,
                 )
-                self._s3_task = asyncio.create_task(
-                    self._s3_uploader.run_periodic(interval)
-                )
-                logger.info("S3 result upload enabled → s3://%s", bucket)
 
             # Startup recovery may collect a previous controller's final
             # output.  Initialize the authoritative S3 sink first so relay-mode
@@ -302,6 +332,14 @@ class ElasticAgentManager:
             # permanent collection failure merely because startup ordering left
             # ``_s3_uploader`` unset.
             await self._initialize_binding_recovery()
+            # Do not let the whole-tree periodic uploader acquire its sync lock
+            # ahead of startup final collection. Recovery must settle old
+            # billable workers before background mirroring starts.
+            if self._s3_uploader is not None:
+                self._s3_task = asyncio.create_task(
+                    self._s3_uploader.run_periodic(interval)
+                )
+                logger.info("S3 result upload enabled → s3://%s", bucket)
 
             online_workers = set(self.connection_manager.connected_workers)
             await self.task_registry.recover(online_workers)
@@ -399,6 +437,11 @@ class ElasticAgentManager:
         if self._s3_task is not None:
             cancellable_tasks.append(self._s3_task)
             self._s3_task = None
+        recovery_cleanup_tasks = getattr(
+            self, "_recovery_transfer_cleanup_tasks", {},
+        )
+        cancellable_tasks.extend(recovery_cleanup_tasks.values())
+        recovery_cleanup_tasks.clear()
         for task in cancellable_tasks:
             task.cancel()
         if cancellable_tasks:
@@ -508,6 +551,56 @@ class ElasticAgentManager:
             )
         active = await self.account_binding_store.list_leases(active_only=True)
         self._recovery_lease_ids = {lease.lease_id for lease in active}
+        # Close the narrow crash window where cloud/lease cleanup committed but
+        # the per-Job terminal summary did not. Released leases retain the exact
+        # shard and collection outcome; merge that proof idempotently at startup.
+        for lease in await self.account_binding_store.list_leases():
+            if (
+                lease.state == "released"
+                and lease.recovery_collection_attempted
+                and lease.job_id != "legacy-binding-migration"
+            ):
+                try:
+                    await self._merge_recovered_terminal_worker(
+                        job_id=lease.job_id,
+                        worker_id=lease.worker_id or lease.instance_id or "",
+                        shard_index=lease.slot,
+                        collected=lease.recovery_collected,
+                        collection_error=lease.recovery_collection_error,
+                        worker_released=True,
+                    )
+                except FileNotFoundError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Cannot reconcile released recovery lease %s",
+                        lease.lease_id,
+                    )
+        for node in await self.registry.list_all():
+            shard_index = node.metadata.get("shard_index")
+            job_id = str(node.metadata.get("job_id") or "")
+            if (
+                node.status == NodeStatus.TERMINATED
+                and job_id
+                and isinstance(shard_index, int)
+                and not isinstance(shard_index, bool)
+            ):
+                try:
+                    await self._merge_recovered_terminal_worker(
+                        job_id=job_id,
+                        worker_id=node.node_id,
+                        shard_index=shard_index,
+                        collected=None,
+                        collection_error=None,
+                        worker_released=True,
+                    )
+                except FileNotFoundError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Cannot reconcile terminal recovery worker %s",
+                        node.node_id,
+                    )
         bindings = await self.account_binding_store.list_bindings()
         self._recovery_allocation_attempts = {
             binding.account_id: EIP_ALLOCATION_RECOVERY_STABLE_SCANS
@@ -530,11 +623,17 @@ class ElasticAgentManager:
         self._binding_recovery_scans_remaining = (
             BOUND_RECOVERY_STABLE_SCANS if active else 1
         )
-        await self._recover_bound_resources_once()
-        if not self._binding_recovery_ready:
-            self._binding_recovery_task = asyncio.create_task(
-                self._binding_recovery_loop()
-            )
+        # Do not make ASGI/systemd readiness wait for final rsync/S3 collection.
+        # A recovered worker can legitimately need hours to upload a large
+        # checkpoint, while the production unit has a much shorter startup
+        # deadline.  Keep Agent-API/EIP admission fail-closed through
+        # ``binding_recovery_ready`` and let the controller-lock-owned background
+        # task perform the first inventory/cleanup pass immediately.
+        self._binding_recovery_ready = False
+        self._binding_recovery_wakeup.set()
+        self._binding_recovery_task = asyncio.create_task(
+            self._binding_recovery_loop()
+        )
 
     async def _binding_recovery_loop(self) -> None:
         try:
@@ -555,7 +654,20 @@ class ElasticAgentManager:
                 self._binding_recovery_wakeup.clear()
                 if self._shutdown_event.is_set():
                     return
-                await self._recover_bound_resources_once()
+                try:
+                    await self._recover_bound_resources_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    # Startup no longer awaits this potentially multi-hour
+                    # transaction. An unexpected provider/store failure must
+                    # therefore keep admission closed and retry in this owned
+                    # loop, rather than terminating the only recovery task.
+                    self._binding_recovery_ready = False
+                    logger.exception(
+                        "Binding recovery pass failed; admission remains "
+                        "blocked and recovery will retry"
+                    )
         except asyncio.CancelledError:
             return
 
@@ -570,11 +682,12 @@ class ElasticAgentManager:
         controller = tags.get("ElasticAgentController", "")
         tagged_lease = tags.get("ElasticAgentLease", "")
         tagged_account = tags.get("ElasticAgentAccount", "")
+        tagged_job = tags.get("ElasticAgentJob", "")
         if lease is None:
             if controller != self.account_binding_store.controller_id:
                 return "instance controller tag does not match this Manager"
-            if not tagged_lease or not tagged_account:
-                return "controller-owned orphan lacks lease/account tags"
+            if not tagged_lease or not tagged_account or not tagged_job:
+                return "controller-owned orphan lacks lease/account/Job tags"
             return None
         if lease.job_id == "legacy-binding-migration":
             if controller and controller != self.account_binding_store.controller_id:
@@ -592,6 +705,38 @@ class ElasticAgentManager:
             return "instance lease tag does not match durable lease"
         if tagged_account != lease.account_id:
             return "instance account tag does not match durable lease"
+        if tagged_job != lease.job_id:
+            return "instance Job tag does not match durable lease"
+        return None
+
+    def _recovery_lease_registry_validation_error(
+        self,
+        node: NodeRecord,
+        lease,
+    ) -> str | None:
+        """Reject conflicting registry identity before enriching legacy rows.
+
+        Older releases did not persist every ownership field in ``metadata``.
+        Missing fields may be reconstructed only after the exact cloud instance
+        has independently matched the durable controller/lease/account/Job
+        tuple.  A present conflicting value is corruption, never a value to
+        overwrite and then use as its own quiescence proof.
+        """
+
+        if node.instance_id != lease.instance_id:
+            return "registry instance does not match durable lease"
+        expected = {
+            "job_id": lease.job_id,
+            "account_id": lease.account_id,
+            "lease_id": lease.lease_id,
+            "controller_id": self.account_binding_store.controller_id,
+        }
+        for key, value in expected.items():
+            observed = str(node.metadata.get(key) or "")
+            if observed and observed != value:
+                return (
+                    f"registry {key} does not match durable recovery identity"
+                )
         return None
 
     async def _detach_then_terminate_orphan(
@@ -915,6 +1060,29 @@ class ElasticAgentManager:
                             node_id,
                             status=NodeStatus.TERMINATED,
                         )
+                        shard_index = node.metadata.get("shard_index")
+                        job_id = str(node.metadata.get("job_id") or "")
+                        if (
+                            job_id
+                            and isinstance(shard_index, int)
+                            and not isinstance(shard_index, bool)
+                        ):
+                            try:
+                                await self._merge_recovered_terminal_worker(
+                                    job_id=job_id,
+                                    worker_id=node_id,
+                                    shard_index=shard_index,
+                                    collected=None,
+                                    collection_error=None,
+                                    worker_released=True,
+                                )
+                            except FileNotFoundError:
+                                pass
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    "Cannot reconcile terminal worker %s",
+                                    node_id,
+                                )
                         await self.connection_manager.disconnect_worker(
                             node_id
                         )
@@ -1125,6 +1293,21 @@ class ElasticAgentManager:
                         current.instance_id,
                     )
                     return
+                if node is not None and current.instance_id:
+                    registry_error = (
+                        self._recovery_lease_registry_validation_error(
+                            node,
+                            current,
+                        )
+                    )
+                    if registry_error:
+                        self._recovery_unsafe_lease_ids.add(lease_id)
+                        logger.error(
+                            "Refusing startup recovery for lease %s: %s",
+                            lease_id,
+                            registry_error,
+                        )
+                        return
             if (
                 current is not None
                 and self._binding_recovery_scan_pending
@@ -1157,6 +1340,35 @@ class ElasticAgentManager:
                     and current.job_id != "legacy-binding-migration"
                 ):
                     await self._collect_recovered_lease(current)
+                    current = await self.binding_manager.get_lease(lease_id)
+                if (
+                    current is not None
+                    and current.recovery_collection_attempted
+                    and current.job_id != "legacy-binding-migration"
+                ):
+                    try:
+                        await self._merge_recovered_terminal_worker(
+                            job_id=current.job_id,
+                            worker_id=(
+                                current.worker_id
+                                or current.instance_id
+                                or ""
+                            ),
+                            shard_index=current.slot,
+                            collected=current.recovery_collected,
+                            collection_error=(
+                                current.recovery_collection_error
+                            ),
+                            worker_released=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Cannot persist recovery collection proof for "
+                            "lease %s",
+                            lease_id,
+                        )
                 released = await self.binding_manager.release(
                     lease_id,
                     cleanup_worker=cleanup_control_plane,
@@ -1172,6 +1384,32 @@ class ElasticAgentManager:
                 )
                 if worker_id:
                     await self.remove_terminated_node_record(worker_id)
+                if (
+                    released.recovery_collection_attempted
+                    and released.job_id != "legacy-binding-migration"
+                ):
+                    try:
+                        await self._merge_recovered_terminal_worker(
+                            job_id=released.job_id,
+                            worker_id=(
+                                released.worker_id
+                                or released.instance_id
+                                or ""
+                            ),
+                            shard_index=released.slot,
+                            collected=released.recovery_collected,
+                            collection_error=(
+                                released.recovery_collection_error
+                            ),
+                            worker_released=True,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Cannot finalize recovery proof for lease %s",
+                            lease_id,
+                        )
                 self._recovery_lease_ids.discard(lease_id)
                 if released.instance_id:
                     self._recovery_instances.pop(released.instance_id, None)
@@ -1283,8 +1521,38 @@ class ElasticAgentManager:
                     instance_id,
                 )
             try:
-                await self._terminate_instance_confirmed(instance_id)
                 job_id = str(instance.tags.get("ElasticAgentJob") or "")
+                recovery_node = await self.registry.get(instance_id)
+                shard_index = (
+                    recovery_node.metadata.get("shard_index")
+                    if recovery_node is not None
+                    else None
+                )
+                if (
+                    re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id,
+                    )
+                    and isinstance(shard_index, int)
+                    and not isinstance(shard_index, bool)
+                ):
+                    try:
+                        await self._merge_recovered_terminal_worker(
+                            job_id=job_id,
+                            worker_id=instance_id,
+                            shard_index=shard_index,
+                            collected=collection_error is None,
+                            collection_error=collection_error,
+                            worker_released=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Cannot persist recovered worker collection proof "
+                            "for %s",
+                            instance_id,
+                        )
+                await self._terminate_instance_confirmed(instance_id)
                 registry_node_ids: list[str] = []
                 for node_id in self._recovery_unbound_registry_scans:
                     node = await self.registry.get(node_id)
@@ -1310,36 +1578,36 @@ class ElasticAgentManager:
                     or bool(self._recovery_unbound_launch_scans)
                     or bool(self._recovery_unbound_registry_scans)
                 )
-                await self.registry.update(
-                    instance_id, status=NodeStatus.TERMINATED
-                )
-                await self.connection_manager.disconnect_worker(instance_id)
+                recovered_node_ids = set(registry_node_ids)
+                recovered_node_ids.add(instance_id)
+                for node_id in recovered_node_ids:
+                    node = await self.registry.get(node_id)
+                    if (
+                        node is not None
+                        and node.instance_id == instance_id
+                    ):
+                        await self.registry.update(
+                            node_id, status=NodeStatus.TERMINATED
+                        )
+                        await self.connection_manager.disconnect_worker(
+                            node_id
+                        )
                 self._recovery_unbound_instances.pop(instance_id, None)
                 self._resolved_unbound_instance_ids.discard(instance_id)
                 if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id):
                     try:
-                        await self._update_batch_job_state(
-                            job_id,
-                            "failed",
-                            {
-                                "job_id": job_id,
-                                "state": "failed",
-                                "done": True,
-                                "workers": 1,
-                                "phases": {"failed": 1},
-                                "cleanup_pending": 0,
-                                "error": (
-                                    "Manager restarted during execution; "
-                                    + (
-                                        "final recovery collection failed: "
-                                        f"{collection_error}"
-                                        if collection_error
-                                        else "the orphan worker was collected "
-                                        "and terminated"
-                                    )
-                                ),
-                            },
-                        )
+                        if (
+                            isinstance(shard_index, int)
+                            and not isinstance(shard_index, bool)
+                        ):
+                            await self._merge_recovered_terminal_worker(
+                                job_id=job_id,
+                                worker_id=instance_id,
+                                shard_index=shard_index,
+                                collected=collection_error is None,
+                                collection_error=collection_error,
+                                worker_released=True,
+                            )
                     except FileNotFoundError:
                         # A legacy/manual tagged instance may have no JobSpec.
                         pass
@@ -1348,6 +1616,14 @@ class ElasticAgentManager:
                             "Could not persist recovered terminal state for %s",
                             job_id,
                         )
+                for node_id in recovered_node_ids:
+                    node = await self.registry.get(node_id)
+                    if (
+                        node is not None
+                        and node.instance_id == instance_id
+                        and node.status == NodeStatus.TERMINATED
+                    ):
+                        await self.remove_terminated_node_record(node_id)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "Startup termination failed for unbound Job worker %s",
@@ -1395,6 +1671,230 @@ class ElasticAgentManager:
         self._binding_recovery_ready = False
         self._ensure_binding_recovery_task()
 
+    async def _merge_recovered_terminal_worker(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        shard_index: int,
+        collected: bool | None,
+        collection_error: str | None,
+        worker_released: bool,
+    ) -> bool:
+        """Durably merge one startup-recovered shard into the Job journal.
+
+        Startup recovery settles fanout workers concurrently and may itself be
+        interrupted. A whole-summary overwrite loses whichever shard completed
+        first. Merge by the durable shard index under the Job-state lock instead;
+        successful collection/release evidence is monotonic across retries.
+        """
+
+        from elastic_agent.core.job_spec_store import (
+            load_job_spec_journal,
+            update_job_state,
+        )
+
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id)
+            is None
+        ):
+            raise ValueError("invalid recovered Job id")
+        if (
+            isinstance(shard_index, bool)
+            or not isinstance(shard_index, int)
+            or shard_index < 0
+        ):
+            raise ValueError("invalid recovered shard index")
+
+        def merge() -> bool:
+            payload = load_job_spec_journal(
+                self.config.registry.path, job_id,
+            )
+            recovery_spec = _load_recovery_collection_spec(payload["spec"])
+            expected_workers = recovery_spec.fanout.workers
+            if shard_index >= expected_workers:
+                raise ValueError(
+                    "recovered shard index is outside persisted fanout"
+                )
+            raw_summary = payload.get("terminal_summary")
+            summary = raw_summary if isinstance(raw_summary, dict) else {}
+            raw_workers = summary.get("terminal_workers")
+            workers_by_shard: dict[int, dict[str, Any]] = {}
+            if isinstance(raw_workers, list):
+                for raw_worker in raw_workers:
+                    if not isinstance(raw_worker, dict):
+                        raise ValueError(
+                            "persisted terminal worker proof is invalid"
+                        )
+                    index = raw_worker.get("shard_index")
+                    if (
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index < 0
+                        or index >= expected_workers
+                        or index in workers_by_shard
+                    ):
+                        raise ValueError(
+                            "persisted terminal shard proof is invalid"
+                        )
+                    workers_by_shard[index] = {
+                        "worker_id": str(
+                            raw_worker.get("worker_id") or ""
+                        )[:256],
+                        "shard_index": index,
+                        "phase": "failed",
+                        "task_id": str(
+                            raw_worker.get("task_id") or ""
+                        )[:256],
+                        "error": (
+                            str(raw_worker.get("error"))[:2_000]
+                            if raw_worker.get("error")
+                            else None
+                        ),
+                        "final_collected": (
+                            raw_worker.get("final_collected") is True
+                            or (
+                                "final_collected" not in raw_worker
+                                and "collection_error" in raw_worker
+                                and not raw_worker.get("collection_error")
+                            )
+                        ),
+                        "collection_error": (
+                            str(raw_worker.get("collection_error"))[:2_000]
+                            if raw_worker.get("collection_error")
+                            else None
+                        ),
+                        "cleanup_error": (
+                            str(raw_worker.get("cleanup_error"))[:2_000]
+                            if raw_worker.get("cleanup_error")
+                            else None
+                        ),
+                        "worker_released": (
+                            raw_worker.get("worker_released") is True
+                            or (
+                                summary.get("done") is True
+                                and summary.get("cleanup_pending") == 0
+                            )
+                        ),
+                    }
+
+            existing = workers_by_shard.get(shard_index)
+            if existing is None and collected is None:
+                return False
+            recovered_worker_id = (
+                str(worker_id)[:256]
+                or f"recovered-shard-{shard_index:05d}"
+            )
+            if existing is None:
+                existing = {
+                    "worker_id": recovered_worker_id,
+                    "shard_index": shard_index,
+                    "phase": "failed",
+                    "task_id": "",
+                    "error": "Manager restarted during execution",
+                    "final_collected": bool(collected),
+                    "collection_error": (
+                        str(collection_error)[:2_000]
+                        if collection_error
+                        else None
+                    ),
+                    "cleanup_error": None,
+                    "worker_released": worker_released,
+                }
+            elif (
+                existing["worker_id"]
+                and existing["worker_id"] != recovered_worker_id
+            ):
+                # Two distinct resources claiming one shard make its filesystem
+                # provenance ambiguous. Cleanup may proceed, but legacy replay
+                # must fail closed rather than selecting one arbitrarily.
+                existing["final_collected"] = False
+                existing["collection_error"] = (
+                    "multiple recovered workers claimed the same shard"
+                )
+                existing["worker_released"] = (
+                    existing["worker_released"] and worker_released
+                )
+            else:
+                existing["worker_id"] = recovered_worker_id
+                if collected is True:
+                    existing["final_collected"] = True
+                    existing["collection_error"] = None
+                elif (
+                    collected is False
+                    and not existing["final_collected"]
+                ):
+                    existing["collection_error"] = (
+                        str(collection_error)[:2_000]
+                        if collection_error
+                        else "final recovery collection failed"
+                    )
+                existing["worker_released"] = (
+                    existing["worker_released"] or worker_released
+                )
+            workers_by_shard[shard_index] = existing
+
+            terminal_workers = [
+                workers_by_shard[index]
+                for index in sorted(workers_by_shard)
+            ]
+            released_shards = sum(
+                worker["worker_released"] for worker in terminal_workers
+            )
+            cleanup_pending = (
+                expected_workers - len(terminal_workers)
+                + len(terminal_workers) - released_shards
+            )
+            complete = (
+                len(terminal_workers) == expected_workers
+                and cleanup_pending == 0
+            )
+            failures = [
+                worker["collection_error"]
+                for worker in terminal_workers
+                if worker["collection_error"]
+            ]
+            rebuilt = {
+                "job_id": job_id,
+                "name": recovery_spec.name,
+                "state": "failed",
+                "done": complete,
+                "workers": expected_workers,
+                "phases": {"failed": len(terminal_workers)},
+                "cleanup_pending": cleanup_pending,
+                "error": (
+                    "Manager restarted during execution; "
+                    + (
+                        "final recovery collection failed: "
+                        + "; ".join(failures[:3])
+                        if failures
+                        else "recovered workers were collected and terminated"
+                    )
+                ),
+                "terminal_workers": terminal_workers,
+                "startup_recovered": True,
+            }
+            for key in (
+                "cancel_requested",
+                "cancel_reason",
+                "created_at",
+                "started_at",
+                "completed_at",
+                "latest_checkpoint_generation",
+            ):
+                if key in summary:
+                    rebuilt[key] = summary[key]
+            update_job_state(
+                self.config.registry.path,
+                job_id,
+                "failed",
+                summary=rebuilt,
+            )
+            return True
+
+        async with self._job_state_lock:
+            return await asyncio.to_thread(merge)
+
     async def _collect_recovered_unbound(self, instance) -> None:
         """Bounded best-effort collect for a prior Manager's ordinary Job."""
         import json
@@ -1419,6 +1919,14 @@ class ElasticAgentManager:
         worker_id = instance.instance_id
         node = await self.registry.get(worker_id)
         if node is None:
+            raw_shard_index = str(
+                instance.tags.get("ElasticAgentShardIndex") or ""
+            )
+            shard_index = (
+                int(raw_shard_index)
+                if re.fullmatch(r"[0-9]{1,5}", raw_shard_index)
+                else None
+            )
             await self.registry.add(NodeRecord(
                 node_id=worker_id,
                 instance_id=instance.instance_id,
@@ -1431,6 +1939,11 @@ class ElasticAgentManager:
                     "controller_id": instance.tags.get(
                         "ElasticAgentController", ""
                     ),
+                    **(
+                        {"shard_index": shard_index}
+                        if shard_index is not None
+                        else {}
+                    ),
                 },
             ))
         else:
@@ -1440,9 +1953,32 @@ class ElasticAgentManager:
                 public_ip=instance.public_ip,
                 private_ip=instance.private_ip,
             )
+        node = await self.registry.get(worker_id)
+        shard_index = (
+            node.metadata.get("shard_index")
+            if node is not None
+            else None
+        )
+        driver = ManagerFleetDriver(self)
         await asyncio.wait_for(
-            ManagerFleetDriver(self).collect(worker_id, spec, job_id),
-            timeout=30.0,
+            driver.quiesce_recovered_worker(
+                worker_id, job_id, spec,
+            ),
+            timeout=300.0,
+        )
+        if spec.recovery.policy != "none":
+            await asyncio.wait_for(
+                driver.reconcile_recovery_install(
+                    worker_id,
+                    job_id,
+                    spec,
+                    shard_index,
+                ),
+                timeout=1_800.0,
+            )
+        await asyncio.wait_for(
+            driver.collect(worker_id, spec, job_id),
+            timeout=BOUND_RECOVERY_COLLECT_TIMEOUT_SECONDS,
         )
 
     async def _collect_recovered_lease(self, lease) -> None:
@@ -1473,14 +2009,26 @@ class ElasticAgentManager:
             if recovered is None:
                 try:
                     recovered = await self.provider.get_instance(lease.instance_id)
-                except Exception:  # noqa: BLE001
-                    # The instance may already be terminating.  The registry or
-                    # attached EIP below can still provide a routable address.
-                    logger.debug(
-                        "Cannot refresh recovered instance %s",
-                        lease.instance_id,
-                        exc_info=True,
-                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        "cannot prove recovered cloud instance identity"
+                    ) from exc
+            if recovered is None:
+                raise RuntimeError(
+                    "cannot prove recovered cloud instance identity"
+                )
+            cloud_error = self._recovery_instance_validation_error(
+                recovered,
+                lease,
+            )
+            if cloud_error:
+                raise RuntimeError(
+                    f"recovered cloud instance identity mismatch: {cloud_error}"
+                )
+            if recovered.state == InstanceState.TERMINATED:
+                raise RuntimeError(
+                    "recovered cloud instance is already terminated"
+                )
 
             attached_eip_ip: str | None = None
             if binding is not None and binding.eip_allocation_id:
@@ -1508,14 +2056,27 @@ class ElasticAgentManager:
                         "job_id": lease.job_id,
                         "account_id": lease.account_id,
                         "lease_id": lease.lease_id,
+                        "shard_index": lease.slot,
                     },
                 ))
             else:
+                registry_error = (
+                    self._recovery_lease_registry_validation_error(
+                        node,
+                        lease,
+                    )
+                )
+                if registry_error:
+                    raise RuntimeError(
+                        "recovered registry identity mismatch: "
+                        f"{registry_error}"
+                    )
                 metadata = dict(node.metadata)
                 metadata.update({
                     "job_id": lease.job_id,
                     "account_id": lease.account_id,
                     "lease_id": lease.lease_id,
+                    "shard_index": lease.slot,
                 })
                 await self.registry.update(
                     worker_id,
@@ -1527,6 +2088,22 @@ class ElasticAgentManager:
                 )
 
             driver = ManagerFleetDriver(self)
+            await asyncio.wait_for(
+                driver.quiesce_recovered_worker(
+                    worker_id, lease.job_id, spec,
+                ),
+                timeout=300.0,
+            )
+            if spec.recovery.policy != "none":
+                await asyncio.wait_for(
+                    driver.reconcile_recovery_install(
+                        worker_id,
+                        lease.job_id,
+                        spec,
+                        lease.slot,
+                    ),
+                    timeout=1_800.0,
+                )
             await asyncio.wait_for(
                 driver.collect(worker_id, spec, lease.job_id),
                 timeout=BOUND_RECOVERY_COLLECT_TIMEOUT_SECONDS,
@@ -1675,6 +2252,25 @@ class ElasticAgentManager:
                 job_id,
                 state,
                 summary=summary,
+            )
+
+    async def _update_batch_checkpoint_generation(
+        self,
+        job_id: str,
+        generation: str,
+        committed_at: str,
+    ) -> None:
+        """Durably expose an S3 COMMITTED set across Manager crashes."""
+
+        from elastic_agent.core.job_spec_store import update_job_checkpoint
+
+        async with self._job_state_lock:
+            await asyncio.to_thread(
+                update_job_checkpoint,
+                self.config.registry.path,
+                job_id,
+                generation,
+                committed_at=committed_at,
             )
 
     @property
@@ -1971,6 +2567,14 @@ class ElasticAgentManager:
         records: list[NodeRecord] = []
         for i in range(count):
             instance_cfg = cfg.model_copy(deep=True)
+            if (
+                instance_cfg.tags.get("ElasticAgentJob")
+                and not instance_cfg.tags.get("ElasticAgentLease")
+            ):
+                # Survives a Manager crash between RunInstances and registry
+                # publication. Startup checkpoint reconciliation must never
+                # guess which immutable shard belongs on an adopted instance.
+                instance_cfg.tags["ElasticAgentShardIndex"] = str(i)
             # Name each instance "<name_prefix>-<i>" so it's identifiable in the
             # cloud console; without a prefix only the ManagedBy tag is set.
             if name_prefix:
@@ -2036,8 +2640,9 @@ class ElasticAgentManager:
                     {
                         "job_id": job_id,
                         "controller_id": controller_id,
+                        "shard_index": i,
                     }
-                    if job_id
+                    if job_id and not lease_id
                     else {}
                 )
                 if lease_id:
@@ -2938,13 +3543,27 @@ class ElasticAgentManager:
                     "Could not resolve EIP lease for disconnected worker %s",
                     worker_id,
                 )
-        if lease_id:
+        batch_job_id = None
+        orchestrator = self._batch
+        if orchestrator is not None and callable(
+            getattr(orchestrator, "job_id_for_worker", None)
+        ):
+            batch_job_id = orchestrator.job_id_for_worker(worker_id)
+        if lease_id and batch_job_id is None:
             existing = self._bound_disconnect_tasks.get(worker_id)
             if existing is None or existing.done():
                 self._bound_disconnect_cancel_events[worker_id] = asyncio.Event()
                 self._bound_disconnect_tasks[worker_id] = asyncio.create_task(
                     self._cleanup_bound_after_disconnect(worker_id, lease_id)
                 )
+        elif lease_id:
+            logger.warning(
+                "Retaining disconnected bound Worker %s for active Job %s; "
+                "the task supervisor, Job TTL, and cloud reconciler own "
+                "liveness",
+                worker_id,
+                batch_job_id,
+            )
 
     async def _cleanup_bound_after_disconnect(
         self, worker_id: str, lease_id: str

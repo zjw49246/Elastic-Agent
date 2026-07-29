@@ -364,6 +364,55 @@ class TestLaunch:
         assert d.dispatched
         assert ("recovery_cleanup", job.job_id) in d.events
 
+    async def test_recovery_staging_remains_durably_prepared_until_complete(
+        self,
+    ):
+        staging_started = asyncio.Event()
+        release_staging = asyncio.Event()
+
+        class BlockingRecoveryDriver(FakeDriver):
+            async def prepare_recovery(self, job_id, spec):
+                await super().prepare_recovery(job_id, spec)
+                staging_started.set()
+                await release_staging.wait()
+                self.events.append(("recovery_prepared", job_id))
+
+        driver = BlockingRecoveryDriver(workers=1)
+
+        async def record_state(job_id, state, summary):
+            driver.events.append(("state", job_id, state))
+
+        orchestrator = BatchOrchestrator(
+            driver,
+            job_state_hook=record_state,
+        )
+        job = orchestrator.prepare(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+        await orchestrator.submit_prepared(job)
+        await staging_started.wait()
+
+        assert job.persisted_state == "prepared"
+        assert not any(event[0] == "state" for event in driver.events)
+        assert not any(event[0] == "scale" for event in driver.events)
+
+        release_staging.set()
+        await job.launch_task
+
+        event_names = [event[0] for event in driver.events]
+        assert event_names.index("recovery_prepared") < event_names.index(
+            "state"
+        )
+        assert event_names.index("state") < event_names.index("scale")
+        assert next(
+            event[2] for event in driver.events if event[0] == "state"
+        ) == "launching"
+
     async def test_recovery_prepare_failure_creates_no_worker(self):
         d = FakeDriver(workers=1)
         d.recovery_prepare_error = "checkpoint missing"
@@ -380,6 +429,79 @@ class TestLaunch:
         assert job.error == "checkpoint missing"
         assert job.runs == {}
         assert not any(event[0] == "scale" for event in d.events)
+
+    async def test_cancel_during_recovery_staging_never_crosses_scale_boundary(
+        self,
+    ):
+        staged = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingRecoveryDriver(FakeDriver):
+            async def prepare_recovery(self, job_id, spec):
+                await super().prepare_recovery(job_id, spec)
+                staged.set()
+                await release.wait()
+
+        d = BlockingRecoveryDriver(workers=1)
+        orch = BatchOrchestrator(d)
+        job = orch.prepare(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+        await orch.submit_prepared(job)
+        await staged.wait()
+        job.cancel_requested = True
+        job.cancel_reason = "cancelled while staging"
+        release.set()
+        await job.launch_task
+
+        assert not any(event[0] == "scale" for event in d.events)
+        assert ("recovery_cleanup", job.job_id) in d.events
+        assert "cancelled while staging" in (job.error or "")
+
+    async def test_cancel_interrupts_cooperative_recovery_staging_promptly(
+        self,
+    ):
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class BlockingRecoveryDriver(FakeDriver):
+            async def prepare_recovery(self, job_id, spec):
+                await super().prepare_recovery(job_id, spec)
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    interrupted.set()
+
+        driver = BlockingRecoveryDriver(workers=1)
+        orchestrator = BatchOrchestrator(driver)
+        job = orchestrator.prepare(_spec(
+            fanout={"workers": 1},
+            recovery={
+                "policy": "checkpoint",
+                "source_job_id": "job-source",
+                "paths": ["results"],
+            },
+        ))
+        await orchestrator.submit_prepared(job)
+        await started.wait()
+
+        assert await asyncio.wait_for(
+            orchestrator.cancel_job(
+                job.job_id, reason="cancel recovery staging",
+            ),
+            timeout=1,
+        )
+
+        assert interrupted.is_set()
+        assert job.launch_complete
+        assert not any(event[0] == "scale" for event in driver.events)
+        assert ("recovery_cleanup", job.job_id) in driver.events
 
     async def test_recovery_restore_failure_stops_before_login_and_dispatch(
         self,
@@ -1079,6 +1201,70 @@ class TestRotation:
         assert job.runs[wid].phase == WorkerPhase.FAILED
         assert (wid, job.job_id) in d.collected
 
+    async def test_checkpointing_continues_after_one_shard_finishes(self):
+        orchestrator = None
+
+        class CheckpointAwareDriver(FakeDriver):
+            async def collect(self, worker_id, spec, job_id):
+                await super().collect(worker_id, spec, job_id)
+                job = orchestrator.get_job(job_id)
+                run = job.runs[worker_id]
+                run.last_checkpoint_generation = (
+                    run.checkpoint_generation
+                )
+
+        driver = CheckpointAwareDriver(workers=2)
+        orchestrator = BatchOrchestrator(driver)
+        job = await orchestrator.launch(_spec(
+            account={"mode": "none"},
+            run={"command": "bench --shard {{shard_id}}"},
+            fanout={"workers": 2, "shard_by": "shard_index"},
+            collect={
+                "paths": ["results"],
+                "checkpoint": True,
+                "interval_seconds": 1,
+            },
+        ))
+
+        for _ in range(30):
+            if len(driver.collected) >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert len(driver.collected) >= 2
+
+        finished = min(
+            job.runs.values(),
+            key=lambda candidate: candidate.ctx.shard_index,
+        )
+        survivor = max(
+            job.runs.values(),
+            key=lambda candidate: candidate.ctx.shard_index,
+        )
+        await orchestrator.on_worker_exit(
+            job.job_id,
+            finished.worker_id,
+            0,
+            task_id=finished.task_id,
+        )
+        assert finished.last_checkpoint_generation == "final"
+
+        driver.collected.clear()
+        for _ in range(30):
+            if (survivor.worker_id, job.job_id) in driver.collected:
+                break
+            await asyncio.sleep(0.1)
+
+        assert (survivor.worker_id, job.job_id) in driver.collected
+        assert survivor.checkpoint_shard_generations == {
+            "shard-00000": "final",
+            "shard-00001": survivor.checkpoint_generation,
+        }
+        await orchestrator._stop_periodic_collect(survivor.worker_id)
+        ttl_task = orchestrator._ttl_tasks.pop(job.job_id, None)
+        if ttl_task is not None:
+            ttl_task.cancel()
+            await asyncio.gather(ttl_task, return_exceptions=True)
+
     async def test_final_collect_retries_then_cleans_bound_instance(self):
         d = FakeDriver()
         d.collect_failures = 2
@@ -1184,6 +1370,43 @@ class TestRotation:
         await asyncio.sleep(1.3)             # one interval elapses mid-run
         assert len(d.collected) >= 1         # collected while still RUNNING
         await orch._stop_periodic_collect(wid)  # cleanup the background loop
+
+    async def test_checkpoint_periodic_collect_uses_one_job_barrier(self):
+        d = FakeDriver()
+        calls = []
+        both_started = asyncio.Event()
+        release_slow = asyncio.Event()
+
+        async def barrier_collect(worker_id, spec, job_id):
+            run = orch.get_job(job_id).runs[worker_id]
+            calls.append((worker_id, run.checkpoint_generation))
+            if len(calls) == 2:
+                both_started.set()
+            if worker_id == "w1":
+                await release_slow.wait()
+
+        d.collect = barrier_collect
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            run={"command": "bench --shard {{shard_id}}"},
+            fanout={"workers": 2, "shard_by": "shard_index"},
+            collect={
+                "paths": ["results"],
+                "interval_seconds": 1,
+                "checkpoint": True,
+            },
+        ))
+        await asyncio.wait_for(both_started.wait(), timeout=2)
+
+        assert {generation for _wid, generation in calls} == {
+            "periodic-00000001"
+        }
+        assert job.checkpoint_sequence == 1
+        await asyncio.sleep(0.05)
+        assert len(calls) == 2
+
+        release_slow.set()
+        await orch._stop_periodic_collect("w0")
 
     async def test_rotation_login_failure_fails(self):
         d = FakeDriver()
@@ -1548,6 +1771,13 @@ class TestCompletion:
             d, cancel_grace_seconds=0.01, cancel_kill_grace_seconds=0.01,
         )
         job = await orch.launch(_spec(fanout={"workers": 2}))
+        original_stop = d.stop_command
+
+        async def stop_and_confirm(*args, **kwargs):
+            await original_stop(*args, **kwargs)
+            job.runs[args[0]].exit_event.set()
+
+        d.stop_command = stop_and_confirm
 
         assert await orch.cancel_job(job.job_id, reason="admin requested") is True
 
@@ -1578,6 +1808,8 @@ class TestCompletion:
             signal = kwargs.get("signal", args[2] if len(args) > 2 else "SIGTERM")
             d.events.append(("stop", args[0], signal))
             await original_stop(*args, **kwargs)
+            if signal == "SIGKILL":
+                run.exit_event.set()
 
         d.run_command = accepted_but_blocked_dispatch
         d.stop_command = record_stop
@@ -1690,20 +1922,18 @@ class TestCompletion:
         ]
         assert states[-1][1]["done"] is True
 
-    async def test_permanent_disconnect_fails_and_tears_down_worker(self):
+    async def test_disconnect_past_legacy_grace_keeps_supervised_task(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d, disconnect_grace_seconds=0.01)
         job = await orch.launch(_spec(fanout={"workers": 1}))
         run = next(iter(job.runs.values()))
 
         await orch.handle_disconnect(run.worker_id)
-        for _ in range(100):
-            if job.summary()["done"]:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.03)
 
-        assert run.phase == WorkerPhase.FAILED
-        assert job.resources_released is True
+        assert run.phase == WorkerPhase.RUNNING
+        assert job.resources_released is False
+        assert d.scale_in_calls == 0
 
     async def test_reconnect_cancels_disconnect_teardown(self):
         d = FakeDriver()
@@ -1809,6 +2039,7 @@ class TestAccountRelease:
         )
 
         assert run.cleaned_up is False
+        assert job.resources_released is False
         assert job.accounts_released is False
         # EIP release_bound owns the exact job:slot claim; the broad ordinary
         # worker fallback must never run before or after that transaction.
@@ -1822,6 +2053,7 @@ class TestAccountRelease:
         )
 
         assert run.cleaned_up is True
+        assert job.resources_released is True
         assert job.accounts_released is True
         assert allocator.released == []
 
@@ -2059,6 +2291,13 @@ class TestShutdown:
         )
         job = await orch.launch(_spec(fanout={"workers": 1}))
         run = next(iter(job.runs.values()))
+        original_stop = driver.stop_command
+
+        async def stop_and_confirm(*args, **kwargs):
+            await original_stop(*args, **kwargs)
+            run.exit_event.set()
+
+        driver.stop_command = stop_and_confirm
 
         await orch.shutdown(timeout=0.1)
 

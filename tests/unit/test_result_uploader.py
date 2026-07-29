@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -105,6 +108,47 @@ def test_custom_prefix_and_uri(tmp_path):
     assert up.s3_uri("j") == "s3://b/runs/j/"
 
 
+def test_periodic_sync_skips_private_collection_attempts(tmp_path):
+    up, root = _uploader(tmp_path)
+    published = root / "job-1" / "workers" / "shard-00000"
+    published.mkdir(parents=True)
+    (published / "answer.txt").write_text("complete")
+    (published / ".application-state").write_text("keep")
+    attempt = (
+        root / "job-1" / "workers"
+        / ".shard-00000.attempt-interrupted"
+    )
+    attempt.mkdir()
+    (attempt / "partial.txt").write_text("must stay private")
+
+    assert up.sync_once() == 2
+    assert sorted(key for _, _, key in up._client.uploads) == [
+        "jobs/job-1/workers/shard-00000/.application-state",
+        "jobs/job-1/workers/shard-00000/answer.txt",
+    ]
+
+
+def test_periodic_sync_applies_limits_per_job_not_all_history(tmp_path):
+    root = tmp_path / "collected"
+    for job_id in ("job-1", "job-2"):
+        result = root / job_id / "answer.bin"
+        result.parent.mkdir(parents=True)
+        result.write_bytes(b"1234")
+    uploader = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=FakeS3(),
+        max_objects=10,
+        max_total_bytes=4,
+    )
+
+    assert uploader.sync_once() == 2
+    assert sorted(key for _, _, key in uploader._client.uploads) == [
+        "jobs/job-1/answer.bin",
+        "jobs/job-2/answer.bin",
+    ]
+
+
 def test_sync_job_only_uploads_requested_job(tmp_path):
     up, root = _uploader(tmp_path)
     for job in ("j1", "j2"):
@@ -113,6 +157,232 @@ def test_sync_job_only_uploads_requested_job(tmp_path):
 
     assert up.sync_job("j1") == 1
     assert [key for _, _, key in up._client.uploads] == ["jobs/j1/a"]
+
+
+def test_sync_worker_only_uploads_requested_namespace(tmp_path):
+    up, root = _uploader(tmp_path)
+    for namespace in ("shard-00000", "shard-00001"):
+        result = root / "j1" / "workers" / namespace / "results"
+        result.mkdir(parents=True)
+        (result / "answer.txt").write_text(namespace)
+
+    assert up.sync_worker("j1", "shard-00001") == 1
+    assert [key for _, _, key in up._client.uploads] == [
+        "jobs/j1/workers/shard-00001/results/answer.txt"
+    ]
+
+
+def test_disjoint_worker_namespaces_upload_concurrently(tmp_path):
+    barrier = threading.Barrier(2, timeout=2)
+
+    class ConcurrentS3(FakeS3):
+        def upload_fileobj(self, stream, bucket, key, **_kwargs):
+            barrier.wait()
+            super().upload_fileobj(stream, bucket, key)
+
+    root = tmp_path / "collected"
+    for namespace in ("shard-00000", "shard-00001"):
+        result = root / "j1" / "workers" / namespace / "results"
+        result.mkdir(parents=True)
+        (result / "answer.txt").write_text(namespace)
+    uploader = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=ConcurrentS3(),
+        max_concurrent_uploads=2,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda namespace: uploader.sync_worker("j1", namespace),
+            ("shard-00000", "shard-00001"),
+        ))
+
+    assert results == [1, 1]
+    assert len(uploader._client.uploads) == 2
+
+
+@pytest.mark.parametrize(
+    ("job_id", "namespace"),
+    [
+        ("", "shard-00000"),
+        ("j1", ""),
+        ("../j1", "shard-00000"),
+        ("j1", "../shard-00000"),
+        ("j1/sub", "shard-00000"),
+        ("j1", "workers/shard-00000"),
+    ],
+)
+def test_sync_worker_rejects_unsafe_components(
+    tmp_path, job_id, namespace,
+):
+    up, _ = _uploader(tmp_path)
+    with pytest.raises(ValueError, match="safe path component"):
+        up.sync_worker(job_id, namespace)
+
+
+def test_sync_worker_honors_internal_deadline(tmp_path, monkeypatch):
+    up, root = _uploader(tmp_path)
+    result = root / "j1" / "workers" / "shard-00000" / "results"
+    result.mkdir(parents=True)
+    (result / "answer.txt").write_text("late")
+    monkeypatch.setattr(
+        "elastic_agent.core.result_uploader.time.monotonic",
+        lambda: 10.0,
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        up.sync_worker(
+            "j1", "shard-00000", deadline_monotonic=9.0,
+        )
+
+    assert up._client.uploads == []
+
+
+def test_sync_tree_enforces_global_object_and_byte_limits(tmp_path):
+    root = tmp_path / "collected"
+    result = root / "j1" / "workers" / "shard-00000" / "results"
+    result.mkdir(parents=True)
+    (result / "a.bin").write_bytes(b"1234")
+    (result / "b.bin").write_bytes(b"5")
+
+    object_limited = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=FakeS3(),
+        max_objects=2,
+        max_total_bytes=100,
+    )
+    with pytest.raises(S3ResultUploadError, match="object limit"):
+        object_limited.sync_worker("j1", "shard-00000")
+
+    byte_limited = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=FakeS3(),
+        max_objects=10,
+        max_total_bytes=4,
+    )
+    with pytest.raises(S3ResultUploadError, match="byte limit"):
+        byte_limited.sync_worker("j1", "shard-00000")
+
+
+def test_cancel_event_without_deadline_interrupts_active_upload(tmp_path):
+    cancel_event = threading.Event()
+
+    class CancellingS3(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.callback_present = False
+
+        def upload_fileobj(self, stream, bucket, key, **kwargs):
+            callback = kwargs.get("Callback")
+            self.callback_present = callback is not None
+            cancel_event.set()
+            if callback is not None:
+                callback(1)
+            super().upload_fileobj(stream, bucket, key)
+
+    root = tmp_path / "collected"
+    result = root / "j1" / "workers" / "shard-00000" / "results"
+    result.mkdir(parents=True)
+    (result / "answer.txt").write_text("payload")
+    client = CancellingS3()
+    uploader = S3ResultUploader("bucket", str(root), client=client)
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        uploader.sync_worker(
+            "j1",
+            "shard-00000",
+            cancel_event=cancel_event,
+        )
+
+    assert client.callback_present
+    assert client.uploads == []
+
+
+def test_scan_and_hash_concurrency_are_bounded(tmp_path, monkeypatch):
+    root = tmp_path / "collected"
+    for namespace in ("shard-00000", "shard-00001"):
+        result = root / "j1" / "workers" / namespace / "results"
+        result.mkdir(parents=True)
+        (result / "answer.txt").write_text(namespace)
+    uploader = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=FakeS3(),
+        max_concurrent_scans=1,
+        max_concurrent_hashes=1,
+        max_concurrent_uploads=2,
+    )
+    scan_lock = threading.Lock()
+    hash_lock = threading.Lock()
+    scan_active = 0
+    hash_active = 0
+    max_scan_active = 0
+    max_hash_active = 0
+    original_safe_files = uploader._safe_files
+    original_hash = uploader._content_sha256
+
+    def tracked_safe_files(*args, **kwargs):
+        nonlocal scan_active, max_scan_active
+        for item in original_safe_files(*args, **kwargs):
+            with scan_lock:
+                scan_active += 1
+                max_scan_active = max(max_scan_active, scan_active)
+            threading.Event().wait(0.02)
+            with scan_lock:
+                scan_active -= 1
+            yield item
+
+    def tracked_hash(stream, deadline_monotonic=None, cancel_event=None):
+        nonlocal hash_active, max_hash_active
+        with hash_lock:
+            hash_active += 1
+            max_hash_active = max(max_hash_active, hash_active)
+        threading.Event().wait(0.02)
+        try:
+            return original_hash(
+                stream, deadline_monotonic, cancel_event,
+            )
+        finally:
+            with hash_lock:
+                hash_active -= 1
+
+    monkeypatch.setattr(uploader, "_safe_files", tracked_safe_files)
+    monkeypatch.setattr(uploader, "_content_sha256", tracked_hash)
+    start = threading.Barrier(2, timeout=2)
+
+    def sync(namespace):
+        start.wait()
+        return uploader.sync_worker("j1", namespace)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(
+            sync,
+            ("shard-00000", "shard-00001"),
+        )) == [1, 1]
+
+    assert max_scan_active == 1
+    assert max_hash_active == 1
+
+
+def test_uploaded_digest_cache_is_bounded_across_worker_syncs(tmp_path):
+    root = tmp_path / "collected"
+    uploader = S3ResultUploader(
+        "bucket",
+        str(root),
+        client=FakeS3(),
+        max_objects=2,
+    )
+    for index in range(3):
+        namespace = f"shard-{index:05d}"
+        result = root / "j1" / "workers" / namespace / "results"
+        result.mkdir(parents=True)
+        (result / "answer.txt").write_text(namespace)
+        assert uploader.sync_worker("j1", namespace) == 1
+
+    assert len(uploader._uploaded) == 2
 
 
 def test_upload_failure_is_not_silently_treated_as_success(tmp_path):
@@ -171,3 +441,34 @@ def test_skips_job_tree_whose_root_is_a_symlink(tmp_path):
     up = S3ResultUploader("bucket", str(root), client=FakeS3())
     assert up.sync_job("j") == 0
     assert up._client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_periodic_cancel_wins_over_simultaneous_upload_failure(
+    tmp_path,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingFailureS3(FakeS3):
+        def upload_fileobj(self, stream, bucket, key, **_kwargs):
+            started.set()
+            release.wait(timeout=2)
+            raise RuntimeError("late upload failure")
+
+    root = tmp_path / "collected"
+    result = root / "j1" / "result.txt"
+    result.parent.mkdir(parents=True)
+    result.write_text("payload")
+    uploader = S3ResultUploader(
+        "bucket", str(root), client=BlockingFailureS3(),
+    )
+
+    periodic = asyncio.create_task(
+        uploader.run_periodic(interval=3600, operation_timeout=60)
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    periodic.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(periodic, timeout=2)

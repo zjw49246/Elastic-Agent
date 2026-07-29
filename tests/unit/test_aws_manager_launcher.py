@@ -102,7 +102,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "AssertPathIsDirectory=/home/ubuntu/.elastic-agent-demo" in source
     assert "ReadWritePaths=/home/ubuntu/.elastic-agent-demo" in source
     assert "ExecStartPost=" in source and "/api/health" in source
-    assert "TimeoutStopSec=1200" in source
+    assert "TimeoutStopSec=32400" in source
     for setting in (
         "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
         "AWS_CONFIG_FILE=/dev/null",
@@ -209,6 +209,44 @@ def test_manager_policy_tags_and_detaches_only_managed_network_interfaces():
     release = statements["ReleaseManagedEips"]
     assert release["Action"] == "ec2:ReleaseAddress"
     assert release["Resource"].endswith(":elastic-ip/*")
+
+
+def test_manager_policy_allows_shard_tag_and_only_internal_checkpoint_deletes():
+    policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
+    statements = {
+        statement["Sid"]: statement
+        for statement in policy["Statement"]
+    }
+
+    for sid in ("LaunchOnlyManagedWorkers", "TagManagedResourcesAtCreation"):
+        assert (
+            "ElasticAgentShardIndex"
+            in statements[sid]["Condition"]["ForAllValues:StringEquals"][
+                "aws:TagKeys"
+            ]
+        )
+    delete = statements["DeleteInternalCheckpointHistory"]
+    assert delete == {
+        "Sid": "DeleteInternalCheckpointHistory",
+        "Effect": "Allow",
+        "Action": "s3:DeleteObject",
+        "Resource": (
+            "arn:aws:s3:::elastic-agent-results-297645381734/"
+            "jobs/.elastic-agent-checkpoints/*"
+        ),
+    }
+    assert "s3:DeleteObject" not in statements["ReadAndWriteResults"]["Action"]
+
+    cutover = IAM_CUTOVER.read_text(encoding="utf-8")
+    assert (
+        "ManagedBy,Name,ElasticAgentJob,ElasticAgentShardIndex,"
+        "ElasticAgentController"
+    ) in cutover
+    assert (
+        "jobs/.elastic-agent-checkpoints/job-test/"
+        "checkpoint-blobs/deadbeef"
+    ) in cutover
+    assert "jobs/job-test/result.json" in cutover
 
 
 def test_worker_policy_reads_only_datasets_and_writes_results():

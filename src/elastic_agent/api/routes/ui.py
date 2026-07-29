@@ -976,8 +976,8 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       <p class="section-intro">这是每台 Worker 真正执行的命令。模板变量会在分发时解析，Shell 变量留给 Worker。</p>
       <div class="field"><label for="jRun">运行命令<span class="required-mark">必填</span> <span class="field-code">run.command</span></label>
         <textarea id="jRun" class="textarea-command" required aria-describedby="jRunHelp"
-                  placeholder='uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"'></textarea>
-        <div class="field-help" id="jRunHelp">支持 Manager 模板 <code>{{shard_index}}</code>/<code>{{num_shards}}</code>，以及 Worker Shell 变量（如 <code>$(hostname -s)</code>）。</div>
+                  placeholder='uv run ai4sci-bench run --output-dir "results/opus48_shard-{{shard_id}}_seed128"'></textarea>
+        <div class="field-help" id="jRunHelp">支持稳定的 Manager 模板 <code>{{shard_id}}</code>/<code>{{shard_index}}</code>/<code>{{num_shards}}</code>。启用 checkpoint 时禁止 hostname 派生路径，因为替换 Worker 的 hostname 会变化。</div>
       </div>
       <div class="form-grid" style="margin-top:10px">
         <div class="field"><label for="jCwd">命令工作目录 <span class="field-code">run.cwd</span></label>
@@ -1042,6 +1042,9 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
                     placeholder=".venv/**&#10;**/core"
                     aria-describedby="jCollectExcludeHelp"></textarea>
           <div class="field-help" id="jCollectExcludeHelp">每行一个相对 glob；用于排除缓存、虚拟环境和崩溃转储。</div></div>
+        <div class="field"><label for="jCheckpointRetention">保留完整检查点数 <span class="field-code">collect.checkpoint_keep_generations</span></label>
+          <input id="jCheckpointRetention" type="number" value="3" min="1" max="100">
+          <div class="field-help">保留最近的完整 Job 级恢复集合；相同内容按 SHA-256 去重，不会每次全量重复存储。</div></div>
       </div>
       <div class="form-notice field-help">长任务建议设为 120 秒并开启原子检查点。间隔大于 0 时页面可下载最近一次完整快照；配置结果桶时会同步到 S3，否则保留在 Manager 本地。</div>
       <details class="form-details">
@@ -1052,7 +1055,6 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
                     aria-describedby="jRecoveryHelp">
               <option value="none">不恢复（全新运行）</option>
               <option value="checkpoint">已校验的原子检查点</option>
-              <option value="legacy_final_collection">旧 Job 的最终收集（兼容模式）</option>
             </select>
             <div class="field-help" id="jRecoveryHelp" data-state role="status" aria-live="polite">不读取先前 Job 的文件。</div></div>
           <div class="field"><label for="jRecoveryJob">来源 Job ID <span class="field-code">recovery.source_job_id</span></label>
@@ -1063,11 +1065,11 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
             <textarea id="jRecoveryPaths" class="textarea-compact" disabled
                       aria-describedby="jRecoveryPathsHelp">results</textarea>
             <div class="field-help" id="jRecoveryPathsHelp">每行一个，必须是来源 Job 已收集的目录；在登录和运行命令前恢复。</div></div>
-          <div class="field"><label for="jRecoveryGeneration">指定 generation（可选） <span class="field-code">recovery.generation</span></label>
+          <div class="field"><label for="jRecoveryGeneration">指定恢复集合（可选） <span class="field-code">recovery.generation</span></label>
             <input id="jRecoveryGeneration" disabled
                    aria-describedby="jRecoveryGenerationHelp"
-                   placeholder="留空使用最新 COMMITTED generation">
-            <div class="field-help" id="jRecoveryGenerationHelp">仅原子检查点模式可用；留空会选择最新完整提交。</div></div>
+                   placeholder="留空使用最新完整 checkpoint set">
+            <div class="field-help" id="jRecoveryGenerationHelp">仅原子检查点模式可用；一个 set 会固定引用全部 Worker 的已校验 generation，缺任一分片都不会发布。</div></div>
         </div>
       </details>
     </fieldset>
@@ -1083,7 +1085,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
           </select></div>
         <div class="field"><label for="jResume">换号重启时追加的参数 <span class="field-code">rotation.resume_args</span></label>
           <input id="jResume" aria-describedby="jRotationHint"
-                 placeholder='--resume "results/opus48_$(hostname -s)_seed128"'></div>
+                 placeholder='--resume "results/opus48_shard-{{shard_id}}_seed128"'></div>
         <div class="field"><label for="jMaxRotations">最多自动换号次数 <span class="field-code">rotation.max_rotations</span></label>
           <input id="jMaxRotations" type="number" value="20" min="0" max="100"></div>
       </div>
@@ -2032,8 +2034,15 @@ function updateCollectUI() {
     ? `运行期间每 ${value} 秒收集一次；下载按钮读取最近一次已完成的快照。`
     : '0 表示只在成功、失败或取消时做最终收集。';
   document.getElementById('jCollectCheckpointHelp').textContent = checkpoint
-    ? '每次成功收集都会先校验文件，再写不可变 S3 generation，最后提交 COMMITTED.json。'
+    ? '每次成功收集都会先校验文件；全部分片齐备后才发布完整 set。相同文件按 SHA-256 去重。'
     : '当前只维护普通结果副本；它可以下载，但不能作为强校验的自动续跑检查点。';
+  document.getElementById('jCheckpointRetention').disabled = !checkpoint;
+  if (
+    checkpoint
+    && document.getElementById('jShard').value === 'hostname'
+  ) {
+    document.getElementById('jShard').value = 'shard_index';
+  }
 }
 function updateRecoveryUI() {
   const policy = document.getElementById('jRecoveryPolicy').value;
@@ -2043,10 +2052,8 @@ function updateRecoveryUI() {
   document.getElementById('jRecoveryGeneration').disabled =
     policy !== 'checkpoint';
   document.getElementById('jRecoveryHelp').textContent = policy === 'checkpoint'
-    ? '只接受先写完文件清单、后提交 COMMITTED.json 的不可变 generation；损坏时不会创建新机器。'
-    : policy === 'legacy_final_collection'
-      ? '兼容旧 Job：只允许已证明完成最终收集的终态 Job；旧对象没有逐文件哈希保证。'
-      : '不读取先前 Job 的文件。';
+    ? '只接受包含全部稳定 shard index 的不可变 checkpoint set；损坏或缺分片时不会创建新机器。'
+    : '不读取先前 Job 的文件。旧 Job 的普通 S3 结果无法证明已删除文件，必须从头重跑。';
 }
 function updateRotationUI() {
   const rotation = document.getElementById('jRot');
@@ -2329,6 +2336,8 @@ function buildJobSpec() {
     collect: {paths: lines('jCollect'),
               exclude: lines('jCollectExclude'),
               checkpoint: document.getElementById('jCollectCheckpoint').value === 'true',
+              checkpoint_keep_generations:
+                parseInt(document.getElementById('jCheckpointRetention').value) || 3,
               interval_seconds: parseInt(document.getElementById('jCollectInterval').value) || 0},
     recovery: {policy: recoveryPolicy,
                source_job_id: recoveryEnabled
@@ -2437,6 +2446,146 @@ async function submitJob() {
     toast('Launched ' + j.job_id); refreshJobs(); refreshAccounts(true); }
   catch(e) { toast(e.message, 'error'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
+}
+
+function recoverySubmissionDefinitivelyRejected(status) {
+  const code = Number(status) || 0;
+  // A recovery may already have reached durable ``prepared`` even when a
+  // later authorization/source/S3 preflight retry returns 4xx. Preserve the
+  // accepted key for every uncertain response; only an explicit identity
+  // conflict proves that this exact key cannot accept this request.
+  return code === 409;
+}
+
+async function recoverJob(rawSourceJobId, rawLatestGeneration) {
+  const sourceJobId = String(rawSourceJobId || '');
+  const pendingKey = 'ea_checkpoint_recovery_pending_v1';
+  let pending = null;
+  try {
+    pending = JSON.parse(sessionStorage.getItem(pendingKey) || 'null');
+  } catch(error) {
+    sessionStorage.removeItem(pendingKey);
+  }
+  if (pending && pending.source_job_id !== sourceJobId) {
+    toast(
+      `来源 ${pending.source_job_id || '未知'} 还有一次响应不确定的恢复提交；`
+      + '请先在该 Job 卡片重试，避免意外创建两组 Worker。',
+      'error'
+    );
+    return;
+  }
+  if (pending && pending.source_job_id === sourceJobId
+      && pending.body && pending.idempotency_key) {
+    if (!window.confirm(
+      '检测到这个来源 Job 有一次响应不确定的恢复提交。\\n\\n'
+      + '点击“确定”将使用原请求和 Idempotency-Key 安全重试；'
+      + '点击“取消”将保留记录且不创建新 Job。'
+    )) {
+      if (window.confirm(
+        '是否明确丢弃这条待重试记录？\\n\\n'
+        + '只有确认后台从未接受该请求时才应丢弃；否则换新 Key 可能重复创建 Worker。'
+      )) {
+        sessionStorage.removeItem(pendingKey);
+        toast('已丢弃恢复待重试记录；未提交新 Job。');
+      }
+      return;
+    }
+  } else {
+    const suggested = String(rawLatestGeneration || '');
+    const generation = window.prompt(
+      '恢复哪个完整 checkpoint set？\\n'
+      + `当前记录为 ${suggested || '未知'}。留空由服务器选择 S3 中真正最新的完整版本；`
+      + '只有需要固定旧版本时才填写 generation。',
+      ''
+    );
+    if (generation === null) return;
+    const command = window.prompt(
+      '可选：输入新的续跑命令。\\n'
+      + '留空会使用来源 Job 的原命令；不要把密钥写入命令。',
+      ''
+    );
+    if (command === null) return;
+    const timeoutText = window.prompt(
+      '可选：新的运行超时（秒，60–2592000）。留空沿用来源 Job。',
+      ''
+    );
+    if (timeoutText === null) return;
+    const ttlText = window.prompt(
+      '可选：新的 Job 总生命周期（秒，300–2592000）。'
+      + '留空沿用来源 Job，且必须不短于运行超时。',
+      ''
+    );
+    if (ttlText === null) return;
+    const parseOptionalInteger = (raw, minimum, label) => {
+      const value = String(raw || '').trim();
+      if (!value) return null;
+      if (!/^\\d+$/.test(value)) throw new Error(label + '必须是整数秒数');
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > 2592000) {
+        throw new Error(`${label}必须在 ${minimum}–2592000 秒之间`);
+      }
+      return parsed;
+    };
+    let timeout;
+    let ttl;
+    try {
+      timeout = parseOptionalInteger(timeoutText, 60, '运行超时');
+      ttl = parseOptionalInteger(ttlText, 300, 'Job 生命周期');
+    } catch(error) {
+      toast(error.message || String(error), 'error');
+      return;
+    }
+    const body = {
+      source_job_id: sourceJobId,
+      generation: String(generation).trim(),
+      run: {},
+    };
+    if (String(command).trim()) body.run.command = String(command).trim();
+    if (timeout !== null) body.run.timeout = timeout;
+    if (ttl !== null) body.ttl_seconds = ttl;
+    if (!window.confirm(
+      `将从 ${sourceJobId} 的 S3 完整检查点创建一组新 Worker。\\n`
+      + '检查点之后尚未上传的工作会重新执行；来源 Job 的私有环境配置'
+      + '只在服务器端复制，不会回显到浏览器。\\n\\n确认继续？'
+    )) return;
+    pending = {
+      source_job_id: sourceJobId,
+      body,
+      idempotency_key: crypto.randomUUID
+        ? crypto.randomUUID()
+        : String(Date.now()) + '-' + Math.random(),
+    };
+    try {
+      sessionStorage.setItem(pendingKey, JSON.stringify(pending));
+    } catch(error) {
+      toast('浏览器无法保存恢复用 Idempotency-Key，已取消提交。', 'error');
+      return;
+    }
+  }
+
+  try {
+    const recovered = await api(
+      'POST',
+      '/jobs/recover',
+      pending.body,
+      {'Idempotency-Key': pending.idempotency_key}
+    );
+    sessionStorage.removeItem(pendingKey);
+    toast('已创建恢复 Job ' + recovered.job_id);
+    refreshJobs();
+    refreshAccounts(true);
+  } catch(error) {
+    if (recoverySubmissionDefinitivelyRejected(error?.status)) {
+      sessionStorage.removeItem(pendingKey);
+      toast('恢复提交被服务器拒绝：' + (error.message || error), 'error');
+    } else {
+      toast(
+        '恢复提交结果不确定：' + (error.message || error)
+        + '。再次点击可用同一 Idempotency-Key 安全重试。',
+        'error'
+      );
+    }
+  }
 }
 
 // ---- Jobs monitor ----
@@ -2923,7 +3072,8 @@ function jobConfigHtml(job) {
         <p class="job-config-note">
           <code>[REDACTED]</code> / <code>[SECRET_REFERENCE]</code> 是脱敏占位符，
           不是真实值，不能直接复制重提；命令文本会原样显示，请勿把密钥直接写进命令。
-          可重提 Job 请使用服务端 resubmit；旧版配置可能需要按当前规则调整。
+          普通重提请使用服务端 resubmit；有完整检查点时请使用 Job 卡片的“从检查点恢复”，
+          由服务器复制未回显的私有配置。
         </p>
         <button class="btn btn-ghost" data-job-focus="job-config-copy"
           onclick="copyJobSpec(${jsArg(jobId)})">复制 JSON</button>
@@ -3046,6 +3196,15 @@ function jobRowHtml(j, r) {
     ? `<button class="btn btn-danger" data-job-focus="job-cancel"
         onclick="cancelJob(${jsArg(j.job_id)})">取消 Job</button>`
     : '';
+  const recoveryAvailable = Boolean(
+    j.latest_checkpoint_generation
+    || j.checkpoint_recovery_available
+  );
+  const recoveryBtn = recoveryAvailable
+    ? `<button class="btn btn-ghost" data-job-focus="job-recover"
+        title="服务端复制私有原始配置，并从完整 S3 检查点创建新 Job"
+        onclick="recoverJob(${jsArg(j.job_id)},${jsArg(j.latest_checkpoint_generation || '')})">↻ 从检查点恢复</button>`
+    : '';
   const errors = [...new Set([
     j.error, j.note, j.cancel_reason,
     ...wd.map(worker => worker.error),
@@ -3081,7 +3240,7 @@ function jobRowHtml(j, r) {
         <div class="job-actions">
           <button class="${outputClass}" data-job-focus="job-output"
             onclick="showJobLogs(${jsArg(j.job_id)},'')">${outputLabel}</button>
-          ${dlBtn}${cancelBtn}
+          ${dlBtn}${recoveryBtn}${cancelBtn}
         </div>
       </div>
       ${errors.length ? `<div class="job-alert">${errors.map(esc).join('\\n')}</div>` : ''}
@@ -3095,6 +3254,9 @@ function jobRowHtml(j, r) {
       </section>
       ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
       ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
+      ${j.latest_checkpoint_generation
+        ? `<div class="muted" style="font-size:.72rem">最新完整 checkpoint set: ${esc(j.latest_checkpoint_generation)}</div>`
+        : ''}
       ${jobConfigHtml(j)}
       <div class="worker-records-title muted">${recordedWorkers} 条 Worker 执行记录</div>
       <div class="hint">

@@ -7,6 +7,9 @@ import io
 import json
 import os
 import stat
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -821,6 +824,49 @@ def test_gc_bounds_long_running_incomplete_shard_generations(tmp_path: Path):
     assert orphan_blobs[-1] in client.objects
 
 
+def test_commit_side_prune_bounds_job_that_never_forms_a_set(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    answer = source / "results" / "answer.txt"
+    client = FakeS3()
+    store = _store(client)
+
+    for index in range(12):
+        answer.write_text(f"generation-{index}")
+        store.commit(
+            job_id="job-never-complete",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation=f"periodic-{index:08d}",
+        )
+        store.prune_incomplete_generations(
+            job_id="job-never-complete",
+            keep_per_shard=3,
+        )
+
+    manifests = {
+        key for key in client.objects
+        if (
+            "/job-never-complete/workers/shard-00000/"
+            "checkpoints/" in key
+            and key.endswith("/COMMITTED.json")
+        )
+    }
+    assert manifests == {
+        "jobs/job-never-complete/workers/shard-00000/"
+        f"checkpoints/periodic-{index:08d}/COMMITTED.json"
+        for index in (9, 10, 11)
+    }
+    blobs = {
+        key for key in client.objects
+        if "/job-never-complete/checkpoint-blobs/" in key
+    }
+    assert len(blobs) == 3
+
+
 def test_corrupt_referenced_shard_blocks_set_publish_and_restore(tmp_path: Path):
     source = tmp_path / "source"
     (source / "results").mkdir(parents=True)
@@ -859,7 +905,10 @@ def test_corrupt_referenced_shard_blocks_set_publish_and_restore(tmp_path: Path)
         "jobs/job-corrupt-set/checkpoint-sets/set-2/COMMITTED.json"
         not in client.objects
     )
-    with pytest.raises(CheckpointError, match="checksum"):
+    with pytest.raises(
+        CheckpointError,
+        match="(?:checksum|missing or changed)",
+    ):
         store.restore_checkpoint(
             source_job_id="job-corrupt-set",
             worker_namespace="shard-00000",
@@ -868,6 +917,44 @@ def test_corrupt_referenced_shard_blocks_set_publish_and_restore(tmp_path: Path)
             checkpoint_set_generation="set-1",
         )
     assert not (tmp_path / "restore").exists()
+
+
+def test_checkpoint_set_cannot_underreport_referenced_object_count(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.txt").write_text("payload")
+    client = FakeS3()
+    store = _store(client)
+    shard = store.commit(
+        job_id="job-object-count",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+    )
+    assert shard["total_objects"] > 0
+    store.publish_checkpoint_set(
+        job_id="job-object-count",
+        shard_generations={"shard-00000": "g1"},
+        generation="set-1",
+    )
+    set_key = (
+        "jobs/job-object-count/checkpoint-sets/set-1/COMMITTED.json"
+    )
+    checkpoint_set = json.loads(client.objects[set_key])
+    checkpoint_set["shards"][0]["total_objects"] = 0
+    checkpoint_set["total_objects"] = 0
+    client.objects[set_key] = json.dumps(
+        checkpoint_set, sort_keys=True, separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(CheckpointError, match="missing or changed"):
+        store.resolve_checkpoint_set(
+            source_job_id="job-object-count",
+            generation="set-1",
+        )
 
 
 def test_corrupt_v2_directory_graph_is_rejected_before_download(tmp_path: Path):
@@ -948,6 +1035,371 @@ def test_checkpoint_commit_limits_fail_closed(
     assert not any(
         key.endswith("/g1/COMMITTED.json") for key in client.objects
     )
+
+
+def test_checkpoint_store_rejects_nonadjacent_overlapping_paths(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "a" / "c").mkdir(parents=True)
+    (source / "a-b").mkdir()
+
+    with pytest.raises(CheckpointError, match="must not overlap"):
+        _store(FakeS3()).commit(
+            job_id="job-overlap",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["a", "a-b", "a/c"],
+            generation="g1",
+        )
+
+
+def test_checkpoint_snapshot_uses_controlled_root_and_cleans_it(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"payload")
+    snapshots = tmp_path / "state" / "checkpoint-snapshots"
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        snapshot_root=snapshots,
+        snapshot_free_reserve_bytes=0,
+    )
+
+    store.commit(
+        job_id="job-snapshot-root",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+    )
+
+    assert snapshots.is_dir()
+    assert list(snapshots.iterdir()) == []
+
+
+def test_checkpoint_snapshot_enforces_single_file_limit(tmp_path: Path):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"four")
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        max_file_bytes=3,
+        snapshot_free_reserve_bytes=0,
+    )
+
+    with pytest.raises(CheckpointError, match="single-file limit"):
+        store.commit(
+            job_id="job-single-limit",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+
+def test_checkpoint_snapshot_preserves_disk_reserve(
+    tmp_path: Path, monkeypatch,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"four")
+    monkeypatch.setattr(
+        "elastic_agent.core.checkpoint_store.shutil.disk_usage",
+        lambda _path: type("Usage", (), {"free": 7})(),
+    )
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        snapshot_free_reserve_bytes=4,
+    )
+
+    with pytest.raises(CheckpointError, match="insufficient disk"):
+        store.commit(
+            job_id="job-disk-limit",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+
+def test_checkpoint_snapshot_never_copies_growth_beyond_open_size(
+    tmp_path: Path, monkeypatch,
+):
+    source = tmp_path / "source"
+    result = source / "results" / "answer.bin"
+    result.parent.mkdir(parents=True)
+    result.write_bytes(b"four")
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        max_snapshot_bytes=4,
+        snapshot_free_reserve_bytes=0,
+    )
+    opened = result.open("rb")
+    opened_stat = os.fstat(opened.fileno())
+    read_sizes: list[int] = []
+
+    class GrowingReader:
+        def read(self, size=-1):
+            read_sizes.append(size)
+            chunk = opened.read(size)
+            if len(read_sizes) == 1:
+                with result.open("ab") as writer:
+                    writer.write(b"-growth")
+            return chunk
+
+        def fileno(self):
+            return opened.fileno()
+
+        def close(self):
+            opened.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    monkeypatch.setattr(
+        store,
+        "_open_validated",
+        lambda _root, _path: (GrowingReader(), opened_stat),
+    )
+
+    with pytest.raises(CheckpointError, match="changed while snapshotting"):
+        store.commit(
+            job_id="job-growing-snapshot",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+    assert read_sizes == [4, 1]
+    assert client.operations == []
+
+
+def test_checkpoint_blob_upload_concurrency_is_bounded(tmp_path: Path):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"payload")
+    client = FakeS3()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    entered = 0
+
+    def upload_hook():
+        nonlocal active, max_active, entered
+        with state_lock:
+            active += 1
+            entered += 1
+            max_active = max(max_active, active)
+            current = entered
+        if current == 1:
+            first_started.set()
+            release.wait(timeout=2)
+        else:
+            second_started.set()
+        with state_lock:
+            active -= 1
+
+    client.upload_hook = upload_hook
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_concurrent_uploads=1,
+        snapshot_free_reserve_bytes=0,
+    )
+
+    def commit(job_id):
+        return store.commit(
+            job_id=job_id,
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(commit, "job-upload-a")
+        assert first_started.wait(timeout=1)
+        second = pool.submit(commit, "job-upload-b")
+        assert not second_started.wait(timeout=0.05)
+        release.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert second_started.is_set()
+    assert max_active == 1
+
+
+def test_checkpoint_commit_honors_internal_deadline(
+    tmp_path: Path, monkeypatch,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"late")
+    client = FakeS3()
+    monkeypatch.setattr(
+        "elastic_agent.core.checkpoint_store.time.monotonic",
+        lambda: 10.0,
+    )
+
+    with pytest.raises(CheckpointError, match="deadline"):
+        _store(client).commit(
+            job_id="job-deadline",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+            deadline_monotonic=9.0,
+        )
+
+    assert not any(
+        key.endswith("COMMITTED.json") for key in client.objects
+    )
+
+
+def test_restore_honors_cooperative_cancellation_before_writing(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"payload")
+    store = _store(FakeS3())
+    store.commit(
+        job_id="job-cancel-restore",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+    )
+    cancel_event = threading.Event()
+    cancel_event.set()
+    destination = tmp_path / "restored"
+
+    with pytest.raises(CheckpointError, match="cancelled"):
+        store.restore_checkpoint(
+            source_job_id="job-cancel-restore",
+            worker_namespace="shard-00000",
+            destination=destination,
+            paths=["results"],
+            generation="g1",
+            cancel_event=cancel_event,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("holder_mode", "waiter_mode"),
+    [("write", "read"), ("read", "write")],
+)
+def test_checkpoint_job_lock_wait_honors_deadline(
+    holder_mode: str,
+    waiter_mode: str,
+):
+    store = _store(FakeS3())
+    lock = store._job_lock(f"job-lock-deadline-{holder_mode}")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with getattr(lock, holder_mode)():
+            entered.set()
+            assert release.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(hold_lock)
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        try:
+            with pytest.raises(CheckpointError, match="deadline"):
+                with getattr(lock, waiter_mode)(
+                    deadline_monotonic=started + 0.05,
+                ):
+                    raise AssertionError("blocked lock was acquired")
+        finally:
+            release.set()
+        holder.result(timeout=2)
+
+    assert time.monotonic() - started < 0.5
+
+
+def test_checkpoint_job_lock_wait_honors_late_cancellation():
+    store = _store(FakeS3())
+    lock = store._job_lock("job-lock-cancel")
+    entered = threading.Event()
+    release = threading.Event()
+    cancel_event = threading.Event()
+
+    def hold_writer():
+        with lock.write():
+            entered.set()
+            assert release.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(hold_writer)
+        assert entered.wait(timeout=1)
+        timer = threading.Timer(0.05, cancel_event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(CheckpointError, match="cancelled"):
+                with lock.read(cancel_event=cancel_event):
+                    raise AssertionError("blocked lock was acquired")
+        finally:
+            timer.cancel()
+            release.set()
+        holder.result(timeout=2)
+
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize("operation", ["limited-read", "restore-write"])
+def test_rejected_s3_object_body_is_always_closed(
+    tmp_path: Path, operation: str,
+):
+    class DeclaredSizeClient(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.body = io.BytesIO(b"data")
+
+        def get_object(self, *, Bucket, Key):  # noqa: N803
+            assert Bucket == self.bucket
+            return {"Body": self.body, "ContentLength": 99}
+
+    client = DeclaredSizeClient()
+    store = _store(client)
+
+    with pytest.raises(CheckpointError):
+        if operation == "limited-read":
+            store._read_object_limited("oversized", limit=4)
+        else:
+            store._write_restored_object(
+                key="wrong-size",
+                destination=tmp_path / "result.bin",
+                expected_size=4,
+                expected_sha256=None,
+            )
+
+    assert client.body.closed
 
 
 def test_checkpoint_set_listing_limit_is_bounded():

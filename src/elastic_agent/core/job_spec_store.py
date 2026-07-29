@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import time
+from datetime import datetime
 from pathlib import Path
 
 from elastic_agent.core.job_spec import JobSpec
@@ -24,6 +25,9 @@ from elastic_agent.core.secure_store import (
 
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_REQUEST_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+_SAFE_CHECKPOINT_GENERATION = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
 _JOB_STATES = {"prepared", "launching", "running", "succeeded", "failed", "cancelled"}
 JOB_REQUEST_FINGERPRINT_SCHEMA = 1
 JOB_REQUEST_FINGERPRINT_ALGORITHM = "sha256"
@@ -70,10 +74,11 @@ def persist_job_spec(
         "job_id": job_id,
         "name": spec.name,
         "submitted_at": time.time(),
-        # ``prepared`` means the durable write completed but the
-        # orchestrator has not crossed its launch gate.  Idempotent retry
-        # may safely schedule this exact spec instead of mistaking the mere
-        # presence of a journal for a completed submission.
+        # ``prepared`` means the durable write completed but the orchestrator
+        # has not crossed its account/cloud launch gate. It may include
+        # pre-cloud checkpoint staging, which is safe to rebuild. Idempotent
+        # retry may therefore schedule this exact spec instead of mistaking
+        # the mere presence of a journal for a completed submission.
         "submission_state": "prepared",
         "state_updated_at": time.time(),
         "spec": spec.model_dump(),
@@ -170,6 +175,65 @@ def update_job_state(
     payload["state_updated_at"] = time.time()
     if summary is not None:
         payload["terminal_summary"] = summary
+    return atomic_write_private(
+        destination,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+def update_job_checkpoint(
+    registry_path: str | Path,
+    job_id: str,
+    generation: str,
+    *,
+    committed_at: str | None = None,
+) -> Path:
+    """Persist the latest durable S3 set without changing lifecycle state."""
+
+    if _SAFE_JOB_ID.fullmatch(job_id) is None:
+        raise ValueError(f"invalid job id for checkpoint update: {job_id!r}")
+    if _SAFE_CHECKPOINT_GENERATION.fullmatch(generation) is None:
+        raise ValueError("invalid checkpoint generation")
+    committed_at = committed_at or datetime.now().astimezone().isoformat()
+    try:
+        committed_time = datetime.fromisoformat(
+            committed_at.replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid checkpoint committed_at") from exc
+    if committed_time.tzinfo is None:
+        raise ValueError("checkpoint committed_at must include a timezone")
+    destination = job_specs_dir(registry_path) / f"{job_id}.json"
+    if not destination.is_file():
+        raise FileNotFoundError(f"JobSpec journal not found: {job_id}")
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    if payload.get("job_id") != job_id or not isinstance(
+        payload.get("spec"), dict,
+    ):
+        raise ValueError(f"invalid JobSpec journal for {job_id!r}")
+    current_generation = payload.get("latest_checkpoint_generation")
+    current_committed_at = payload.get("checkpoint_committed_at")
+    if current_generation and current_committed_at:
+        try:
+            current_time = datetime.fromisoformat(
+                str(current_committed_at).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid checkpoint pointer for {job_id!r}"
+            ) from exc
+        if current_time.tzinfo is None:
+            raise ValueError(
+                f"invalid checkpoint pointer for {job_id!r}"
+            )
+        if (current_time, str(current_generation)) >= (
+            committed_time,
+            generation,
+        ):
+            return destination
+    payload["latest_checkpoint_generation"] = generation
+    payload["checkpoint_committed_at"] = committed_at
+    payload["checkpoint_updated_at"] = time.time()
     return atomic_write_private(
         destination,
         json.dumps(payload, ensure_ascii=False, indent=2),

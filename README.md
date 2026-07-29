@@ -111,7 +111,18 @@ use `codex exec ... </dev/null`.
 On POSIX, each Mode-B command runs in its own process session. STOP, timeout,
 exhaustion, and a parent that exits while leaving children behind terminate the
 whole process group before the Worker publishes its terminal event. A
-CloudRouter 500/502 is classified as transient and the CLI may recover
+production Worker places that process group under the independent
+`ea-task-supervisor.service`, not the reconnectable `ea-runtime.service`.
+Restarting the runtime or losing its Manager WebSocket therefore inventories
+and reattaches the original task instead of launching the command again;
+private, bounded output and a stable terminal event are replayed after
+reconnect. A socket grace period alone never destroys an active supervised
+batch task: reconnect, its reliable terminal event, explicit cancellation,
+cloud-terminal reconciliation, or the Job TTL supplies the liveness decision.
+A lost instance or supervisor is a different boundary and requires an S3
+checkpoint on a replacement Worker.
+
+A CloudRouter 500/502 is classified as transient and the CLI may recover
 internally, but Elastic does not silently replay an arbitrary outer Mode-B
 command after the CLI gives up: that could duplicate benchmark side effects.
 The Job therefore fails even when `rotation.resume_args` is configured; that
@@ -136,14 +147,14 @@ spec = JobSpec.model_validate({
         "steps": [{"name": "install", "command": "uv sync",
                    "timeout": 1200, "retries": 1}],
     },
-    "run": {"command": 'uv run ai4sci-bench run --output-dir "results/opus48_$(hostname -s)_seed128"',
+    "run": {"command": 'uv run ai4sci-bench run --output-dir "results/opus48_shard-{{shard_id}}_seed128"',
             "env": {"AI4SCI_SANDBOX_CPU": "1", "AI4SCI_SANDBOX_MEM": "4g"},
             "cwd": ".", "timeout": 86400, "shell": True},
     "ttl_seconds": 172800,
     "account": {"mode": "worker_local_login", "per_worker": 1},
     "rotation": {"strategy": "on_exhaust_restart_resume",
-                 "resume_args": '--resume "results/opus48_$(hostname -s)_seed128"'},
-    "fanout": {"workers": 8, "shard_by": "hostname"},
+                 "resume_args": '--resume "results/opus48_shard-{{shard_id}}_seed128"'},
+    "fanout": {"workers": 8, "shard_by": "shard_index"},
 })
 job = await manager.batch.launch(spec)   # scale → bootstrap → login → run, per worker
 ```
@@ -155,7 +166,10 @@ when submitting a different repository.
 Template `{{shard_index}}` / `{{shard_id}}` / `{{num_shards}}` /
 `{{hostname}}` are rendered by the Manager; `shard_id` is the zero-padded
 five-digit shard index. Shell constructs like `$(hostname -s)` are evaluated on
-the worker. Whitespace inside a token, such as `{{ shard_id }}`, is accepted.
+the worker, but checkpoint Jobs reject hostname-derived workload paths because
+a replacement EC2 has a different hostname. Use `{{shard_id}}` for recoverable
+output and resume paths. Whitespace inside a token, such as
+`{{ shard_id }}`, is accepted.
 The same templates work in `setup.s3_datasets[].uri` and `dest`, so
 a fanout Job can stage one exact S3 object per worker instead of copying a whole
 prefix to every worker:
@@ -597,8 +611,10 @@ terminated without waiting for a Manager restart. An EIP Job also reserves the w
 accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for run timeout/Job TTL,
 and an 86,400-second collection interval; provider `max_instances` defaults to
 30. At terminal state, periodic collection stops and final collection is awaited
-for up to three attempts/300 seconds before teardown. Collection failure marks
-the Job failed but does not retain the billable EC2 indefinitely.
+for up to three attempts/7200 seconds before teardown. The longer bounded
+window permits a large rsync plus separate 30-minute immutable-checkpoint and
+public-result S3 stages. Collection failure marks the Job failed but does not
+retain the billable EC2 indefinitely.
 
 Collected output is isolated per stable fan-out slot at
 `<prefix>/<job_id>/workers/shard-00000/...` (with a collision-resistant Worker
@@ -613,6 +629,55 @@ positive interval such as `120` for a long Job whose intermediate files must be
 visible in S3 and downloadable before the command exits. A running download is
 the latest completed snapshot; it does not trigger an immediate sync from the
 Worker.
+
+For replacement-instance recovery, set `collect.checkpoint=true`,
+`fanout.shard_by="shard_index"`, and a positive interval. Each shard commits an
+immutable hash manifest, then Elastic publishes a Job-level checkpoint set only
+after every shard is present. Content-addressed blobs deduplicate unchanged
+files and `checkpoint_keep_generations` (default `3`) bounds retained complete
+sets. A new Job can select the latest complete set with
+`recovery.policy="checkpoint"` and `recovery.source_job_id`; recovery verifies
+the source spec and resolves a real complete S3 set during preflight. It checks
+the exact shard map, metadata, hashes, aggregate totals, Manager staging
+limits, and target disk allowance, then pins that generation in the private
+target JobSpec before durable prepare. All data is staged before creating an
+instance. `POST /api/jobs/recover` (also exposed as **从检查点恢复** in the
+Batch page) builds that new Job from the Manager's private source journal, so
+redacted environment values and secret references never need to round-trip
+through the browser. Only checkpoint generation, run command/run timeout, and
+Job TTL may be overridden, and the normal Idempotency-Key submit path is
+retained. S3 `COMMITTED` is authoritative even if the Manager crashed before
+updating its local `latest` convenience pointer. Work written after the last
+complete set must run again.
+
+On the replacement Worker, Elastic transfers every recovery path into a
+root-private transaction tree outside the workload checkout
+(`/var/lib/elastic-agent/recovery-transactions-v1`), fsyncs and re-measures it,
+and durably enters an installing state before any selected directory is renamed
+into place. The transaction tree and checkout must be on the same filesystem.
+Login and dispatch are gated on one `installed` marker. A Manager crash between
+directory renames is rolled forward on startup; an incomplete transfer is never
+collected as a new final checkpoint. Every Manager-side rsync is fenced by a
+pre-spawn durable transfer journal; staging and its reservation remain
+quarantined until the entire transfer process group is proven gone. Startup
+also stops/masks framework and Job-user services, removes all containers from
+the dedicated Worker, stops Docker/containerd, verifies their cgroups, and
+scans for surviving worktree writers before reconciling the transaction and
+collecting. Disk admission includes at least one filesystem allocation block
+per restored object, rather than trusting logical file bytes alone.
+
+Ordinary results from Jobs created before checkpoint mode remain downloadable
+but are not accepted as recovery input. Their mutable S3 prefixes do not carry
+an authoritative deletion manifest and may retain stale objects. With no
+complete immutable set, restart the workload from the beginning.
+
+The resumed command must opt into the application's own resume mode and use the
+same stable shard-relative output path. For AI4Sci `run`, for example, keep
+`results/opus48_shard-{{shard_id}}_seed128` as both the restored output and
+`--resume` directory; for `batch-run`, pass the same batch root to
+`--output-dir` and `--resume`. Do not use a hostname-derived path because the
+replacement EC2 has a different hostname.
+See [Mode-B reconnect and checkpoint recovery](docs/operations/checkpoint-recovery.md).
 
 S3 upload is automatic only when `ELASTIC_AGENT_RESULTS_S3_BUCKET` is set. On
 AWS Workers with `worker_instance_profile`, each Worker pushes directly with its

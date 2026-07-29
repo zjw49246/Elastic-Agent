@@ -5,12 +5,14 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -24,6 +26,8 @@ _SUPPORTED_CHECKPOINT_SCHEMAS = frozenset({1, _SCHEMA_VERSION})
 _CHECKPOINT_SET_SCHEMA_VERSION = 1
 _READ_CHUNK = 1024 * 1024
 _S3_DELETE_BATCH = 1_000
+_DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES = 1024 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class _ReadWriteLock:
@@ -35,11 +39,49 @@ class _ReadWriteLock:
         self._writer = False
         self._waiting_writers = 0
 
-    @contextmanager
-    def read(self) -> Iterator[None]:
-        with self._condition:
-            while self._writer or self._waiting_writers:
+    def _wait(
+        self,
+        predicate,
+        *,
+        deadline_monotonic: float | None,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        while predicate():
+            if cancel_event is not None and cancel_event.is_set():
+                raise CheckpointError("checkpoint operation cancelled")
+            remaining = (
+                None
+                if deadline_monotonic is None
+                else deadline_monotonic - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise CheckpointError(
+                    "checkpoint operation deadline exceeded"
+                )
+            if deadline_monotonic is None and cancel_event is None:
                 self._condition.wait()
+            else:
+                self._condition.wait(
+                    timeout=(
+                        0.1
+                        if remaining is None
+                        else min(0.1, remaining)
+                    )
+                )
+
+    @contextmanager
+    def read(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[None]:
+        with self._condition:
+            self._wait(
+                lambda: self._writer or self._waiting_writers,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
             self._readers += 1
         try:
             yield
@@ -50,15 +92,26 @@ class _ReadWriteLock:
                     self._condition.notify_all()
 
     @contextmanager
-    def write(self) -> Iterator[None]:
+    def write(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[None]:
         with self._condition:
             self._waiting_writers += 1
             try:
-                while self._writer or self._readers:
-                    self._condition.wait()
+                self._wait(
+                    lambda: self._writer or self._readers,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
+                )
                 self._writer = True
             finally:
                 self._waiting_writers -= 1
+                # A cancelled/timed-out writer must wake readers that were
+                # blocked solely by writer preference.
+                self._condition.notify_all()
         try:
             yield
         finally:
@@ -73,6 +126,21 @@ _JOB_LOCKS: dict[tuple[str, str, str], _ReadWriteLock] = {}
 
 class CheckpointError(RuntimeError):
     """A checkpoint cannot be committed or restored safely."""
+
+
+class IncompleteCheckpointSetError(CheckpointError):
+    """Not every requested shard manifest has committed yet."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        committed_namespaces: set[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.committed_namespaces = frozenset(
+            committed_namespaces or set()
+        )
 
 
 def _safe_component(value: str, *, label: str) -> str:
@@ -179,7 +247,20 @@ class S3CheckpointStore:
         max_generations: int = 10_000,
         max_checkpoint_sets: int = 1_000,
         max_gc_objects: int = 1_000_000,
+        snapshot_root: str | Path | None = None,
+        max_file_bytes: int | None = None,
+        max_snapshot_bytes: int | None = None,
+        snapshot_free_reserve_bytes: int = (
+            _DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES
+        ),
+        max_concurrent_uploads: int = 8,
     ) -> None:
+        max_file_bytes = max_total_bytes if max_file_bytes is None else max_file_bytes
+        max_snapshot_bytes = (
+            max_total_bytes
+            if max_snapshot_bytes is None
+            else max_snapshot_bytes
+        )
         if not bucket.strip():
             raise ValueError("checkpoint bucket cannot be empty")
         if min(
@@ -189,8 +270,23 @@ class S3CheckpointStore:
             max_generations,
             max_checkpoint_sets,
             max_gc_objects,
+            max_file_bytes,
+            max_snapshot_bytes,
         ) <= 0:
             raise ValueError("checkpoint limits must be positive")
+        if snapshot_free_reserve_bytes < 0:
+            raise ValueError(
+                "checkpoint snapshot free-space reserve cannot be negative"
+            )
+        if (
+            isinstance(max_concurrent_uploads, bool)
+            or not isinstance(max_concurrent_uploads, int)
+            or max_concurrent_uploads <= 0
+            or max_concurrent_uploads > 64
+        ):
+            raise ValueError(
+                "checkpoint max_concurrent_uploads must be between 1 and 64"
+            )
         self._bucket = bucket.strip()
         self._prefix = prefix.strip("/")
         self._client = client
@@ -201,6 +297,26 @@ class S3CheckpointStore:
         self._max_generations = max_generations
         self._max_checkpoint_sets = max_checkpoint_sets
         self._max_gc_objects = max_gc_objects
+        self._max_file_bytes = max_file_bytes
+        self._max_snapshot_bytes = max_snapshot_bytes
+        self._snapshot_free_reserve_bytes = snapshot_free_reserve_bytes
+        self._snapshot_budget_lock = threading.Lock()
+        self._snapshot_reserved_bytes = 0
+        self._upload_slots = threading.BoundedSemaphore(
+            max_concurrent_uploads
+        )
+        self._snapshot_root: Path | None = None
+        if snapshot_root is not None:
+            configured_root = Path(snapshot_root).expanduser()
+            if configured_root.is_symlink():
+                raise ValueError("checkpoint snapshot root cannot be a symlink")
+            configured_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not configured_root.is_dir():
+                raise ValueError(
+                    "checkpoint snapshot root must be a directory"
+                )
+            os.chmod(configured_root, 0o700)
+            self._snapshot_root = configured_root
 
     def _s3(self):
         if self._client is None:
@@ -211,9 +327,12 @@ class S3CheckpointStore:
                 "s3",
                 region_name=self._region,
                 config=Config(
-                    connect_timeout=5,
-                    read_timeout=60,
-                    retries={"max_attempts": 5, "mode": "adaptive"},
+                    connect_timeout=3,
+                    read_timeout=10,
+                    retries={
+                        "total_max_attempts": 3,
+                        "mode": "standard",
+                    },
                     tcp_keepalive=True,
                 ),
             )
@@ -250,7 +369,7 @@ class S3CheckpointStore:
             raise CheckpointError("checkpoint paths cannot be empty")
         if len(set(normalized)) != len(normalized):
             raise CheckpointError("checkpoint paths must be unique")
-        ordered = sorted(normalized)
+        ordered = sorted(normalized, key=lambda value: PurePosixPath(value).parts)
         for path, other in zip(ordered, ordered[1:], strict=False):
             if other.startswith(path.rstrip("/") + "/"):
                 raise CheckpointError(
@@ -407,15 +526,40 @@ class S3CheckpointStore:
         relative: str,
         snapshot_root: Path,
         remaining_bytes: int,
+        deadline_monotonic: float | None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[Path, int, str, int]:
         """Copy a live file into a private, fsynced, read-only local snapshot."""
 
         source, opened_stat = self._open_validated(root, path)
         snapshot = snapshot_root / uuid.uuid4().hex
         descriptor = -1
+        reserved = False
         try:
             if opened_stat.st_size > remaining_bytes:
                 raise CheckpointError("checkpoint byte limit exceeded")
+            if opened_stat.st_size > self._max_file_bytes:
+                raise CheckpointError("checkpoint single-file limit exceeded")
+            with self._snapshot_budget_lock:
+                free = shutil.disk_usage(snapshot_root).free
+                if (
+                    self._snapshot_reserved_bytes + opened_stat.st_size
+                    > self._max_snapshot_bytes
+                ):
+                    raise CheckpointError(
+                        "checkpoint snapshot byte budget is exhausted"
+                    )
+                if (
+                    self._snapshot_reserved_bytes
+                    + opened_stat.st_size
+                    + self._snapshot_free_reserve_bytes
+                    > free
+                ):
+                    raise CheckpointError(
+                        "insufficient disk for checkpoint snapshot"
+                    )
+                self._snapshot_reserved_bytes += opened_stat.st_size
+                reserved = True
             descriptor = os.open(
                 snapshot,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
@@ -423,15 +567,34 @@ class S3CheckpointStore:
             )
             digest = hashlib.sha256()
             copied = 0
+            expected_size = opened_stat.st_size
             with source, os.fdopen(descriptor, "wb") as output:
                 descriptor = -1
                 before = _stable_identity(opened_stat)
-                while chunk := source.read(_READ_CHUNK):
+                while copied < expected_size:
+                    self._check_deadline(deadline_monotonic, cancel_event)
+                    chunk = source.read(min(
+                        _READ_CHUNK,
+                        expected_size - copied,
+                    ))
+                    if not chunk:
+                        raise CheckpointError(
+                            f"checkpoint file changed while snapshotting: "
+                            f"{relative}"
+                        )
                     copied += len(chunk)
-                    if copied > remaining_bytes:
-                        raise CheckpointError("checkpoint byte limit exceeded")
                     output.write(chunk)
                     digest.update(chunk)
+                # The reservation is exactly the size observed at open. Never
+                # copy appended bytes into the private snapshot: one-byte look
+                # ahead detects growth without allowing it to spend unreserved
+                # Manager disk.
+                self._check_deadline(deadline_monotonic, cancel_event)
+                if source.read(1):
+                    raise CheckpointError(
+                        f"checkpoint file changed while snapshotting: "
+                        f"{relative}"
+                    )
                 output.flush()
                 os.fsync(output.fileno())
                 after = os.fstat(source.fileno())
@@ -452,10 +615,15 @@ class S3CheckpointStore:
         except BaseException:
             if descriptor >= 0:
                 os.close(descriptor)
+            source.close()
+            cleaned = not snapshot.exists()
             try:
                 snapshot.unlink()
             except FileNotFoundError:
-                pass
+                cleaned = True
+            if reserved and cleaned:
+                with self._snapshot_budget_lock:
+                    self._snapshot_reserved_bytes -= opened_stat.st_size
             raise
 
     def _head_blob(self, key: str) -> dict[str, Any] | None:
@@ -499,9 +667,12 @@ class S3CheckpointStore:
         snapshot: Path,
         size: int,
         digest: str,
+        deadline_monotonic: float | None,
+        cancel_event: threading.Event | None = None,
     ) -> bool:
         """Upload a new stable blob or prove the existing blob is identical."""
 
+        self._check_deadline(deadline_monotonic, cancel_event)
         existing = self._head_blob(key)
         if existing is not None:
             self._validate_blob_head(
@@ -509,15 +680,29 @@ class S3CheckpointStore:
             )
             return False
         with snapshot.open("rb") as stream:
-            self._s3().upload_fileobj(
-                stream,
-                self._bucket,
-                key,
-                ExtraArgs={
+            kwargs: dict[str, Any] = {
+                "ExtraArgs": {
                     "ContentType": "application/octet-stream",
                     "Metadata": {"sha256": digest},
                 },
+            }
+            if deadline_monotonic is not None or cancel_event is not None:
+                kwargs["Callback"] = lambda _bytes: self._check_deadline(
+                    deadline_monotonic, cancel_event,
+                )
+            self._acquire_bounded(
+                self._upload_slots,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                label="upload slot",
             )
+            try:
+                self._s3().upload_fileobj(
+                    stream, self._bucket, key, **kwargs,
+                )
+            finally:
+                self._upload_slots.release()
+        self._check_deadline(deadline_monotonic, cancel_event)
         uploaded = self._head_blob(key)
         if uploaded is None:
             raise CheckpointError(
@@ -527,6 +712,44 @@ class S3CheckpointStore:
             uploaded, key=key, size=size, digest=digest,
         )
         return True
+
+    @staticmethod
+    def _check_deadline(
+        deadline_monotonic: float | None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CheckpointError("checkpoint operation cancelled")
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            raise CheckpointError("checkpoint operation deadline exceeded")
+
+    @staticmethod
+    def _acquire_bounded(
+        lock,
+        *,
+        deadline_monotonic: float | None,
+        cancel_event: threading.Event | None,
+        label: str,
+    ) -> None:
+        while True:
+            S3CheckpointStore._check_deadline(
+                deadline_monotonic, cancel_event,
+            )
+            remaining = (
+                None
+                if deadline_monotonic is None
+                else max(0.0, deadline_monotonic - time.monotonic())
+            )
+            wait = 0.1 if remaining is None else min(0.1, remaining)
+            if lock.acquire(timeout=wait):
+                return
+            if remaining is not None and remaining <= 0:
+                raise CheckpointError(
+                    f"checkpoint {label} deadline exceeded"
+                )
 
     def _json_payload(self, value: dict[str, Any], *, label: str) -> bytes:
         try:
@@ -548,7 +771,10 @@ class S3CheckpointStore:
         payload: bytes,
         duplicate_message: str,
         allow_existing: bool = False,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> bool:
+        self._check_deadline(deadline_monotonic, cancel_event)
         try:
             self._s3().put_object(
                 Bucket=self._bucket,
@@ -577,6 +803,8 @@ class S3CheckpointStore:
         exclude: list[str] | None = None,
         generation: str | None = None,
         metadata: dict[str, Any] | None = None,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Upload all blobs, then atomically publish one generation manifest."""
 
@@ -593,19 +821,30 @@ class S3CheckpointStore:
         )
         blob_root = f"{self._job_root(job_id)}/checkpoint-blobs"
 
-        with self._job_lock(job_id).read():
+        with self._job_lock(job_id).read(
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        ):
+            self._check_deadline(deadline_monotonic, cancel_event)
             generation_exists = self._head_blob(committed_key) is not None
+            self._check_deadline(deadline_monotonic, cancel_event)
             files: list[dict[str, Any]] = []
             directories: list[dict[str, Any]] = []
             total_bytes = 0
             with tempfile.TemporaryDirectory(
                 prefix=".elastic-checkpoint-",
+                dir=(
+                    str(self._snapshot_root)
+                    if self._snapshot_root is not None
+                    else None
+                ),
             ) as temporary:
                 snapshot_root = Path(temporary)
                 os.chmod(snapshot_root, 0o700)
                 for kind, root, path, relative, entry_stat in self._safe_entries(
                     Path(source_root), normalized_paths, normalized_exclude,
                 ):
+                    self._check_deadline(deadline_monotonic, cancel_event)
                     if len(files) + len(directories) >= self._max_objects:
                         raise CheckpointError(
                             "checkpoint object limit exceeded"
@@ -622,6 +861,8 @@ class S3CheckpointStore:
                         relative=relative,
                         snapshot_root=snapshot_root,
                         remaining_bytes=self._max_total_bytes - total_bytes,
+                        deadline_monotonic=deadline_monotonic,
+                        cancel_event=cancel_event,
                     )
                     total_bytes += size
                     object_key = f"{blob_root}/{digest}"
@@ -632,12 +873,18 @@ class S3CheckpointStore:
                                 snapshot=snapshot,
                                 size=size,
                                 digest=digest,
+                                deadline_monotonic=deadline_monotonic,
+                                cancel_event=cancel_event,
                             )
                     finally:
+                        cleaned = not snapshot.exists()
                         try:
                             snapshot.unlink()
                         except FileNotFoundError:
-                            pass
+                            cleaned = True
+                        if cleaned:
+                            with self._snapshot_budget_lock:
+                                self._snapshot_reserved_bytes -= size
                     files.append({
                         "path": relative,
                         "size": size,
@@ -654,6 +901,7 @@ class S3CheckpointStore:
                 "paths": normalized_paths,
                 "directories": directories,
                 "files": files,
+                "total_objects": len(directories) + len(files),
                 "total_bytes": total_bytes,
                 "committed_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": normalized_metadata,
@@ -666,6 +914,8 @@ class S3CheckpointStore:
                     source_job_id=job_id,
                     worker_namespace=worker_namespace,
                     generation=generation,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
                 )
                 comparable_keys = (
                     "schema_version",
@@ -675,6 +925,7 @@ class S3CheckpointStore:
                     "paths",
                     "directories",
                     "files",
+                    "total_objects",
                     "total_bytes",
                     "metadata",
                 )
@@ -694,12 +945,16 @@ class S3CheckpointStore:
                     "checkpoint generation is already committed"
                 ),
                 allow_existing=True,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             if not published:
                 existing, _manifest_sha256 = self._committed_manifest(
                     source_job_id=job_id,
                     worker_namespace=worker_namespace,
                     generation=generation,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
                 )
                 comparable_keys = (
                     "schema_version",
@@ -709,6 +964,7 @@ class S3CheckpointStore:
                     "paths",
                     "directories",
                     "files",
+                    "total_objects",
                     "total_bytes",
                     "metadata",
                 )
@@ -723,36 +979,55 @@ class S3CheckpointStore:
                 return existing
             return manifest
 
-    def _read_object_limited(self, key: str, *, limit: int) -> bytes:
+    def _read_object_limited(
+        self,
+        key: str,
+        *,
+        limit: int,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> bytes:
+        self._check_deadline(deadline_monotonic, cancel_event)
         try:
             response = self._s3().get_object(
                 Bucket=self._bucket, Key=key,
             )
-            declared = int(response.get("ContentLength"))
             body = response["Body"]
         except Exception as exc:  # noqa: BLE001
             raise CheckpointError(
                 f"cannot read checkpoint object: {key}"
             ) from exc
-        if declared < 0 or declared > limit:
-            raise CheckpointError(f"S3 object exceeds read limit: {key}")
-        chunks: list[bytes] = []
-        consumed = 0
         try:
-            while chunk := body.read(min(_READ_CHUNK, limit + 1 - consumed)):
+            try:
+                declared = int(response.get("ContentLength"))
+            except Exception as exc:  # noqa: BLE001
+                raise CheckpointError(
+                    f"checkpoint object size is invalid: {key}"
+                ) from exc
+            if declared < 0 or declared > limit:
+                raise CheckpointError(f"S3 object exceeds read limit: {key}")
+            chunks: list[bytes] = []
+            consumed = 0
+            while True:
+                self._check_deadline(deadline_monotonic, cancel_event)
+                chunk = body.read(min(_READ_CHUNK, limit + 1 - consumed))
+                if not chunk:
+                    break
                 chunks.append(chunk)
                 consumed += len(chunk)
                 if consumed > limit:
                     raise CheckpointError(
                         f"S3 object exceeds read limit: {key}"
                     )
+            if consumed != declared:
+                raise CheckpointError(
+                    f"S3 object size changed while reading: {key}"
+                )
+            return b"".join(chunks)
         finally:
             close = getattr(body, "close", None)
             if callable(close):
                 close()
-        if consumed != declared:
-            raise CheckpointError(f"S3 object size changed while reading: {key}")
-        return b"".join(chunks)
 
     def _list_matching_keys(
         self,
@@ -761,17 +1036,22 @@ class S3CheckpointStore:
         matcher: Any,
         label: str,
         limit: int | None = None,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[str]:
         listing_limit = self._max_objects if limit is None else limit
         keys: list[str] = []
         seen: set[str] = set()
         try:
+            self._check_deadline(deadline_monotonic, cancel_event)
             pages = self._s3().get_paginator("list_objects_v2").paginate(
                 Bucket=self._bucket,
                 Prefix=prefix,
             )
             for page in pages:
+                self._check_deadline(deadline_monotonic, cancel_event)
                 for item in page.get("Contents") or []:
+                    self._check_deadline(deadline_monotonic, cancel_event)
                     key = str(item.get("Key") or "")
                     if not matcher(key):
                         continue
@@ -789,12 +1069,22 @@ class S3CheckpointStore:
             raise CheckpointError(f"cannot list {label}") from exc
         return keys
 
-    def _decode_json_object(self, key: str, *, label: str) -> tuple[
+    def _decode_json_object(
+        self,
+        key: str,
+        *,
+        label: str,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[
         dict[str, Any], bytes, str
     ]:
         try:
             raw = self._read_object_limited(
-                key, limit=self._max_manifest_bytes,
+                key,
+                limit=self._max_manifest_bytes,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             value = json.loads(raw.decode("utf-8"))
         except CheckpointError:
@@ -812,6 +1102,8 @@ class S3CheckpointStore:
         worker_namespace: str,
         generation: str,
         expected_sha256: str | None = None,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[dict[str, Any], str]:
         worker_root = self._worker_root(source_job_id, worker_namespace)
         if generation:
@@ -838,6 +1130,8 @@ class S3CheckpointStore:
                 matcher=matches,
                 label="checkpoint generation",
                 limit=self._max_generations,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             if not candidates:
                 raise CheckpointError("no committed checkpoint generation found")
@@ -848,7 +1142,10 @@ class S3CheckpointStore:
         ) is None:
             raise CheckpointError("invalid expected checkpoint manifest hash")
         manifest, _raw, manifest_sha256 = self._decode_json_object(
-            key, label="checkpoint manifest",
+            key,
+            label="checkpoint manifest",
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
         )
         if manifest.get("generation") != selected:
             raise CheckpointError(
@@ -1069,6 +1366,18 @@ class S3CheckpointStore:
             or manifest_total != total
         ):
             raise CheckpointError("checkpoint total size mismatch")
+        manifest_objects = manifest.get("total_objects")
+        if (
+            schema_version == _SCHEMA_VERSION
+            and manifest_objects is not None
+            and (
+                isinstance(manifest_objects, bool)
+                or not isinstance(manifest_objects, int)
+                or manifest_objects
+                != len(directories) + len(validated_files)
+            )
+        ):
+            raise CheckpointError("checkpoint object count mismatch")
         return directories, validated_files, blob_keys
 
     def _checkpoint_set_key(self, job_id: str, generation: str) -> str:
@@ -1108,6 +1417,7 @@ class S3CheckpointStore:
         seen: set[str] = set()
         validated: list[dict[str, Any]] = []
         total = 0
+        total_objects = 0
         for raw in shards:
             if not isinstance(raw, dict):
                 raise CheckpointError("invalid checkpoint set shard entry")
@@ -1119,6 +1429,7 @@ class S3CheckpointStore:
             )
             manifest_sha256 = raw.get("manifest_sha256")
             shard_bytes = raw.get("total_bytes")
+            shard_objects = raw.get("total_objects")
             if (
                 namespace in seen
                 or not isinstance(manifest_sha256, str)
@@ -1127,15 +1438,27 @@ class S3CheckpointStore:
                 or not isinstance(shard_bytes, int)
                 or shard_bytes < 0
                 or shard_bytes > self._max_total_bytes
+                or (
+                    shard_objects is not None
+                    and (
+                        isinstance(shard_objects, bool)
+                        or not isinstance(shard_objects, int)
+                        or shard_objects < 0
+                        or shard_objects > self._max_objects
+                    )
+                )
             ):
                 raise CheckpointError("invalid checkpoint set shard entry")
             seen.add(namespace)
             total += shard_bytes
+            if shard_objects is not None:
+                total_objects += shard_objects
             validated.append({
                 "worker_namespace": namespace,
                 "generation": shard_generation,
                 "manifest_sha256": manifest_sha256,
                 "total_bytes": shard_bytes,
+                "total_objects": shard_objects,
             })
         declared_total = manifest.get("total_bytes")
         if (
@@ -1144,11 +1467,34 @@ class S3CheckpointStore:
             or declared_total != total
         ):
             raise CheckpointError("checkpoint set total size mismatch")
+        declared_objects = manifest.get("total_objects")
+        missing_objects = any(
+            shard["total_objects"] is None
+            for shard in validated
+        )
+        if (
+            (declared_objects is None and not missing_objects)
+            or (
+                declared_objects is not None
+                and (
+                    missing_objects
+                    or isinstance(declared_objects, bool)
+                    or not isinstance(declared_objects, int)
+                    or declared_objects != total_objects
+                )
+            )
+        ):
+            raise CheckpointError(
+                "checkpoint set total object count mismatch"
+            )
         return validated
 
     def _checkpoint_set_records(
         self,
         source_job_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
         prefix = f"{self._job_root(source_job_id)}/checkpoint-sets/"
 
@@ -1167,12 +1513,17 @@ class S3CheckpointStore:
             matcher=matches,
             label="checkpoint set",
             limit=self._max_checkpoint_sets,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
         )
         records: list[dict[str, Any]] = []
         for key in keys:
             generation = key.removeprefix(prefix).split("/", 1)[0]
             manifest, _raw, manifest_sha256 = self._decode_json_object(
-                key, label="checkpoint set manifest",
+                key,
+                label="checkpoint set manifest",
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             shards = self._validate_checkpoint_set_manifest(
                 manifest,
@@ -1186,6 +1537,37 @@ class S3CheckpointStore:
                 "manifest_sha256": manifest_sha256,
                 "shards": shards,
             })
+        if records:
+            inventory = self._shard_manifest_inventory(
+                source_job_id,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            self._verify_set_references(records, inventory)
+            for record in records:
+                normalized_shards: list[dict[str, Any]] = []
+                total_objects = 0
+                for shard in record["shards"]:
+                    normalized = dict(shard)
+                    stored = inventory[(
+                        normalized["worker_namespace"],
+                        normalized["generation"],
+                    )]
+                    # The immutable shard manifest is authoritative. Legacy
+                    # set markers omitted this field; modern markers must
+                    # match it exactly (verified above). Always normalize from
+                    # the reference so resource admission cannot trust an
+                    # underreported set-level count.
+                    normalized["total_objects"] = int(
+                        stored["manifest"]["total_objects"]
+                    )
+                    total_objects += normalized["total_objects"]
+                    normalized_shards.append(normalized)
+                manifest = dict(record["manifest"])
+                manifest["shards"] = normalized_shards
+                manifest["total_objects"] = total_objects
+                record["manifest"] = manifest
+                record["shards"] = normalized_shards
         return records
 
     def _resolve_checkpoint_set_unlocked(
@@ -1193,8 +1575,14 @@ class S3CheckpointStore:
         *,
         source_job_id: str,
         generation: str,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        records = self._checkpoint_set_records(source_job_id)
+        records = self._checkpoint_set_records(
+            source_job_id,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
         if generation:
             selected = _safe_component(
                 generation, label="checkpoint set generation",
@@ -1211,7 +1599,10 @@ class S3CheckpointStore:
         selected_record = max(
             records,
             key=lambda record: (
-                record["manifest"]["committed_at"],
+                self._parse_committed_at(
+                    record["manifest"]["committed_at"],
+                    label="checkpoint set manifest",
+                ),
                 record["generation"],
             ),
         )
@@ -1222,18 +1613,28 @@ class S3CheckpointStore:
         *,
         source_job_id: str,
         generation: str = "",
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Return the complete latest or explicitly selected Job checkpoint set."""
 
-        with self._job_lock(source_job_id).read():
+        with self._job_lock(source_job_id).read(
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        ):
             return self._resolve_checkpoint_set_unlocked(
                 source_job_id=source_job_id,
                 generation=generation,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
 
     def _shard_manifest_inventory(
         self,
         job_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         prefix = f"{self._job_root(job_id)}/workers/"
 
@@ -1254,26 +1655,36 @@ class S3CheckpointStore:
             matcher=matches,
             label="checkpoint shard manifest",
             limit=self._max_generations,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
         )
         inventory: dict[tuple[str, str], dict[str, Any]] = {}
         for key in keys:
             parts = key.removeprefix(prefix).split("/")
             namespace, generation = parts[0], parts[2]
             manifest, _raw, manifest_sha256 = self._decode_json_object(
-                key, label="checkpoint manifest",
+                key,
+                label="checkpoint manifest",
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             self._validate_manifest_identity(
                 manifest,
                 source_job_id=job_id,
                 worker_namespace=namespace,
             )
-            _directories, _files, blob_keys = (
+            directories, files, blob_keys = (
                 self._validated_manifest_entries(
                     manifest,
                     source_job_id=job_id,
                     worker_namespace=namespace,
                 )
             )
+            if manifest.get("total_objects") is None:
+                manifest = dict(manifest)
+                manifest["total_objects"] = (
+                    len(directories) + len(files)
+                )
             if manifest.get("generation") != generation:
                 raise CheckpointError(
                     "checkpoint generation identity mismatch"
@@ -1307,13 +1718,24 @@ class S3CheckpointStore:
                     != shard["manifest_sha256"]
                     or stored["manifest"].get("total_bytes")
                     != shard["total_bytes"]
+                    or (
+                        shard.get("total_objects") is not None
+                        and stored["manifest"].get("total_objects")
+                        != shard["total_objects"]
+                    )
                 ):
                     raise CheckpointError(
                         "checkpoint set references a missing or changed "
                         "shard manifest"
                     )
 
-    def _stable_blob_keys(self, job_id: str) -> list[str]:
+    def _stable_blob_keys(
+        self,
+        job_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[str]:
         prefix = f"{self._job_root(job_id)}/checkpoint-blobs/"
 
         def matches(key: str) -> bool:
@@ -1329,13 +1751,22 @@ class S3CheckpointStore:
             matcher=matches,
             label="checkpoint blob",
             limit=self._max_gc_objects,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
         )
 
-    def _delete_keys(self, keys: set[str] | list[str]) -> None:
+    def _delete_keys(
+        self,
+        keys: set[str] | list[str],
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         ordered = sorted(set(keys))
         if len(ordered) > self._max_gc_objects:
             raise CheckpointError("checkpoint garbage collection limit exceeded")
         for start in range(0, len(ordered), _S3_DELETE_BATCH):
+            self._check_deadline(deadline_monotonic, cancel_event)
             batch = ordered[start : start + _S3_DELETE_BATCH]
             if not batch:
                 continue
@@ -1365,11 +1796,17 @@ class S3CheckpointStore:
         keep_last_n: int,
         records: list[dict[str, Any]],
         inventory: dict[tuple[str, str], dict[str, Any]],
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
+        self._check_deadline(deadline_monotonic, cancel_event)
         ordered = sorted(
             records,
             key=lambda record: (
-                record["manifest"]["committed_at"],
+                self._parse_committed_at(
+                    record["manifest"]["committed_at"],
+                    label="checkpoint set manifest",
+                ),
                 record["generation"],
             ),
         )
@@ -1464,16 +1901,131 @@ class S3CheckpointStore:
             if blob_key not in protected_blobs
         }
         stable_orphans = set(
-            self._stable_blob_keys(job_id)
+            self._stable_blob_keys(
+                job_id, deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
         ) - protected_blobs
         # Remove discoverability before data. A crash can leak bytes, but can
         # never leave a visible retained set pointing at deleted data.
-        self._delete_keys({record["key"] for record in pruned})
-        self._delete_keys({
-            inventory[reference]["key"]
-            for reference in removed_references
-        })
-        self._delete_keys(candidate_blobs | stable_orphans)
+        self._delete_keys(
+            {record["key"] for record in pruned},
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
+        self._delete_keys(
+            {
+                inventory[reference]["key"]
+                for reference in removed_references
+            },
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
+        self._delete_keys(
+            candidate_blobs | stable_orphans,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
+
+    def prune_incomplete_generations(
+        self,
+        *,
+        job_id: str,
+        keep_per_shard: int = 3,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
+        """Bound shard generations that have never entered a complete set.
+
+        A permanently failing shard must not let every healthy shard append
+        manifests and blobs forever. Complete-set references are immutable;
+        among unreferenced generations retain only a small newest window per
+        shard so temporarily lagging peers can still catch up.
+        """
+
+        if (
+            isinstance(keep_per_shard, bool)
+            or not isinstance(keep_per_shard, int)
+            or keep_per_shard <= 0
+            or keep_per_shard > 32
+        ):
+            raise CheckpointError(
+                "invalid incomplete checkpoint retention"
+            )
+        with self._job_lock(job_id).write(
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        ):
+            self._check_deadline(deadline_monotonic, cancel_event)
+            records = self._checkpoint_set_records(
+                job_id,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            inventory = self._shard_manifest_inventory(
+                job_id,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            self._verify_set_references(records, inventory)
+            referenced = {
+                (
+                    shard["worker_namespace"],
+                    shard["generation"],
+                )
+                for record in records
+                for shard in record["shards"]
+            }
+            grouped: dict[str, list[tuple[str, str]]] = {}
+            for reference in set(inventory) - referenced:
+                grouped.setdefault(reference[0], []).append(reference)
+            stale: set[tuple[str, str]] = set()
+            for references in grouped.values():
+                ordered = sorted(
+                    references,
+                    key=lambda reference: (
+                        self._parse_committed_at(
+                            inventory[reference]["manifest"].get(
+                                "committed_at"
+                            ),
+                            label="checkpoint manifest",
+                        ),
+                        reference[1],
+                    ),
+                )
+                stale.update(ordered[:-keep_per_shard])
+            if not stale:
+                return 0
+            surviving_inventory = {
+                reference: value
+                for reference, value in inventory.items()
+                if reference not in stale
+            }
+            protected_blobs = {
+                blob_key
+                for value in surviving_inventory.values()
+                for blob_key in value["blob_keys"]
+            }
+            candidate_blobs = {
+                blob_key
+                for reference in stale
+                for blob_key in inventory[reference]["blob_keys"]
+                if blob_key not in protected_blobs
+            }
+            # Hide stale generations before deleting their unreferenced data.
+            self._delete_keys({
+                inventory[reference]["key"]
+                for reference in stale
+            },
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            self._delete_keys(
+                candidate_blobs,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            return len(stale)
 
     def publish_checkpoint_set(
         self,
@@ -1483,6 +2035,8 @@ class S3CheckpointStore:
         generation: str | None = None,
         metadata: dict[str, Any] | None = None,
         keep_last_n: int = 3,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Atomically publish a complete Job-level selection of shard manifests."""
 
@@ -1516,25 +2070,51 @@ class S3CheckpointStore:
             metadata, label="checkpoint set",
         )
 
-        with self._job_lock(job_id).write():
-            existing_records = self._checkpoint_set_records(job_id)
+        with self._job_lock(job_id).write(
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        ):
+            self._check_deadline(deadline_monotonic, cancel_event)
+            existing_records = self._checkpoint_set_records(
+                job_id,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
             if (
                 len(existing_records) >= self._max_checkpoint_sets
                 and keep_last_n >= self._max_checkpoint_sets
             ):
                 raise CheckpointError("checkpoint set listing limit exceeded")
-            inventory = self._shard_manifest_inventory(job_id)
+            inventory = self._shard_manifest_inventory(
+                job_id,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
             self._verify_set_references(existing_records, inventory)
+            committed_namespaces = {
+                namespace
+                for namespace, shard_generation in normalized_shards
+                if (namespace, shard_generation) in inventory
+            }
+            if len(committed_namespaces) != len(normalized_shards):
+                raise IncompleteCheckpointSetError(
+                    "checkpoint set references an uncommitted shard",
+                    committed_namespaces=committed_namespaces,
+                )
             shards: list[dict[str, Any]] = []
             total_bytes = 0
+            total_objects = 0
             for namespace, shard_generation in normalized_shards:
                 reference = (namespace, shard_generation)
                 stored = inventory.get(reference)
-                if stored is None:
+                if stored is None:  # pragma: no cover - guarded above
                     raise CheckpointError(
-                        "checkpoint set references an uncommitted shard"
+                        "checkpoint inventory changed while publishing"
                     )
                 shard_bytes = stored["manifest"].get("total_bytes")
+                shard_objects = stored["manifest"].get(
+                    "total_objects",
+                )
                 if (
                     isinstance(shard_bytes, bool)
                     or not isinstance(shard_bytes, int)
@@ -1544,12 +2124,23 @@ class S3CheckpointStore:
                     raise CheckpointError(
                         "checkpoint shard total size is invalid"
                     )
+                if (
+                    isinstance(shard_objects, bool)
+                    or not isinstance(shard_objects, int)
+                    or shard_objects < 0
+                    or shard_objects > self._max_objects
+                ):
+                    raise CheckpointError(
+                        "checkpoint shard total object count is invalid"
+                    )
                 total_bytes += shard_bytes
+                total_objects += shard_objects
                 shards.append({
                     "worker_namespace": namespace,
                     "generation": shard_generation,
                     "manifest_sha256": stored["manifest_sha256"],
                     "total_bytes": shard_bytes,
+                    "total_objects": shard_objects,
                 })
             manifest: dict[str, Any] = {
                 "schema_version": _CHECKPOINT_SET_SCHEMA_VERSION,
@@ -1558,6 +2149,7 @@ class S3CheckpointStore:
                 "generation": generation,
                 "shards": shards,
                 "total_bytes": total_bytes,
+                "total_objects": total_objects,
                 "committed_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": normalized_metadata,
             }
@@ -1572,6 +2164,8 @@ class S3CheckpointStore:
                     "checkpoint set generation is already committed"
                 ),
                 allow_existing=True,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             if published:
                 record = {
@@ -1601,6 +2195,7 @@ class S3CheckpointStore:
                     "generation",
                     "shards",
                     "total_bytes",
+                    "total_objects",
                     "metadata",
                 )
                 if any(
@@ -1614,13 +2209,26 @@ class S3CheckpointStore:
                 records = existing_records
                 returned_manifest = record["manifest"]
             self._verify_set_references(records, inventory)
-            self._apply_retention(
-                job_id=job_id,
-                current_generation=generation,
-                keep_last_n=keep_last_n,
-                records=records,
-                inventory=inventory,
-            )
+            try:
+                self._apply_retention(
+                    job_id=job_id,
+                    current_generation=generation,
+                    keep_last_n=keep_last_n,
+                    records=records,
+                    inventory=inventory,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
+                )
+            except Exception:  # noqa: BLE001
+                # COMMITTED is already visible and fully reference-verified.
+                # Retention is maintenance: never report a durable checkpoint as
+                # failed merely because bounded garbage collection needs retry.
+                logger.warning(
+                    "checkpoint retention deferred for %s generation %s",
+                    job_id,
+                    generation,
+                    exc_info=True,
+                )
             return returned_manifest
 
     def _write_restored_object(
@@ -1631,26 +2239,37 @@ class S3CheckpointStore:
         expected_size: int,
         expected_sha256: str | None,
         mode: int = 0o600,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
+        self._check_deadline(deadline_monotonic, cancel_event)
         try:
             response = self._s3().get_object(
                 Bucket=self._bucket, Key=key,
             )
-            declared = int(response.get("ContentLength"))
             body = response["Body"]
         except Exception as exc:  # noqa: BLE001
             raise CheckpointError(
                 f"cannot read checkpoint object: {key}"
             ) from exc
-        if declared != expected_size:
-            raise CheckpointError(f"checkpoint object size mismatch: {key}")
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = destination.with_name(
-            f".{destination.name}.part-{uuid.uuid4().hex}"
-        )
-        digest = hashlib.sha256()
-        consumed = 0
+        temporary: Path | None = None
         try:
+            try:
+                declared = int(response.get("ContentLength"))
+            except Exception as exc:  # noqa: BLE001
+                raise CheckpointError(
+                    f"checkpoint object size is invalid: {key}"
+                ) from exc
+            if declared != expected_size:
+                raise CheckpointError(
+                    f"checkpoint object size mismatch: {key}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = destination.with_name(
+                f".{destination.name}.part-{uuid.uuid4().hex}"
+            )
+            digest = hashlib.sha256()
+            consumed = 0
             descriptor = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -1659,7 +2278,13 @@ class S3CheckpointStore:
             try:
                 with os.fdopen(descriptor, "wb") as output:
                     descriptor = -1
-                    while chunk := body.read(_READ_CHUNK):
+                    while True:
+                        self._check_deadline(
+                            deadline_monotonic, cancel_event,
+                        )
+                        chunk = body.read(_READ_CHUNK)
+                        if not chunk:
+                            break
                         consumed += len(chunk)
                         if consumed > expected_size:
                             raise CheckpointError(
@@ -1689,10 +2314,11 @@ class S3CheckpointStore:
             close = getattr(body, "close", None)
             if callable(close):
                 close()
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def _remove_partial_restore(
@@ -1720,6 +2346,8 @@ class S3CheckpointStore:
         expected_metadata: dict[str, Any] | None = None,
         expected_manifest_sha256: str | None = None,
         checkpoint_set_generation: str | None = None,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Restore one committed generation into a new private staging tree."""
 
@@ -1727,13 +2355,19 @@ class S3CheckpointStore:
         destination = Path(destination)
         if destination.exists():
             raise CheckpointError("checkpoint restore destination already exists")
-        with self._job_lock(source_job_id).read():
+        with self._job_lock(source_job_id).read(
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        ):
+            self._check_deadline(deadline_monotonic, cancel_event)
             selected_generation = generation
             selected_sha256 = expected_manifest_sha256
             if checkpoint_set_generation is not None:
                 checkpoint_set = self._resolve_checkpoint_set_unlocked(
                     source_job_id=source_job_id,
                     generation=checkpoint_set_generation,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
                 )
                 matching = [
                     shard for shard in checkpoint_set["shards"]
@@ -1766,6 +2400,8 @@ class S3CheckpointStore:
                 worker_namespace=worker_namespace,
                 generation=selected_generation,
                 expected_sha256=selected_sha256,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             self._validate_manifest_identity(
                 manifest,
@@ -1801,6 +2437,9 @@ class S3CheckpointStore:
                 destination.mkdir(mode=0o700)
                 created = True
                 for requested in normalized_paths:
+                    self._check_deadline(
+                        deadline_monotonic, cancel_event,
+                    )
                     (destination / requested).mkdir(
                         parents=True, exist_ok=True, mode=0o700,
                     )
@@ -1811,16 +2450,24 @@ class S3CheckpointStore:
                         entry["path"],
                     ),
                 ):
+                    self._check_deadline(
+                        deadline_monotonic, cancel_event,
+                    )
                     (destination / directory["path"]).mkdir(
                         parents=True, exist_ok=True, mode=0o700,
                     )
                 for entry in files:
+                    self._check_deadline(
+                        deadline_monotonic, cancel_event,
+                    )
                     self._write_restored_object(
                         key=entry["object_key"],
                         destination=destination / entry["path"],
                         expected_size=entry["size"],
                         expected_sha256=entry["sha256"],
                         mode=entry["mode"],
+                        deadline_monotonic=deadline_monotonic,
+                        cancel_event=cancel_event,
                     )
                 for directory in sorted(
                     directories,
@@ -1829,6 +2476,9 @@ class S3CheckpointStore:
                         entry["path"],
                     ),
                 ):
+                    self._check_deadline(
+                        deadline_monotonic, cancel_event,
+                    )
                     os.chmod(
                         destination / directory["path"],
                         directory["mode"],
@@ -1846,6 +2496,8 @@ class S3CheckpointStore:
         worker_namespace: str,
         destination: Path,
         paths: list[str],
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Explicitly restore a pre-checkpoint mutable final collection."""
 
@@ -1861,7 +2513,10 @@ class S3CheckpointStore:
         )
         try:
             raw_manifest = self._read_object_limited(
-                manifest_key, limit=self._max_manifest_bytes,
+                manifest_key,
+                limit=self._max_manifest_bytes,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
             manifest = json.loads(raw_manifest.decode("utf-8"))
             if (
@@ -1878,11 +2533,16 @@ class S3CheckpointStore:
             count = 0
             total = 0
             for requested in normalized_paths:
+                self._check_deadline(deadline_monotonic, cancel_event)
                 prefix = f"{worker_root}/{requested}/"
                 for page in self._s3().get_paginator(
                     "list_objects_v2"
                 ).paginate(Bucket=self._bucket, Prefix=prefix):
+                    self._check_deadline(deadline_monotonic, cancel_event)
                     for item in page.get("Contents") or []:
+                        self._check_deadline(
+                            deadline_monotonic, cancel_event,
+                        )
                         key = str(item.get("Key") or "")
                         if not key.startswith(prefix):
                             raise CheckpointError(
@@ -1917,6 +2577,8 @@ class S3CheckpointStore:
                             destination=destination / relative,
                             expected_size=size,
                             expected_sha256=None,
+                            deadline_monotonic=deadline_monotonic,
+                            cancel_event=cancel_event,
                         )
             return manifest
         except BaseException as exc:

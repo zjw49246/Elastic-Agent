@@ -248,7 +248,7 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
   --context-entries \
     'ContextKeyName=aws:RequestedRegion,ContextKeyValues=ap-northeast-1,ContextKeyType=string' \
     'ContextKeyName=aws:RequestTag/ManagedBy,ContextKeyValues=elastic-agent,ContextKeyType=string' \
-    'ContextKeyName=aws:TagKeys,ContextKeyValues=ManagedBy,Name,ElasticAgentJob,ElasticAgentController,ContextKeyType=stringList' \
+    'ContextKeyName=aws:TagKeys,ContextKeyValues=ManagedBy,Name,ElasticAgentJob,ElasticAgentShardIndex,ElasticAgentController,ContextKeyType=stringList' \
     'ContextKeyName=ec2:VolumeType,ContextKeyValues=gp3,ContextKeyType=string' \
     'ContextKeyName=ec2:Encrypted,ContextKeyValues=true,ContextKeyType=boolean' \
     'ContextKeyName=ec2:VolumeSize,ContextKeyValues=100,ContextKeyType=numeric' \
@@ -258,6 +258,19 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
     'ContextKeyName=ec2:InstanceProfile,ContextKeyValues=arn:aws:iam::297645381734:instance-profile/elastic-agent-worker,ContextKeyType=string' \
   --query 'length(EvaluationResults[?EvalDecision!=`allowed`])' \
   --output text)" = 0
+
+# Checkpoint retention may delete only the Manager's internal immutable
+# generations. Public result objects remain non-deletable by this role.
+test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
+  --action-names s3:DeleteObject \
+  --resource-arns \
+    arn:aws:s3:::elastic-agent-results-297645381734/jobs/.elastic-agent-checkpoints/job-test/checkpoint-blobs/deadbeef \
+  --query 'EvaluationResults[0].EvalDecision' --output text)" = allowed
+test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
+  --action-names s3:DeleteObject \
+  --resource-arns \
+    arn:aws:s3:::elastic-agent-results-297645381734/jobs/job-test/result.json \
+  --query 'EvaluationResults[0].EvalDecision' --output text)" = implicitDeny
 ```
 
 Also change the simulated AMI or instance type and confirm `implicitDeny` before

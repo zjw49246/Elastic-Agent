@@ -2546,6 +2546,30 @@ class TestBoundHooks:
 
 
 class TestProvisionHook:
+    @pytest.fixture(autouse=True)
+    def _stub_current_framework_delivery(self, monkeypatch):
+        """Every declarative Job now receives the current dual-unit runtime."""
+
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        import elastic_agent.core.code_sync as code_sync_mod
+
+        class FakeSync:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def deliver(self, local, host, target):
+                return True
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None):
+                return 0, "", ""
+
+        monkeypatch.setattr(code_sync_mod, "ManagerCodeSync", FakeSync)
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
     async def test_success(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec
         mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
@@ -2560,7 +2584,7 @@ class TestProvisionHook:
         ok = await hook("w1", None, JobSpec(name="j", run=RunSpec(command="x")))
         assert ok is True
         assert ran["host"] == "1.2.3.4"
-        assert "runtime-deploy" in ran["steps"]
+        assert "runtime-deploy" not in ran["steps"]
 
     async def test_aws_bootstrap_uses_private_worker_address(self, tmp_path):
         """SG-to-SG SSH rules only apply reliably on the VPC/private path."""
@@ -2601,9 +2625,12 @@ class TestProvisionHook:
 
         class FakeSSHExecutor:
             def __init__(self, *args, **kwargs):
-                assert kwargs["use_sudo"] is False
+                self.use_sudo = kwargs.get("use_sudo")
 
             async def execute(self, command, timeout=None, **kwargs):
+                if "ea-task-supervisor.service" in command:
+                    return 0, "", ""
+                assert self.use_sudo is False
                 commands.append(command)
                 return 0, "", ""
 
@@ -2653,6 +2680,8 @@ class TestProvisionHook:
                 pass
 
             async def execute(self, command, timeout=None, **kwargs):
+                if "ea-task-supervisor.service" in command:
+                    return 0, "", ""
                 commands.append(command)
                 if command.startswith("command -v aws "):
                     return 127, "", "awscli is required"
@@ -2935,15 +2964,18 @@ class TestProvisionHook:
                 return "/local/clone"
             async def deliver(self, local, host, target): return True
 
-        captured = {"calls": []}
+        captured = {"calls": [], "executors": []}
 
         class FakeSSHExecutor:
             def __init__(self, host, *, user=None, key_path=None, use_sudo=None):
-                captured["user"] = user
-                captured["use_sudo"] = use_sudo
+                self.user = user
+                self.use_sudo = use_sudo
+                captured["executors"].append((user, use_sudo))
 
             async def execute(self, cmd, timeout=None, env=None, cwd=None):
-                captured["cmd"] = cmd
+                if "ea-task-supervisor.service" in cmd:
+                    return 0, "", ""
+                assert self.use_sudo is False
                 captured["calls"].append({
                     "cmd": cmd, "timeout": timeout, "env": env, "cwd": cwd,
                 })
@@ -2964,8 +2996,7 @@ class TestProvisionHook:
         )
         hook = make_provision_hook(mgr, bootstrap_runner=runner, ws_wait_timeout=1)
         assert await hook("w1", None, spec) is True
-        assert captured["user"] == "ubuntu"
-        assert captured["use_sudo"] is False
+        assert ("ubuntu", False) in captured["executors"]
         assert captured["calls"][0]["cwd"] == "/home/ubuntu/bench"
 
     async def test_manager_rsync_structured_setup_honors_step_policy(
@@ -2991,9 +3022,12 @@ class TestProvisionHook:
 
         class FakeSSHExecutor:
             def __init__(self, *args, **kwargs):
-                assert kwargs["use_sudo"] is False
+                self.use_sudo = kwargs.get("use_sudo")
 
             async def execute(self, command, timeout=None, env=None, cwd=None):
+                if "ea-task-supervisor.service" in command:
+                    return 0, "", ""
+                assert self.use_sudo is False
                 calls.append((command, timeout, env, cwd))
                 # Exercise retry_count=1 without delaying the test.
                 return (1, "", "retry") if len(calls) == 1 else (0, "", "")

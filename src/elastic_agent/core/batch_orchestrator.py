@@ -148,6 +148,17 @@ class WorkerRun:
     assignment: WorkerAssignment | None = field(default=None, repr=False)
     final_collected: bool = False
     collection_error: str | None = None
+    # The Job-wide periodic collector assigns the same generation to every
+    # shard and does not advance until all shard attempts settle.
+    checkpoint_generation: str = ""
+    checkpoint_set_generation: str = ""
+    checkpoint_shard_generations: dict[str, str] = field(
+        default_factory=dict,
+    )
+    # Last shard manifest whose COMMITTED write has returned successfully.
+    # Finished shards retain this pointer while surviving shards keep taking
+    # mixed Job-level checkpoint sets.
+    last_checkpoint_generation: str = ""
     # Ordinary cleanup has two ordered commits: cloud termination first, then
     # allocator reference release. Keep them separate so a failed claim
     # release can retry without needlessly repeating a destructive cloud call.
@@ -212,6 +223,12 @@ class BatchJob:
     accounts_released: bool = False
     persisted_state: str = "prepared"
     terminal_state_persisted: bool = False
+    latest_checkpoint_generation: str = ""
+    latest_checkpoint_committed_at: str = ""
+    checkpoint_sequence: int = 0
+    # True only while recovery is still a Manager-local, pre-cloud operation.
+    # Cancellation may safely interrupt the launch task in this phase.
+    recovery_staging: bool = False
     launch_task: asyncio.Task | None = field(default=None, repr=False)
     created_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -311,6 +328,16 @@ class BatchJob:
             ],
             "cancel_requested": self.cancel_requested,
             "cancel_reason": self.cancel_reason,
+            "latest_checkpoint_generation": (
+                self.latest_checkpoint_generation or None
+            ),
+            # This is safe list metadata, not a projection of the private
+            # JobSpec.  It keeps recovery discoverable if Manager crashes
+            # after S3 COMMITTED but before the local convenience pointer is
+            # persisted.
+            "checkpoint_recovery_available": bool(
+                self.spec.collect.checkpoint
+            ),
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -487,7 +514,10 @@ class BatchOrchestrator:
         *,
         scale_in_on_complete: bool = True,
         final_collect_attempts: int = 3,
-        final_collect_timeout: float = 300.0,
+        # Large checkpoint Jobs may need an rsync pass plus immutable and
+        # public S3 uploads. Keep the whole finalizer bounded, but do not let
+        # the former five-minute ceiling pre-empt its own 30-minute stages.
+        final_collect_timeout: float = 7_200.0,
         cleanup_retry_seconds: float = 5.0,
         worker_concurrency: int = 8,
         persist_spec_hook: PersistSpecHook | None = None,
@@ -639,29 +669,22 @@ class BatchOrchestrator:
         return True
 
     async def handle_disconnect(self, worker_id: str) -> None:
-        """Fail a batch run only when a disconnected worker stays gone."""
+        """Keep a supervised run alive across an unbounded WS interruption.
+
+        A disconnected runtime is not proof that either its EC2 instance or
+        the independently supervised process died.  The Job TTL remains the
+        bounded abandonment policy; reconnect STATUS / reliable PROCESS_EXIT
+        provide the positive process evidence.  Destroying a Worker solely
+        because a socket grace elapsed would defeat durable reconnect.
+        """
         if worker_id not in self._worker_index or self._shutting_down:
             return
-        existing = self._disconnect_tasks.get(worker_id)
-        if existing is not None and not existing.done():
-            return
-
-        async def expire() -> None:
-            try:
-                if self._disconnect_grace_seconds:
-                    await asyncio.sleep(self._disconnect_grace_seconds)
-                await self.cancel_worker(
-                    worker_id,
-                    "worker disconnected and did not reconnect within "
-                    f"{self._disconnect_grace_seconds:g}s",
-                )
-            except asyncio.CancelledError:
-                return
-            finally:
-                if self._disconnect_tasks.get(worker_id) is asyncio.current_task():
-                    self._disconnect_tasks.pop(worker_id, None)
-
-        self._disconnect_tasks[worker_id] = asyncio.create_task(expire())
+        logger.warning(
+            "Worker %s disconnected; retaining its supervised Job task until "
+            "reconnect, a reliable terminal event, explicit cancellation, "
+            "cloud-terminal reconciliation, or Job TTL",
+            worker_id,
+        )
 
     async def handle_reconnect(self, worker_id: str) -> None:
         task = self._disconnect_tasks.pop(worker_id, None)
@@ -794,6 +817,10 @@ class BatchOrchestrator:
         if job.job_id in self._jobs:
             raise ValueError(f"job {job.job_id!r} is already registered")
         self._jobs[job.job_id] = job
+        # Establish the safely-cancellable pre-cloud phase synchronously with
+        # task publication. An immediate cancel must not miss a boolean gap
+        # before _bring_up_all reaches prepare_recovery.
+        job.recovery_staging = job.spec.recovery.policy != "none"
         task = asyncio.create_task(self._bring_up_all(job))
         job.launch_task = task
         self._launch_tasks.add(task)
@@ -962,6 +989,8 @@ class BatchOrchestrator:
                     if not run.final_collected:
                         if run.task_id:
                             try:
+                                if job.spec.collect.checkpoint:
+                                    self._plan_terminal_checkpoint(job, run)
                                 await asyncio.wait_for(
                                     self._driver.collect(
                                         run.worker_id, job.spec, job.job_id
@@ -1068,10 +1097,6 @@ class BatchOrchestrator:
         job.started_at = datetime.now(timezone.utc)
         recovery_attempted = False
         try:
-            # This durable gate is crossed before account reservation or any
-            # cloud call.  A journal left at ``prepared`` can therefore be
-            # safely scheduled by an idempotent retry after a crash.
-            await self._record_job_state(job, "launching")
             if spec.recovery.policy != "none":
                 prepare_recovery = getattr(
                     self._driver, "prepare_recovery", None,
@@ -1081,9 +1106,32 @@ class BatchOrchestrator:
                         "fleet driver does not support checkpoint recovery"
                     )
                 recovery_attempted = True
+                if job.cancel_requested:
+                    raise RuntimeError(
+                        job.cancel_reason
+                        or "job cancelled before recovery staging"
+                    )
                 # Validate and stage before scale_out/reserve so a missing or
                 # corrupt checkpoint cannot create a billable worker.
-                await prepare_recovery(job.job_id, spec)
+                try:
+                    await prepare_recovery(job.job_id, spec)
+                finally:
+                    job.recovery_staging = False
+                if self._shutting_down:
+                    raise RuntimeError(
+                        "manager shutting down after recovery staging"
+                    )
+                if job.cancel_requested:
+                    raise RuntimeError(
+                        job.cancel_reason
+                        or "job cancelled after recovery staging"
+                    )
+            # ``prepared`` deliberately includes recovery staging: staging is
+            # pre-account and pre-cloud, and is safe to rebuild after a crash.
+            # Cross the durable launch gate only after it completes and
+            # immediately before the first reservation or scale-out side
+            # effect. Non-recovery Jobs reach this line without waiting.
+            await self._record_job_state(job, "launching")
             if self._is_eip_bound(spec):
                 await self._bring_up_bound_all(job)
             else:
@@ -1751,6 +1799,32 @@ class BatchOrchestrator:
         if run.phase == WorkerPhase.RUNNING:
             self._start_periodic_collect(job, run.worker_id)
 
+    @staticmethod
+    def _plan_terminal_checkpoint(
+        job: BatchJob,
+        run: WorkerRun,
+    ) -> None:
+        """Freeze one mixed set plan before collecting a terminal shard."""
+
+        job.checkpoint_sequence += 1
+        run.checkpoint_generation = "final"
+        run.checkpoint_set_generation = (
+            "terminal-"
+            f"{job.checkpoint_sequence:08d}-"
+            f"{run.ctx.shard_index:05d}"
+        )
+        run.checkpoint_shard_generations = {
+            f"shard-{other.ctx.shard_index:05d}": (
+                "final"
+                if other is run
+                else (
+                    other.last_checkpoint_generation
+                    or "pending"
+                )
+            )
+            for other in job.runs.values()
+        }
+
     def _start_periodic_collect(self, job: BatchJob, worker_id: str) -> None:
         """While the run goes, pull results back every ``collect.interval_seconds``
         (0 = off) so long runs stream partial results to the Manager → S3 as
@@ -1759,8 +1833,95 @@ class BatchOrchestrator:
         interval = spec.collect.interval_seconds
         if interval <= 0 or not spec.collect.paths:
             return
-        existing = self._collect_tasks.get(worker_id)
+        task_key = (
+            f"checkpoint:{job.job_id}"
+            if spec.collect.checkpoint
+            else worker_id
+        )
+        existing = self._collect_tasks.get(task_key)
         if existing and not existing.done():
+            return
+
+        if spec.collect.checkpoint:
+            async def _checkpoint_loop() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(interval)
+                        runs = list(job.runs.values())
+                        if len(runs) != spec.fanout.workers:
+                            continue
+                        active = [
+                            run
+                            for run in runs
+                            if run.phase == WorkerPhase.RUNNING
+                        ]
+                        if not active:
+                            if all(
+                                run.phase in TERMINAL_WORKER_PHASES
+                                for run in runs
+                            ):
+                                return
+                            continue
+                        if any(
+                            run.phase != WorkerPhase.RUNNING
+                            and (
+                                run.phase not in TERMINAL_WORKER_PHASES
+                                or not run.last_checkpoint_generation
+                            )
+                            for run in runs
+                        ):
+                            # A terminal shard's final collector owns the
+                            # transition. Once its durable pointer is visible,
+                            # survivors can publish mixed sets without keeping
+                            # the finished EC2 alive.
+                            continue
+                        job.checkpoint_sequence += 1
+                        generation = (
+                            "periodic-"
+                            f"{job.checkpoint_sequence:08d}"
+                        )
+                        target_generations = {
+                            f"shard-{run.ctx.shard_index:05d}": (
+                                generation
+                                if run.phase == WorkerPhase.RUNNING
+                                else run.last_checkpoint_generation
+                            )
+                            for run in runs
+                        }
+                        for run in active:
+                            run.checkpoint_generation = generation
+                            run.checkpoint_set_generation = generation
+                            run.checkpoint_shard_generations = dict(
+                                target_generations
+                            )
+                        results = await asyncio.gather(
+                            *(
+                                self._driver.collect(
+                                    run.worker_id,
+                                    spec,
+                                    job.job_id,
+                                )
+                                for run in active
+                            ),
+                            return_exceptions=True,
+                        )
+                        for run, result in zip(active, results):
+                            if isinstance(result, BaseException):
+                                logger.error(
+                                    "checkpoint collect failed for %s",
+                                    run.worker_id,
+                                    exc_info=(
+                                        type(result),
+                                        result,
+                                        result.__traceback__,
+                                    ),
+                                )
+                except asyncio.CancelledError:
+                    return
+
+            self._collect_tasks[task_key] = asyncio.create_task(
+                _checkpoint_loop()
+            )
             return
 
         async def _loop() -> None:
@@ -1777,15 +1938,34 @@ class BatchOrchestrator:
             except asyncio.CancelledError:
                 return
 
-        self._collect_tasks[worker_id] = asyncio.create_task(_loop())
+        self._collect_tasks[task_key] = asyncio.create_task(_loop())
 
     async def _stop_periodic_collect(self, worker_id: str) -> None:
         """Cancel and fully quiesce a periodic collect before final teardown."""
-        task = self._collect_tasks.pop(worker_id, None)
-        if task and not task.done():
-            task.cancel()
-        if task is not None and task is not asyncio.current_task():
-            await asyncio.gather(task, return_exceptions=True)
+        keys = [worker_id]
+        job_id = self._worker_index.get(worker_id)
+        if job_id:
+            keys.append(f"checkpoint:{job_id}")
+        # Do not pop before the task settles. Concurrent shard finalizers must
+        # all discover and await the same Job-wide collector; otherwise the
+        # first caller hides a still-running periodic generation and another
+        # caller can begin the final generation against mutable files.
+        keyed_tasks = [
+            (key, task)
+            for key in keys
+            if (task := self._collect_tasks.get(key)) is not None
+        ]
+        tasks = list(dict.fromkeys(task for _key, task in keyed_tasks))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        current = asyncio.current_task()
+        awaited = [task for task in tasks if task is not current]
+        if awaited:
+            await asyncio.gather(*awaited, return_exceptions=True)
+        for key, task in keyed_tasks:
+            if self._collect_tasks.get(key) is task and task.done():
+                self._collect_tasks.pop(key, None)
 
     # -- lifecycle events (called by the Manager's message handlers) --------
 
@@ -2081,6 +2261,17 @@ class BatchOrchestrator:
             return False
         run = job.runs[worker_id]
         if run.phase not in TERMINAL_WORKER_PHASES:
+            quiescent = await self._stop_run_for_cancel(
+                run,
+                term_grace=self._cancel_grace_seconds,
+                kill_grace=self._cancel_kill_grace_seconds,
+            )
+            if not quiescent and run.task_id:
+                run.final_collected = True
+                run.collection_error = (
+                    "task exit was not confirmed; skipped non-quiescent "
+                    "final collection"
+                )
             self._fail(run, reason)
         await self._finalize_terminal_run(job, run)
         await self._maybe_finish(job)
@@ -2107,17 +2298,17 @@ class BatchOrchestrator:
         *,
         term_grace: float,
         kill_grace: float,
-    ) -> None:
+    ) -> bool:
         """Wait for the matching reliable exit before result collection."""
         # Cancelling a bring-up can mark DISPATCHING terminal while the EXECUTE
         # frame is already in the WebSocket but ``send_text`` has not returned.
         # A terminal phase is therefore not proof that the remote process exited;
         # only the matching reliable PROCESS_EXIT closes that uncertainty.
         if not run.task_id:
-            return
+            return True
         if run.exit_event.is_set():
             await self._wait_for_exit_archive(run)
-            return
+            return True
         try:
             await self._driver.stop_command(
                 run.worker_id, run.task_id, "SIGTERM"
@@ -2127,7 +2318,7 @@ class BatchOrchestrator:
         try:
             await asyncio.wait_for(run.exit_event.wait(), timeout=term_grace)
             await self._wait_for_exit_archive(run)
-            return
+            return True
         except asyncio.TimeoutError:
             pass
         try:
@@ -2139,11 +2330,14 @@ class BatchOrchestrator:
         try:
             await asyncio.wait_for(run.exit_event.wait(), timeout=kill_grace)
             await self._wait_for_exit_archive(run)
+            return True
         except asyncio.TimeoutError:
             logger.error(
-                "task %s did not confirm exit before cancellation collection",
+                "task %s did not confirm exit; refusing a non-quiescent final "
+                "collection",
                 run.task_id,
             )
+            return False
 
     async def _wait_for_exit_archive(self, run: WorkerRun) -> None:
         if not run.exit_archive_pending:
@@ -2202,11 +2396,23 @@ class BatchOrchestrator:
                 and launch_task is not asyncio.current_task()
                 and not launch_task.done()
             ):
+                # Recovery staging owns no cloud/account resources yet. Stop
+                # its cooperative S3 restore promptly instead of waiting for
+                # the full staging deadline. Once scale-out begins, preserve
+                # the transaction-boundary behavior below.
+                if job.recovery_staging:
+                    launch_task.cancel()
                 # EIP reservation has no WorkerRun yet; the flag above makes its
                 # transaction roll back after all in-flight cloud calls settle.
                 await asyncio.gather(launch_task, return_exceptions=True)
+                if launch_task.cancelled() and not job.launch_complete:
+                    # The task may have been cancelled before its coroutine ran
+                    # and therefore before its finally block could commit this.
+                    job.recovery_staging = False
+                    job.launch_complete = True
 
-            await asyncio.gather(*(
+            stopping_runs = list(job.runs.values())
+            quiescent_results = await asyncio.gather(*(
                 self._stop_run_for_cancel(
                     run,
                     term_grace=(
@@ -2218,8 +2424,20 @@ class BatchOrchestrator:
                         if kill_grace is None else max(0.01, kill_grace)
                     ),
                 )
-                for run in list(job.runs.values())
+                for run in stopping_runs
             ))
+            for run, quiescent in zip(
+                stopping_runs, quiescent_results, strict=True,
+            ):
+                if not quiescent and run.task_id:
+                    # A live writer cannot produce a coherent terminal
+                    # snapshot. Preserve the last complete periodic checkpoint
+                    # and proceed with bounded teardown instead.
+                    run.final_collected = True
+                    run.collection_error = (
+                        "task exit was not confirmed; skipped non-quiescent "
+                        "final collection"
+                    )
 
             for run in job.runs.values():
                 if run.phase not in TERMINAL_WORKER_PHASES:
@@ -2250,6 +2468,9 @@ class BatchOrchestrator:
             # detach its EIP and destroy the remote filesystem.
             await self._stop_periodic_collect(run.worker_id)
             if not run.final_collected and run.task_id:
+                if job.spec.collect.checkpoint:
+                    self._plan_terminal_checkpoint(job, run)
+
                 async def collect_with_retries() -> None:
                     for attempt in range(1, self._final_collect_attempts + 1):
                         try:
@@ -2326,6 +2547,18 @@ class BatchOrchestrator:
                 and not run.cleaned_up
             ):
                 await self._cleanup_ordinary_run_locked(job, run)
+
+            if job.spec.collect.checkpoint:
+                survivor = next(
+                    (
+                        other
+                        for other in job.runs.values()
+                        if other.phase == WorkerPhase.RUNNING
+                    ),
+                    None,
+                )
+                if survivor is not None:
+                    self._start_periodic_collect(job, survivor.worker_id)
 
     async def _cleanup_ordinary_run_locked(
         self,
@@ -2533,6 +2766,8 @@ class BatchOrchestrator:
                 or any(not run.cleaned_up for run in job.runs.values())
             ):
                 return
+            if eip_bound:
+                job.resources_released = True
 
             if not job.accounts_released:
                 if not per_run_ordinary_cleanup and not eip_bound:

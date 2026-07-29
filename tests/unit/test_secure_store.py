@@ -9,6 +9,7 @@ from elastic_agent.core.job_spec import JobSpec, RunSpec
 from elastic_agent.core.job_spec_store import (
     job_specs_dir,
     persist_job_spec,
+    update_job_checkpoint,
     update_job_state,
 )
 
@@ -28,6 +29,26 @@ def test_job_spec_journal_is_private_and_durable(tmp_path):
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
     assert json.loads(destination.read_text())["submission_state"] == "prepared"
     assert not list(destination.parent.glob("*.tmp"))
+
+    update_job_checkpoint(
+        registry,
+        "job-secure-1",
+        "periodic-00000001",
+        committed_at="2026-07-29T00:00:02+00:00",
+    )
+    update_job_checkpoint(
+        registry,
+        "job-secure-1",
+        "periodic-00000000",
+        committed_at="2026-07-29T00:00:01+00:00",
+    )
+    checkpointed = json.loads(destination.read_text())
+    assert checkpointed["submission_state"] == "prepared"
+    assert (
+        checkpointed["latest_checkpoint_generation"]
+        == "periodic-00000001"
+    )
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
     update_job_state(
         registry,

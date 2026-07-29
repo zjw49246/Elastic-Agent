@@ -142,12 +142,87 @@ def _rewrite_persisted_account_mode(
     spec_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+async def _wait_for_binding_recovery(
+    manager: ElasticAgentManager,
+    *,
+    timeout: float = 2,
+) -> None:
+    """Wait for startup recovery when a test needs its terminal effects."""
+    async with asyncio.timeout(timeout):
+        while not manager.binding_recovery_ready:
+            await asyncio.sleep(0.01)
+
+
 # ------------------------------------------------------------------
 # Tests: lifecycle
 # ------------------------------------------------------------------
 
 
 class TestManagerLifecycle:
+    @pytest.mark.asyncio
+    async def test_startup_long_recovery_runs_after_manager_is_ready(
+        self, tmp_config, provider,
+    ):
+        manager = ElasticAgentManager(tmp_config, provider)
+        recovery_entered = asyncio.Event()
+        allow_recovery = asyncio.Event()
+
+        async def slow_recovery():
+            recovery_entered.set()
+            await allow_recovery.wait()
+            manager._binding_recovery_ready = True
+
+        manager._recover_bound_resources_once = slow_recovery
+
+        await asyncio.wait_for(manager.start(), timeout=1)
+        await asyncio.wait_for(recovery_entered.wait(), timeout=1)
+        try:
+            assert manager._started is True
+            assert manager.binding_recovery_ready is False
+            assert manager._binding_recovery_task is not None
+            assert manager._binding_recovery_task.done() is False
+        finally:
+            allow_recovery.set()
+            if manager._binding_recovery_task is not None:
+                await asyncio.wait_for(
+                    manager._binding_recovery_task,
+                    timeout=1,
+                )
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_background_startup_recovery_retries_unexpected_failure(
+        self, tmp_config, provider,
+    ):
+        manager = ElasticAgentManager(tmp_config, provider)
+        attempts = 0
+        first_failed = asyncio.Event()
+
+        async def recover():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_failed.set()
+                raise RuntimeError("transient recovery failure")
+            manager._binding_recovery_ready = True
+
+        manager._recover_bound_resources_once = recover
+
+        await manager.start()
+        try:
+            await asyncio.wait_for(first_failed.wait(), timeout=1)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert manager.binding_recovery_ready is False
+            assert manager._binding_recovery_task is not None
+            assert manager._binding_recovery_task.done() is False
+
+            manager._binding_recovery_wakeup.set()
+            await _wait_for_binding_recovery(manager)
+            assert attempts == 2
+        finally:
+            await manager.stop()
+
     @pytest.mark.asyncio
     async def test_startup_terminates_unbound_job_worker_from_previous_manager(
         self, tmp_config, provider
@@ -186,7 +261,7 @@ class TestManagerLifecycle:
             status=NodeStatus.READY,
             public_ip=instance.public_ip,
             private_ip=instance.private_ip,
-            metadata={"job_id": "job-interrupted"},
+            metadata={"job_id": "job-interrupted", "shard_index": 0},
         ))
         await previous.stop()
 
@@ -197,12 +272,13 @@ class TestManagerLifecycle:
         )
         await restarted.start()
         try:
+            await _wait_for_binding_recovery(restarted)
             assert provider._instances == {}
             restarted.binding_manager.wait_instance_terminated.assert_awaited_once_with(
                 instance.instance_id
             )
             recovered = await restarted.registry.get(instance.instance_id)
-            assert recovered.status == NodeStatus.TERMINATED
+            assert recovered is None
             assert restarted.binding_recovery_ready is True
             journal = json.loads(
                 (
@@ -255,7 +331,7 @@ class TestManagerLifecycle:
             status=NodeStatus.READY,
             public_ip=instance.public_ip,
             private_ip=instance.private_ip,
-            metadata={"job_id": job_id},
+            metadata={"job_id": job_id, "shard_index": 0},
         ))
         await previous.stop()
         _rewrite_persisted_account_mode(
@@ -276,16 +352,294 @@ class TestManagerLifecycle:
             assert not hasattr(recovery_spec, "account")
             collected.append((worker_id, recovered_job_id))
 
+        async def quiesce(_driver, worker_id, recovered_job_id, spec):
+            assert worker_id == instance.instance_id
+            assert recovered_job_id == job_id
+            assert spec.setup.target_dir == "/srv/legacy-job"
+
+        monkeypatch.setattr(
+            ManagerFleetDriver,
+            "quiesce_recovered_worker",
+            quiesce,
+        )
         monkeypatch.setattr(ManagerFleetDriver, "collect", record_collect)
         restarted = ElasticAgentManager(tmp_config, provider)
         await restarted.start()
         try:
+            await _wait_for_binding_recovery(restarted)
             assert collected == [(instance.instance_id, job_id)]
             assert provider._instances == {}
             recovered = await restarted.registry.get(instance.instance_id)
-            assert recovered.status == NodeStatus.TERMINATED
+            assert recovered is None
         finally:
             await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_checkpoint_collection_reconciles_before_collect(
+        self, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = "job-startup-checkpoint-order"
+        spec = JobSpec.model_validate({
+            "name": "startup-checkpoint-order",
+            "setup": {
+                "repo": "https://github.com/example/bench.git",
+                "target_dir": "/srv/checkpoint-order",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "resume"},
+            "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+            "recovery": {
+                "policy": "checkpoint",
+                "source_job_id": "job-checkpoint-source",
+                "paths": ["results"],
+                "generation": "periodic-00000003",
+            },
+        })
+        await manager._persist_batch_job_spec(job_id, spec)
+        instance = SimpleNamespace(
+            instance_id="dryrun:i-recovered-checkpoint",
+            platform="dryrun",
+            public_ip="198.51.100.20",
+            private_ip="10.0.0.20",
+            tags={
+                "ElasticAgentJob": job_id,
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentShardIndex": "0",
+            },
+        )
+        await manager.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.DRAINING,
+            public_ip=instance.public_ip,
+            private_ip=instance.private_ip,
+            metadata={"job_id": job_id, "shard_index": 0},
+        ))
+        order = []
+
+        async def quiesce(
+            _driver, worker_id, recovered_job_id, recovered_spec,
+        ):
+            assert worker_id == instance.instance_id
+            assert recovered_job_id == job_id
+            assert recovered_spec.recovery.generation == (
+                "periodic-00000003"
+            )
+            order.append("quiesce")
+
+        async def reconcile(
+            _driver,
+            worker_id,
+            recovered_job_id,
+            recovered_spec,
+            shard_index,
+        ):
+            assert worker_id == instance.instance_id
+            assert recovered_job_id == job_id
+            assert recovered_spec.recovery.source_job_id == (
+                "job-checkpoint-source"
+            )
+            assert shard_index == 0
+            order.append("reconcile")
+
+        async def collect(
+            _driver, worker_id, _recovered_spec, recovered_job_id,
+        ):
+            assert worker_id == instance.instance_id
+            assert recovered_job_id == job_id
+            order.append("collect")
+
+        monkeypatch.setattr(
+            ManagerFleetDriver, "quiesce_recovered_worker", quiesce,
+        )
+        monkeypatch.setattr(
+            ManagerFleetDriver, "reconcile_recovery_install", reconcile,
+        )
+        monkeypatch.setattr(ManagerFleetDriver, "collect", collect)
+
+        await manager._collect_recovered_unbound(instance)
+
+        assert order == ["quiesce", "reconcile", "collect"]
+
+    @pytest.mark.asyncio
+    async def test_startup_checkpoint_never_collects_unproven_install(
+        self, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = "job-unproven-checkpoint-install"
+        await manager._persist_batch_job_spec(
+            job_id,
+            JobSpec.model_validate({
+                "name": "unproven-checkpoint-install",
+                "setup": {
+                    "repo": "https://github.com/example/bench.git",
+                    "target_dir": "/srv/unproven-checkpoint",
+                    "resolved_commit": "b" * 40,
+                },
+                "run": {"command": "resume"},
+                "account": {"mode": "none"},
+                "fanout": {"shard_by": "shard_index"},
+                "collect": {
+                    "paths": ["results"],
+                    "checkpoint": True,
+                },
+                "recovery": {
+                    "policy": "checkpoint",
+                    "source_job_id": "job-checkpoint-source",
+                    "paths": ["results"],
+                    "generation": "periodic-00000004",
+                },
+            }),
+        )
+        instance = SimpleNamespace(
+            instance_id="dryrun:i-unproven-checkpoint",
+            platform="dryrun",
+            public_ip="198.51.100.21",
+            private_ip="10.0.0.21",
+            tags={
+                "ElasticAgentJob": job_id,
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentShardIndex": "0",
+            },
+        )
+        collect = AsyncMock()
+
+        async def quiesce(
+            _driver, _worker_id, _job_id, _spec,
+        ):
+            return None
+
+        async def reject_install(
+            _driver, _worker_id, _job_id, _spec, _shard_index,
+        ):
+            raise RuntimeError(
+                "recovery transfer was not durably committed"
+            )
+
+        monkeypatch.setattr(
+            ManagerFleetDriver, "quiesce_recovered_worker", quiesce,
+        )
+        monkeypatch.setattr(
+            ManagerFleetDriver,
+            "reconcile_recovery_install",
+            reject_install,
+        )
+        monkeypatch.setattr(ManagerFleetDriver, "collect", collect)
+
+        with pytest.raises(
+            RuntimeError, match="not durably committed",
+        ):
+            await manager._collect_recovered_unbound(instance)
+
+        collect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovered_fanout_summary_merges_every_shard_atomically(
+        self, tmp_config, provider,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import load_job_spec_journal
+        from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
+
+        job_id = "job-recovered-fanout"
+        manager = ElasticAgentManager(tmp_config, provider)
+        await manager.start()
+        source = JobSpec.model_validate({
+            "name": "recovered-fanout",
+            "setup": {
+                "repo": "https://github.com/example/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "capture"},
+            "fanout": {"workers": 2, "shard_by": "shard_index"},
+            "collect": {"paths": ["results"]},
+        })
+        await manager._persist_batch_job_spec(job_id, source)
+        await manager._update_batch_job_state(job_id, "running")
+        try:
+            await asyncio.gather(*(
+                manager._merge_recovered_terminal_worker(
+                    job_id=job_id,
+                    worker_id=f"worker-{shard}",
+                    shard_index=shard,
+                    collected=True,
+                    collection_error=None,
+                    worker_released=False,
+                )
+                for shard in range(2)
+            ))
+            partial = load_job_spec_journal(
+                tmp_config.registry.path, job_id,
+            )["terminal_summary"]
+            assert partial["done"] is False
+            assert partial["cleanup_pending"] == 2
+
+            await asyncio.gather(*(
+                manager._merge_recovered_terminal_worker(
+                    job_id=job_id,
+                    worker_id=f"worker-{shard}",
+                    shard_index=shard,
+                    collected=None,
+                    collection_error=None,
+                    worker_released=True,
+                )
+                for shard in reversed(range(2))
+            ))
+            terminal = load_job_spec_journal(
+                tmp_config.registry.path, job_id,
+            )["terminal_summary"]
+            assert terminal["done"] is True
+            assert terminal["cleanup_pending"] == 0
+            assert [
+                worker["shard_index"]
+                for worker in terminal["terminal_workers"]
+            ] == [0, 1]
+            assert all(
+                worker["final_collected"]
+                and worker["worker_released"]
+                and worker["collection_error"] is None
+                for worker in terminal["terminal_workers"]
+            )
+
+            target = JobSpec.model_validate({
+                "name": "resume",
+                "setup": {
+                    "repo": source.setup.repo,
+                    "resolved_commit": source.setup.resolved_commit,
+                },
+                "run": {"command": "resume"},
+                "fanout": {"workers": 2, "shard_by": "shard_index"},
+                "recovery": {
+                    "policy": "legacy_final_collection",
+                    "source_job_id": job_id,
+                    "paths": ["results"],
+                },
+            })
+            with pytest.raises(
+                RuntimeError, match="legacy mutable.*disabled",
+            ):
+                ManagerFleetDriver._validate_recovery_contract(
+                    load_job_spec_journal(
+                        tmp_config.registry.path, job_id,
+                    ),
+                    source,
+                    target,
+                    source_quiescent=True,
+                )
+        finally:
+            await manager.stop()
 
     @pytest.mark.asyncio
     async def test_restart_does_not_trust_previous_process_unbound_ownership(
@@ -311,6 +665,7 @@ class TestManagerLifecycle:
             "controller_id": (
                 previous.account_binding_store.controller_id
             ),
+            "shard_index": 0,
         }
         assert load_unbound_launch_intents(
             tmp_config.registry.path,
@@ -352,7 +707,7 @@ class TestManagerLifecycle:
 
             assert provider._instances == {}
             recovered = await restarted.registry.get(record.node_id)
-            assert recovered.status == NodeStatus.TERMINATED
+            assert recovered is None
             assert restarted.binding_recovery_ready is True
             assert load_unbound_launch_intents(
                 tmp_config.registry.path,
@@ -568,6 +923,7 @@ class TestManagerLifecycle:
                         previous.account_binding_store.controller_id
                     ),
                     "ElasticAgentAccount": "acct-1",
+                    "ElasticAgentJob": lease.job_id,
                     "ElasticAgentLease": lease.lease_id,
                 },
             )
@@ -594,6 +950,7 @@ class TestManagerLifecycle:
         restarted = ElasticAgentManager(tmp_config, provider)
         await restarted.start()
         try:
+            await _wait_for_binding_recovery(restarted)
             recovered = await restarted.binding_manager.get_lease(lease.lease_id)
             assert recovered.state == LeaseState.RELEASED
             assert recovered.eip_detached is True
@@ -682,10 +1039,21 @@ class TestManagerLifecycle:
             assert not hasattr(recovery_spec, "account")
             collected.append((worker_id, recovered_job_id))
 
+        async def quiesce(_driver, worker_id, recovered_job_id, spec):
+            assert worker_id == instance.instance_id
+            assert recovered_job_id == job_id
+            assert spec.setup.target_dir == "/srv/legacy-eip-job"
+
+        monkeypatch.setattr(
+            ManagerFleetDriver,
+            "quiesce_recovered_worker",
+            quiesce,
+        )
         monkeypatch.setattr(ManagerFleetDriver, "collect", record_collect)
         restarted = ElasticAgentManager(tmp_config, provider)
         await restarted.start()
         try:
+            await _wait_for_binding_recovery(restarted)
             recovered = await restarted.binding_manager.get_lease(lease.lease_id)
             assert collected == [(instance.instance_id, job_id)]
             assert recovered.recovery_collection_attempted is True
@@ -776,12 +1144,23 @@ class TestManagerLifecycle:
             assert instance.state != InstanceState.TERMINATED
             collected.append((worker_id, recovered_spec.name, job_id))
 
+        async def quiesce(_driver, worker_id, recovered_job_id, spec):
+            assert worker_id == str(crashed["instance_id"])
+            assert recovered_job_id == str(crashed["job_id"])
+            assert spec.name == "direct-eip-crash"
+
+        monkeypatch.setattr(
+            ManagerFleetDriver,
+            "quiesce_recovered_worker",
+            quiesce,
+        )
         monkeypatch.setattr(
             ManagerFleetDriver, "collect", record_recovery_collect
         )
         restarted = ElasticAgentManager(tmp_config, provider)
         await restarted.start()
         try:
+            await _wait_for_binding_recovery(restarted)
             recovered = await restarted.binding_manager.get_lease(
                 str(crashed["lease_id"])
             )
@@ -820,6 +1199,7 @@ class TestManagerLifecycle:
                         previous.account_binding_store.controller_id
                     ),
                     "ElasticAgentAccount": "acct-1",
+                    "ElasticAgentJob": lease.job_id,
                     "ElasticAgentLease": lease.lease_id,
                 },
             )
@@ -1907,6 +2287,36 @@ class TestEventRouting:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_bound_batch_disconnect_does_not_destroy_supervised_run(
+        self, manager,
+    ):
+        await manager.start()
+        node = NodeRecord(
+            node_id="w-bound-job",
+            instance_id="dryrun:i-bound-job",
+            platform="dryrun",
+            status=NodeStatus.READY,
+            metadata={"lease_id": "lease-bound-job"},
+        )
+        await manager.registry.add(node)
+        manager._cleanup_bound_lease = AsyncMock()
+        orchestrator = manager.batch
+        orchestrator.job_id_for_worker = MagicMock(
+            return_value="job-long-running",
+        )
+
+        with patch(
+            "elastic_agent.manager.manager.BOUND_DISCONNECT_GRACE_SECONDS", 0
+        ):
+            await manager._on_worker_disconnect(node.node_id)
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        manager._cleanup_bound_lease.assert_not_awaited()
+        assert node.node_id not in manager._bound_disconnect_tasks
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_bound_reconnect_cancels_pending_disconnect_cleanup(self, manager):
         await manager.start()
         node = NodeRecord(
@@ -2200,6 +2610,7 @@ class TestEipRecoveryHardening:
                     previous.account_binding_store.controller_id
                 ),
                 "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
                 "ElasticAgentLease": lease.lease_id,
             },
         ))
@@ -2474,6 +2885,115 @@ class TestEipRecoveryHardening:
         assert provider.get_operations("terminate") == []
         assert provider.get_operations("disassociate_eip") == []
         await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_quarantines_cloud_job_tag_mismatch(
+        self, tmp_config,
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-job-mismatch",
+            job_id="job-durable",
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": "job-cloud-conflict",
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id,
+            instance.instance_id,
+            instance.instance_id,
+        )
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        restarted._collect_recovered_lease = AsyncMock()
+        await restarted.start()
+        try:
+            for _ in range(100):
+                if lease.lease_id in restarted._recovery_unsafe_lease_ids:
+                    break
+                await asyncio.sleep(0.01)
+            assert lease.lease_id in restarted._recovery_unsafe_lease_ids
+            restarted._collect_recovered_lease.assert_not_awaited()
+            assert provider.get_operations("terminate") == []
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_quarantines_conflicting_registry_job_identity(
+        self, tmp_config,
+    ):
+        provider = DryRunProvider()
+        previous = ElasticAgentManager(tmp_config, provider)
+        await previous.start()
+        lease = await previous.binding_manager.reserve(
+            "acct-registry-job-mismatch",
+            job_id="job-durable-registry",
+        )
+        instance = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                "ManagedBy": "elastic-agent",
+                "ElasticAgentController": (
+                    previous.account_binding_store.controller_id
+                ),
+                "ElasticAgentAccount": lease.account_id,
+                "ElasticAgentJob": lease.job_id,
+                "ElasticAgentLease": lease.lease_id,
+            },
+        ))
+        await previous.account_binding_store.begin_attach(
+            lease.lease_id,
+            instance.instance_id,
+            instance.instance_id,
+        )
+        await previous.registry.add(NodeRecord(
+            node_id=instance.instance_id,
+            instance_id=instance.instance_id,
+            platform=instance.platform,
+            status=NodeStatus.READY,
+            metadata={
+                "job_id": "job-registry-conflict",
+                "account_id": lease.account_id,
+                "lease_id": lease.lease_id,
+                "controller_id": (
+                    previous.account_binding_store.controller_id
+                ),
+            },
+        ))
+        await previous.stop()
+
+        restarted = ElasticAgentManager(tmp_config, provider)
+        restarted._collect_recovered_lease = AsyncMock()
+        await restarted.start()
+        try:
+            for _ in range(100):
+                if lease.lease_id in restarted._recovery_unsafe_lease_ids:
+                    break
+                await asyncio.sleep(0.01)
+            assert lease.lease_id in restarted._recovery_unsafe_lease_ids
+            restarted._collect_recovered_lease.assert_not_awaited()
+            node = await restarted.registry.get(instance.instance_id)
+            assert node is not None
+            assert node.metadata["job_id"] == "job-registry-conflict"
+            assert provider.get_operations("terminate") == []
+        finally:
+            await restarted.stop()
 
     @pytest.mark.asyncio
     async def test_startup_quarantines_worker_without_durable_instance(

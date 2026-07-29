@@ -62,6 +62,7 @@ def test_builder_disables_background_updates_before_image_creation() -> None:
     assert "unattended-upgrades.service" in source
     assert "systemctl mask" in source
     assert "/etc/needrestart/conf.d/99-elastic-agent.conf" in source
+    assert "ea-task-supervisor|elastic-agent-task-supervisor" in source
     assert "$nrconf{restart} = 'l';" in source
     assert "ea-runtime" in source
     assert "elastic-agent-runtime" in source

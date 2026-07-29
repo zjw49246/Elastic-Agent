@@ -24,7 +24,7 @@ class TestSystemInitStep:
         assert "golden image system packages verified" in step.command
         assert "apt-get" in step.command and "update" in step.command
         assert "python3" in step.command
-        assert "awscli" in step.command
+        assert "awscli" not in step.command
         assert "cloud-init status --wait" in step.command   # fresh-boot apt lock
         assert "DPkg::Lock::Timeout" in step.command
         assert step.retry_count == 2
@@ -32,7 +32,7 @@ class TestSystemInitStep:
     def test_custom_packages(self) -> None:
         step = system_init_step(packages=["nodejs", "npm"])
         assert "nodejs npm" in step.command
-        assert "awscli" in step.command
+        assert "awscli" not in step.command
 
     def test_custom_timeout(self) -> None:
         step = system_init_step(timeout=600)
@@ -114,6 +114,7 @@ class TestHostUpdateHardeningStep:
             assert unit in step.command
         assert "systemctl mask" in step.command
         assert "/etc/needrestart/conf.d/99-elastic-agent.conf" in step.command
+        assert "ea-task-supervisor|elastic-agent-task-supervisor" in step.command
         assert "$nrconf{restart} = 'l';" in step.command
         assert "ea-runtime" in step.command
         assert "elastic-agent-runtime" in step.command
