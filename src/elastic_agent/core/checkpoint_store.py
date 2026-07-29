@@ -224,8 +224,11 @@ class S3CheckpointStore:
             if not stat.S_ISREG(opened_stat.st_mode):
                 raise CheckpointError(f"checkpoint file is not regular: {path}")
             proc_path = Path(f"/proc/self/fd/{descriptor}")
-            if proc_path.exists():
-                proc_path.resolve(strict=True).relative_to(root)
+            if not proc_path.exists():
+                raise CheckpointError(
+                    "cannot verify checkpoint file descriptor ancestry"
+                )
+            proc_path.resolve(strict=True).relative_to(root)
             return os.fdopen(descriptor, "rb"), opened_stat
         except BaseException:
             os.close(descriptor)
@@ -541,6 +544,7 @@ class S3CheckpointStore:
             blob_root = (
                 f"{worker_root}/checkpoints/{manifest_generation}/blobs/"
             )
+            restored_paths: set[str] = set()
             for raw in files:
                 if not isinstance(raw, dict):
                     raise CheckpointError("invalid checkpoint file entry")
@@ -548,6 +552,11 @@ class S3CheckpointStore:
                     str(raw.get("path") or ""),
                     label="checkpoint path",
                 )
+                if relative in restored_paths:
+                    raise CheckpointError(
+                        "duplicate checkpoint file path"
+                    )
+                restored_paths.add(relative)
                 if not _under_any_path(relative, normalized_paths):
                     raise CheckpointError(
                         f"checkpoint path is outside requested roots: {relative}"
