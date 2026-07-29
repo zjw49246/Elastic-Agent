@@ -12,9 +12,11 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
+import elastic_agent.worker.task_supervisor as task_supervisor_module
 from elastic_agent.worker.runtime import WorkerRuntime
 from elastic_agent.worker.task_supervisor import (
     SupervisedTaskLaunch,
@@ -598,3 +600,407 @@ async def test_spool_symlink_is_rejected_without_overwriting_target(
 
     assert terminal["error_type"] == "task_supervisor_error"
     assert victim.read_text() == "untouched"
+
+
+@pytest.mark.asyncio
+async def test_spool_limit_stops_noisy_task_without_hanging(tmp_path):
+    socket_path = tmp_path / "run" / "control.sock"
+    server = TaskSupervisorServer(
+        socket_path=socket_path,
+        state_dir=tmp_path / "state",
+        log_dir=tmp_path / "logs",
+        max_spool_bytes=600_000,
+    )
+    await server.start()
+    client = TaskSupervisorClient(socket_path)
+    try:
+        await client.launch(SupervisedTaskLaunch(
+            task_id="bounded-spool",
+            command=[
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys\nwhile True: sys.stdout.write('x' * 65535 + '\\n')",
+            ],
+            cwd=str(tmp_path),
+            env=dict(os.environ),
+            timeout_seconds=60,
+        ))
+        _, terminal = await _wait_for_terminal(
+            client, "bounded-spool", timeout=10,
+        )
+        assert terminal["error_type"] == "task_supervisor_error"
+        assert (tmp_path / "logs" / "bounded-spool.ndjson").stat().st_size <= 600_000
+    finally:
+        await server.stop(terminate_tasks=True)
+
+
+@pytest.mark.asyncio
+async def test_partial_spool_write_is_rolled_back_before_terminal(
+    supervisor,
+    tmp_path,
+    monkeypatch,
+):
+    _server, client, _state_dir, log_dir = supervisor
+    original_write_all = task_supervisor_module._write_all
+    failed = False
+
+    def partial_write(fd, data):
+        nonlocal failed
+        if not failed and data.startswith(b'{"task_id"'):
+            failed = True
+            os.write(fd, data[: max(1, len(data) // 2)])
+            raise OSError("injected partial spool write")
+        return original_write_all(fd, data)
+
+    monkeypatch.setattr(task_supervisor_module, "_write_all", partial_write)
+    await client.launch(SupervisedTaskLaunch(
+        task_id="partial-spool",
+        command=[
+            sys.executable,
+            "-u",
+            "-c",
+            "import time; print('partial-record'); time.sleep(60)",
+        ],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=120,
+    ))
+
+    records, terminal = await _wait_for_terminal(
+        client,
+        "partial-spool",
+    )
+    assert records == []
+    assert terminal["error_type"] == "task_supervisor_error"
+    raw = (log_dir / "partial-spool.ndjson").read_bytes()
+    assert raw == b""
+
+
+@pytest.mark.asyncio
+async def test_unrecoverable_partial_spool_tail_cannot_hide_terminal(
+    supervisor,
+    tmp_path,
+    monkeypatch,
+):
+    _server, client, _state_dir, log_dir = supervisor
+    original_write_all = task_supervisor_module._write_all
+    failed = False
+
+    def partial_write(fd, data):
+        nonlocal failed
+        if not failed and data.startswith(b'{"task_id"'):
+            failed = True
+            os.write(fd, data[: max(1, len(data) // 2)])
+            raise OSError("injected partial spool write")
+        return original_write_all(fd, data)
+
+    def fail_rollback(_fd, _length):
+        raise OSError("injected truncate failure")
+
+    monkeypatch.setattr(task_supervisor_module, "_write_all", partial_write)
+    monkeypatch.setattr(task_supervisor_module.os, "ftruncate", fail_rollback)
+    await client.launch(SupervisedTaskLaunch(
+        task_id="partial-spool-no-rollback",
+        command=[
+            sys.executable,
+            "-u",
+            "-c",
+            "import time; print('partial-record'); time.sleep(60)",
+        ],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=120,
+    ))
+
+    records, terminal = await _wait_for_terminal(
+        client,
+        "partial-spool-no-rollback",
+    )
+    assert records == []
+    assert terminal["error_type"] == "task_supervisor_error"
+    raw = (log_dir / "partial-spool-no-rollback.ndjson").read_bytes()
+    assert raw and not raw.endswith(b"\n")
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_retries_using_reserved_space(
+    supervisor,
+    tmp_path,
+    monkeypatch,
+):
+    server, client, state_dir, _log_dir = supervisor
+    original_atomic_write = task_supervisor_module.atomic_write_private
+    terminal_attempts = 0
+
+    def flaky_atomic_write(path, data):
+        nonlocal terminal_attempts
+        if Path(path).name == "terminal.json":
+            terminal_attempts += 1
+            if terminal_attempts < 3:
+                raise OSError("injected terminal ENOSPC")
+        return original_atomic_write(path, data)
+
+    monkeypatch.setattr(
+        task_supervisor_module,
+        "atomic_write_private",
+        flaky_atomic_write,
+    )
+    await client.launch(SupervisedTaskLaunch(
+        task_id="terminal-retry",
+        command=[sys.executable, "-c", "raise SystemExit(4)"],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=10,
+    ))
+
+    _, terminal = await _wait_for_terminal(client, "terminal-retry")
+    assert terminal["exit_code"] == 4
+    assert terminal_attempts == 3
+    assert server.fatal_error is None
+    task_dir = next(
+        path for path in state_dir.iterdir() if path.is_dir()
+    )
+    assert not (task_dir / "terminal.reserve").exists()
+
+
+@pytest.mark.asyncio
+async def test_permanent_terminal_commit_failure_marks_supervisor_fatal(
+    supervisor,
+    tmp_path,
+    monkeypatch,
+):
+    server, client, _state_dir, _log_dir = supervisor
+    original_atomic_write = task_supervisor_module.atomic_write_private
+
+    def fail_terminal(path, data):
+        if Path(path).name == "terminal.json":
+            raise OSError("injected permanent terminal failure")
+        return original_atomic_write(path, data)
+
+    monkeypatch.setattr(
+        task_supervisor_module,
+        "atomic_write_private",
+        fail_terminal,
+    )
+    await client.launch(SupervisedTaskLaunch(
+        task_id="terminal-fatal",
+        command=[sys.executable, "-c", "raise SystemExit(0)"],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=10,
+    ))
+
+    await asyncio.wait_for(server.fatal_event.wait(), timeout=5)
+    assert server.fatal_error == "durable terminal state is unavailable"
+    with pytest.raises(TaskSupervisorError):
+        await client.list_tasks()
+
+
+@pytest.mark.asyncio
+async def test_runtime_cursor_advances_only_after_complete_batch_and_reloads(
+    supervisor,
+    tmp_path,
+):
+    server, client, _state_dir, _log_dir = supervisor
+    await client.launch(SupervisedTaskLaunch(
+        task_id="durable-cursor",
+        command=[
+            sys.executable,
+            "-u",
+            "-c",
+            "print('first'); print('second')",
+        ],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=10,
+    ))
+    runtime_log_dir = tmp_path / "runtime-cursor"
+    runtime = WorkerRuntime(
+        manager_url="ws://unused",
+        auth_token="token",
+        worker_id="worker-1",
+        log_dir=str(runtime_log_dir),
+        task_supervisor_socket=str(server.socket_path),
+    )
+    original_handler = runtime._handle_process_log_line
+
+    async def fail_first_batch(*_args, **_kwargs):
+        raise RuntimeError("injected relay failure")
+
+    runtime._handle_process_log_line = fail_first_batch
+    assert await runtime._recover_supervised_task_inventory()
+    first_monitor = runtime._supervised_monitor_tasks["durable-cursor"]
+    await asyncio.wait_for(first_monitor, timeout=5)
+    assert runtime._supervised_offsets["durable-cursor"] == 0
+
+    runtime._handle_process_log_line = original_handler
+    assert await runtime._recover_supervised_task_inventory()
+    second_monitor = runtime._supervised_monitor_tasks["durable-cursor"]
+    await asyncio.wait_for(second_monitor, timeout=5)
+    committed_offset = runtime._supervised_offsets["durable-cursor"]
+    assert committed_offset > 0
+
+    restarted = WorkerRuntime(
+        manager_url="ws://unused",
+        auth_token="token",
+        worker_id="worker-1",
+        log_dir=str(runtime_log_dir),
+        task_supervisor_socket=str(server.socket_path),
+    )
+    assert restarted._supervised_offsets["durable-cursor"] == committed_offset
+    await runtime.stop()
+    await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_ack_failure_retains_outbox_until_retry(
+    supervisor,
+    tmp_path,
+):
+    server, _client, _state_dir, _log_dir = supervisor
+    runtime = WorkerRuntime(
+        manager_url="ws://unused",
+        auth_token="token",
+        worker_id="worker-1",
+        log_dir=str(tmp_path / "runtime-ack"),
+        task_supervisor_socket=str(server.socket_path),
+    )
+    runtime._running = True
+    await runtime._recover_supervised_task_inventory()
+    from elastic_agent.core.protocols.messages import (
+        EventAckMessage,
+        ExecuteMessage,
+    )
+
+    await runtime._handle_execute(ExecuteMessage(
+        task_id="ack-retry",
+        command=[sys.executable, "-c", "print('done')"],
+        cwd=str(tmp_path),
+        timeout=10,
+    ))
+    await asyncio.wait_for(
+        runtime._supervised_monitor_tasks["ack-retry"],
+        timeout=5,
+    )
+    event_id = next(
+        event_id
+        for event_id, data in runtime._reliable_events.items()
+        if json.loads(data)["type"] == "PROCESS_EXIT"
+    )
+    supervisor_client = runtime._task_supervisor
+    original_ack = runtime._task_supervisor.ack_event
+    attempts = 0
+
+    async def flaky_ack(candidate):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TaskSupervisorError("injected ACK outage")
+        await original_ack(candidate)
+
+    runtime._task_supervisor.ack_event = flaky_ack
+    await runtime._handle_event_ack(EventAckMessage(event_id=event_id))
+    assert event_id in runtime._reliable_events
+    assert not runtime._process_inventory_complete
+    assert len(await supervisor_client.list_tasks()) == 1
+
+    await runtime._handle_event_ack(EventAckMessage(event_id=event_id))
+    assert event_id not in runtime._reliable_events
+    assert "ack-retry" not in runtime._supervised_offsets
+    assert await supervisor_client.list_tasks() == []
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_fence_failure_replays_same_spool_frame(
+    supervisor,
+    tmp_path,
+):
+    server, client, _state_dir, _log_dir = supervisor
+    await client.launch(SupervisedTaskLaunch(
+        task_id="exhaustion-fence-retry",
+        command=[
+            sys.executable,
+            "-u",
+            "-c",
+            "import time; print('You hit your usage limit'); time.sleep(60)",
+        ],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=120,
+        job_id="job-exhaustion-retry",
+        watch_exhaustion=True,
+    ))
+    runtime = WorkerRuntime(
+        manager_url="ws://unused",
+        auth_token="token",
+        worker_id="worker-1",
+        log_dir=str(tmp_path / "runtime-exhaustion"),
+        task_supervisor_socket=str(server.socket_path),
+    )
+    original_mark = runtime._task_supervisor.mark_exhaustion
+
+    async def fail_mark(*_args, **_kwargs):
+        raise TaskSupervisorError("injected exhaustion-fence outage")
+
+    runtime._task_supervisor.mark_exhaustion = fail_mark
+    assert await runtime._recover_supervised_task_inventory()
+    first_monitor = runtime._supervised_monitor_tasks[
+        "exhaustion-fence-retry"
+    ]
+    await asyncio.wait_for(first_monitor, timeout=5)
+    assert runtime._supervised_offsets["exhaustion-fence-retry"] == 0
+    assert "exhaustion-fence-retry" not in runtime._exhaustion_fired
+
+    runtime._task_supervisor.mark_exhaustion = original_mark
+    assert await runtime._recover_supervised_task_inventory()
+    second_monitor = runtime._supervised_monitor_tasks[
+        "exhaustion-fence-retry"
+    ]
+    await asyncio.wait_for(second_monitor, timeout=25)
+    persisted_types = [
+        json.loads(data)["type"]
+        for data in runtime._reliable_events.values()
+    ]
+    assert persisted_types == ["RUN_EXHAUSTED", "PROCESS_EXIT"]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_ack_tombstone_wins_crash_before_descriptor_cleanup(
+    supervisor,
+    tmp_path,
+):
+    server, client, state_dir, log_dir = supervisor
+    await client.launch(SupervisedTaskLaunch(
+        task_id="acked-crash-window",
+        command=[sys.executable, "-c", "raise SystemExit(0)"],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=10,
+    ))
+    await _wait_for_terminal(client, "acked-crash-window")
+    server._completed_task_ids["acked-crash-window"] = None
+    server._persist_task_tombstones()
+    await server.stop(terminate_tasks=True)
+
+    restarted_server = TaskSupervisorServer(
+        socket_path=server.socket_path,
+        state_dir=state_dir,
+        log_dir=log_dir,
+    )
+    await restarted_server.start()
+    try:
+        restarted = TaskSupervisorClient(server.socket_path)
+        assert await restarted.list_tasks() == []
+        with pytest.raises(TaskSupervisorError):
+            await restarted.launch(SupervisedTaskLaunch(
+                task_id="acked-crash-window",
+                command=[sys.executable, "-c", "raise SystemExit(99)"],
+                cwd=str(tmp_path),
+                env=dict(os.environ),
+                timeout_seconds=10,
+            ))
+    finally:
+        await restarted_server.stop(terminate_tasks=True)

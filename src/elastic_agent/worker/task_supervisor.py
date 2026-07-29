@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
+import errno
 import hashlib
 import json
 import logging
@@ -29,7 +30,7 @@ import signal
 import stat
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -47,6 +48,9 @@ _SCHEMA_VERSION = 1
 _MAX_RPC_BYTES = 32 * 1024 * 1024
 _MAX_LOG_FRAME_BYTES = 64 * 1024
 _MAX_SPOOL_RECORD_BYTES = _MAX_LOG_FRAME_BYTES * 8 + 4096
+_DEFAULT_MAX_SPOOL_BYTES = 2 * 1024 * 1024 * 1024
+_TERMINAL_RESERVE_BYTES = 256 * 1024
+_TERMINAL_COMMIT_ATTEMPTS = 5
 _MAX_POLL_RECORDS = 16
 _MAX_POLL_BYTES = 1024 * 1024
 _MAX_ACKED_TASK_TOMBSTONES = 4096
@@ -175,11 +179,13 @@ class _ServerTask:
     directory: Path
     descriptor_path: Path
     terminal_path: Path
+    terminal_reserve_path: Path
     spool_path: Path
     process: asyncio.subprocess.Process | None = None
     monitor_task: asyncio.Task[None] | None = None
     stdin_lock: asyncio.Lock | None = None
     signal_lock: asyncio.Lock | None = None
+    spool_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     terminal: dict[str, Any] | None = None
     last_spool_fsync: float = 0.0
     deadline_monotonic: float | None = None
@@ -346,15 +352,29 @@ class TaskSupervisorServer:
         socket_path: str | Path,
         state_dir: str | Path,
         log_dir: str | Path,
+        max_spool_bytes: int = _DEFAULT_MAX_SPOOL_BYTES,
     ) -> None:
+        if max_spool_bytes <= _MAX_SPOOL_RECORD_BYTES:
+            raise ValueError("max_spool_bytes is too small")
         self.socket_path = Path(socket_path)
         self.state_dir = Path(state_dir)
         self.log_dir = Path(log_dir)
+        self.max_spool_bytes = max_spool_bytes
         self._server: asyncio.AbstractServer | None = None
         self._tasks: dict[str, _ServerTask] = {}
         self._tasks_lock = asyncio.Lock()
         self._tombstone_path = self.state_dir / "acked_tasks.json"
         self._completed_task_ids: dict[str, None] = {}
+        self._fatal_error: str | None = None
+        self._fatal_event = asyncio.Event()
+
+    @property
+    def fatal_event(self) -> asyncio.Event:
+        return self._fatal_event
+
+    @property
+    def fatal_error(self) -> str | None:
+        return self._fatal_error
 
     @property
     def running_task_ids(self) -> list[str]:
@@ -432,7 +452,20 @@ class TaskSupervisorServer:
             _secure_directory(directory)
             descriptor_path = directory / "descriptor.json"
             terminal_path = directory / "terminal.json"
+            terminal_reserve_path = directory / "terminal.reserve"
             if not descriptor_path.exists():
+                # A daemon can die after reserving terminal-state space but
+                # before the process/descriptor commit.  No command can be
+                # adopted without a descriptor, so clean only this known
+                # private artifact and leave any unexpected entry untouched.
+                if terminal_reserve_path.exists():
+                    tighten_state_file(terminal_reserve_path)
+                    terminal_reserve_path.unlink()
+                    fsync_directory(directory)
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
                 continue
             tighten_state_file(descriptor_path)
             try:
@@ -446,6 +479,24 @@ class TaskSupervisorServer:
                 ) from exc
             if directory.name != _task_key(descriptor.task_id):
                 raise TaskSupervisorError("task descriptor directory mismatch")
+            if descriptor.task_id in self._completed_task_ids:
+                # The tombstone is the durable ACK commit point.  A crash can
+                # occur before the acknowledged descriptor is unlinked; never
+                # resurrect it and replay an already-accepted terminal event.
+                for path in (
+                    terminal_path,
+                    terminal_reserve_path,
+                    descriptor_path,
+                ):
+                    if path.exists():
+                        tighten_state_file(path)
+                        path.unlink()
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+                fsync_directory(self.state_dir)
+                continue
             terminal = None
             if terminal_path.exists():
                 tighten_state_file(terminal_path)
@@ -477,6 +528,7 @@ class TaskSupervisorServer:
                 directory=directory,
                 descriptor_path=descriptor_path,
                 terminal_path=terminal_path,
+                terminal_reserve_path=terminal_reserve_path,
                 spool_path=self.log_dir / f"{descriptor.task_id}.ndjson",
                 terminal=terminal,
                 stdin_lock=asyncio.Lock(),
@@ -487,6 +539,7 @@ class TaskSupervisorServer:
                 self._persist_descriptor(task)
             self._tasks[descriptor.task_id] = task
             if descriptor.state == "running":
+                self._ensure_terminal_reserve(task)
                 # The daemon is the only process that can retain waitpid and
                 # pipe ownership. A daemon restart cannot safely adopt a stale
                 # PID, so terminate only an exact Linux start-time match and
@@ -609,6 +662,8 @@ class TaskSupervisorServer:
             await writer.wait_closed()
 
     async def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self._fatal_error is not None:
+            raise TaskSupervisorError("task supervisor state is unavailable")
         op = request.get("op")
         if op == "launch":
             launch = self._parse_launch(request.get("launch"))
@@ -772,7 +827,9 @@ class TaskSupervisorServer:
             )
             descriptor_path = directory / "descriptor.json"
             terminal_path = directory / "terminal.json"
+            terminal_reserve_path = directory / "terminal.reserve"
             spool_path = self.log_dir / f"{launch.task_id}.ndjson"
+            self._create_terminal_reserve(terminal_reserve_path)
             try:
                 process = await asyncio.create_subprocess_exec(
                     *launch.command,
@@ -784,10 +841,18 @@ class TaskSupervisorServer:
                     start_new_session=True,
                 )
             except Exception as exc:
+                self._discard_terminal_reserve(
+                    terminal_reserve_path,
+                    directory,
+                )
                 raise TaskSupervisorError("process launch failed") from exc
             start_ticks = _pid_start_ticks(process.pid)
             if os.name == "posix" and start_ticks == 0:
                 await self._kill_unregistered_process(process)
+                self._discard_terminal_reserve(
+                    terminal_reserve_path,
+                    directory,
+                )
                 raise TaskSupervisorError(
                     "could not bind process identity"
                 )
@@ -817,6 +882,7 @@ class TaskSupervisorServer:
                 directory=directory,
                 descriptor_path=descriptor_path,
                 terminal_path=terminal_path,
+                terminal_reserve_path=terminal_reserve_path,
                 spool_path=spool_path,
                 process=process,
                 stdin_lock=asyncio.Lock(),
@@ -831,10 +897,111 @@ class TaskSupervisorServer:
                 self._persist_descriptor(task)
             except Exception:
                 await self._kill_unregistered_process(process)
+                self._discard_terminal_reserve(
+                    terminal_reserve_path,
+                    directory,
+                )
                 raise
             self._tasks[launch.task_id] = task
             task.monitor_task = asyncio.create_task(self._monitor(task))
+            task.monitor_task.add_done_callback(self._monitor_done)
             return task
+
+    @staticmethod
+    def _create_terminal_reserve(path: Path) -> None:
+        """Durably reserve blocks needed to publish terminal metadata.
+
+        The spool and state directories normally share one worker filesystem.
+        Releasing this allocation immediately before terminal.json is written
+        keeps a noisy task or result tree from consuming the final metadata
+        blocks and stranding a dead process as ``running``.
+        """
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            allocated = False
+            if hasattr(os, "posix_fallocate"):
+                try:
+                    os.posix_fallocate(fd, 0, _TERMINAL_RESERVE_BYTES)
+                    allocated = True
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EINVAL,
+                        errno.ENOSYS,
+                        errno.EOPNOTSUPP,
+                    }:
+                        raise
+            if not allocated:
+                remaining = _TERMINAL_RESERVE_BYTES
+                block = b"\0" * min(64 * 1024, remaining)
+                while remaining:
+                    chunk = block[:remaining]
+                    _write_all(fd, chunk)
+                    remaining -= len(chunk)
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            fsync_directory(path.parent)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            path.unlink(missing_ok=True)
+            raise
+
+    @classmethod
+    def _discard_terminal_reserve(
+        cls,
+        path: Path,
+        directory: Path,
+    ) -> None:
+        if path.exists():
+            tighten_state_file(path)
+            path.unlink()
+            fsync_directory(directory)
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    def _ensure_terminal_reserve(self, task: _ServerTask) -> None:
+        path = task.terminal_reserve_path
+        if path.exists():
+            tighten_state_file(path)
+            if path.stat().st_size < _TERMINAL_RESERVE_BYTES:
+                path.unlink()
+                fsync_directory(task.directory)
+            else:
+                return
+        self._create_terminal_reserve(path)
+
+    @staticmethod
+    def _release_terminal_reserve(task: _ServerTask) -> None:
+        path = task.terminal_reserve_path
+        if not path.exists():
+            return
+        tighten_state_file(path)
+        path.unlink()
+        fsync_directory(task.directory)
+
+    def _monitor_done(self, monitor: asyncio.Task[None]) -> None:
+        if monitor.cancelled():
+            return
+        try:
+            error = monitor.exception()
+        except asyncio.CancelledError:
+            return
+        if error is None:
+            return
+        logger.critical(
+            "Task supervisor cannot publish durable terminal state (%s)",
+            type(error).__name__,
+        )
+        self._fatal_error = "durable terminal state is unavailable"
+        self._fatal_event.set()
 
     @staticmethod
     async def _kill_unregistered_process(
@@ -873,6 +1040,11 @@ class TaskSupervisorServer:
         monitor_error = False
         try:
             while process.returncode is None:
+                for stream_task in (stdout_task, stderr_task):
+                    if stream_task.done():
+                        stream_error = stream_task.exception()
+                        if stream_error is not None:
+                            raise stream_error
                 deadline = task.deadline_monotonic
                 if deadline is not None and time.monotonic() >= deadline:
                     timeout_error = True
@@ -1007,25 +1179,46 @@ class TaskSupervisorServer:
                 "parsed": None,
             }
             encoded = _json_line(record)
-            open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-            if hasattr(os, "O_NOFOLLOW"):
-                open_flags |= os.O_NOFOLLOW
-            fd = os.open(
-                task.spool_path,
-                open_flags,
-                0o600,
-            )
-            try:
-                os.fchmod(fd, 0o600)
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise TaskSupervisorError("task spool is not regular")
-                _write_all(fd, encoded)
-                now = time.monotonic()
-                if now - task.last_spool_fsync >= 1.0:
-                    os.fsync(fd)
-                    task.last_spool_fsync = now
-            finally:
-                os.close(fd)
+            async with task.spool_lock:
+                open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                if hasattr(os, "O_NOFOLLOW"):
+                    open_flags |= os.O_NOFOLLOW
+                fd = os.open(
+                    task.spool_path,
+                    open_flags,
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    spool_stat = os.fstat(fd)
+                    if not stat.S_ISREG(spool_stat.st_mode):
+                        raise TaskSupervisorError("task spool is not regular")
+                    if spool_stat.st_size + len(encoded) > self.max_spool_bytes:
+                        raise TaskSupervisorError(
+                            "task output spool limit exceeded"
+                        )
+                    try:
+                        _write_all(fd, encoded)
+                        now = time.monotonic()
+                        if now - task.last_spool_fsync >= 1.0:
+                            os.fsync(fd)
+                            task.last_spool_fsync = now
+                    except Exception:
+                        # os.write may have appended only part of the JSON line
+                        # before ENOSPC/EIO.  A trailing partial line prevents
+                        # poll() from ever reaching EOF and therefore suppresses
+                        # the terminal event forever.  Roll the record back
+                        # while both stream writers remain serialized.
+                        try:
+                            os.ftruncate(fd, spool_stat.st_size)
+                            os.fsync(fd)
+                        except Exception as rollback_error:
+                            raise TaskSupervisorError(
+                                "task spool rollback failed"
+                            ) from rollback_error
+                        raise
+                finally:
+                    os.close(fd)
 
     @staticmethod
     def _fsync_spool(task: _ServerTask) -> None:
@@ -1046,8 +1239,6 @@ class TaskSupervisorServer:
         error_type: str | None,
         error_message: str | None,
     ) -> None:
-        if task.terminal is not None:
-            return
         terminal = {
             "schema_version": _SCHEMA_VERSION,
             "task_id": task.descriptor.task_id,
@@ -1057,19 +1248,45 @@ class TaskSupervisorServer:
             "error_message": error_message,
             "finished_at": _utcnow_iso(),
         }
-        atomic_write_private(
-            task.terminal_path,
-            json.dumps(terminal, sort_keys=True, separators=(",", ":")),
-        )
-        task.terminal = terminal
-        task.descriptor = SupervisedTaskDescriptor(
-            **{
-                **asdict(task.descriptor),
-                "state": "terminal",
-            }
-        )
-        self._persist_descriptor(task)
-        task.process = None
+        last_error: Exception | None = None
+        for attempt in range(_TERMINAL_COMMIT_ATTEMPTS):
+            try:
+                self._release_terminal_reserve(task)
+                if task.terminal is None:
+                    atomic_write_private(
+                        task.terminal_path,
+                        json.dumps(
+                            terminal,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    task.terminal = terminal
+                if task.descriptor.state != "terminal":
+                    task.descriptor = SupervisedTaskDescriptor(
+                        **{
+                            **asdict(task.descriptor),
+                            "state": "terminal",
+                        }
+                    )
+                    self._persist_descriptor(task)
+                task.process = None
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.error(
+                    "Could not commit terminal state for task %s "
+                    "(attempt %d/%d, %s)",
+                    task.descriptor.task_id,
+                    attempt + 1,
+                    _TERMINAL_COMMIT_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                if attempt + 1 < _TERMINAL_COMMIT_ATTEMPTS:
+                    await asyncio.sleep(0.05 * (2**attempt))
+        raise TaskSupervisorError(
+            "durable terminal state could not be committed"
+        ) from last_error
 
     async def _get_task(self, task_id: str) -> _ServerTask:
         async with self._tasks_lock:
@@ -1102,8 +1319,16 @@ class TaskSupervisorServer:
                     if not raw:
                         break
                     if not raw.endswith(b"\n"):
-                        # A writer has not committed the complete record yet.
-                        stream.seek(-len(raw), os.SEEK_CUR)
+                        if task.terminal is not None:
+                            # No writer exists after terminal commit.  A prior
+                            # ENOSPC/EIO may have prevented even the rollback
+                            # truncate; discard only this uncommitted tail so it
+                            # cannot suppress the durable terminal forever.
+                            stream.seek(0, os.SEEK_END)
+                        else:
+                            # A live writer has not committed the complete
+                            # record yet; retry from the same byte next poll.
+                            stream.seek(-len(raw), os.SEEK_CUR)
                         break
                     consumed += len(raw)
                     if consumed > _MAX_POLL_BYTES:
@@ -1180,6 +1405,10 @@ class TaskSupervisorServer:
                 task.terminal is not None
                 and task.terminal["event_id"] == event_id
             ):
+                if task.descriptor.pending_exhaustion is not None:
+                    raise TaskSupervisorError(
+                        "prior exhaustion event is not acknowledged"
+                    )
                 async with self._tasks_lock:
                     current = self._tasks.get(task.descriptor.task_id)
                     if current is not task:
@@ -1300,6 +1529,7 @@ async def _serve(args: argparse.Namespace) -> None:
         socket_path=args.socket,
         state_dir=args.state_dir,
         log_dir=args.log_dir,
+        max_spool_bytes=args.max_spool_bytes,
     )
     await server.start()
     stopping = asyncio.Event()
@@ -1309,8 +1539,21 @@ async def _serve(args: argparse.Namespace) -> None:
             loop.add_signal_handler(sig, stopping.set)
         except NotImplementedError:
             pass
-    await stopping.wait()
+    stopping_task = asyncio.create_task(stopping.wait())
+    fatal_task = asyncio.create_task(server.fatal_event.wait())
+    done, pending = await asyncio.wait(
+        {stopping_task, fatal_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    fatal = fatal_task in done and server.fatal_error is not None
+    for waiter in pending:
+        waiter.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     await server.stop(terminate_tasks=True)
+    if fatal:
+        raise TaskSupervisorError(
+            server.fatal_error or "task supervisor state is unavailable"
+        )
 
 
 def main() -> None:
@@ -1320,6 +1563,12 @@ def main() -> None:
     parser.add_argument("--socket", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--log-dir", required=True)
+    parser.add_argument(
+        "--max-spool-bytes",
+        type=int,
+        default=_DEFAULT_MAX_SPOOL_BYTES,
+        help="maximum durable stdout/stderr spool bytes per task",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,

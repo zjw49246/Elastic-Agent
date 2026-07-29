@@ -80,7 +80,11 @@ from elastic_agent.core.rate_limit import (
     is_cloudrouter_transient,
     is_rate_limited,
 )
-from elastic_agent.core.secure_store import atomic_write_private, secure_state_directory
+from elastic_agent.core.secure_store import (
+    atomic_write_private,
+    secure_state_directory,
+    tighten_state_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +109,8 @@ _MAX_PENDING_DATA_FRAMES = 64
 _MAX_DATA_TRANSPORT_FRAME_BYTES = 1024 * 1024
 _MAX_PENDING_DATA_BYTES = 8 * 1024 * 1024
 _MAX_COMPLETED_LOGIN_RECORDS = 256
+_SUPERVISED_OFFSETS_VERSION = 1
+_MAX_SUPERVISED_OFFSETS = 4096
 _AGENT_API_ERROR_PRIORITY = {
     "agent_api_error": 1,
     "agent_api_transient_error": 2,
@@ -359,6 +365,9 @@ class WorkerRuntime:
         self._heartbeat_interval = heartbeat_interval
         self._log_dir = Path(log_dir)
         self._event_outbox_path = self._log_dir / "event_outbox.json"
+        self._supervised_offsets_path = (
+            self._log_dir / "supervised_offsets.json"
+        )
         self._event_outbox_lock = asyncio.Lock()
         self._reliable_events = self._load_reliable_events()
         # A WebSocket send can fail after dequeue.  Keep that exact frame ahead
@@ -403,7 +412,7 @@ class WorkerRuntime:
             self._task_supervisor = TaskSupervisorClient(supervisor_socket)
         self._supervised_tasks: dict[str, Any] = {}
         self._supervised_monitor_tasks: dict[str, asyncio.Task] = {}
-        self._supervised_offsets: dict[str, int] = {}
+        self._supervised_offsets = self._load_supervised_offsets()
         self._supervisor_event_task_ids: dict[str, str] = {}
         self._process_inventory_complete = self._task_supervisor is None
         self._process_inventory_error: str | None = None
@@ -1159,6 +1168,7 @@ class WorkerRuntime:
             inventory_ids = {
                 descriptor.task_id for descriptor in descriptors
             }
+            offsets_changed = False
             for stale_task_id in (
                 set(self._supervised_tasks) - inventory_ids
             ):
@@ -1169,12 +1179,25 @@ class WorkerRuntime:
                 if stale_monitor is not None:
                     stale_monitor.cancel()
                 self._supervised_tasks.pop(stale_task_id, None)
-                self._supervised_offsets.pop(stale_task_id, None)
+                if self._supervised_offsets.pop(stale_task_id, None) is not None:
+                    offsets_changed = True
                 self._exhaustion_watch.pop(stale_task_id, None)
                 self._exhaustion_fired.discard(stale_task_id)
                 self._agent_api_tasks.pop(stale_task_id, None)
             for descriptor in descriptors:
                 self._register_supervised_task(descriptor)
+            retained_exit_task_ids = (
+                self._pending_outbox_process_exit_task_ids()
+            )
+            for stale_task_id in (
+                set(self._supervised_offsets)
+                - inventory_ids
+                - retained_exit_task_ids
+            ):
+                self._supervised_offsets.pop(stale_task_id, None)
+                offsets_changed = True
+            if offsets_changed:
+                self._persist_supervised_offsets()
         except Exception as exc:
             logger.warning(
                 "Independent task inventory is incomplete (%s)",
@@ -1248,7 +1271,6 @@ class WorkerRuntime:
                     task_id,
                     offset=offset,
                 )
-                self._supervised_offsets[task_id] = snapshot.next_offset
                 for record in snapshot.records:
                     stream = record.get("stream")
                     data = record.get("data")
@@ -1262,6 +1284,16 @@ class WorkerRuntime:
                         stream,
                         data,
                     )
+                if snapshot.next_offset != offset:
+                    self._supervised_offsets[task_id] = snapshot.next_offset
+                    try:
+                        self._persist_supervised_offsets()
+                    except Exception:
+                        # The durable cursor remains at ``offset``.  Keep memory
+                        # aligned with that truth so the next inventory retries
+                        # this whole batch instead of silently skipping frames.
+                        self._supervised_offsets[task_id] = offset
+                        raise
                 if snapshot.terminal is not None:
                     await self._finish_supervised_task(
                         task_id,
@@ -1332,7 +1364,6 @@ class WorkerRuntime:
 
         await self._mark_task_exiting(task_id)
         self._supervised_tasks.pop(task_id, None)
-        self._supervised_offsets.pop(task_id, None)
         self._exhaustion_watch.pop(task_id, None)
         self._exhaustion_fired.discard(task_id)
         self._agent_api_tasks.pop(task_id, None)
@@ -1826,14 +1857,22 @@ class WorkerRuntime:
                 )
             except Exception as exc:
                 # Rotation without a durable ownership fence could dispatch a
-                # second command after runtime replacement. Fail the eventual
-                # PROCESS_EXIT instead of risking concurrent credential use.
+                # second command after runtime replacement.  Do not consume the
+                # spool batch or permanently suppress detection: inventory will
+                # retry the same frame once the supervisor is reachable.
+                self._exhaustion_fired.discard(task_id)
+                self._process_inventory_complete = False
+                self._process_inventory_error = (
+                    "independent exhaustion fence is unavailable"
+                )
                 logger.error(
                     "Could not persist exhaustion for task %s (%s)",
                     task_id,
                     type(exc).__name__,
                 )
-                return
+                raise RuntimeError(
+                    "could not persist supervised exhaustion fence"
+                ) from exc
             descriptor = self._supervised_tasks[task_id]
             pending = {
                 "event_id": exhausted_event.event_id,
@@ -1861,7 +1900,13 @@ class WorkerRuntime:
                     "Task %s did not stop after exhaustion; refusing rotation",
                     task_id,
                 )
-                return
+                self._process_inventory_complete = False
+                self._process_inventory_error = (
+                    "exhausted supervised task has not stopped"
+                )
+                raise RuntimeError(
+                    "exhausted supervised task has not reached terminal state"
+                )
         if proc is not None and proc.returncode is None:
             if not await self._wait_process_exit(proc, 15):
                 logger.warning(
@@ -3207,6 +3252,75 @@ class WorkerRuntime:
 
     # ---- Send helper ----
 
+    def _load_supervised_offsets(self) -> dict[str, int]:
+        """Load the durable supervisor spool cursor.
+
+        Replaying from zero is safe but can take hours for a multi-gigabyte
+        short-line spool and delays terminal collection.  A corrupt cursor is
+        therefore ignored (safe replay) rather than trusted to skip output.
+        """
+
+        try:
+            if not self._supervised_offsets_path.is_file():
+                return {}
+            tighten_state_file(self._supervised_offsets_path)
+            payload = json.loads(
+                self._supervised_offsets_path.read_text(encoding="utf-8")
+            )
+            offsets = payload.get("offsets") if isinstance(payload, dict) else None
+            if (
+                set(payload) != {"version", "offsets"}
+                or payload["version"] != _SUPERVISED_OFFSETS_VERSION
+                or not isinstance(offsets, dict)
+                or len(offsets) > _MAX_SUPERVISED_OFFSETS
+                or any(
+                    not isinstance(task_id, str)
+                    or not task_id
+                    or len(task_id) > 256
+                    or not isinstance(offset, int)
+                    or isinstance(offset, bool)
+                    or offset < 0
+                    or offset > (1 << 63) - 1
+                    for task_id, offset in offsets.items()
+                )
+            ):
+                raise ValueError("invalid supervised offset schema")
+            return dict(offsets)
+        except Exception:
+            logger.exception(
+                "Failed to load durable supervised-task offsets; "
+                "replaying spools from the beginning"
+            )
+            return {}
+
+    def _persist_supervised_offsets(self) -> None:
+        secure_state_directory(self._log_dir)
+        atomic_write_private(
+            self._supervised_offsets_path,
+            json.dumps(
+                {
+                    "version": _SUPERVISED_OFFSETS_VERSION,
+                    "offsets": self._supervised_offsets,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _pending_outbox_process_exit_task_ids(self) -> set[str]:
+        task_ids: set[str] = set()
+        for data in self._reliable_events.values():
+            try:
+                payload = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                payload.get("type") == "PROCESS_EXIT"
+                and isinstance(payload.get("task_id"), str)
+            ):
+                task_ids.add(payload["task_id"])
+        return task_ids
+
     def _load_reliable_events(self) -> dict[str, str]:
         """Load terminal events that were not acknowledged before a restart."""
         try:
@@ -3320,39 +3434,34 @@ class WorkerRuntime:
                 self._exiting_task_ids.discard(msg.task_id)
 
     async def _handle_event_ack(self, msg: EventAckMessage) -> None:
-        persist_error: Exception | None = None
-        removed: str | None = None
+        # Keep the runtime outbox authoritative until the independent
+        # supervisor has also durably accepted the ACK.  If its Unix socket is
+        # temporarily unavailable, replaying the same Manager-deduped event is
+        # the retry mechanism; dropping our outbox entry first would leak the
+        # supervisor terminal forever in an otherwise healthy runtime.
         async with self._event_outbox_lock:
-            previous_events = dict(self._reliable_events)
-            removed = self._reliable_events.pop(msg.event_id, None)
-            if removed is not None:
-                try:
-                    self._persist_reliable_events()
-                except Exception as exc:
-                    # The on-disk outbox still contains the event. Restore
-                    # memory to the same truth so replay remains possible.
-                    self._reliable_events = previous_events
-                    persist_error = exc
-        if persist_error is not None:
-            await self._force_reconnect_for_outbox_failure()
-            raise ReliableEventPersistenceError(
-                "failed to durably acknowledge terminal event"
-            ) from persist_error
+            removed = self._reliable_events.get(msg.event_id)
+
+        supervisor_task_id = self._supervisor_event_task_ids.get(
+            msg.event_id
+        )
         if (
             self._task_supervisor is not None
-            and msg.event_id in self._supervisor_event_task_ids
+            and supervisor_task_id is not None
         ):
             try:
                 await self._task_supervisor.ack_event(msg.event_id)
             except Exception as exc:
-                # The stable supervisor record remains authoritative. A later
-                # runtime inventories and replays the same id; Manager-side
-                # event dedupe will ACK it again without repeating lifecycle
-                # side effects.
+                self._process_inventory_complete = False
+                self._process_inventory_error = (
+                    "independent task acknowledgement is pending"
+                )
                 logger.warning(
-                    "Could not acknowledge supervisor event (%s)",
+                    "Could not acknowledge supervisor event; retaining "
+                    "runtime outbox for retry (%s)",
                     type(exc).__name__,
                 )
+                await self._force_reconnect_for_outbox_failure()
                 return
             task_id = self._supervisor_event_task_ids.pop(
                 msg.event_id,
@@ -3368,6 +3477,50 @@ class WorkerRuntime:
                     descriptor,
                     pending_exhaustion=None,
                 )
+
+        persist_error: Exception | None = None
+        if removed is not None:
+            async with self._event_outbox_lock:
+                previous_events = dict(self._reliable_events)
+                current = self._reliable_events.get(msg.event_id)
+                if current is not None:
+                    removed = self._reliable_events.pop(msg.event_id)
+                    try:
+                        self._persist_reliable_events()
+                    except Exception as exc:
+                        # The on-disk outbox still contains the event. Restore
+                        # memory to the same truth so replay remains possible.
+                        self._reliable_events = previous_events
+                        persist_error = exc
+        if persist_error is not None:
+            await self._force_reconnect_for_outbox_failure()
+            raise ReliableEventPersistenceError(
+                "failed to durably acknowledge terminal event"
+            ) from persist_error
+
+        if removed is not None:
+            try:
+                payload = json.loads(removed)
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            task_id = payload.get("task_id")
+            if (
+                payload.get("type") == "PROCESS_EXIT"
+                and isinstance(task_id, str)
+                and task_id in self._supervised_offsets
+            ):
+                previous_offset = self._supervised_offsets.pop(task_id)
+                try:
+                    self._persist_supervised_offsets()
+                except Exception:
+                    # A stale cursor cannot resurrect an ACKed supervisor task,
+                    # but keep memory aligned with the still-durable file and
+                    # let the next complete inventory prune it.
+                    self._supervised_offsets[task_id] = previous_offset
+                    logger.warning(
+                        "Could not remove acknowledged supervisor cursor",
+                        exc_info=True,
+                    )
 
     def _transport_reservation(self, kind: str) -> tuple[int, int]:
         reserved_bytes = 0
