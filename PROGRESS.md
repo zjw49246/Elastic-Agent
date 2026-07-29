@@ -1,5 +1,30 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-29 Job 提交配置持久查看（commit `9d548b6`）
+
+**问题**：JobSpec 已在云资源副作用前写入 mode-0600 journal，但 Batch Console 的
+`GET /jobs` 轻量轮询故意不携带 spec，Job 卡也没有按需读取详情的入口。用户因此无法在
+提交后或 Manager 重启后确认当时实际生效的 repo/ref、运行命令、资源、账号与收集配置；
+直接把 spec 加进列表又会造成历史响应膨胀和秘密暴露。
+
+**解决**：每张 Job 卡新增“提交时生效配置（已脱敏）”折叠区，仅在管理员显式展开时读取
+`GET /api/jobs/{job_id}`，通过 `textContent` 显示和复制 JSON。详情优先从 durable
+journal 读取不可变的 normalized snapshot，不信任后续可变的 live model；普通/Setup
+环境值和 Secret 引用均隐藏，未知旧字段、损坏/超大/symlink journal fail closed。
+读取复用专用线程池、fail-fast admission 和取消 owner，响应 `no-store`；前端同时限制
+single-flight、全局并发、等待队列、LRU 总量和单配置预览大小，并在轮询重绘后保留展开、
+滚动与焦点。`/jobs` 列表继续不带 spec。
+
+**以后避免**：持久化能力只有形成可发现、可理解的只读 UI 才算完整；历史配置应明确区分
+raw request 与“当时验证/归一化后的生效配置”。新增历史展示入口时必须先确定秘密投影、
+响应与浏览器内存预算、旧 schema 策略和重启语义，不能为了减少一次请求把重对象塞进高频
+列表轮询。
+
+**验证**：先以红测试复现缺少入口、live spec 漂移和无 `no-store`；修复后 Batch API +
+UI `197 passed`，全量 Unit `2526 passed`，Integration `90 passed / 12 skipped`。
+Node 内联脚本语法、focused Ruff、compileall、`git diff --check` 和 claude-pty lock
+dry-run 均通过。未部署、未重启或修改运行中的服务。
+
 ## 2026-07-28 全量代码审计修复闭环
 
 **结果**：以 `86dd0f8` 为修复基线，关闭
