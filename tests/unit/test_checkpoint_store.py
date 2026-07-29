@@ -53,6 +53,12 @@ class FakeS3:
             "ContentLength": len(self.objects[Key]),
         }
 
+    def head_object(self, *, Bucket, Key):
+        assert Bucket == self.bucket
+        if Key not in self.objects:
+            raise KeyError(Key)
+        return {"ContentLength": len(self.objects[Key])}
+
     def get_paginator(self, operation):
         assert operation == "list_objects_v2"
         return _Paginator(self)
@@ -106,6 +112,10 @@ def test_commit_is_immutable_manifest_last_and_round_trips(
         "results/nested/b.json",
     ]
     assert all("/blobs/" in entry["object_key"] for entry in manifest["files"])
+    assert all(
+        "/checkpoints/20260729T010203Z-test/blobs/" in entry["object_key"]
+        for entry in manifest["files"]
+    )
 
     restored = tmp_path / "restored"
     restored_manifest = store.restore_checkpoint(
@@ -161,12 +171,13 @@ def test_restore_rejects_manifest_path_traversal(tmp_path: Path):
         "worker_namespace": "shard-00000",
         "generation": "g1",
         "paths": ["results"],
+        "metadata": {},
         "files": [{
             "path": "../escape",
             "size": 1,
             "sha256": "0" * 64,
             "object_key": (
-                "jobs/job-source/workers/shard-00000/checkpoints/blobs/"
+                "jobs/job-source/workers/shard-00000/checkpoints/g1/blobs/"
                 + "0" * 64
             ),
         }],
@@ -181,6 +192,61 @@ def test_restore_rejects_manifest_path_traversal(tmp_path: Path):
         )
 
     assert not (tmp_path / "escape").exists()
+
+
+def test_commit_refuses_to_overwrite_committed_generation(tmp_path: Path):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.json").write_text("first")
+    client = FakeS3()
+    store = _store(client)
+    store.commit(
+        job_id="job-source",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+    )
+    first_objects = dict(client.objects)
+    (source / "results" / "answer.json").write_text("second")
+
+    with pytest.raises(CheckpointError, match="already committed"):
+        store.commit(
+            job_id="job-source",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+    assert client.objects == first_objects
+
+
+def test_restore_rejects_checkpoint_metadata_mismatch(tmp_path: Path):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.json").write_text("correct")
+    client = FakeS3()
+    store = _store(client)
+    store.commit(
+        job_id="job-source",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+        metadata={"resolved_commit": "a" * 40},
+    )
+
+    with pytest.raises(CheckpointError, match="metadata mismatch"):
+        store.restore_checkpoint(
+            source_job_id="job-source",
+            worker_namespace="shard-00000",
+            destination=tmp_path / "restore",
+            paths=["results"],
+            expected_metadata={"resolved_commit": "b" * 40},
+        )
+
+    assert not (tmp_path / "restore").exists()
 
 
 def test_legacy_restore_requires_matching_collection_manifest(tmp_path: Path):

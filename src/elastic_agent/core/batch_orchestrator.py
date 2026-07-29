@@ -294,6 +294,7 @@ class BatchJob:
                     "phase": r.phase.value,
                     "task_id": r.task_id,
                     "error": r.error,
+                    "final_collected": r.final_collected,
                     "collection_error": r.collection_error,
                     "cleanup_error": r.cleanup_error,
                     "worker_released": (

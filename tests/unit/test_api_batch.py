@@ -1598,7 +1598,7 @@ class TestJobsAPI:
             "account": {"mode": "none"},
         })
 
-        assert response.status_code == 200, response.text
+        assert response.status_code == 200
         assert response.json()["datasets"] == [{
             "uri": "s3://bucket/shard-plan-worker-00000.tar",
             "dest": "/home/ubuntu/data/plan-worker-00000",

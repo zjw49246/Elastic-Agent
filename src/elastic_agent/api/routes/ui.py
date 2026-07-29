@@ -1030,8 +1030,46 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
           <div class="field-help" id="jCollectIntervalHelp" data-state role="status" aria-live="polite">
             0 表示只在成功、失败或取消时做最终收集。
           </div></div>
+        <div class="field"><label for="jCollectCheckpoint">S3 原子检查点 <span class="field-code">collect.checkpoint</span></label>
+          <select id="jCollectCheckpoint" onchange="updateCollectUI()"
+                  aria-describedby="jCollectCheckpointHelp">
+            <option value="false">关闭</option>
+            <option value="true">开启（长任务推荐）</option>
+          </select>
+          <div class="field-help" id="jCollectCheckpointHelp">开启后每次成功收集都会写入不可变、带 SHA-256 校验的 S3 generation；需要 Manager 结果桶。</div></div>
+        <div class="field"><label for="jCollectExclude">收集排除规则 <span class="field-code">collect.exclude</span></label>
+          <textarea id="jCollectExclude" class="textarea-compact"
+                    placeholder=".venv/**&#10;**/core"
+                    aria-describedby="jCollectExcludeHelp"></textarea>
+          <div class="field-help" id="jCollectExcludeHelp">每行一个相对 glob；用于排除缓存、虚拟环境和崩溃转储。</div></div>
       </div>
-      <div class="form-notice field-help">长任务建议设为 120 秒。间隔大于 0 时页面可下载最近一次完整快照；配置结果桶时会同步到 S3，否则保留在 Manager 本地。</div>
+      <div class="form-notice field-help">长任务建议设为 120 秒并开启原子检查点。间隔大于 0 时页面可下载最近一次完整快照；配置结果桶时会同步到 S3，否则保留在 Manager 本地。</div>
+      <details class="form-details">
+        <summary>从先前 Job 的检查点恢复</summary>
+        <div class="form-grid">
+          <div class="field"><label for="jRecoveryPolicy">恢复来源 <span class="field-code">recovery.policy</span></label>
+            <select id="jRecoveryPolicy" onchange="updateRecoveryUI()"
+                    aria-describedby="jRecoveryHelp">
+              <option value="none">不恢复（全新运行）</option>
+              <option value="checkpoint">已校验的原子检查点</option>
+              <option value="legacy_final_collection">旧 Job 的最终收集（兼容模式）</option>
+            </select>
+            <div class="field-help" id="jRecoveryHelp" data-state role="status" aria-live="polite">不读取先前 Job 的文件。</div></div>
+          <div class="field"><label for="jRecoveryJob">来源 Job ID <span class="field-code">recovery.source_job_id</span></label>
+            <input id="jRecoveryJob" disabled placeholder="job-..."
+                   aria-describedby="jRecoveryJobHelp">
+            <div class="field-help" id="jRecoveryJobHelp">来源必须已经终止，Worker 数、仓库和 resolved commit 必须与当前 Job 一致。</div></div>
+          <div class="field"><label for="jRecoveryPaths">恢复目录 <span class="field-code">recovery.paths</span></label>
+            <textarea id="jRecoveryPaths" class="textarea-compact" disabled
+                      aria-describedby="jRecoveryPathsHelp">results</textarea>
+            <div class="field-help" id="jRecoveryPathsHelp">每行一个，必须是来源 Job 已收集的目录；在登录和运行命令前恢复。</div></div>
+          <div class="field"><label for="jRecoveryGeneration">指定 generation（可选） <span class="field-code">recovery.generation</span></label>
+            <input id="jRecoveryGeneration" disabled
+                   aria-describedby="jRecoveryGenerationHelp"
+                   placeholder="留空使用最新 COMMITTED generation">
+            <div class="field-help" id="jRecoveryGenerationHelp">仅原子检查点模式可用；留空会选择最新完整提交。</div></div>
+        </div>
+      </details>
     </fieldset>
 
     <fieldset class="form-section" data-job-section="rotation">
@@ -1989,9 +2027,26 @@ function updateSourceUI() {
 }
 function updateCollectUI() {
   const value = parseInt(document.getElementById('jCollectInterval').value) || 0;
+  const checkpoint = document.getElementById('jCollectCheckpoint').value === 'true';
   document.getElementById('jCollectIntervalHelp').textContent = value > 0
     ? `运行期间每 ${value} 秒收集一次；下载按钮读取最近一次已完成的快照。`
     : '0 表示只在成功、失败或取消时做最终收集。';
+  document.getElementById('jCollectCheckpointHelp').textContent = checkpoint
+    ? '每次成功收集都会先校验文件，再写不可变 S3 generation，最后提交 COMMITTED.json。'
+    : '当前只维护普通结果副本；它可以下载，但不能作为强校验的自动续跑检查点。';
+}
+function updateRecoveryUI() {
+  const policy = document.getElementById('jRecoveryPolicy').value;
+  const enabled = policy !== 'none';
+  document.getElementById('jRecoveryJob').disabled = !enabled;
+  document.getElementById('jRecoveryPaths').disabled = !enabled;
+  document.getElementById('jRecoveryGeneration').disabled =
+    policy !== 'checkpoint';
+  document.getElementById('jRecoveryHelp').textContent = policy === 'checkpoint'
+    ? '只接受先写完文件清单、后提交 COMMITTED.json 的不可变 generation；损坏时不会创建新机器。'
+    : policy === 'legacy_final_collection'
+      ? '兼容旧 Job：只允许已证明完成最终收集的终态 Job；旧对象没有逐文件哈希保证。'
+      : '不读取先前 Job 的文件。';
 }
 function updateRotationUI() {
   const rotation = document.getElementById('jRot');
@@ -2164,6 +2219,27 @@ function validateJobForm() {
       control.setCustomValidity(error.message);
     }
   }
+  const checkpoint = document.getElementById('jCollectCheckpoint').value === 'true';
+  const collectPaths = lines('jCollect');
+  document.getElementById('jCollect').setCustomValidity(
+    checkpoint && !collectPaths.length
+      ? '开启原子检查点时至少填写一个结果目录。'
+      : ''
+  );
+  const recoveryEnabled =
+    document.getElementById('jRecoveryPolicy').value !== 'none';
+  const recoveryJob = document.getElementById('jRecoveryJob');
+  recoveryJob.setCustomValidity(
+    recoveryEnabled && !recoveryJob.value.trim()
+      ? '启用恢复时必须填写来源 Job ID。'
+      : ''
+  );
+  const recoveryPaths = document.getElementById('jRecoveryPaths');
+  recoveryPaths.setCustomValidity(
+    recoveryEnabled && !lines('jRecoveryPaths').length
+      ? '启用恢复时至少填写一个恢复目录。'
+      : ''
+  );
   const controls = document.querySelectorAll(
     '#jobSubmissionCard input, #jobSubmissionCard select, #jobSubmissionCard textarea'
   );
@@ -2209,6 +2285,8 @@ function buildJobSpec() {
     ? document.getElementById('jRot').value
     : 'none';
   const rotationEnabled = rotationStrategy === 'on_exhaust_restart_resume';
+  const recoveryPolicy = document.getElementById('jRecoveryPolicy').value;
+  const recoveryEnabled = recoveryPolicy !== 'none';
   const spec = {
     name: document.getElementById('jName').value.trim() || 'job',
     environment: {profile: document.getElementById('jProfile').value},
@@ -2249,7 +2327,17 @@ function buildJobSpec() {
              disk_gb: parseInt(document.getElementById('jDiskGb').value) || 0,
              spot: document.getElementById('jSpot').value === 'true'},
     collect: {paths: lines('jCollect'),
+              exclude: lines('jCollectExclude'),
+              checkpoint: document.getElementById('jCollectCheckpoint').value === 'true',
               interval_seconds: parseInt(document.getElementById('jCollectInterval').value) || 0},
+    recovery: {policy: recoveryPolicy,
+               source_job_id: recoveryEnabled
+                 ? document.getElementById('jRecoveryJob').value.trim()
+                 : '',
+               paths: recoveryEnabled ? lines('jRecoveryPaths') : [],
+               generation: recoveryPolicy === 'checkpoint'
+                 ? document.getElementById('jRecoveryGeneration').value.trim()
+                 : ''},
   };
   if (ref) spec.harness_ref = ref;
   return spec;
@@ -3517,7 +3605,8 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 updateThemeLabel();
-updateDeliveryUI(); updateSourceUI(); updateCollectUI(); updateRotationUI();
+updateDeliveryUI(); updateSourceUI(); updateCollectUI(); updateRecoveryUI();
+updateRotationUI();
 updateEipBindingUI(); updateAgentUI(); updateAgentApiProviderUI();
 providerDefaultsReady = initializeProviderDefaults();
 refreshAccounts(); refreshResults(); runDashboardPoll();

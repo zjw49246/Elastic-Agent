@@ -109,6 +109,27 @@ class S3CheckpointStore:
             self._client = boto3.client("s3", region_name=self._region)
         return self._client
 
+    def _assert_generation_uncommitted(self, key: str) -> None:
+        try:
+            self._s3().head_object(Bucket=self._bucket, Key=key)
+        except KeyError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            response = getattr(exc, "response", {})
+            error = response.get("Error", {}) if isinstance(response, dict) else {}
+            code = str(error.get("Code") or "")
+            status = (
+                response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if isinstance(response, dict)
+                else None
+            )
+            if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+                return
+            raise CheckpointError(
+                "cannot verify checkpoint generation immutability"
+            ) from exc
+        raise CheckpointError("checkpoint generation is already committed")
+
     def _worker_root(self, job_id: str, worker_namespace: str) -> str:
         job_id = _safe_component(job_id, label="job id")
         worker_namespace = _safe_component(
@@ -127,6 +148,15 @@ class S3CheckpointStore:
             raise CheckpointError("checkpoint paths cannot be empty")
         if len(set(normalized)) != len(normalized):
             raise CheckpointError("checkpoint paths must be unique")
+        for index, path in enumerate(normalized):
+            if any(
+                other.startswith(path.rstrip("/") + "/")
+                or path.startswith(other.rstrip("/") + "/")
+                for other in normalized[index + 1 :]
+            ):
+                raise CheckpointError(
+                    "checkpoint paths must not overlap"
+                )
         return normalized
 
     @staticmethod
@@ -222,7 +252,14 @@ class S3CheckpointStore:
         )
         generation = _safe_component(generation, label="checkpoint generation")
         worker_root = self._worker_root(job_id, worker_namespace)
-        blob_root = f"{worker_root}/checkpoints/blobs"
+        committed_key = (
+            f"{worker_root}/checkpoints/{generation}/COMMITTED.json"
+        )
+        self._assert_generation_uncommitted(committed_key)
+        # Blobs live inside their generation. A failed live-file validation can
+        # therefore leave only unreachable objects; it can never overwrite a
+        # blob already referenced by an older committed generation.
+        blob_root = f"{worker_root}/checkpoints/{generation}/blobs"
         files: list[dict[str, Any]] = []
         total_bytes = 0
 
@@ -280,9 +317,6 @@ class S3CheckpointStore:
         ).encode("utf-8")
         if len(payload) > self._max_manifest_bytes:
             raise CheckpointError("checkpoint manifest limit exceeded")
-        committed_key = (
-            f"{worker_root}/checkpoints/{generation}/COMMITTED.json"
-        )
         self._s3().put_object(
             Bucket=self._bucket,
             Key=committed_key,
@@ -352,6 +386,7 @@ class S3CheckpointStore:
             if not candidates:
                 raise CheckpointError("no committed checkpoint generation found")
             key = max(candidates)
+            selected = key.removeprefix(prefix).split("/", 1)[0]
         try:
             raw = self._read_object_limited(
                 key, limit=self._max_manifest_bytes,
@@ -363,6 +398,10 @@ class S3CheckpointStore:
             raise CheckpointError("invalid checkpoint manifest") from exc
         if not isinstance(manifest, dict):
             raise CheckpointError("invalid checkpoint manifest")
+        if manifest.get("generation") != selected:
+            raise CheckpointError(
+                "checkpoint generation identity mismatch"
+            )
         return manifest
 
     @staticmethod
@@ -372,6 +411,7 @@ class S3CheckpointStore:
         source_job_id: str,
         worker_namespace: str,
         paths: list[str],
+        expected_metadata: dict[str, Any] | None = None,
     ) -> None:
         if (
             manifest.get("schema_version") != _SCHEMA_VERSION
@@ -381,6 +421,14 @@ class S3CheckpointStore:
             or not isinstance(manifest.get("files"), list)
         ):
             raise CheckpointError("checkpoint manifest identity mismatch")
+        metadata = manifest.get("metadata")
+        if not isinstance(metadata, dict):
+            raise CheckpointError("checkpoint manifest metadata is invalid")
+        for key, expected in (expected_metadata or {}).items():
+            if metadata.get(key) != expected:
+                raise CheckpointError(
+                    f"checkpoint metadata mismatch: {key}"
+                )
 
     def _write_restored_object(
         self,
@@ -452,6 +500,7 @@ class S3CheckpointStore:
         destination: Path,
         paths: list[str],
         generation: str = "",
+        expected_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Restore one committed generation into a new private staging tree."""
 
@@ -472,6 +521,7 @@ class S3CheckpointStore:
                 source_job_id=source_job_id,
                 worker_namespace=worker_namespace,
                 paths=normalized_paths,
+                expected_metadata=expected_metadata,
             )
             files = manifest["files"]
             if len(files) > self._max_objects:
@@ -480,7 +530,17 @@ class S3CheckpointStore:
             worker_root = self._worker_root(
                 source_job_id, worker_namespace,
             )
-            blob_root = f"{worker_root}/checkpoints/blobs/"
+            manifest_generation = _safe_component(
+                str(manifest.get("generation") or ""),
+                label="checkpoint generation",
+            )
+            if generation and manifest_generation != generation:
+                raise CheckpointError(
+                    "checkpoint generation identity mismatch"
+                )
+            blob_root = (
+                f"{worker_root}/checkpoints/{manifest_generation}/blobs/"
+            )
             for raw in files:
                 if not isinstance(raw, dict):
                     raise CheckpointError("invalid checkpoint file entry")

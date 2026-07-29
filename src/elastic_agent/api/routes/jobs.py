@@ -609,6 +609,17 @@ def _persisted_job_view(
             shard_index = int(raw.get("shard_index") or 0)
         except (TypeError, ValueError):
             shard_index = 0
+        collection_error = (
+            str(raw["collection_error"])
+            if raw.get("collection_error") else None
+        )
+        final_collected = (
+            raw.get("final_collected") is True
+            or (
+                "final_collected" not in raw
+                and "collection_error" in raw
+            )
+        )
         terminal_workers.append({
             "worker_id": worker_id,
             "phase": str(raw.get("phase") or "failed"),
@@ -623,11 +634,8 @@ def _persisted_job_view(
             "lease_id": "",
             "eip": "",
             "eip_allocation_id": "",
-            "final_collected": True,
-            "collection_error": (
-                str(raw["collection_error"])
-                if raw.get("collection_error") else None
-            ),
+            "final_collected": final_collected,
+            "collection_error": collection_error,
             "cleaned_up": bool(raw.get("worker_released", terminal)),
             "cleanup_error": (
                 str(raw["cleanup_error"]) if raw.get("cleanup_error") else None

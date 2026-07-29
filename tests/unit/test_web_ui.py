@@ -103,7 +103,13 @@ class TestDashboardEndpoint:
             "source": ("jRepo", "jDeliver", "jSetup", "jS3"),
             "account": ("jAcctMode", "jAgentType", "jAcctBinding", "jAcctIds"),
             "run": ("jRun", "jCwd", "jRunTimeout", "jTtl"),
-            "results": ("jCollect", "jCollectInterval"),
+            "results": (
+                "jCollect",
+                "jCollectInterval",
+                "jCollectCheckpoint",
+                "jRecoveryPolicy",
+                "jRecoveryJob",
+            ),
             "rotation": ("jRot", "jResume", "jMaxRotations"),
             "advanced": ("hFile", "hClass", "hCode", "jHarnessRef"),
         }
@@ -145,6 +151,12 @@ class TestDashboardEndpoint:
             "jSecretEnv",
             "jCollect",
             "jCollectInterval",
+            "jCollectCheckpoint",
+            "jCollectExclude",
+            "jRecoveryPolicy",
+            "jRecoveryJob",
+            "jRecoveryPaths",
+            "jRecoveryGeneration",
             "jAcctMode",
             "jAgentType",
             "jAcctGroup",
@@ -212,11 +224,20 @@ class TestDashboardEndpoint:
             "jDiskGb",
             "jSpot",
             "jCollectInterval",
+            "jCollectCheckpoint",
+            "jRecoveryPolicy",
+            "jRecoveryJob",
+            "jRecoveryGeneration",
         }
         for control_id in expected_direct_controls:
             assert f"document.getElementById('{control_id}')" in build_spec
 
-        for line_control in ("jSetup", "jCollect"):
+        for line_control in (
+            "jSetup",
+            "jCollect",
+            "jCollectExclude",
+            "jRecoveryPaths",
+        ):
             assert f"lines('{line_control}')" in build_spec
         assert "lines('jS3')" in _javascript_function(html, "parseS3Datasets")
         assert "steps: parseSetupSteps()" in build_spec
@@ -241,6 +262,9 @@ class TestDashboardEndpoint:
         assert "const rotationEnabled =" in build_spec
         assert "resume_args: rotationEnabled" in build_spec
         assert "max_rotations: rotationEnabled" in build_spec
+        assert "const recoveryEnabled =" in build_spec
+        assert "source_job_id: recoveryEnabled" in build_spec
+        assert "generation: recoveryPolicy === 'checkpoint'" in build_spec
         assert "s3_datasets: parseS3Datasets()" in build_spec
         assert "=== 'true'" in build_spec
         assert "if (ref) spec.harness_ref = ref" in build_spec
@@ -367,6 +391,12 @@ process.stdout.write(JSON.stringify(results));
             "jTtl",
             "jCollect",
             "jCollectInterval",
+            "jCollectCheckpoint",
+            "jCollectExclude",
+            "jRecoveryPolicy",
+            "jRecoveryJob",
+            "jRecoveryPaths",
+            "jRecoveryGeneration",
             "jAcctMode",
             "jPerWorker",
             "jAcctBinding",

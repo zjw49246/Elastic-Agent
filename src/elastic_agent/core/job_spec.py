@@ -713,6 +713,23 @@ class CollectSpec(StrictSpecModel):
             normalized.append(value)
         return normalized
 
+    @model_validator(mode="after")
+    def checkpoint_paths_are_disjoint(self) -> CollectSpec:
+        if not self.checkpoint:
+            return self
+        if len(set(self.paths)) != len(self.paths):
+            raise ValueError("checkpoint collect.paths must be unique")
+        for index, path in enumerate(self.paths):
+            if any(
+                other.startswith(path.rstrip("/") + "/")
+                or path.startswith(other.rstrip("/") + "/")
+                for other in self.paths[index + 1 :]
+            ):
+                raise ValueError(
+                    "checkpoint collect.paths must not overlap"
+                )
+        return self
+
 
 class RecoverySpec(StrictSpecModel):
     """Restore one trusted prior Job shard before dispatching this Job.
@@ -789,6 +806,15 @@ class RecoverySpec(StrictSpecModel):
             raise ValueError(
                 "recovery.generation is supported only for checkpoint recovery"
             )
+        if len(set(self.paths)) != len(self.paths):
+            raise ValueError("recovery.paths must be unique")
+        for index, path in enumerate(self.paths):
+            if any(
+                other.startswith(path.rstrip("/") + "/")
+                or path.startswith(other.rstrip("/") + "/")
+                for other in self.paths[index + 1 :]
+            ):
+                raise ValueError("recovery.paths must not overlap")
         return self
 
 

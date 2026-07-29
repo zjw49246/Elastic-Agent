@@ -109,7 +109,10 @@ class FakeCheckpointStore:
         destination = Path(kwargs["destination"])
         (destination / "results").mkdir(parents=True)
         (destination / "results" / "restored.json").write_text("ok")
-        return {"generation": "g1"}
+        return {
+            "generation": "g1",
+            "metadata": dict(kwargs.get("expected_metadata") or {}),
+        }
 
     def restore_legacy_collection(self, **kwargs):
         self.restores.append(("legacy", kwargs))
@@ -267,6 +270,7 @@ async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
     assert commit["paths"] == ["results"]
     assert commit["exclude"] == ["**/core"]
     assert commit["metadata"]["resolved_commit"] == "a" * 40
+    assert commit["metadata"]["shard_index"] == 0
 
 
 async def test_worker_direct_s3_missing_awscli_fails_without_runtime_install(
@@ -372,6 +376,15 @@ async def test_prepare_and_restore_checkpoint_before_run(
         ("checkpoint", "shard-00000"),
         ("checkpoint", "shard-00001"),
     ]
+    assert [
+        call["expected_metadata"]["shard_index"]
+        for _kind, call in manager._checkpoint_store.restores
+    ] == [0, 1]
+    assert all(
+        call["expected_metadata"]["job_spec_sha256"]
+        == driver._job_hash(source)
+        for _kind, call in manager._checkpoint_store.restores
+    )
 
     commands = []
 
@@ -450,6 +463,99 @@ async def test_prepare_recovery_rejects_mismatched_source_contract(
         )
 
     assert manager._checkpoint_store.restores == []
+
+
+async def test_legacy_recovery_accepts_old_proven_final_collection_summary():
+    source = JobSpec.model_validate({
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "fanout": {"workers": 2},
+        "collect": {"paths": ["results"]},
+    })
+    target = JobSpec.model_validate({
+        "name": "resume",
+        "setup": {
+            "repo": source.setup.repo,
+            "resolved_commit": source.setup.resolved_commit,
+        },
+        "run": {"command": "resume"},
+        "fanout": {"workers": 2},
+        "recovery": {
+            "policy": "legacy_final_collection",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+    payload = {
+        "submission_state": "failed",
+        "terminal_summary": {
+            "terminal_workers": [
+                {
+                    "shard_index": shard,
+                    # Compatibility proof written by the old summary schema.
+                    "collection_error": None,
+                }
+                for shard in range(2)
+            ],
+        },
+    }
+
+    ManagerFleetDriver._validate_recovery_contract(
+        payload, source, target,
+    )
+
+
+async def test_legacy_recovery_rejects_duplicate_or_failed_shard_proof():
+    source = JobSpec.model_validate({
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "fanout": {"workers": 2},
+        "collect": {"paths": ["results"]},
+    })
+    target = JobSpec.model_validate({
+        "name": "resume",
+        "setup": {
+            "repo": source.setup.repo,
+            "resolved_commit": source.setup.resolved_commit,
+        },
+        "run": {"command": "resume"},
+        "fanout": {"workers": 2},
+        "recovery": {
+            "policy": "legacy_final_collection",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+    payload = {
+        "submission_state": "failed",
+        "terminal_summary": {
+            "terminal_workers": [
+                {
+                    "shard_index": 0,
+                    "final_collected": True,
+                    "collection_error": None,
+                },
+                {
+                    "shard_index": 0,
+                    "final_collected": True,
+                    "collection_error": "S3 failed",
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="proven successful"):
+        ManagerFleetDriver._validate_recovery_contract(
+            payload, source, target,
+        )
 
 
 async def test_empty_collect_paths_is_noop_before_registry_or_storage(

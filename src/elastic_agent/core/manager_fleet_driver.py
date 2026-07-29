@@ -304,12 +304,30 @@ class ManagerFleetDriver:
                 if isinstance(terminal_summary, dict)
                 else []
             )
+            expected_shards = set(range(source_spec.fanout.workers))
+            actual_shards = {
+                worker.get("shard_index")
+                for worker in (workers if isinstance(workers, list) else [])
+                if isinstance(worker, dict)
+                and isinstance(worker.get("shard_index"), int)
+            }
             if (
                 not isinstance(workers, list)
-                or len(workers) < source_spec.fanout.workers
+                or len(workers) != source_spec.fanout.workers
+                or actual_shards != expected_shards
                 or any(
                     not isinstance(worker, dict)
-                    or not worker.get("final_collected")
+                    or not (
+                        worker.get("final_collected") is True
+                        # Terminal summaries written before the explicit flag
+                        # were persisted only after final collection settled;
+                        # the always-present collection_error field is the
+                        # compatibility proof for those journals.
+                        or (
+                            "final_collected" not in worker
+                            and "collection_error" in worker
+                        )
+                    )
                     or worker.get("collection_error")
                     for worker in workers
                 )
@@ -358,6 +376,11 @@ class ManagerFleetDriver:
                 }
                 if spec.recovery.policy == "checkpoint":
                     kwargs["generation"] = spec.recovery.generation
+                    kwargs["expected_metadata"] = {
+                        "resolved_commit": source_spec.setup.resolved_commit,
+                        "job_spec_sha256": self._job_hash(source_spec),
+                        "shard_index": shard_index,
+                    }
                     await asyncio.to_thread(
                         store.restore_checkpoint, **kwargs,
                     )
@@ -796,6 +819,7 @@ class ManagerFleetDriver:
                     "resolved_commit": spec.setup.resolved_commit,
                     "job_spec_sha256": self._job_hash(spec),
                     "command_sha256": self._command_hash(spec, context),
+                    "shard_index": shard_index,
                 }
                 try:
                     await asyncio.to_thread(

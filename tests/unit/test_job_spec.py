@@ -112,6 +112,23 @@ class TestCheckpointRecovery:
                 collect={"checkpoint": True},
             )
 
+    @pytest.mark.parametrize(
+        "paths",
+        [
+            ["results", "results"],
+            ["results", "results/nested"],
+        ],
+    )
+    def test_checkpoint_collection_rejects_duplicate_or_overlapping_paths(
+        self, paths,
+    ):
+        with pytest.raises(ValidationError, match="must (?:be unique|not overlap)"):
+            JobSpec(
+                name="checkpoint",
+                run=RunSpec(command="bench"),
+                collect={"paths": paths, "checkpoint": True},
+            )
+
     def test_checkpoint_recovery_requires_source_and_paths(self):
         with pytest.raises(
             ValidationError,
@@ -164,6 +181,18 @@ class TestCheckpointRecovery:
                 recovery={
                     "source_job_id": "job-0123456789abcdef",
                     "paths": ["results"],
+                },
+            )
+
+    def test_recovery_rejects_overlapping_paths(self):
+        with pytest.raises(ValidationError, match="must not overlap"):
+            JobSpec(
+                name="resume",
+                run=RunSpec(command="bench --resume"),
+                recovery={
+                    "policy": "checkpoint",
+                    "source_job_id": "job-0123456789abcdef",
+                    "paths": ["results", "results/nested"],
                 },
             )
 
