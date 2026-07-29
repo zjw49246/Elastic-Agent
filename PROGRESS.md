@@ -623,3 +623,41 @@ fetch 测试；完整套件 **2356 passed / 12 skipped / 0 failed**，`git diff 
 
 **验证**：IAM、dataset provision、JobSpec 和 worker projection 定向测试 **276 passed**，
 `git diff --check` 通过。
+
+## 2026-07-29 Mode-B 断线续跑与不可变检查点恢复（Elastic `e9d6e5e` / AI4Sci `c89b4091`）
+
+**问题**：长时间 Mode-B 命令把 Worker WebSocket/runtime 连接误当成任务生命线；runtime
+断开后 Manager 可能清理仍在运行的进程或实例。实例、EBS 或 supervisor 真正丢失时，旧的
+mutable S3 结果又无法证明删除和完整 generation，只能从头运行。AI4Sci 的部分结果、workspace
+与 trace 还存在“先发布完成 JSON、后保留产物”的崩溃窗口，`--resume` 可能跳过不完整实例。
+
+**解决**：Worker 新增独立 `ea-task-supervisor`，以私有 socket、0600 spool/descriptor 和稳定
+terminal event id 跨 `ea-runtime` 重启保留原 PID/process group，runtime 重连后 inventory、
+补发输出并继续 ACK；单纯断线不再销毁活跃 supervised Job。跨实例恢复新增 v2 S3
+content-addressed blob、不可变 shard manifest、完整 Job set、retention、preflight 解析及 exact
+generation pin；所有 shard 在云创建前完成有界 Manager staging，新 Worker 以 root 私有同盘事务
+树 fsync/re-measure/roll-forward，`installed` 后才登录和 dispatch。rsync 有 pre-spawn durable
+journal，未证明 PGID 消失时 staging/配额 quarantine。startup 先禁用 Job-user respawn、停止
+framework/container runtime 并证明 quiescent，再 reconcile→final collect；长恢复在 fail-closed
+后台 barrier 内执行。对象数、逻辑字节、filesystem allocation block、inode、target disk 和全局
+预算都纳入 admission；旧 mutable recovery 明确拒绝，无完整 set 时必须从头开始。
+
+AI4Sci 的 metadata/trajectory/raw/execution/eval/analyze/result 写入全部采用同目录临时文件、
+file fsync、atomic replace、directory fsync；普通 agent workspace 与 trace 全部耐久后才发布
+result marker，失败会退役旧 marker 而不会让 `--resume` 误判完成。修复位于用户指定的
+`archive/youchengsong-managed-agent-api-20260728` 分支。
+
+**生产边界同步**：Manager IAM 两处 tag allowlist 加入 `ElasticAgentShardIndex`，并只对
+`jobs/.elastic-agent-checkpoints/*` 授予 `s3:DeleteObject` 供 retention 使用；public result
+仍不可删除。IAM runbook 增加 allow/deny simulation。systemd `TimeoutStopSec=32400` 覆盖当前
+Batch、遗留 EIP 与 ordinary orphan 三个不可取消收敛波次。Batch Console 增加从完整 checkpoint
+恢复入口和 generation 选择；配置、secret 引用继续只保存在 Manager 私有 journal。
+
+**验证**：Elastic 全仓 **2810 passed / 12 skipped / 0 failed**；恢复/Manager/编排 253 项、
+API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transaction 78 项专项均通过。
+变更 Python Ruff、`compileall`、shell、JSON、Batch JavaScript、secret pattern 与
+`git diff --check` 全部通过。AI4Sci 相关回归 **242 passed / 1 deselected**，综合恢复/report
+回归 **319 passed**，compile/fatal Ruff/diff check 通过；其全仓剩余失败均为既有环境/基线，
+与本次文件无关。
+
+**发布状态**：代码已提交，未部署、未重载、未重启当前服务；运行中 Job/实例未被触碰。
