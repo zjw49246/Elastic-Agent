@@ -298,9 +298,11 @@ class ManagerFleetDriver:
                 "source Job did not enable immutable checkpoint collection"
             )
         if target_spec.recovery.policy == "legacy_final_collection":
+            terminal_summary = source_payload.get("terminal_summary")
             workers = (
-                source_payload.get("terminal_summary", {})
-                .get("terminal_workers", [])
+                terminal_summary.get("terminal_workers", [])
+                if isinstance(terminal_summary, dict)
+                else []
             )
             if (
                 not isinstance(workers, list)

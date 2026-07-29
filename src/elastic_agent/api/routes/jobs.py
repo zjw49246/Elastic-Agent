@@ -58,6 +58,7 @@ from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import (
     JOB_REQUEST_FINGERPRINT_ALGORITHM,
     JOB_REQUEST_FINGERPRINT_SCHEMA,
+    load_job_spec_journal,
 )
 from elastic_agent.core.secure_store import (
     atomic_write_private,
@@ -1187,6 +1188,78 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             "worker can read S3 without static credentials",
         )
 
+    results_bucket = _s3_bucket()
+    if spec.collect.checkpoint and not results_bucket:
+        raise HTTPException(
+            422,
+            "collect.checkpoint requires "
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+        )
+
+    recovery_preview = None
+    if spec.recovery.policy != "none":
+        if not results_bucket:
+            raise HTTPException(
+                422,
+                "checkpoint recovery requires "
+                "ELASTIC_AGENT_RESULTS_S3_BUCKET",
+            )
+        try:
+            permit = _acquire_result_operation(
+                _JOB_HISTORY_ADMISSION,
+                operation="recovery source validation",
+            )
+        except HTTPException:
+            raise
+        try:
+            source_payload = await _run_owned_executor(
+                _JOB_HISTORY_EXECUTOR,
+                load_job_spec_journal,
+                mgr.config.registry.path,
+                spec.recovery.source_job_id,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                422,
+                f"recovery source Job "
+                f"{spec.recovery.source_job_id!r} does not exist",
+            ) from exc
+        except (
+            json.JSONDecodeError,
+            OSError,
+            RuntimeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(
+                422,
+                "recovery source Job journal is invalid",
+            ) from exc
+        finally:
+            permit.release()
+        try:
+            source_spec = JobSpec.model_validate(source_payload["spec"])
+            from elastic_agent.core.manager_fleet_driver import (
+                ManagerFleetDriver,
+            )
+
+            ManagerFleetDriver._validate_recovery_contract(
+                source_payload,
+                source_spec,
+                spec,
+            )
+        except (ValidationError, RuntimeError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        recovery_preview = {
+            "policy": spec.recovery.policy,
+            "source_job_id": spec.recovery.source_job_id,
+            "paths": list(spec.recovery.paths),
+            "generation": spec.recovery.generation or "latest",
+            "source_state": source_payload["submission_state"],
+            "source_resolved_commit": source_spec.setup.resolved_commit,
+            "staged_before_cloud_create": True,
+        }
+
     accounts = await mgr.account_store.list()
     agent_api_store = getattr(mgr, "agent_api_store", None)
     if agent_api_store is not None:
@@ -1356,6 +1429,12 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             "results are collected only at process exit; set an interval for "
             "long-running Jobs that need partial-result durability"
         )
+    if spec.recovery.policy == "legacy_final_collection":
+        warnings.append(
+            "legacy_final_collection has no immutable per-file hash manifest; "
+            "use it only for a proven stopped source Job, then enable "
+            "collect.checkpoint on the recovery Job"
+        )
     if (
         provider.type == "aws"
         and spec.account.mode == "worker_local_login"
@@ -1367,8 +1446,9 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             "stable login identity"
         )
 
-    results_bucket = _s3_bucket()
-    if results_bucket and provider.type == "aws" and worker_profile:
+    if spec.collect.checkpoint:
+        collection_mode = "manager-relay-s3-checkpoint"
+    elif results_bucket and provider.type == "aws" and worker_profile:
         collection_mode = "worker-direct-s3"
     elif results_bucket:
         collection_mode = "manager-relay-s3"
@@ -1435,11 +1515,14 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
         },
         "results": {
             "paths": list(spec.collect.paths),
+            "exclude": list(spec.collect.exclude),
             "interval_seconds": spec.collect.interval_seconds,
+            "checkpoint": spec.collect.checkpoint,
             "mode": collection_mode,
             "s3_bucket": results_bucket or None,
             "automatic_final_collect": bool(spec.collect.paths),
         },
+        "recovery": recovery_preview,
         "warnings": warnings,
     }
 

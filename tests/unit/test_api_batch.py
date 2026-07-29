@@ -1598,7 +1598,7 @@ class TestJobsAPI:
             "account": {"mode": "none"},
         })
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         assert response.json()["datasets"] == [{
             "uri": "s3://bucket/shard-plan-worker-00000.tar",
             "dest": "/home/ubuntu/data/plan-worker-00000",
@@ -2788,6 +2788,125 @@ class TestJobsAPI:
         assert manager.provider._n == 0
         specs = Path(manager.config.registry.path).with_name("specs")
         assert list(specs.glob("*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_plan_validates_checkpoint_recovery_source_before_cloud(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source = JobSpec.model_validate({
+            "name": "source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "capture"},
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+            },
+        })
+        persist_job_spec(
+            manager.config.registry.path,
+            "job-source-checkpoint",
+            source,
+        )
+        update_job_state(
+            manager.config.registry.path,
+            "job-source-checkpoint",
+            "failed",
+        )
+        target = {
+            "name": "resume",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "recover --resume"},
+            "account": {"mode": "none"},
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+                "exclude": ["**/core"],
+            },
+            "recovery": {
+                "policy": "checkpoint",
+                "source_job_id": "job-source-checkpoint",
+                "paths": ["results"],
+            },
+        }
+
+        response = await client.post("/api/jobs/plan", json=target)
+
+        assert response.status_code == 200, response.text
+        plan = response.json()
+        assert plan["recovery"] == {
+            "policy": "checkpoint",
+            "source_job_id": "job-source-checkpoint",
+            "paths": ["results"],
+            "generation": "latest",
+            "source_state": "failed",
+            "source_resolved_commit": "a" * 40,
+            "staged_before_cloud_create": True,
+        }
+        assert plan["results"]["mode"] == "manager-relay-s3-checkpoint"
+        assert plan["results"]["checkpoint"] is True
+        assert plan["results"]["exclude"] == ["**/core"]
+        assert manager.provider._n == 0
+
+    @pytest.mark.asyncio
+    async def test_plan_rejects_nonterminal_recovery_source(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import persist_job_spec
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source = JobSpec.model_validate({
+            "name": "source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "capture"},
+            "collect": {
+                "paths": ["results"],
+                "checkpoint": True,
+            },
+        })
+        persist_job_spec(
+            manager.config.registry.path,
+            "job-source-running",
+            source,
+        )
+
+        response = await client.post("/api/jobs/plan", json={
+            "name": "resume",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "a" * 40,
+            },
+            "run": {"command": "recover --resume"},
+            "account": {"mode": "none"},
+            "recovery": {
+                "policy": "checkpoint",
+                "source_job_id": "job-source-running",
+                "paths": ["results"],
+            },
+        })
+
+        assert response.status_code == 422
+        assert "durable terminal state" in response.text
 
     @pytest.mark.asyncio
     async def test_plan_warns_when_worker_login_bypasses_account_eip(
