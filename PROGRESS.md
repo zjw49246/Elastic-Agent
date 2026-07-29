@@ -1,5 +1,36 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-07-29 Job 人工冷中断与一键续跑（commit `192430b`）
+
+**问题**：已有恢复能力只覆盖 runtime/连接重启和实例丢失后的新 Job 恢复，没有一个由
+管理员主动触发的安全停止事务。直接复用 Cancel 会在应用写中间文件时终止进程，并可能把
+不完整目录上传；只增加 SIGINT 按钮又无法覆盖 HTTP 断连、Manager 崩溃、自然
+`PROCESS_EXIT` 并发清理、EC2 已终止但 Job 终态未写盘等窗口，也无法证明后续续跑使用的是
+哪一份完整 checkpoint。
+
+**解决**：JobSpec 新增完整、显式的 `run.resume_command`。Batch API/UI 增加
+`中断并保存进度` 与 `一键续跑`：interrupt 先把 Idempotency-Key 的 SHA-256 和
+`suspending` intent 在同一次 mode-0600 journal replace 中提交，再以 group-scoped、
+non-escalating SIGINT 给应用协作收口机会，超时后按 TERM/KILL，随后停止
+runtime/supervisor/Docker/containerd 并扫描宿主残留 writer。只有可靠 exit、日志归档、
+final collect、完整 S3 set、Worker/EIP/账号 cleanup 全部收敛且 generation/timestamp 与
+本地 durable pointer 精确一致时才写 `suspended`。普通 Worker 在终止后保留带 collection
+proof 的 registry tombstone，EIP 在 release 前写 lease proof；terminal journal 成功后才
+移除/视为完成。后台异常有界重试，shutdown 同步接管已提交事务，仍失败则保留 durable
+资源给启动恢复，禁止从未静止文件系统收集。续跑永不复活旧 Job id，而是从私有 source
+spec 和 exact generation 创建新 attempt，并记录 direct/root/attempt lineage。
+
+**关键经验**：优雅信号只是“请求”，不是静止证明；应用、shell wrapper、容器和逃逸进程
+必须分别收敛。任何“先销毁资源、后写终态”的路径都需要一个跨崩溃 tombstone。异步调用方
+取消不能撤销已进入线程或文件替换的事务，owner 必须在释放锁前等真实结果。幂等 sidecar
+不能成为唯一真相；当前每次 action 在全局锁内完整校验所有有界私有 Job journal，sidecar
+只作可重建缓存。宿主静止证明要求独立的非 root runtime 用户；root 部署会 fail closed。
+
+**验证**：Elastic 全仓 `2866 passed / 12 skipped / 0 failed`；另有 API/UI
+`230 passed`、核心交叉套件 `615 passed` 和独立对抗复核 `787 + 58 passed`。
+`compileall`、fatal Ruff、Batch 内联 JavaScript `node --check`、敏感 Key pattern 与
+`git diff --check` 均通过。未创建云资源、未部署、未重载或重启当前服务。
+
 ## 2026-07-29 Job 提交配置持久查看（commit `9d548b6`）
 
 **问题**：JobSpec 已在云资源副作用前写入 mode-0600 journal，但 Batch Console 的
