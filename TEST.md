@@ -270,6 +270,16 @@ The focused suite covers:
   labels, challenge-only visibility, keyed DOM transplant with input/focus
   preservation, single collapsible mobile reminder, and no browser-persisted
   code.
+- Per-Job submission config history: `GET /api/jobs/{job_id}` prefers the
+  immutable mode-0600 journal snapshot over a mutated live model, survives a
+  Manager restart, projects only current or explicitly supported legacy
+  JobSpec fields, redacts run/setup environment values and secret references,
+  rejects incompatible/oversized/symlinked journals, uses fail-fast bounded
+  reads, and returns `Cache-Control: no-store`. The Batch card fetches this
+  detail only when its nested config disclosure opens, renders JSON through
+  `textContent`, copies only `spec`, bounds concurrent requests, queue, cache,
+  and preview size, and preserves disclosure, scroll, and focus across keyed
+  reconciliation.
 - Accounts allocation UI fault injection: terminal-but-uncleaned runs remain
   `cleanup_pending`, Job/lease read failures return 503 instead of an empty
   allocation map, and the visible-page 15-second/manual refresh stays

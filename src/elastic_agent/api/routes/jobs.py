@@ -105,6 +105,18 @@ JOB_LIST_HISTORY_MAX_RETURNED = 500
 JOB_LIST_HISTORY_MAX_READ_BYTES = 64 * 1024 * 1024
 JOB_LIST_HISTORY_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 JOB_LIST_HISTORY_MAX_LEASES = 10_000
+# One detail request is scoped to a single Job.  EIP Jobs currently create at
+# most one durable lease per worker, but retain a generous compatibility margin
+# while preventing a corrupt binding journal from being fully materialized.
+JOB_DETAIL_MAX_RECOVERY_LEASES = 1_000
+# The persisted journal itself is capped at 32 MiB.  Redaction replaces short
+# values with visible markers and can therefore expand a configuration, so give
+# the final serialized snapshot a separate, still-finite response boundary.
+JOB_CONFIG_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+JOB_CONFIG_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+}
 RESULT_ARCHIVE_STREAM_WORKERS = 4
 RESULT_ARCHIVE_BUILD_WORKERS = 2
 RESULT_READ_WORKERS = 4
@@ -367,8 +379,10 @@ def _read_job_journal_sized(
     path: Path,
     expected_job_id: str,
     *,
-    max_bytes: int = JOB_JOURNAL_MAX_BYTES,
+    max_bytes: int | None = None,
 ) -> tuple[dict, int]:
+    if max_bytes is None:
+        max_bytes = JOB_JOURNAL_MAX_BYTES
     payload, bytes_read = _read_bounded_json_file(
         path,
         max_bytes=max_bytes,
@@ -383,6 +397,50 @@ def _read_job_journal_sized(
 
 def _read_job_journal(path: Path, expected_job_id: str) -> dict:
     return _read_job_journal_sized(path, expected_job_id)[0]
+
+
+def _job_journal_exists(path: Path) -> bool:
+    """Treat a symlink as present so the bounded no-follow reader rejects it."""
+
+    return path.exists() or path.is_symlink()
+
+
+def _read_and_redact_job_config(path: Path, job_id: str) -> tuple[dict, dict]:
+    """Read, validate, redact, and bound one snapshot off the event loop."""
+
+    payload = _read_job_journal(path, job_id)
+    # Do not hand the raw environment values/secret references back across the
+    # executor boundary.  Detail rendering needs only lifecycle metadata plus
+    # the already-redacted projection.
+    raw_spec = payload.pop("spec")
+    return payload, _redacted_spec(raw_spec)
+
+
+async def _read_job_journal_for_detail(path: Path, job_id: str) -> tuple[dict, dict]:
+    """Build an exact config snapshot on the bounded history executor."""
+
+    try:
+        permit = _acquire_result_operation(
+            _JOB_HISTORY_ADMISSION,
+            operation="Job config read",
+        )
+    except HTTPException as exc:
+        exc.headers = {
+            **(exc.headers or {}),
+            **JOB_CONFIG_NO_STORE_HEADERS,
+        }
+        raise
+    try:
+        return await _run_owned_executor(
+            _JOB_HISTORY_EXECUTOR,
+            _read_and_redact_job_config,
+            path,
+            job_id,
+        )
+    finally:
+        # A cancelled request cannot return this permit while its disk read is
+        # still occupying one of the dedicated history threads.
+        permit.release()
 
 
 def _load_historical_job_journals(
@@ -510,6 +568,7 @@ def _persisted_job_view(
     recovered: list,
     *,
     include_spec: bool,
+    recovery_leases_truncated: bool = False,
 ) -> dict:
     """Render a crash-recovered journal without inventing completion.
 
@@ -519,7 +578,12 @@ def _persisted_job_view(
     """
     submission_state = _journal_state(payload)
     terminal = submission_state in _TERMINAL_JOB_STATES
-    cleanup_pending = sum(lease.state != "released" for lease in recovered)
+    cleanup_pending = (
+        sum(lease.state != "released" for lease in recovered)
+        # A truncated tail may contain an active lease. Never report a
+        # recovered Job fully released when that cannot be proven.
+        + int(recovery_leases_truncated)
+    )
     collection_errors = [
         lease.recovery_collection_error
         for lease in recovered
@@ -597,6 +661,7 @@ def _persisted_job_view(
         "in_memory": False,
         "workers_detail": terminal_workers,
         "recovery_leases": [lease.model_dump() for lease in recovered],
+        "recovery_leases_truncated": recovery_leases_truncated,
     }
     if include_spec:
         view["spec"] = _redacted_spec(payload.get("spec") or {})
@@ -610,10 +675,52 @@ def _persisted_job_view(
     return view
 
 
+def _api_spec_projection(spec: JobSpec | dict) -> dict:
+    """Project a JobSpec onto the known schema before any API exposure.
+
+    A current in-memory model is already validated.  Persisted dictionaries are
+    untrusted recovery input: validating with ``extra='forbid'`` prevents a
+    legacy/corrupt journal from smuggling an unknown secret field into the
+    response. ``exclude_unset`` preserves old snapshots without inventing
+    defaults that did not exist when they were written.
+
+    ``manager_distribute`` is the one explicitly known read-only legacy value.
+    It is mapped only for structural validation and then restored in the
+    projection; current submissions and resubmits continue to reject it.
+    """
+
+    if isinstance(spec, JobSpec):
+        return spec.model_dump(mode="json")
+    if not isinstance(spec, dict):
+        raise ValueError("persisted JobSpec is not an object")
+
+    candidate = copy.deepcopy(spec)
+    legacy_manager_distribution = False
+    account = candidate.get("account")
+    if (
+        isinstance(account, dict)
+        and account.get("mode") == "manager_distribute"
+    ):
+        account["mode"] = "worker_local_login"
+        legacy_manager_distribution = True
+    try:
+        validated = JobSpec.model_validate(candidate)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("persisted JobSpec is incompatible with the API schema") from exc
+
+    projected = validated.model_dump(mode="json", exclude_unset=True)
+    if legacy_manager_distribution:
+        projected_account = projected.get("account")
+        if not isinstance(projected_account, dict):
+            raise ValueError("persisted legacy account section is invalid")
+        projected_account["mode"] = "manager_distribute"
+    return projected
+
+
 def _redacted_spec(spec: JobSpec | dict) -> dict:
-    """Return API-safe JobSpec data while retaining useful key names."""
-    raw = spec.model_dump(mode="json") if isinstance(spec, JobSpec) else spec
-    data = copy.deepcopy(raw)
+    """Return a bounded, schema-aware API snapshot with secret values removed."""
+
+    data = _api_spec_projection(spec)
     run = data.get("run") if isinstance(data, dict) else None
     if isinstance(run, dict):
         env = run.get("env")
@@ -652,6 +759,23 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
                 step["env"] = {
                     str(key): "[REDACTED]" for key in step["env"]
                 }
+
+    try:
+        encoded = json.dumps(
+            data,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (
+        RecursionError,
+        TypeError,
+        UnicodeEncodeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("persisted JobSpec cannot be serialized safely") from exc
+    if len(encoded) > JOB_CONFIG_MAX_RESPONSE_BYTES:
+        raise ValueError("persisted JobSpec exceeds the config response boundary")
     return data
 
 
@@ -880,14 +1004,17 @@ def _idempotency_conflict(*, legacy: bool) -> HTTPException:
     )
 
 
-def _job_detail(job) -> dict:
+def _job_detail(
+    job,
+    *,
+    include_spec: bool = True,
+) -> dict:
     is_eip_bound = job.spec.account.binding == "eip"
     worker_release_expected = is_eip_bound or job.release_workers_on_complete
     summary = job.summary()
     summary.pop("terminal_workers", None)
-    return {
+    detail = {
         **summary,
-        "spec": _redacted_spec(job.spec),
         "workers_detail": [
             {
                 "worker_id": r.worker_id,
@@ -946,13 +1073,15 @@ def _job_detail(job) -> dict:
             for assignment in job.pending_cleanup.values()
         ],
     }
+    if include_spec:
+        detail["spec"] = _redacted_spec(job.spec)
+    return detail
 
 
 def _job_list_item(job) -> dict:
     """Job summary + workers_detail but WITHOUT the (heavy) spec — enough for the
     UI's job list to render a full card without a per-job detail request."""
-    d = _job_detail(job)
-    d.pop("spec", None)
+    d = _job_detail(job, include_spec=False)
     d["in_memory"] = True
     return d
 
@@ -1603,25 +1732,78 @@ async def list_jobs() -> dict:
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: str) -> dict:
-    job_id = _validate_job_id(job_id)
+async def get_job(job_id: str, response: Response) -> dict:
+    try:
+        job_id = _validate_job_id(job_id)
+    except HTTPException as exc:
+        exc.headers = {
+            **(exc.headers or {}),
+            **JOB_CONFIG_NO_STORE_HEADERS,
+        }
+        raise
+    response.headers.update(JOB_CONFIG_NO_STORE_HEADERS)
     mgr = _mgr()
     job = mgr.batch.get_job(job_id)
-    if job is not None:
-        return _job_detail(job)
-    # Fall back to the persisted spec (job gone from memory after a restart).
     p = _job_spec_path(mgr, job_id)
-    if p.exists():
+    if job is not None:
+        # A persisted snapshot is authoritative even while the Job is live:
+        # runtime code may mutate its in-memory model after submission.  The
+        # fallback exists only for older/test integrations that created an
+        # in-memory Job without installing the persistence hook.
+        if not _job_journal_exists(p):
+            return _job_detail(job)
         try:
-            data = await asyncio.to_thread(_read_job_journal, p, job_id)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise HTTPException(500, f"invalid persisted spec for job {job_id}") from exc
-        leases = await mgr.account_binding_store.list_leases()
-        recovered = [lease for lease in leases if lease.job_id == job_id]
-        return _persisted_job_view(
-            job_id, data, recovered, include_spec=True,
-        )
-    raise HTTPException(404, f"Job {job_id} not found")
+            _data, submitted_spec = await _read_job_journal_for_detail(
+                p,
+                job_id,
+            )
+            detail = _job_detail(job, include_spec=False)
+            detail["spec"] = submitted_spec
+            return detail
+        except HTTPException:
+            raise
+        except (OSError, RecursionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                500,
+                f"persisted Job config is unavailable for job {job_id}",
+                headers=dict(JOB_CONFIG_NO_STORE_HEADERS),
+            ) from exc
+
+    # Fall back to the persisted spec (job gone from memory after a restart).
+    if _job_journal_exists(p):
+        try:
+            data, submitted_spec = await _read_job_journal_for_detail(
+                p,
+                job_id,
+            )
+            leases = await mgr.account_binding_store.list_leases(
+                job_ids={job_id},
+                limit=JOB_DETAIL_MAX_RECOVERY_LEASES + 1,
+            )
+            leases_truncated = len(leases) > JOB_DETAIL_MAX_RECOVERY_LEASES
+            recovered = leases[:JOB_DETAIL_MAX_RECOVERY_LEASES]
+            detail = _persisted_job_view(
+                job_id,
+                data,
+                recovered,
+                include_spec=False,
+                recovery_leases_truncated=leases_truncated,
+            )
+            detail["spec"] = submitted_spec
+            return detail
+        except HTTPException:
+            raise
+        except (OSError, RecursionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                500,
+                f"persisted Job config is unavailable for job {job_id}",
+                headers=dict(JOB_CONFIG_NO_STORE_HEADERS),
+            ) from exc
+    raise HTTPException(
+        404,
+        f"Job {job_id} not found",
+        headers=dict(JOB_CONFIG_NO_STORE_HEADERS),
+    )
 
 
 @router.get("/jobs/{job_id}/logs")

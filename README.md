@@ -775,7 +775,16 @@ collapsed with their identity, state, phase,
 submission time, and Worker count visible; opening a card reveals its actions,
 errors, cleanup state, results, and Worker execution table, and polling keeps
 the user's open/closed choice. Completed execution rows remain available as
-history. Command output remains queryable after teardown; the read-only live
+history. Each card also has a nested **Submission-time effective config
+(redacted)** disclosure. It lazily fetches the single-Job detail only when
+opened, formats the immutable journaled JobSpec as copyable JSON, and remains
+available after a Manager restart. This is the validated/normalized effective
+spec, not the raw request: `run.env`, setup-step environment values, and secret
+references are replaced by markers, while command text is shown as submitted.
+Do not embed credentials directly in commands. The polling list never carries
+all specs, and the browser uses bounded in-memory concurrency, preview, and LRU
+budgets rather than persistent storage. Command output remains queryable after
+teardown; the read-only live
 system-journal action remains available until the Worker resource is released,
 then stops polling on a not-found/conflict response; destructive terminate
 actions disappear at execution terminal state. Historical Job enumeration is
@@ -805,7 +814,8 @@ are accepted only in
 the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
 `sessionStorage` and strips legacy query-string credentials. REST includes
 `/api/accounts`, `/api/agent-api/accounts`,
-`/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}/logs`, and
+`/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}` (including
+the redacted submission snapshot), `/api/jobs/{job_id}/logs`, and
 `/api/jobs/harness`.
 
 Live batch runs require provision/login hooks wired at deployment:

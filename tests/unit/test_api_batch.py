@@ -1946,6 +1946,342 @@ class TestJobsAPI:
         assert detail["spec"]["name"] == "ai4sci"
 
     @pytest.mark.asyncio
+    async def test_get_uses_immutable_persisted_submission_config_live_and_after_restart(
+        self, client, manager,
+    ):
+        spec = {
+            **self._SPEC,
+            "setup": {"steps": [{
+                "name": "install",
+                "command": "true",
+                "env": {"SETUP_TOKEN": "setup-plaintext"},
+            }]},
+            "run": {
+                "command": "original-command",
+                "env": {"RUN_TOKEN": "run-plaintext"},
+                "secret_env": {
+                    "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
+                },
+            },
+        }
+        submitted = (await client.post("/api/jobs", json=spec)).json()
+        job_id = submitted["job_id"]
+        submitted_config = submitted["spec"]
+
+        # Runtime code owns a mutable model.  The detail API must still expose
+        # what was submitted, not a later in-memory mutation.
+        live_job = manager.batch.get_job(job_id)
+        live_job.spec.name = "mutated-name"
+        live_job.spec.run.command = "mutated-command"
+        live_job.spec.run.env["RUN_TOKEN"] = "mutated-secret"
+
+        live = await client.get(f"/api/jobs/{job_id}")
+        assert live.status_code == 200
+        assert live.headers["cache-control"] == "no-store"
+        assert live.headers["pragma"] == "no-cache"
+        assert live.json()["spec"] == submitted_config
+        assert live.json()["spec"]["run"]["command"] == "original-command"
+        assert live.json()["spec"]["run"]["env"] == {
+            "RUN_TOKEN": "[REDACTED]",
+        }
+        assert live.json()["spec"]["run"]["secret_env"] == {
+            "SECRET_TOKEN": "[SECRET_REFERENCE]",
+        }
+        assert live.json()["spec"]["setup"]["steps"][0]["env"] == {
+            "SETUP_TOKEN": "[REDACTED]",
+        }
+        assert "plaintext" not in live.text
+        assert "aws-secretsmanager" not in live.text
+
+        # Simulate the in-memory batch registry being lost on Manager restart.
+        manager.batch._jobs.clear()
+        historical = await client.get(f"/api/jobs/{job_id}")
+        assert historical.status_code == 200
+        assert historical.headers["cache-control"] == "no-store"
+        assert historical.headers["pragma"] == "no-cache"
+        assert historical.json()["spec"] == submitted_config
+        assert "plaintext" not in historical.text
+        assert "aws-secretsmanager" not in historical.text
+
+    @pytest.mark.asyncio
+    async def test_get_config_snapshot_read_fails_fast_when_capacity_is_full(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(jobs_route, "_JOB_HISTORY_ADMISSION", admission)
+        held = admission.try_acquire()
+        assert held is not None
+        try:
+            response = await client.get(f"/api/jobs/{submitted['job_id']}")
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "1"
+            assert response.headers["cache-control"] == "no-store"
+            assert response.headers["pragma"] == "no-cache"
+            assert admission.active == 1
+        finally:
+            held.release()
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_get_live_job_fails_closed_on_invalid_or_oversized_snapshot(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+
+        original = journal.read_bytes()
+        journal.write_text(
+            json.dumps({"job_id": job_id, "spec": []}),
+            encoding="utf-8",
+        )
+        invalid = await client.get(f"/api/jobs/{job_id}")
+        assert invalid.status_code == 500
+        assert invalid.headers["cache-control"] == "no-store"
+        assert invalid.headers["pragma"] == "no-cache"
+        assert "persisted Job config is unavailable" in invalid.json()["detail"]
+
+        journal.write_bytes(original)
+        monkeypatch.setattr(
+            jobs_route,
+            "JOB_JOURNAL_MAX_BYTES",
+            journal.stat().st_size - 1,
+        )
+        oversized = await client.get(f"/api/jobs/{job_id}")
+        assert oversized.status_code == 500
+        assert oversized.headers["cache-control"] == "no-store"
+        assert oversized.headers["pragma"] == "no-cache"
+        assert "persisted Job config is unavailable" in oversized.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_get_config_projection_stays_bounded_off_the_event_loop(
+        self, client, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        admission = jobs_route._ResultOperationAdmission(1)
+        monkeypatch.setattr(jobs_route, "_JOB_HISTORY_ADMISSION", admission)
+        original_redactor = jobs_route._redacted_spec
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_redactor(spec):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("test did not release config projection")
+            return original_redactor(spec)
+
+        monkeypatch.setattr(jobs_route, "_redacted_spec", blocking_redactor)
+        first = asyncio.create_task(
+            client.get(f"/api/jobs/{submitted['job_id']}")
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+
+        # The projection is running on the owned executor, so the event loop is
+        # responsive and the admission token remains held for the heavy work.
+        saturated = await client.get(f"/api/jobs/{submitted['job_id']}")
+        assert saturated.status_code == 503
+        assert saturated.headers["retry-after"] == "1"
+        assert admission.active == 1
+
+        release.set()
+        completed = await first
+        assert completed.status_code == 200
+        assert admission.active == 0
+
+    @pytest.mark.asyncio
+    async def test_get_legacy_snapshot_without_lifecycle_metadata_is_compatible(
+        self, client, manager,
+    ):
+        job_id = "legacy-config-snapshot"
+        specs = Path(manager.config.registry.path).with_name("specs")
+        specs.mkdir(mode=0o700, exist_ok=True)
+        journal = specs / f"{job_id}.json"
+        journal.write_text(
+            json.dumps({
+                "job_id": job_id,
+                "name": self._SPEC["name"],
+                "spec": self._SPEC,
+            }),
+            encoding="utf-8",
+        )
+        journal.chmod(0o600)
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 200
+        assert detail.json()["submission_state"] == "unknown"
+        assert detail.json()["spec"]["name"] == "ai4sci"
+
+    @pytest.mark.asyncio
+    async def test_get_known_legacy_manager_distribute_snapshot_preserves_mode(
+        self, client, manager,
+    ):
+        job_id = self._seed_job_journal(
+            manager,
+            "known-legacy-config-snapshot",
+            "succeeded",
+        )
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["spec"]["account"]["mode"] = "manager_distribute"
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 200
+        assert detail.json()["spec"]["account"]["mode"] == "manager_distribute"
+
+    @pytest.mark.asyncio
+    async def test_get_historical_snapshot_uses_bounded_job_scoped_lease_query(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+
+        job_id = self._seed_job_journal(
+            manager,
+            "bounded-config-lease-query",
+            "succeeded",
+        )
+        observed = {}
+
+        async def list_leases(*, job_ids, limit):
+            observed["job_ids"] = job_ids
+            observed["limit"] = limit
+            return []
+
+        monkeypatch.setattr(
+            manager.account_binding_store,
+            "list_leases",
+            list_leases,
+        )
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 200
+        assert observed == {
+            "job_ids": {job_id},
+            "limit": jobs_route.JOB_DETAIL_MAX_RECOVERY_LEASES + 1,
+        }
+        assert detail.json()["recovery_leases_truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_historical_snapshot_marks_truncated_leases_not_done(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.api.routes import jobs as jobs_route
+        from elastic_agent.core.account_binding import AccountLease
+
+        job_id = self._seed_job_journal(
+            manager,
+            "truncated-config-lease-query",
+            "succeeded",
+        )
+        monkeypatch.setattr(jobs_route, "JOB_DETAIL_MAX_RECOVERY_LEASES", 1)
+
+        async def list_leases(*, job_ids, limit):
+            assert job_ids == {job_id}
+            assert limit == 2
+            return [
+                AccountLease(
+                    lease_id="released-visible",
+                    account_id="account-1",
+                    job_id=job_id,
+                    state="released",
+                ),
+                AccountLease(
+                    lease_id="possibly-active-truncated",
+                    account_id="account-2",
+                    job_id=job_id,
+                    state="attached",
+                    instance_id="i-hidden",
+                    worker_id="w-hidden",
+                ),
+            ]
+
+        monkeypatch.setattr(
+            manager.account_binding_store,
+            "list_leases",
+            list_leases,
+        )
+
+        detail = (await client.get(f"/api/jobs/{job_id}")).json()
+
+        assert detail["recovery_leases_truncated"] is True
+        assert len(detail["recovery_leases"]) == 1
+        assert detail["cleanup_pending"] == 1
+        assert detail["done"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mutate", "secret"),
+        [
+            (
+                lambda spec: spec.update({
+                    "operator_secret": "unknown-top-level-secret",
+                }),
+                "unknown-top-level-secret",
+            ),
+            (
+                lambda spec: spec["run"].update({
+                    "private_note": "unknown-nested-secret",
+                }),
+                "unknown-nested-secret",
+            ),
+            (
+                lambda spec: spec.update({
+                    "setup": {
+                        "repo": (
+                            "https://operator:repository-secret@example.com/"
+                            "project.git?token=query-secret"
+                        ),
+                    },
+                }),
+                "repository-secret",
+            ),
+        ],
+    )
+    async def test_get_incompatible_legacy_snapshot_never_echoes_unknown_fields(
+        self, client, manager, mutate, secret,
+    ):
+        job_id = "incompatible-config-snapshot"
+        raw_spec = copy.deepcopy(self._SPEC)
+        mutate(raw_spec)
+        specs = Path(manager.config.registry.path).with_name("specs")
+        specs.mkdir(mode=0o700, exist_ok=True)
+        journal = specs / f"{job_id}.json"
+        journal.write_text(
+            json.dumps({
+                "job_id": job_id,
+                "name": self._SPEC["name"],
+                "spec": raw_spec,
+            }),
+            encoding="utf-8",
+        )
+        journal.chmod(0o600)
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 500
+        assert detail.headers["cache-control"] == "no-store"
+        assert detail.headers["pragma"] == "no-cache"
+        assert "persisted Job config is unavailable" in detail.json()["detail"]
+        assert secret not in detail.text
+        assert "query-secret" not in detail.text
+
+    @pytest.mark.asyncio
     async def test_historical_job_list_uses_scandir_and_explicit_caps(
         self, client, manager, monkeypatch,
     ):
@@ -2151,7 +2487,10 @@ class TestJobsAPI:
 
     @pytest.mark.asyncio
     async def test_get_missing_404(self, client):
-        assert (await client.get("/api/jobs/nope")).status_code == 404
+        response = await client.get("/api/jobs/nope")
+        assert response.status_code == 404
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
 
     @pytest.mark.asyncio
     async def test_job_logs_are_available_live_and_after_worker_release(

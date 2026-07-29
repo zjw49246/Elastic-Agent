@@ -867,6 +867,403 @@ process.stdout.write(JSON.stringify(results));
         assert "!document.hidden && !_logPaused" in html
 
     @pytest.mark.asyncio
+    async def test_job_cards_load_and_copy_redacted_submission_config_on_demand(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        formatter = _javascript_function(html, "jobSpecTextFromDetail")
+        loader = _javascript_function(html, "loadJobSpec")
+        detail_request = _javascript_function(
+            html, "requestJobSpecDetail"
+        )
+        card = _javascript_function(html, "jobConfigHtml")
+
+        assert "const jobSpecCache = new Map()" in html
+        assert "const jobSpecRequests = new Map()" in html
+        assert (
+            "api('GET', '/jobs/' + encodeURIComponent(jobId))"
+            in detail_request
+        )
+        assert "JOB_SPEC_REQUEST_CONCURRENCY = 2" in html
+        assert "JOB_SPEC_CACHE_MAX_ENTRIES = 8" in html
+        assert "JOB_SPEC_TEXT_MAX_CHARS" in loader
+        assert "detail.spec" in formatter
+        assert "JSON.stringify(spec, null, 2)" in formatter
+        assert "JSON.stringify(detail" not in formatter
+        assert "提交时生效配置（已脱敏）" in card
+        assert "复制 JSON" in card
+        assert 'data-job-config=""' in card
+        assert 'class="job-config-json"' in card
+        assert "copyJobSpec" in card
+        assert "requestJobConfigLoad" in card
+        assert "handleJobConfigToggle" in card
+        assert "jobConfigLoadRequested" in (
+            _javascript_function(html, "handleJobConfigToggle")
+        )
+        assert "handleJobCardToggle" not in (
+            _javascript_function(html, "jobRowHtml")
+        )
+        assert "[REDACTED]" in card
+        assert "[SECRET_REFERENCE]" in card
+        assert "命令文本会原样显示" in card
+        assert "请勿把密钥直接写进命令" in card
+        assert "可重提 Job 请使用服务端 resubmit" in card
+        assert "旧版配置可能需要按当前规则调整" in card
+        assert "${cached.text}" not in card
+        assert ".textContent = cached.text" in (
+            _javascript_function(html, "hydrateJobConfigNode")
+        )
+        assert "navigator.clipboard.writeText(cached.text)" in (
+            _javascript_function(html, "copyJobSpec")
+        )
+
+        rendered = _run_node_json(
+            formatter
+            + """
+const detail = {
+  spec: {
+    name: 'historical-job',
+    run: {
+      command: 'uv run benchmark',
+      env: {VISIBLE_NAME:'[REDACTED]'},
+      secret_env: {TOKEN:'[SECRET_REFERENCE]'},
+    },
+  },
+  password: 'DO_NOT_RENDER_DETAIL_FIELDS',
+  workers_detail: [{account_email:'private@example.test'}],
+};
+process.stdout.write(JSON.stringify({text:jobSpecTextFromDetail(detail)}));
+"""
+        )
+        parsed = json.loads(rendered["text"])
+        assert parsed["name"] == "historical-job"
+        assert parsed["run"]["env"] == {"VISIBLE_NAME": "[REDACTED]"}
+        assert parsed["run"]["secret_env"] == {
+            "TOKEN": "[SECRET_REFERENCE]"
+        }
+        assert "DO_NOT_RENDER_DETAIL_FIELDS" not in rendered["text"]
+        assert "private@example.test" not in rendered["text"]
+
+    @pytest.mark.asyncio
+    async def test_job_config_detail_cache_is_single_flight_and_handles_old_jobs(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        functions = "\n".join(
+            _javascript_function(html, name)
+            for name in (
+                "jobSpecTextFromDetail",
+                "setJobSpecState",
+                "touchJobSpecState",
+                "loadJobSpec",
+            )
+        )
+
+        result = _run_node_json(
+            """
+const jobSpecCache = new Map();
+const jobSpecRequests = new Map();
+let jobSpecRevision = 0;
+let jobSpecCacheChars = 0;
+const JOB_SPEC_CACHE_MAX_ENTRIES = 8;
+const JOB_SPEC_CACHE_MAX_CHARS = 4_000_000;
+const JOB_SPEC_TEXT_MAX_CHARS = 1_000_000;
+let latestJobs = [];
+let paints = 0;
+const calls = [];
+let releaseFirst;
+const firstResponse = new Promise(resolve => { releaseFirst = resolve; });
+const responses = [
+  firstResponse,
+  () => ({job_id:'legacy', spec:{}}),
+  () => { throw Object.assign(new Error('503: busy'), {status:503}); },
+  () => ({job_id:'temporary', spec:{name:'retry-ok'}}),
+  () => ({job_id:'huge', spec:{command:'x'.repeat(1_000_001)}}),
+];
+async function api(method, path) {
+  calls.push([method, path]);
+  const response = responses.shift();
+  return typeof response === 'function' ? response() : response;
+}
+function requestJobSpecDetail(jobId) {
+  return api('GET', '/jobs/' + encodeURIComponent(jobId));
+}
+function visibleJobs() { return []; }
+function reconcileJobCards() { paints += 1; }
+"""
+            + functions
+            + """
+(async () => {
+  const first = loadJobSpec('job/one');
+  const duplicate = loadJobSpec('job/one');
+  await new Promise(resolve => setImmediate(resolve));
+  const callsWhileLoading = calls.length;
+  releaseFirst({
+    job_id:'job/one',
+    spec:{name:'one', run:{env:{TOKEN:'[REDACTED]'}}},
+  });
+  await Promise.all([first, duplicate]);
+  await loadJobSpec('job/one');
+  const callsAfterCachedRead = calls.length;
+  await loadJobSpec('legacy');
+  await loadJobSpec('temporary');
+  const temporaryError = {...jobSpecCache.get('temporary')};
+  await loadJobSpec('temporary', true);
+  await loadJobSpec('huge');
+  const snapshots = {
+    ready:{...jobSpecCache.get('job/one')},
+    legacy:{...jobSpecCache.get('legacy')},
+    temporaryError,
+    temporaryRetry:{...jobSpecCache.get('temporary')},
+    huge:{...jobSpecCache.get('huge')},
+  };
+  for (let index = 0; index < 9; index += 1) {
+    setJobSpecState('lru-' + index, {status:'ready', text:'value-' + index});
+  }
+  process.stdout.write(JSON.stringify({
+    calls,
+    callsWhileLoading,
+    callsAfterCachedRead,
+    snapshots,
+    cacheKeys:Array.from(jobSpecCache.keys()),
+    cacheChars:jobSpecCacheChars,
+    requestsCleared:jobSpecRequests.size === 0,
+    paints,
+  }));
+})().catch(error => {
+  process.stderr.write(String(error.stack || error));
+  process.exitCode = 1;
+});
+"""
+        )
+
+        assert result["callsWhileLoading"] == 1
+        assert result["callsAfterCachedRead"] == 1
+        assert result["calls"] == [
+            ["GET", "/jobs/job%2Fone"],
+            ["GET", "/jobs/legacy"],
+            ["GET", "/jobs/temporary"],
+            ["GET", "/jobs/temporary"],
+            ["GET", "/jobs/huge"],
+        ]
+        snapshots = result["snapshots"]
+        assert snapshots["ready"]["status"] == "ready"
+        assert json.loads(snapshots["ready"]["text"])["name"] == "one"
+        assert snapshots["legacy"]["status"] == "missing"
+        assert snapshots["temporaryError"]["status"] == "error"
+        assert snapshots["temporaryError"]["error_status"] == 503
+        assert snapshots["temporaryRetry"]["status"] == "ready"
+        assert snapshots["huge"]["status"] == "too_large"
+        assert "text" not in snapshots["huge"]
+        assert result["cacheKeys"] == [
+            "lru-1",
+            "lru-2",
+            "lru-3",
+            "lru-4",
+            "lru-5",
+            "lru-6",
+            "lru-7",
+            "lru-8",
+        ]
+        assert result["cacheChars"] == sum(
+            len(f"value-{index}") for index in range(1, 9)
+        )
+        assert result["requestsCleared"] is True
+        assert result["paints"] >= 6
+
+    @pytest.mark.asyncio
+    async def test_job_config_detail_requests_have_global_concurrency_limit(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        functions = "\n".join(
+            _javascript_function(html, name)
+            for name in (
+                "drainJobSpecRequestQueue",
+                "requestJobSpecDetail",
+            )
+        )
+
+        result = _run_node_json(
+            """
+const JOB_SPEC_REQUEST_CONCURRENCY = 2;
+const JOB_SPEC_REQUEST_QUEUE_MAX = 8;
+const jobSpecRequestQueue = [];
+let jobSpecRequestActive = 0;
+let active = 0;
+let maximumActive = 0;
+const releases = [];
+async function api(method, path) {
+  active += 1;
+  maximumActive = Math.max(maximumActive, active);
+  await new Promise(resolve => releases.push(resolve));
+  active -= 1;
+  return {path};
+}
+"""
+            + functions
+            + """
+(async () => {
+  const requests = Array.from(
+    {length:10}, (_, index) => requestJobSpecDetail('job-' + index)
+  );
+  const overflow = requestJobSpecDetail('job-overflow')
+    .then(() => null, error => error.status);
+  await new Promise(resolve => setImmediate(resolve));
+  const firstWave = {active, queued:jobSpecRequestQueue.length};
+  while (releases.length || jobSpecRequestQueue.length || active) {
+    const batch = releases.splice(0);
+    batch.forEach(resolve => resolve());
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const values = await Promise.all(requests);
+  process.stdout.write(JSON.stringify({
+    firstWave,
+    maximumActive,
+    paths:values.map(value => value.path),
+    overflow:await overflow,
+    active:jobSpecRequestActive,
+    queued:jobSpecRequestQueue.length,
+  }));
+})().catch(error => {
+  process.stderr.write(String(error.stack || error));
+  process.exitCode = 1;
+});
+"""
+        )
+
+        assert result == {
+            "firstWave": {"active": 2, "queued": 8},
+            "maximumActive": 2,
+            "paths": [f"/jobs/job-{index}" for index in range(10)],
+            "overflow": 429,
+            "active": 0,
+            "queued": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_job_config_out_of_order_details_stay_with_their_job(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        functions = "\n".join(
+            _javascript_function(html, name)
+            for name in (
+                "jobSpecTextFromDetail",
+                "setJobSpecState",
+                "loadJobSpec",
+            )
+        )
+
+        result = _run_node_json(
+            """
+const jobSpecCache = new Map();
+const jobSpecRequests = new Map();
+let jobSpecRevision = 0;
+let jobSpecCacheChars = 0;
+const JOB_SPEC_CACHE_MAX_ENTRIES = 8;
+const JOB_SPEC_CACHE_MAX_CHARS = 4_000_000;
+const JOB_SPEC_TEXT_MAX_CHARS = 1_000_000;
+let latestJobs = [];
+const resolvers = new Map();
+function requestJobSpecDetail(jobId) {
+  return new Promise(resolve => resolvers.set(jobId, resolve));
+}
+function visibleJobs() { return []; }
+function reconcileJobCards() {}
+"""
+            + functions
+            + """
+(async () => {
+  const a = loadJobSpec('job-a');
+  const b = loadJobSpec('job-b');
+  resolvers.get('job-b')({job_id:'job-b', spec:{name:'B'}});
+  await b;
+  resolvers.get('job-a')({job_id:'job-a', spec:{name:'A'}});
+  await a;
+  process.stdout.write(JSON.stringify({
+    a:JSON.parse(jobSpecCache.get('job-a').text),
+    b:JSON.parse(jobSpecCache.get('job-b').text),
+  }));
+})().catch(error => {
+  process.stderr.write(String(error.stack || error));
+  process.exitCode = 1;
+});
+"""
+        )
+
+        assert result == {"a": {"name": "A"}, "b": {"name": "B"}}
+
+    @pytest.mark.asyncio
+    async def test_job_config_open_and_scroll_survive_card_reconciliation(
+        self, ui_client,
+    ):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+        capture = _javascript_function(html, "captureJobConfigUiState")
+        restore = _javascript_function(html, "restoreJobConfigUiState")
+        reconcile = _javascript_function(html, "reconcileJobCards")
+
+        assert "replacement.open = wasOpen" in reconcile
+        assert "captureJobConfigUiState(node)" in reconcile
+        assert "restoreJobConfigUiState(replacement" in reconcile
+        assert "restoreJobFocus(replacement, focusedControl)" in reconcile
+        assert 'data-job-focus="job-config-summary"' in html
+        assert 'data-job-focus="job-config-copy"' in html
+        assert "window.scrollTo(viewportX, viewportY)" in reconcile
+
+        state = _run_node_json(
+            """
+const oldDetails = {open:true};
+const oldJson = {scrollTop:137, scrollLeft:29};
+const oldNode = {
+  querySelector(selector) {
+    if (selector === '[data-job-config]') return oldDetails;
+    if (selector === '.job-config-json') return oldJson;
+    return null;
+  },
+};
+const newDetails = {open:false};
+const newJson = {scrollTop:0, scrollLeft:0};
+const newNode = {
+  querySelector(selector) {
+    if (selector === '[data-job-config]') return newDetails;
+    if (selector === '.job-config-json') return newJson;
+    return null;
+  },
+};
+"""
+            + capture
+            + "\n"
+            + restore
+            + """
+const captured = captureJobConfigUiState(oldNode);
+restoreJobConfigUiState(newNode, captured);
+process.stdout.write(JSON.stringify({
+  captured,
+  open:newDetails.open,
+  scrollTop:newJson.scrollTop,
+  scrollLeft:newJson.scrollLeft,
+}));
+"""
+        )
+
+        assert state == {
+            "captured": {
+                "open": True,
+                "scrollTop": 137,
+                "scrollLeft": 29,
+            },
+            "open": True,
+            "scrollTop": 137,
+            "scrollLeft": 29,
+        }
+
+    @pytest.mark.asyncio
     async def test_account_status_refresh_is_visible_single_flight_and_ordered(
         self, ui_client,
     ):

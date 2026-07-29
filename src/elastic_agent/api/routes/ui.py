@@ -612,6 +612,28 @@ _BATCH_HTML = """\
   .job-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
   .job-actions .btn { margin:0; padding:5px 10px; }
   .job-actions [data-result-action] { min-width:132px; }
+  .job-config { margin-top:12px; border:1px solid var(--border); border-radius:9px;
+    background:var(--surface-soft); overflow:hidden; }
+  .job-config > summary { display:flex; justify-content:space-between; align-items:center;
+    gap:10px; padding:9px 11px; list-style:none; color:var(--accent);
+    font-size:.82rem; font-weight:700; }
+  .job-config > summary::-webkit-details-marker { display:none; }
+  .job-config > summary::after { content:'查看 JSON ▾'; color:var(--muted);
+    font-size:.72rem; font-weight:500; white-space:nowrap; }
+  .job-config[open] > summary { border-bottom:1px solid var(--border);
+    background:var(--surface); }
+  .job-config[open] > summary::after { content:'收起 JSON ▴'; }
+  .job-config-body { padding:10px; }
+  .job-config-toolbar { display:flex; justify-content:space-between; align-items:flex-start;
+    gap:10px; margin-bottom:8px; }
+  .job-config-toolbar .btn,.job-config-message .btn { margin:0; padding:5px 9px; }
+  .job-config-note { color:var(--muted); font-size:.74rem; line-height:1.45; }
+  .job-config-message { display:flex; justify-content:space-between; align-items:center;
+    gap:10px; min-height:38px; color:var(--muted); font-size:.78rem; }
+  .job-config-json { max-height:420px; overflow:auto; white-space:pre; tab-size:2;
+    margin:0; padding:11px; border:1px solid var(--border); border-radius:7px;
+    background:var(--terminal); color:var(--terminal-text);
+    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
   .worker-records-title { margin-top:10px; margin-bottom:4px; }
   .job-alert { background:color-mix(in srgb,var(--red) 8%,var(--surface));
     border:1px solid color-mix(in srgb,var(--red) 35%,var(--border));
@@ -639,6 +661,7 @@ _BATCH_HTML = """\
     .container { padding:12px; }
     header,.job-head,.job-summary { align-items:flex-start; flex-direction:column; }
     .job-actions { justify-content:flex-start; }
+    .job-config-toolbar,.job-config-message { align-items:flex-start; flex-direction:column; }
     .log-dialog { width:96%; height:90vh; }
     .otp-action-card { right:10px; bottom:10px; width:calc(100vw - 20px);
       max-height:52vh; }
@@ -1134,6 +1157,17 @@ let lastAccountsRefreshAt = 0;
 const jobResultsCache = new Map();
 const jobResultsRequestVersions = new Map();
 const resultDownloadsInFlight = new Map();
+const JOB_SPEC_CACHE_MAX_ENTRIES = 8;
+const JOB_SPEC_CACHE_MAX_CHARS = 4_000_000;
+const JOB_SPEC_TEXT_MAX_CHARS = 1_000_000;
+const JOB_SPEC_REQUEST_CONCURRENCY = 2;
+const JOB_SPEC_REQUEST_QUEUE_MAX = 8;
+const jobSpecCache = new Map();
+const jobSpecRequests = new Map();
+const jobSpecRequestQueue = [];
+let jobSpecCacheChars = 0;
+let jobSpecRevision = 0;
+let jobSpecRequestActive = 0;
 const PENDING_JOB_SUBMISSION_KEY = 'ea_pending_job_submission';
 let latestLoginAttempts = [];
 const otpCardsByKey = new Map();
@@ -2622,6 +2656,242 @@ function formatWhen(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
 }
+function jobSpecTextFromDetail(detail) {
+  const spec = detail && detail.spec;
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)
+      || !Object.keys(spec).length) {
+    return null;
+  }
+  return JSON.stringify(spec, null, 2);
+}
+function setJobSpecState(rawJobId, state) {
+  const jobId = String(rawJobId);
+  const previous = jobSpecCache.get(jobId);
+  if (previous) jobSpecCacheChars -= Number(previous.text_chars) || 0;
+  jobSpecCache.delete(jobId);
+  const entry = {...state, revision:++jobSpecRevision};
+  if (typeof entry.text === 'string') {
+    entry.text_chars = entry.text.length;
+  } else {
+    delete entry.text;
+    entry.text_chars = 0;
+  }
+  jobSpecCache.set(jobId, entry);
+  jobSpecCacheChars += entry.text_chars;
+  while (jobSpecCache.size > JOB_SPEC_CACHE_MAX_ENTRIES
+         || jobSpecCacheChars > JOB_SPEC_CACHE_MAX_CHARS) {
+    const oldestJobId = jobSpecCache.keys().next().value;
+    const evicted = jobSpecCache.get(oldestJobId);
+    jobSpecCacheChars -= Number(evicted?.text_chars) || 0;
+    jobSpecCache.delete(oldestJobId);
+  }
+  return entry;
+}
+function touchJobSpecState(rawJobId) {
+  const jobId = String(rawJobId);
+  const cached = jobSpecCache.get(jobId);
+  if (!cached) return null;
+  jobSpecCache.delete(jobId);
+  jobSpecCache.set(jobId, cached);
+  return cached;
+}
+function drainJobSpecRequestQueue() {
+  while (jobSpecRequestActive < JOB_SPEC_REQUEST_CONCURRENCY
+         && jobSpecRequestQueue.length) {
+    const queued = jobSpecRequestQueue.shift();
+    jobSpecRequestActive += 1;
+    Promise.resolve().then(queued.run).then(
+      queued.resolve, queued.reject,
+    ).finally(() => {
+      jobSpecRequestActive -= 1;
+      drainJobSpecRequestQueue();
+    });
+  }
+}
+function requestJobSpecDetail(jobId) {
+  return new Promise((resolve, reject) => {
+    if (jobSpecRequestQueue.length >= JOB_SPEC_REQUEST_QUEUE_MAX) {
+      const error = new Error(
+        '等待加载的 Job 配置过多，请稍后重试。',
+      );
+      error.status = 429;
+      reject(error);
+      return;
+    }
+    jobSpecRequestQueue.push({
+      run:() => api('GET', '/jobs/' + encodeURIComponent(jobId)),
+      resolve,
+      reject,
+    });
+    drainJobSpecRequestQueue();
+  });
+}
+function loadJobSpec(rawJobId, force=false) {
+  const jobId = String(rawJobId);
+  const cached = jobSpecCache.get(jobId);
+  if (!force && ['ready','too_large'].includes(cached?.status)) {
+    touchJobSpecState(jobId);
+    return Promise.resolve(cached);
+  }
+  const existing = jobSpecRequests.get(jobId);
+  if (existing) return existing;
+
+  setJobSpecState(jobId, {status:'loading'});
+  reconcileJobCards(visibleJobs(latestJobs));
+  const request = requestJobSpecDetail(jobId).then(detail => {
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+      throw new Error('Job 详情响应格式无效');
+    }
+    if (detail.job_id !== undefined && detail.job_id !== null
+        && String(detail.job_id) !== jobId) {
+      throw new Error('Job 详情响应与请求不匹配');
+    }
+    const text = jobSpecTextFromDetail(detail);
+    if (text === null) {
+      return setJobSpecState(jobId, {
+        status:'missing',
+        message:'此旧 Job 记录没有可读取的提交配置。',
+      });
+    }
+    if (text.length > JOB_SPEC_TEXT_MAX_CHARS) {
+      return setJobSpecState(jobId, {
+        status:'too_large',
+        message:'提交配置超过页面的安全展示上限，请通过单 Job 详情 API 检查。',
+      });
+    }
+    return setJobSpecState(jobId, {status:'ready', text});
+  }).catch(error => {
+    const status = Number(error?.status) || null;
+    if (status === 404) {
+      return setJobSpecState(jobId, {
+        status:'missing',
+        error_status:status,
+        message:'此 Job 已不存在，或旧记录没有可读取的提交配置。',
+      });
+    }
+    return setJobSpecState(jobId, {
+      status:'error',
+      error_status:status,
+      message:String(error?.message || error).replace(/\\s+/g, ' ').slice(0, 300),
+    });
+  }).finally(() => {
+    jobSpecRequests.delete(jobId);
+    reconcileJobCards(visibleJobs(latestJobs));
+  });
+  jobSpecRequests.set(jobId, request);
+  return request;
+}
+function requestJobConfigLoad(config) {
+  if (!config.open) config.dataset.jobConfigLoadRequested = 'true';
+}
+function handleJobConfigToggle(config, rawJobId) {
+  const requested = config.dataset.jobConfigLoadRequested === 'true';
+  delete config.dataset.jobConfigLoadRequested;
+  if (config.open && requested) loadJobSpec(rawJobId);
+}
+async function copyJobSpec(rawJobId) {
+  const jobId = String(rawJobId);
+  const cached = touchJobSpecState(jobId);
+  if (!cached || cached.status !== 'ready' || typeof cached.text !== 'string') {
+    toast('提交配置尚未加载。', 'error');
+    return;
+  }
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(cached.text);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = cached.text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      if (!copied) throw new Error('浏览器拒绝剪贴板访问');
+    }
+    toast('已复制脱敏后的提交配置 JSON');
+  } catch(error) {
+    toast('复制失败：' + (error.message || error), 'error');
+  }
+}
+function jobConfigHtml(job) {
+  const jobId = String(job.job_id);
+  const cached = jobSpecCache.get(jobId);
+  let content = `
+    <div class="job-config-message">
+      <span>配置仅在你展开本区域后按需加载。</span>
+      <button class="btn btn-ghost" data-job-focus="job-config-load"
+        onclick="loadJobSpec(${jsArg(jobId)},true)">加载配置</button>
+    </div>`;
+  if (cached?.status === 'loading') {
+    content = `<div class="job-config-message" role="status">
+      <span>正在加载脱敏后的提交配置…</span>
+    </div>`;
+  } else if (cached?.status === 'ready') {
+    content = `
+      <div class="job-config-toolbar">
+        <p class="job-config-note">
+          <code>[REDACTED]</code> / <code>[SECRET_REFERENCE]</code> 是脱敏占位符，
+          不是真实值，不能直接复制重提；命令文本会原样显示，请勿把密钥直接写进命令。
+          可重提 Job 请使用服务端 resubmit；旧版配置可能需要按当前规则调整。
+        </p>
+        <button class="btn btn-ghost" data-job-focus="job-config-copy"
+          onclick="copyJobSpec(${jsArg(jobId)})">复制 JSON</button>
+      </div>
+      <pre class="job-config-json" data-job-focus="job-config-json"
+           tabindex="0" aria-label="脱敏后的 Job 提交配置 JSON"></pre>`;
+  } else if (cached?.status === 'missing') {
+    content = `<div class="job-config-message" role="status">
+      <span>${esc(cached.message || '此 Job 没有可读取的提交配置。')}</span>
+      <button class="btn btn-ghost" data-job-focus="job-config-retry"
+        onclick="loadJobSpec(${jsArg(jobId)},true)">重试</button>
+    </div>`;
+  } else if (cached?.status === 'too_large') {
+    content = `<div class="job-config-message" role="status">
+      <span>${esc(cached.message || '提交配置过大，无法在页面安全展示。')}</span>
+    </div>`;
+  } else if (cached?.status === 'error') {
+    content = `<div class="job-config-message" role="alert">
+      <span>加载失败：${esc(cached.message || '暂时不可用')}</span>
+      <button class="btn btn-ghost" data-job-focus="job-config-retry"
+        onclick="loadJobSpec(${jsArg(jobId)},true)">重试</button>
+    </div>`;
+  }
+  return `<details class="job-config" data-job-config=""
+      ontoggle="handleJobConfigToggle(this,${jsArg(jobId)})">
+    <summary data-job-focus="job-config-summary"
+      onclick="requestJobConfigLoad(this.parentElement)">提交时生效配置（已脱敏）</summary>
+    <div class="job-config-body">${content}</div>
+  </details>`;
+}
+function hydrateJobConfigNode(node, rawJobId) {
+  const cached = jobSpecCache.get(String(rawJobId));
+  const json = node.querySelector('.job-config-json');
+  if (json && cached?.status === 'ready' && typeof cached.text === 'string') {
+    json.textContent = cached.text;
+  }
+}
+function captureJobConfigUiState(node) {
+  const config = node.querySelector('[data-job-config]');
+  const json = node.querySelector('.job-config-json');
+  return {
+    open:Boolean(config?.open),
+    scrollTop:Number(json?.scrollTop) || 0,
+    scrollLeft:Number(json?.scrollLeft) || 0,
+  };
+}
+function restoreJobConfigUiState(node, state) {
+  if (!state) return;
+  const config = node.querySelector('[data-job-config]');
+  const json = node.querySelector('.job-config-json');
+  if (config) config.open = state.open;
+  if (json) {
+    json.scrollTop = state.scrollTop;
+    json.scrollLeft = state.scrollLeft;
+  }
+}
 function resultFor(jobId) {
   return jobResultsCache.get(jobId)?.value || null;
 }
@@ -2701,7 +2971,8 @@ function jobRowHtml(j, r) {
     .map(([phase,count]) => badge(phase)+' '+(Number(count)||0)).join(' ');
   const created = formatWhen(j.created_at);
   return `
-  <details id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}" data-job-id="${esc(j.job_id)}">
+  <details id="jobrow-${esc(j.job_id)}" class="job-row job-${esc(state)}"
+      data-job-id="${esc(j.job_id)}">
     <summary class="job-summary" data-job-focus="job-summary">
       <span class="job-summary-main">
         <span class="job-summary-title"><b>${esc(j.name||'')}</b> ${badge(state)}
@@ -2736,6 +3007,7 @@ function jobRowHtml(j, r) {
       </section>
       ${scoreStr ? `<div class="muted" style="margin-top:4px">📊 ${scoreStr}</div>` : ''}
       ${r && r.s3_uri ? `<div class="muted" style="font-size:.72rem">S3: ${esc(r.s3_uri)}</div>` : ''}
+      ${jobConfigHtml(j)}
       <div class="worker-records-title muted">${recordedWorkers} 条 Worker 执行记录</div>
       <div class="hint">
         任务输出是命令 stdout/stderr，Worker 销毁后仍可查看；
@@ -2765,13 +3037,15 @@ function jobRenderSignature(job, result) {
     Number(cached?.errorStatus) || Boolean(cached?.error),
     resultDownloadsInFlight.has(jobId),
   ];
-  return JSON.stringify([job, result || null, resultUiState]);
+  const specRevision = Number(jobSpecCache.get(jobId)?.revision) || 0;
+  return JSON.stringify([job, result || null, resultUiState, specRevision]);
 }
 function makeJobNode(job) {
   const template = document.createElement('template');
   const result = resultFor(job.job_id);
   template.innerHTML = jobRowHtml(job, result).trim();
   const node = template.content.firstElementChild;
+  hydrateJobConfigNode(node, job.job_id);
   node._renderSignature = jobRenderSignature(job, result);
   return node;
 }
@@ -2842,6 +3116,7 @@ function reconcileJobCards(jobs) {
       const wasOpen = node.open;
       const focusedControl = jobFocusedControl(node);
       const otpFocus = focusedOtpState(node);
+      const configUiState = captureJobConfigUiState(node);
       const otpCards = Array.from(
         node.querySelectorAll('.otp-challenge-card'),
       );
@@ -2858,6 +3133,7 @@ function reconcileJobCards(jobs) {
           replacementScrolls[index].scrollLeft = scrollLeft;
         }
       });
+      restoreJobConfigUiState(replacement, configUiState);
       restoreJobFocus(replacement, focusedControl);
       if (otpFocus) otpFocusTarget = {node:replacement, state:otpFocus};
       replacedAny = true;
