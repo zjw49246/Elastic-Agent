@@ -163,6 +163,9 @@ The focused suite covers:
 - immutable checkpoint recovery: stable shard-index contracts, per-file
   snapshot race detection, content-addressed blob deduplication, atomic shard
   manifests and all-shard Job sets, incomplete-generation rejection,
+  canonical C-locale vanished-source rc=24 recognition with bounded
+  re-transfer and mandatory rc=0 convergence,
+  mixed-error/no-convergence rejection without checkpoint publication,
   retention/garbage collection, v1 and legacy compatibility, S3-COMMITTED
   recovery before the local latest pointer exists, pre-prepare generation
   pinning, exact metadata/shard/aggregate-budget validation, hash/size/mode and

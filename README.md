@@ -649,7 +649,9 @@ through the browser. Only checkpoint generation, run command/run timeout, and
 Job TTL may be overridden, and the normal Idempotency-Key submit path is
 retained. S3 `COMMITTED` is authoritative even if the Manager crashed before
 updating its local `latest` convenience pointer. Work written after the last
-complete set must run again.
+complete set must run again. If a source entry vanishes during rsync, Elastic
+retries only the canonical rsync rc=24 vanished-source case and still requires
+a subsequent complete rc=0 pass before publishing the snapshot.
 
 On the replacement Worker, Elastic transfers every recovery path into a
 root-private transaction tree outside the workload checkout

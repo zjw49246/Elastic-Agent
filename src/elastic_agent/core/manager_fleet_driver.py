@@ -82,6 +82,7 @@ _DEFAULT_MAX_COLLECTION_FILE_BYTES = 20 * 1024 * 1024 * 1024
 _COLLECTION_FREE_SPACE_RESERVE_BYTES = 1024 * 1024 * 1024
 _COLLECTION_FREE_INODE_RESERVE = 10_000
 _COLLECTION_MONITOR_INTERVAL_SECONDS = 0.25
+_COLLECTION_VANISHED_SOURCE_RETRIES = 2
 _S3_COLLECTION_DEADLINE_SECONDS = 1_800
 _COLLECTION_STAGING_RESERVATION_WAIT_SECONDS = 1_800
 _RECOVERY_STAGING_DEADLINE_SECONDS = 1800
@@ -93,6 +94,16 @@ _SUBPROCESS_GROUP_REAP_TIMEOUT_SECONDS = 5
 _SUBPROCESS_GROUP_POLL_SECONDS = 0.05
 _RECOVERY_TRANSFER_ENV = "ELASTIC_AGENT_RECOVERY_TRANSFER_ID"
 _RECOVERY_TRANSFER_SCHEMA_VERSION = 1
+_RSYNC_VANISHED_ENTRY = re.compile(
+    r"^(?:file|directory) has vanished: .+$",
+)
+_RSYNC_VANISHED_SUMMARY = re.compile(
+    r"^rsync warning: some files vanished before they could be transferred "
+    r"\(code 24\) at .+$",
+)
+_SSH_NEW_HOST_WARNING = re.compile(
+    r"^Warning: Permanently added .+ to the list of known hosts\.$",
+)
 _RECOVERY_PROCESS_SCANNER = r"""
 import base64
 import json
@@ -506,6 +517,39 @@ async def _no_bound_release(
     raise NotImplementedError(
         "ManagerFleetDriver.release_bound requires EIP binding hooks"
     )
+
+
+def _rsync_reported_only_vanished_sources(stderr: bytes) -> bool:
+    """Recognize rsync's narrow exit-24 vanished-source diagnostic.
+
+    Exit 24 is retryable, not successful: the caller must run a fresh rsync
+    pass and receive rc=0 before it can publish the staging tree. Requiring the
+    per-entry diagnostic and the canonical summary prevents an unrelated
+    partial-transfer error from entering that retry path.
+    """
+
+    try:
+        lines = [
+            line.strip()
+            for line in stderr.decode("utf-8", errors="strict").splitlines()
+            if line.strip()
+        ]
+    except UnicodeDecodeError:
+        return False
+    saw_entry = False
+    saw_summary = False
+    for line in lines:
+        if _RSYNC_VANISHED_ENTRY.fullmatch(line):
+            saw_entry = True
+        elif _RSYNC_VANISHED_SUMMARY.fullmatch(line):
+            saw_summary = True
+        elif _SSH_NEW_HOST_WARNING.fullmatch(line):
+            # The collection transport intentionally uses an isolated
+            # known-hosts file, so OpenSSH may emit this on every connection.
+            continue
+        else:
+            return False
+    return saw_entry and saw_summary
 
 
 class ManagerFleetDriver:
@@ -3891,46 +3935,73 @@ sleep 1
                 # scan remains authoritative for total/single-file limits.
                 rsync_args.append("--bwlimit=131072")
                 # Every attempt starts empty. Deletion is still explicit so
-                # retries within one rsync invocation cannot preserve a remote
-                # file that disappeared during transfer.
+                # repeated rsync passes cannot preserve a remote file that
+                # disappeared during transfer.
                 rsync_args.extend(["--delete", "--delete-excluded"])
                 for pattern in exclude:
                     rsync_args.extend(["--exclude", pattern])
                 rsync_args.extend(["-e", ssh, src, str(local_path) + "/"])
-                proc = await asyncio.create_subprocess_exec(
-                    # Checksum comparison catches same-size, same-mtime rewrites;
-                    # the Manager-side uploader then uses SHA-256 as its own
-                    # authoritative S3 deduplication key.
-                    *rsync_args,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=(os.name == "posix"),
-                )
-                try:
-                    stderr = await self._run_bounded_collection_rsync(
-                        proc,
-                        staging_root=attempt,
-                        max_bytes=max_bytes,
-                        max_objects=max_objects,
-                        max_file_bytes=max_file_bytes,
-                        timeout=1800,
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        f"rsync collect timed out for {rel!r} on "
-                        f"{worker_id!r}"
-                    ) from exc
-                except BaseException:
-                    raise
-                try:
-                    if proc.returncode != 0:
-                        detail = stderr.decode(errors="replace")[-500:]
-                        raise RuntimeError(
-                            f"rsync collect failed for {rel!r} "
-                            f"(rc={proc.returncode}): {detail}"
+                rsync_deadline = time.monotonic() + 1800
+                for transfer_attempt in range(
+                    _COLLECTION_VANISHED_SOURCE_RETRIES + 1,
+                ):
+                    try:
+                        remaining = rsync_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        proc = await asyncio.create_subprocess_exec(
+                            # Checksum comparison catches same-size, same-mtime
+                            # rewrites; the Manager-side uploader then uses
+                            # SHA-256 as its authoritative S3 deduplication key.
+                            *rsync_args,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                            env={**os.environ, "LC_ALL": "C"},
+                            start_new_session=(os.name == "posix"),
                         )
-                except BaseException:
-                    raise
+                        stderr = await self._run_bounded_collection_rsync(
+                            proc,
+                            staging_root=attempt,
+                            max_bytes=max_bytes,
+                            max_objects=max_objects,
+                            max_file_bytes=max_file_bytes,
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise RuntimeError(
+                            f"rsync collect timed out for {rel!r} on "
+                            f"{worker_id!r}"
+                        ) from exc
+                    except BaseException:
+                        raise
+                    if proc.returncode == 0:
+                        break
+                    if (
+                        spec.collect.checkpoint
+                        and proc.returncode == 24
+                        and _rsync_reported_only_vanished_sources(stderr)
+                        and transfer_attempt
+                        < _COLLECTION_VANISHED_SOURCE_RETRIES
+                    ):
+                        # Never publish an rc=24 staging tree. A fresh pass over
+                        # the same --delete destination must settle at rc=0,
+                        # which both picks up the atomically published name and
+                        # removes any stale receiver-side entry.
+                        logger.warning(
+                            "checkpoint rsync source changed during transfer "
+                            "for job %s worker %s path %s; retrying (%d/%d)",
+                            job_id,
+                            worker_id,
+                            rel,
+                            transfer_attempt + 1,
+                            _COLLECTION_VANISHED_SOURCE_RETRIES,
+                        )
+                        continue
+                    detail = stderr.decode(errors="replace")[-500:]
+                    raise RuntimeError(
+                        f"rsync collect failed for {rel!r} "
+                        f"(rc={proc.returncode}): {detail}"
+                    )
             await asyncio.to_thread(
                 self._validate_collection_tree,
                 attempt,

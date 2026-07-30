@@ -179,6 +179,20 @@ def _spec(tmp_path):
     })
 
 
+def _checkpoint_spec(tmp_path):
+    return JobSpec.model_validate({
+        "name": "checkpoint-test",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "target_dir": str(tmp_path / "remote-work"),
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "true"},
+        "fanout": {"shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+
+
 class FakeCheckpointStore:
     def __init__(self):
         self.restores = []
@@ -872,6 +886,241 @@ async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
         },
         "keep_last_n": 3,
     }
+
+
+async def test_checkpoint_rsync_retries_c_locale_vanished_then_requires_rc0(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    monkeypatch.setenv("LC_ALL", "zh_CN.UTF-8")
+    monkeypatch.setenv("ELASTIC_AGENT_TEST_REQUIRED_ENV", "preserved")
+    vanished = (
+        b"Warning: Permanently added '10.0.0.10' (ED25519) to the list "
+        b"of known hosts.\n"
+        b'file has vanished: "/opt/work/results/.state.json.abc.tmp"\n'
+        b"rsync warning: some files vanished before they could be transferred "
+        b"(code 24) at main.c(1338) [sender=3.2.7]\n"
+    )
+    outcomes = [(24, vanished), (0, b"")]
+    calls = []
+    subprocess_envs = []
+
+    class CompletedProcess:
+        def __init__(self, returncode, stderr):
+            self.returncode = returncode
+            self.stderr = stderr
+
+        async def communicate(self):
+            return b"", self.stderr
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **kwargs):
+        calls.append(args)
+        subprocess_envs.append(kwargs["env"])
+        return CompletedProcess(*outcomes.pop(0))
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    manager = FakeManager(tmp_path)
+    manager._batch.job.runs.pop("worker-b")
+    manager._checkpoint_store = FakeCheckpointStore()
+    manager._s3_uploader = SimpleNamespace(
+        sync_worker=lambda *_args, **_kwargs: 1,
+    )
+
+    await ManagerFleetDriver(manager).collect(
+        "worker-a", _checkpoint_spec(tmp_path), "job-1",
+    )
+
+    assert len(calls) == 2
+    assert all(env["LC_ALL"] == "C" for env in subprocess_envs)
+    assert all(
+        env["ELASTIC_AGENT_TEST_REQUIRED_ENV"] == "preserved"
+        for env in subprocess_envs
+    )
+    assert os.environ["LC_ALL"] == "zh_CN.UTF-8"
+    assert manager._checkpoint_store.commits
+
+
+async def test_checkpoint_rsync_second_retry_must_reach_rc0_before_commit(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    vanished = (
+        b'file has vanished: "/opt/work/results/.state.json.abc.tmp"\n'
+        b"rsync warning: some files vanished before they could be transferred "
+        b"(code 24) at main.c(1338) [sender=3.2.7]\n"
+    )
+    outcomes = [(24, vanished), (24, vanished), (0, b"")]
+    calls = []
+    manager = FakeManager(tmp_path)
+    manager._batch.job.runs.pop("worker-b")
+    checkpoint_store = FakeCheckpointStore()
+    manager._checkpoint_store = checkpoint_store
+    manager._s3_uploader = SimpleNamespace(
+        sync_worker=lambda *_args, **_kwargs: 1,
+    )
+
+    class CompletedProcess:
+        def __init__(self, returncode, stderr):
+            self.returncode = returncode
+            self.stderr = stderr
+
+        async def communicate(self):
+            return b"", self.stderr
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **_kwargs):
+        calls.append(args)
+        assert not checkpoint_store.commits
+        return CompletedProcess(*outcomes.pop(0))
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+
+    await ManagerFleetDriver(manager).collect(
+        "worker-a", _checkpoint_spec(tmp_path), "job-1",
+    )
+
+    assert len(calls) == 3
+    assert not outcomes
+    assert len(checkpoint_store.commits) == 1
+
+
+async def test_checkpoint_rsync_does_not_retry_mixed_rc24_error(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    mixed_error = (
+        b'file has vanished: "/opt/work/results/.state.json.abc.tmp"\n'
+        b"rsync: [receiver] write failed: Input/output error (5)\n"
+        b"rsync warning: some files vanished before they could be transferred "
+        b"(code 24) at main.c(1338) [sender=3.2.7]\n"
+    )
+    calls = []
+
+    class MixedFailure:
+        returncode = 24
+
+        async def communicate(self):
+            return b"", mixed_error
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **_kwargs):
+        calls.append(args)
+        return MixedFailure()
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    manager = FakeManager(tmp_path)
+    manager._batch.job.runs.pop("worker-b")
+    manager._checkpoint_store = FakeCheckpointStore()
+
+    with pytest.raises(RuntimeError, match=r"rc=24"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _checkpoint_spec(tmp_path), "job-1",
+        )
+
+    assert len(calls) == 1
+    assert not manager._checkpoint_store.commits
+
+
+async def test_checkpoint_rsync_fails_after_bounded_vanished_source_retries(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    vanished = (
+        b'file has vanished: "/opt/work/results/.state.json.abc.tmp"\n'
+        b"rsync warning: some files vanished before they could be transferred "
+        b"(code 24) at main.c(1338) [sender=3.2.7]\n"
+    )
+    calls = []
+
+    class VanishedFailure:
+        returncode = 24
+
+        async def communicate(self):
+            return b"", vanished
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **_kwargs):
+        calls.append(args)
+        return VanishedFailure()
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    manager = FakeManager(tmp_path)
+    manager._batch.job.runs.pop("worker-b")
+    manager._checkpoint_store = FakeCheckpointStore()
+
+    with pytest.raises(RuntimeError, match=r"rc=24"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _checkpoint_spec(tmp_path), "job-1",
+        )
+
+    assert len(calls) == 3
+    assert not manager._checkpoint_store.commits
+
+
+async def test_non_checkpoint_rsync_does_not_retry_vanished_rc24(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+    vanished = (
+        b'file has vanished: "/opt/work/results/.state.json.abc.tmp"\n'
+        b"rsync warning: some files vanished before they could be transferred "
+        b"(code 24) at main.c(1338) [sender=3.2.7]\n"
+    )
+    calls = []
+
+    class VanishedFailure:
+        returncode = 24
+
+        async def communicate(self):
+            return b"", vanished
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **_kwargs):
+        calls.append(args)
+        return VanishedFailure()
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    manager = FakeManager(tmp_path)
+    manager._checkpoint_store = FakeCheckpointStore()
+
+    with pytest.raises(RuntimeError, match=r"rc=24"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _spec(tmp_path), "job-1",
+        )
+
+    assert len(calls) == 1
+    assert not manager._checkpoint_store.commits
 
 
 async def test_worker_direct_s3_missing_awscli_fails_without_runtime_install(
