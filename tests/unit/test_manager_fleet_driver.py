@@ -382,6 +382,154 @@ async def test_collection_tree_enforces_object_file_and_byte_limits(
         )
 
 
+async def test_collection_live_scan_tolerates_vanished_entry_only(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "relay"
+    root.mkdir()
+
+    class VanishedEntry:
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError("entry vanished")
+
+    class Entries:
+        def __iter__(self):
+            return iter([VanishedEntry()])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.os.scandir",
+        lambda _path: Entries(),
+    )
+
+    assert ManagerFleetDriver._validate_collection_tree(
+        root,
+        max_bytes=10,
+        max_objects=10,
+        max_file_bytes=10,
+        tolerate_vanished=True,
+    ) == (0, 0)
+    with pytest.raises(RuntimeError, match="staging entry"):
+        ManagerFleetDriver._validate_collection_tree(
+            root,
+            max_bytes=10,
+            max_objects=10,
+            max_file_bytes=10,
+            tolerate_vanished=False,
+        )
+
+
+async def test_collection_live_scan_tolerates_vanished_queued_directory_only(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "relay"
+    queued = root / "queued"
+    queued.mkdir(parents=True)
+    real_scandir = os.scandir
+
+    def raced_scandir(path):
+        if Path(path) == queued:
+            raise FileNotFoundError("queued directory vanished")
+        return real_scandir(path)
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.os.scandir",
+        raced_scandir,
+    )
+
+    assert ManagerFleetDriver._validate_collection_tree(
+        root,
+        max_bytes=10,
+        max_objects=10,
+        max_file_bytes=10,
+        tolerate_vanished=True,
+    ) == (0, 1)
+    with pytest.raises(RuntimeError, match="staging tree"):
+        ManagerFleetDriver._validate_collection_tree(
+            root,
+            max_bytes=10,
+            max_objects=10,
+            max_file_bytes=10,
+            tolerate_vanished=False,
+        )
+
+
+async def test_bounded_rsync_uses_tolerant_live_scan_and_strict_final_scan(
+    tmp_path, monkeypatch,
+):
+    scans = []
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class RunningProcess:
+        returncode = None
+
+        async def communicate(self):
+            started.set()
+            await release.wait()
+            self.returncode = 0
+            return b"", b""
+
+        async def wait(self):
+            return self.returncode
+
+    def record_scan(
+        _root,
+        *,
+        max_bytes,
+        max_objects,
+        max_file_bytes,
+        tolerate_vanished=False,
+    ):
+        assert (max_bytes, max_objects, max_file_bytes) == (10, 10, 10)
+        scans.append(tolerate_vanished)
+        return 0, 0
+
+    monkeypatch.setattr(
+        ManagerFleetDriver,
+        "_validate_collection_tree",
+        staticmethod(record_scan),
+    )
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "_COLLECTION_MONITOR_INTERVAL_SECONDS",
+        0.001,
+    )
+    terminate = AsyncMock()
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver._terminate_subprocess",
+        terminate,
+    )
+    driver = ManagerFleetDriver(FakeManager(tmp_path))
+    process = RunningProcess()
+    running = asyncio.create_task(driver._run_bounded_collection_rsync(
+        process,
+        staging_root=tmp_path,
+        max_bytes=10,
+        max_objects=10,
+        max_file_bytes=10,
+        timeout=1,
+    ))
+    await started.wait()
+    for _ in range(100):
+        if scans:
+            break
+        await asyncio.sleep(0.001)
+    assert scans and all(scans)
+
+    release.set()
+    assert await running == b""
+    assert scans[-1] is False
+    assert all(scans[:-1])
+    terminate.assert_awaited_once_with(process)
+
+
 async def test_remote_inventory_rejects_before_manager_rsync(
     tmp_path, monkeypatch,
 ):
@@ -887,6 +1035,59 @@ async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
         },
         "keep_last_n": 3,
     }
+
+
+async def test_checkpoint_strict_final_scan_failure_does_not_commit(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "result-bucket")
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return FakeProcess()
+
+    scans = []
+
+    def fail_strict_scan(
+        _root,
+        *,
+        max_bytes,
+        max_objects,
+        max_file_bytes,
+        tolerate_vanished=False,
+    ):
+        assert max_bytes > 0
+        assert max_objects > 0
+        assert max_file_bytes > 0
+        scans.append(tolerate_vanished)
+        if not tolerate_vanished:
+            raise RuntimeError("strict final collection scan failed")
+        return 0, 0
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(
+        ManagerFleetDriver,
+        "_validate_collection_tree",
+        staticmethod(fail_strict_scan),
+    )
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver._terminate_subprocess",
+        AsyncMock(),
+    )
+    manager = FakeManager(tmp_path)
+    manager._batch.job.runs.pop("worker-b")
+    manager._checkpoint_store = FakeCheckpointStore()
+
+    with pytest.raises(RuntimeError, match="strict final"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _checkpoint_spec(tmp_path), "job-1",
+        )
+
+    assert scans[-1] is False
+    assert not manager._checkpoint_store.commits
 
 
 async def test_checkpoint_rsync_retries_c_locale_vanished_then_requires_rc0(

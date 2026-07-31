@@ -1814,8 +1814,14 @@ class ManagerFleetDriver:
         max_bytes: int,
         max_objects: int,
         max_file_bytes: int,
+        tolerate_vanished: bool = False,
     ) -> tuple[int, int]:
-        """Bound a worker-controlled relay tree without following symlinks."""
+        """Bound a worker-controlled relay tree without following symlinks.
+
+        An active rsync can delete or atomically replace an entry after it was
+        enumerated.  Live monitor scans may ignore that narrow ``ENOENT`` race;
+        callers validating a completed transfer remain strict.
+        """
 
         if not root.exists():
             return 0, 0
@@ -1828,23 +1834,35 @@ class ManagerFleetDriver:
             directory = pending.pop()
             try:
                 entries = os.scandir(directory)
+            except FileNotFoundError as exc:
+                if tolerate_vanished:
+                    continue
+                raise RuntimeError(
+                    "cannot inspect Manager collection staging tree"
+                ) from exc
             except OSError as exc:
                 raise RuntimeError(
                     "cannot inspect Manager collection staging tree"
                 ) from exc
             with entries:
                 for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError as exc:
+                        if tolerate_vanished:
+                            continue
+                        raise RuntimeError(
+                            "cannot inspect Manager collection staging entry"
+                        ) from exc
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "cannot inspect Manager collection staging entry"
+                        ) from exc
                     total_objects += 1
                     if total_objects > max_objects:
                         raise RuntimeError(
                             "Manager collection staging object limit exceeded"
                         )
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except OSError as exc:
-                        raise RuntimeError(
-                            "cannot inspect Manager collection staging entry"
-                        ) from exc
                     if stat.S_ISDIR(entry_stat.st_mode):
                         pending.append(Path(entry.path))
                         continue
@@ -1904,6 +1922,7 @@ class ManagerFleetDriver:
                     max_bytes=max_bytes,
                     max_objects=max_objects,
                     max_file_bytes=max_file_bytes,
+                    tolerate_vanished=True,
                 )
             _stdout, stderr = communication.result()
             # A final scan closes the interval between the last timer tick and
@@ -1915,6 +1934,7 @@ class ManagerFleetDriver:
                 max_bytes=max_bytes,
                 max_objects=max_objects,
                 max_file_bytes=max_file_bytes,
+                tolerate_vanished=False,
             )
         except BaseException:
             async def settle_failed_transfer() -> None:
@@ -4012,6 +4032,7 @@ sleep 1
                 max_bytes=max_bytes,
                 max_objects=max_objects,
                 max_file_bytes=max_file_bytes,
+                tolerate_vanished=False,
             )
             manifest = self._manifest_bytes(
                 job_id=job_id,
