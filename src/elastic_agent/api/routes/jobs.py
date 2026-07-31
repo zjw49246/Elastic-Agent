@@ -746,9 +746,9 @@ def _read_and_redact_job_config(path: Path, job_id: str) -> tuple[dict, dict]:
     """Read, validate, redact, and bound one snapshot off the event loop."""
 
     payload = _read_job_journal(path, job_id)
-    # Do not hand the raw environment values/secret references back across the
-    # executor boundary.  Detail rendering needs only lifecycle metadata plus
-    # the already-redacted projection.
+    # Plaintext environment values stay inside the private journal. Validated
+    # secret_env entries are opaque AWS references rather than secret values,
+    # so the authenticated JobSpec projection may return them for safe reuse.
     raw_spec = payload.pop("spec")
     raw_collect = (
         raw_spec.get("collect")
@@ -1213,23 +1213,30 @@ def _persisted_job_view(
 def _api_spec_projection(spec: JobSpec | dict) -> dict:
     """Project a JobSpec onto the known schema before any API exposure.
 
-    A current in-memory model is already validated.  Persisted dictionaries are
-    untrusted recovery input: validating with ``extra='forbid'`` prevents a
-    legacy/corrupt journal from smuggling an unknown secret field into the
-    response. ``exclude_unset`` preserves old snapshots without inventing
-    defaults that did not exist when they were written.
+    Both current models and persisted dictionaries are untrusted at this
+    boundary. Pydantic models are mutable after construction, including their
+    nested environment maps, so every projection is dumped and revalidated
+    with ``extra='forbid'`` before it can cross the API boundary.
+    ``exclude_unset`` preserves old snapshots without inventing defaults that
+    did not exist when they were written.
 
     ``manager_distribute`` is the one explicitly known read-only legacy value.
     It is mapped only for structural validation and then restored in the
     projection; current submissions and resubmits continue to reject it.
     """
 
-    if isinstance(spec, JobSpec):
-        return spec.model_dump(mode="json")
-    if not isinstance(spec, dict):
+    current_model = isinstance(spec, JobSpec)
+    if not current_model and not isinstance(spec, dict):
         raise ValueError("persisted JobSpec is not an object")
 
-    candidate = copy.deepcopy(spec)
+    try:
+        candidate = (
+            spec.model_dump(mode="python", warnings=False)
+            if current_model
+            else copy.deepcopy(spec)
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("JobSpec is incompatible with the API schema") from None
     legacy_manager_distribution = False
     account = candidate.get("account")
     if (
@@ -1240,10 +1247,15 @@ def _api_spec_projection(spec: JobSpec | dict) -> dict:
         legacy_manager_distribution = True
     try:
         validated = JobSpec.model_validate(candidate)
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise ValueError("persisted JobSpec is incompatible with the API schema") from exc
+    except (TypeError, ValueError, RecursionError):
+        # Validation details may contain the rejected value. Keep them out of
+        # both the HTTP response and chained exception tracebacks.
+        raise ValueError("JobSpec is incompatible with the API schema") from None
 
-    projected = validated.model_dump(mode="json", exclude_unset=True)
+    projected = validated.model_dump(
+        mode="json",
+        exclude_unset=not current_model,
+    )
     if legacy_manager_distribution:
         projected_account = projected.get("account")
         if not isinstance(projected_account, dict):
@@ -1253,7 +1265,12 @@ def _api_spec_projection(spec: JobSpec | dict) -> dict:
 
 
 def _redacted_spec(spec: JobSpec | dict) -> dict:
-    """Return a bounded, schema-aware API snapshot with secret values removed."""
+    """Return a bounded schema-aware snapshot with plaintext values removed.
+
+    ``run.secret_env`` contains only validated AWS reference URIs. Returning
+    those references lets an authenticated user copy a JobSpec without ever
+    exposing the resolved Secrets Manager/SSM value.
+    """
 
     data = _api_spec_projection(spec)
     run = data.get("run") if isinstance(data, dict) else None
@@ -1261,11 +1278,6 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
         env = run.get("env")
         if isinstance(env, dict):
             run["env"] = {str(key): "[REDACTED]" for key in env}
-        secret_env = run.get("secret_env")
-        if isinstance(secret_env, dict):
-            run["secret_env"] = {
-                str(key): "[SECRET_REFERENCE]" for key in secret_env
-            }
     setup = data.get("setup") if isinstance(data, dict) else None
     if isinstance(setup, dict):
         repo = setup.get("repo")
@@ -1839,8 +1851,8 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                     ) from exc
         except ValidationError as exc:
             # Detailed Pydantic errors include rejected source values. A
-            # persisted source may contain private environment values and
-            # secret references that must never cross the REST boundary.
+            # persisted source may contain plaintext environment values or an
+            # invalid secret_env value that is not a validated opaque URI.
             raise HTTPException(
                 422,
                 "recovery source JobSpec is incompatible with the current schema",
@@ -2426,7 +2438,7 @@ def _build_checkpoint_recovery_spec(
         ValueError,
     ) as exc:
         # Pydantic's detailed error includes rejected input values. Keep raw
-        # environment values and secret references on the Manager.
+        # plaintext or malformed values on the Manager.
         raise HTTPException(
             422,
             "persisted source JobSpec is incompatible with checkpoint recovery",
@@ -2606,9 +2618,9 @@ async def create_recovery_job(
 ) -> dict:
     """Create a new Job from a private source spec and an immutable checkpoint.
 
-    Unlike the redacted Job detail response, this path never asks the browser
-    to reconstruct environment values or secret references. They remain in the
-    Manager's private journal and are copied only into the new private journal.
+    This path never asks the browser to reconstruct redacted plaintext
+    environment values. Validated secret reference URIs are visible in Job
+    detail, but the source journal remains authoritative and is copied directly.
     """
 
     mgr = _mgr()
@@ -3074,7 +3086,14 @@ async def get_job(job_id: str, response: Response) -> dict:
         # fallback exists only for older/test integrations that created an
         # in-memory Job without installing the persistence hook.
         if not _job_journal_exists(p):
-            return _job_detail(job)
+            try:
+                return _job_detail(job)
+            except (RecursionError, ValueError) as exc:
+                raise HTTPException(
+                    500,
+                    f"current Job config is unavailable for job {job_id}",
+                    headers=dict(JOB_CONFIG_NO_STORE_HEADERS),
+                ) from exc
         try:
             _data, submitted_spec = await _read_job_journal_for_detail(
                 p,

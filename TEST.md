@@ -306,7 +306,8 @@ The focused suite covers:
 - Per-Job submission config history: `GET /api/jobs/{job_id}` prefers the
   immutable mode-0600 journal snapshot over a mutated live model, survives a
   Manager restart, projects only current or explicitly supported legacy
-  JobSpec fields, redacts run/setup environment values and secret references,
+  JobSpec fields, redacts plaintext run/setup environment values while returning
+  validated `run.secret_env` AWS reference URIs,
   rejects incompatible/oversized/symlinked journals, uses fail-fast bounded
   reads, and returns `Cache-Control: no-store`. The Batch card fetches this
   detail only when its nested config disclosure opens, renders JSON through
@@ -348,7 +349,8 @@ The focused suite covers:
 - immutable content-addressed Harness upload, exact Idempotency-Key replay
   before mutable preflight, pending UI key/spec recovery without provider
   default waits, server-side checkpoint recovery that preserves private
-  env/secret references while allowing only generation/run/TTL overrides,
+  environment values and visible secret references while allowing only
+  generation/run/TTL overrides,
   S3 template whitespace/empty-context/object-vs-prefix guards,
   quoted destination parents, bounded Manager session/cost metadata, and
   historical Job `scandir`/journal-read/response/admission ceilings with

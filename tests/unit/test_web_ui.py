@@ -1133,7 +1133,7 @@ process.stdout.write(JSON.stringify(Object.fromEntries(
         assert "detail.spec" in formatter
         assert "JSON.stringify(spec, null, 2)" in formatter
         assert "JSON.stringify(detail" not in formatter
-        assert "提交时生效配置（已脱敏）" in card
+        assert "提交时生效配置（Secret 引用可见）" in card
         assert "复制 JSON" in card
         assert 'data-job-config=""' in card
         assert 'class="job-config-json"' in card
@@ -1147,12 +1147,12 @@ process.stdout.write(JSON.stringify(Object.fromEntries(
             _javascript_function(html, "jobRowHtml")
         )
         assert "[REDACTED]" in card
-        assert "[SECRET_REFERENCE]" in card
+        assert "run.secret_env" in card
+        assert "可复用的 AWS 引用 URI" in card
         assert "命令文本会原样显示" in card
         assert "请勿把密钥直接写进命令" in card
-        assert "普通重提请使用服务端 resubmit" in card
+        assert "原样重提仍可使用服务端 resubmit" in card
         assert "从检查点恢复" in card
-        assert "由服务器复制未回显的私有配置" in card
         assert "${cached.text}" not in card
         assert ".textContent = cached.text" in (
             _javascript_function(html, "hydrateJobConfigNode")
@@ -1170,7 +1170,7 @@ const detail = {
     run: {
       command: 'uv run benchmark',
       env: {VISIBLE_NAME:'[REDACTED]'},
-      secret_env: {TOKEN:'[SECRET_REFERENCE]'},
+      secret_env: {TOKEN:'aws-secretsmanager://prod/token#value'},
     },
   },
   password: 'DO_NOT_RENDER_DETAIL_FIELDS',
@@ -1183,7 +1183,7 @@ process.stdout.write(JSON.stringify({text:jobSpecTextFromDetail(detail)}));
         assert parsed["name"] == "historical-job"
         assert parsed["run"]["env"] == {"VISIBLE_NAME": "[REDACTED]"}
         assert parsed["run"]["secret_env"] == {
-            "TOKEN": "[SECRET_REFERENCE]"
+            "TOKEN": "aws-secretsmanager://prod/token#value"
         }
         assert "DO_NOT_RENDER_DETAIL_FIELDS" not in rendered["text"]
         assert "private@example.test" not in rendered["text"]

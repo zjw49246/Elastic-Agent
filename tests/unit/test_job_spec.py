@@ -460,6 +460,17 @@ class TestRunSafetyAndSecretEnv:
         with pytest.raises(ValidationError, match="must use"):
             RunSpec(command="bench", secret_env={"TOKEN": "plaintext"})
 
+    @pytest.mark.parametrize("reference", [
+        "aws-secretsmanager://prod/token?api_key=sk-plaintext",
+        "aws-secretsmanager://https://user:plaintext@example/x",
+        "aws-ssm:///prod/token?password=plaintext",
+    ])
+    def test_secret_env_rejects_values_disguised_as_aws_references(
+        self, reference,
+    ):
+        with pytest.raises(ValidationError, match="invalid aws-"):
+            RunSpec(command="bench", secret_env={"TOKEN": reference})
+
     def test_plain_and_secret_env_keys_cannot_overlap(self):
         with pytest.raises(ValidationError, match="cannot define the same"):
             RunSpec(

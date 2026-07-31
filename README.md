@@ -225,8 +225,9 @@ group selection is not currently supported.
 Keep plaintext values in `run.env`. For managed secrets, put only AWS references
 in `run.secret_env`, for example `{"OPENAI_API_KEY":
 "aws-secretsmanager://prod/agent#OPENAI_API_KEY"}` or an `aws-ssm://...`
-reference. The reference is persisted and shown in plans, while the value is
-resolved immediately before dispatch and is never returned by the Job API.
+reference. The validated reference URI is persisted and returned in authenticated
+JobSpec snapshots so a user can safely copy the configuration. The referenced
+value is resolved immediately before dispatch and is never returned by the API.
 Cross-host secret delivery requires `ELASTIC_AGENT_MANAGER_URL=wss://...`;
 plaintext WebSocket delivery is rejected before Secrets Manager/SSM is read.
 
@@ -644,8 +645,9 @@ limits, and target disk allowance, then pins that generation in the private
 target JobSpec before durable prepare. All data is staged before creating an
 instance. `POST /api/jobs/recover` (also exposed as **从检查点恢复** in the
 Batch page) builds that new Job from the Manager's private source journal, so
-redacted environment values and secret references never need to round-trip
-through the browser. Only checkpoint generation, run command/run timeout, and
+redacted plaintext environment values never need to round-trip through the
+browser; opaque secret reference URIs remain visible for ordinary JobSpec reuse.
+Only checkpoint generation, run command/run timeout, and
 Job TTL may be overridden, and the normal Idempotency-Key submit path is
 retained. S3 `COMMITTED` is authoritative even if the Manager crashed before
 updating its local `latest` convenience pointer. Work written after the last
@@ -700,8 +702,10 @@ generation and another stable `Idempotency-Key`. It creates a new Job rather
 than mutating or replaying the stopped one, uses the private persisted
 `run.resume_command`, and records `resumed_from_job_id`, `root_job_id`, and
 `attempt_no` (parallel branches from one source may share an attempt number).
-Secret references and redacted environment values never round-trip through the
-browser. The first signal can also reach active child processes; already
+Server-side resume reads both the visible secret references and redacted
+plaintext environment values from the private journal; it does not depend on a
+browser round-trip. The references remain visible for ordinary JobSpec copying.
+The first signal can also reach active child processes; already
 published application completion markers are retained, but any unit without a
 complete marker must run again after restore.
 See [Mode-B reconnect and checkpoint recovery](docs/operations/checkpoint-recovery.md).

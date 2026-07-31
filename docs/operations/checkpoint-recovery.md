@@ -173,9 +173,10 @@ Content-Type: application/json
 `generation`, `run.command`, `run.timeout`, and `ttl_seconds` are optional.
 Everything else is copied from the source's private persisted JobSpec. This is
 important because Job detail deliberately redacts ordinary environment values,
-setup-step environment values, and secret references; the browser cannot and
-must not reconstruct them. The recovery response remains redacted, while the
-new mode-`0600` journal retains the original private values server-side.
+and setup-step environment values; the browser cannot and must not reconstruct
+those plaintext values. Validated `run.secret_env` AWS reference URIs remain
+visible, while their resolved values never leave the dispatch boundary. The new
+mode-`0600` journal retains the original private values server-side.
 This convenience endpoint is intentionally limited to declarative Jobs; a
 custom `harness_ref` remains an explicit trusted-code workflow.
 

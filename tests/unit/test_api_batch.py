@@ -2853,6 +2853,7 @@ class TestJobsAPI:
         live_job.spec.name = "mutated-name"
         live_job.spec.run.command = "mutated-command"
         live_job.spec.run.env["RUN_TOKEN"] = "mutated-secret"
+        live_job.spec.run.secret_env["SECRET_TOKEN"] = "resolved-plaintext"
 
         live = await client.get(f"/api/jobs/{job_id}")
         assert live.status_code == 200
@@ -2864,13 +2865,13 @@ class TestJobsAPI:
             "RUN_TOKEN": "[REDACTED]",
         }
         assert live.json()["spec"]["run"]["secret_env"] == {
-            "SECRET_TOKEN": "[SECRET_REFERENCE]",
+            "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
         }
         assert live.json()["spec"]["setup"]["steps"][0]["env"] == {
             "SETUP_TOKEN": "[REDACTED]",
         }
         assert "plaintext" not in live.text
-        assert "aws-secretsmanager" not in live.text
+        assert "aws-secretsmanager://prod/token#value" in live.text
 
         # Simulate the in-memory batch registry being lost on Manager restart.
         manager.batch._jobs.clear()
@@ -2880,7 +2881,84 @@ class TestJobsAPI:
         assert historical.headers["pragma"] == "no-cache"
         assert historical.json()["spec"] == submitted_config
         assert "plaintext" not in historical.text
-        assert "aws-secretsmanager" not in historical.text
+        assert "aws-secretsmanager://prod/token#value" in historical.text
+
+    @pytest.mark.asyncio
+    async def test_live_fallback_revalidates_mutated_secret_references(
+        self, client, manager,
+    ):
+        spec = {
+            **self._SPEC,
+            "run": {
+                "command": "true",
+                "secret_env": {
+                    "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
+                },
+            },
+        }
+        submitted = (await client.post("/api/jobs", json=spec)).json()
+        job_id = submitted["job_id"]
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+        journal.unlink()
+        live_job = manager.batch.get_job(job_id)
+        live_job.spec.run.secret_env["SECRET_TOKEN"] = "resolved-plaintext"
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 500
+        assert detail.headers["cache-control"] == "no-store"
+        assert detail.headers["pragma"] == "no-cache"
+        assert detail.json()["detail"] == (
+            f"current Job config is unavailable for job {job_id}"
+        )
+        assert "resolved-plaintext" not in detail.text
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_secret_values_disguised_as_references(
+        self, client,
+    ):
+        marker = "sk-plaintext-must-not-echo"
+        response = await client.post("/api/jobs", json={
+            **self._SPEC,
+            "run": {
+                "command": "true",
+                "secret_env": {
+                    "SECRET_TOKEN": (
+                        "aws-secretsmanager://prod/token?api_key=" + marker
+                    ),
+                },
+            },
+        })
+
+        assert response.status_code == 422
+        assert marker not in response.text
+
+    def test_spec_projection_revalidates_mutated_secret_references(self):
+        from elastic_agent.api.routes import jobs as jobs_route
+        from elastic_agent.core.job_spec import JobSpec
+
+        marker = "live-mutated-plaintext"
+        spec = JobSpec.model_validate({
+            **self._SPEC,
+            "run": {
+                "command": "true",
+                "secret_env": {
+                    "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
+                },
+            },
+        })
+        spec.run.secret_env["SECRET_TOKEN"] = marker
+
+        with pytest.raises(
+            ValueError,
+            match="JobSpec is incompatible with the API schema",
+        ) as exc_info:
+            jobs_route._redacted_spec(spec)
+
+        assert marker not in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_config_snapshot_read_fails_fast_when_capacity_is_full(
@@ -3129,6 +3207,17 @@ class TestJobsAPI:
                     },
                 }),
                 "repository-secret",
+            ),
+            (
+                lambda spec: spec["run"].update({
+                    "secret_env": {
+                        "SECRET_TOKEN": (
+                            "aws-secretsmanager://prod/token?api_key="
+                            "journal-plaintext-secret"
+                        ),
+                    },
+                }),
+                "journal-plaintext-secret",
             ),
         ],
     )
@@ -4016,13 +4105,13 @@ class TestJobsAPI:
         assert first_body["spec"]["run"]["command"] == "capture --resume"
         assert first_body["spec"]["run"]["timeout"] == 1_200
         assert first_body["spec"]["ttl_seconds"] == 2_400
-        for private_value in (
-            "private-setup-value",
-            "private-run-value",
-            "aws-ssm:///prod/db/password",
-        ):
+        for private_value in ("private-setup-value", "private-run-value"):
             assert private_value not in first.text
             assert private_value not in second.text
+        assert first_body["spec"]["run"]["secret_env"] == {
+            "DB_PASSWORD": "aws-ssm:///prod/db/password",
+        }
+        assert "aws-ssm:///prod/db/password" in second.text
 
         target_journal = (
             Path(manager.config.registry.path).with_name("specs")
@@ -4632,7 +4721,7 @@ class TestJobsAPI:
         assert "requires 2" in response.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_job_detail_and_persisted_replay_redact_all_env_values(
+    async def test_job_detail_and_persisted_replay_expose_only_secret_references(
         self, client, manager,
     ):
         spec = {
@@ -4655,13 +4744,13 @@ class TestJobsAPI:
         body = first.json()["spec"]
         assert body["run"]["env"] == {"VISIBLE_TOKEN": "[REDACTED]"}
         assert body["run"]["secret_env"] == {
-            "SECRET_TOKEN": "[SECRET_REFERENCE]",
+            "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
         }
         assert body["setup"]["steps"][0]["env"] == {
             "SETUP_TOKEN": "[REDACTED]",
         }
         assert "plaintext" not in first.text
-        assert "aws-secretsmanager" not in first.text
+        assert "aws-secretsmanager://prod/token#value" in first.text
 
         # Force the idempotency path to use the persisted journal rather than
         # the in-memory Job, and verify that response is redacted too.
@@ -4670,7 +4759,7 @@ class TestJobsAPI:
         assert replay.status_code == 201
         assert replay.json()["spec"] == body
         assert "plaintext" not in replay.text
-        assert "aws-secretsmanager" not in replay.text
+        assert "aws-secretsmanager://prod/token#value" in replay.text
 
         detail = await client.get(f"/api/jobs/{first.json()['job_id']}")
         assert detail.status_code == 200

@@ -3289,7 +3289,7 @@ async function copyJobSpec(rawJobId) {
       textarea.remove();
       if (!copied) throw new Error('浏览器拒绝剪贴板访问');
     }
-    toast('已复制脱敏后的提交配置 JSON');
+    toast('已复制提交配置 JSON（普通环境变量仍脱敏）');
   } catch(error) {
     toast('复制失败：' + (error.message || error), 'error');
   }
@@ -3305,22 +3305,22 @@ function jobConfigHtml(job) {
     </div>`;
   if (cached?.status === 'loading') {
     content = `<div class="job-config-message" role="status">
-      <span>正在加载脱敏后的提交配置…</span>
+      <span>正在加载提交配置…</span>
     </div>`;
   } else if (cached?.status === 'ready') {
     content = `
       <div class="job-config-toolbar">
         <p class="job-config-note">
-          <code>[REDACTED]</code> / <code>[SECRET_REFERENCE]</code> 是脱敏占位符，
-          不是真实值，不能直接复制重提；命令文本会原样显示，请勿把密钥直接写进命令。
-          普通重提请使用服务端 resubmit；有完整检查点时请使用 Job 卡片的“从检查点恢复”，
-          由服务器复制未回显的私有配置。
+          <code>run.secret_env</code> 显示的是可复用的 AWS 引用 URI，不是真实 Secret 值；
+          <code>[REDACTED]</code> 仍表示普通环境变量或 setup 环境值，复制新建前需重新填写。
+          命令文本会原样显示，请勿把密钥直接写进命令。原样重提仍可使用服务端 resubmit；
+          有完整检查点时可使用 Job 卡片的“从检查点恢复”。
         </p>
         <button class="btn btn-ghost" data-job-focus="job-config-copy"
           onclick="copyJobSpec(${jsArg(jobId)})">复制 JSON</button>
       </div>
       <pre class="job-config-json" data-job-focus="job-config-json"
-           tabindex="0" aria-label="脱敏后的 Job 提交配置 JSON"></pre>`;
+           tabindex="0" aria-label="Job 提交配置 JSON"></pre>`;
   } else if (cached?.status === 'missing') {
     content = `<div class="job-config-message" role="status">
       <span>${esc(cached.message || '此 Job 没有可读取的提交配置。')}</span>
@@ -3341,7 +3341,7 @@ function jobConfigHtml(job) {
   return `<details class="job-config" data-job-config=""
       ontoggle="handleJobConfigToggle(this,${jsArg(jobId)})">
     <summary data-job-focus="job-config-summary"
-      onclick="requestJobConfigLoad(this.parentElement)">提交时生效配置（已脱敏）</summary>
+      onclick="requestJobConfigLoad(this.parentElement)">提交时生效配置（Secret 引用可见）</summary>
     <div class="job-config-body">${content}</div>
   </details>`;
 }

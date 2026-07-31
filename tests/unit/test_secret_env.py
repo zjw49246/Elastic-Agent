@@ -47,9 +47,51 @@ def test_parse_reference_accepts_only_supported_opaque_schemes():
     assert (ssm.provider, ssm.identifier, ssm.json_key) == (
         "ssm", "/prod/service/token", None,
     )
+    secret_arn = (
+        "arn:aws:secretsmanager:ap-northeast-1:123456789012:"
+        "secret:elastic-agent/prod-token-AbCdEf"
+    )
+    assert parse_secret_reference(
+        f"aws-secretsmanager://{secret_arn}#token"
+    ).identifier == secret_arn
+    longest_secret_arn = (
+        "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:"
+        + ("x" * 512)
+        + "-AbCdEf"
+    )
+    assert parse_secret_reference(
+        f"aws-secretsmanager://{longest_secret_arn}"
+    ).identifier == longest_secret_arn
+    ssm_arn = (
+        "arn:aws:ssm:ap-northeast-1:123456789012:"
+        "parameter/elastic-agent/prod-token"
+    )
+    assert parse_secret_reference(f"aws-ssm://{ssm_arn}:current").identifier == (
+        f"{ssm_arn}:current"
+    )
+    assert parse_secret_reference("aws-ssm:///prod/service/token:7").identifier == (
+        "/prod/service/token:7"
+    )
+    longest_ssm_name = "/" + ("x" * 1_010)
+    assert parse_secret_reference(
+        f"aws-ssm://{longest_ssm_name}:current"
+    ).identifier == f"{longest_ssm_name}:current"
     for invalid in (
         "plaintext", "env://TOKEN", "aws-secretsmanager://", "aws-ssm://",
         "aws-ssm:///path#key", "aws-secretsmanager://secret#bad/key",
+        " aws-secretsmanager://prod/token",
+        "aws-secretsmanager://prod/token ",
+        "aws-secretsmanager://prod/token?api_key=sk-plaintext",
+        "aws-secretsmanager://https://user:plaintext@example/x",
+        "aws-secretsmanager://prod/token%3Fapi_key=plaintext",
+        "aws-ssm:///prod/token?password=plaintext",
+        "aws-ssm://https://user:plaintext@example/x",
+        "aws-ssm:///prod/token%3Fpassword=plaintext",
+        "aws-ssm:///prod/token:01",
+        "aws-ssm:///prod/token:awsCurrent",
+        "aws-ssm:///prod/token:ssmCurrent",
+        f"aws-secretsmanager://{'x' * 513}",
+        f"aws-ssm:///{'x' * 1_011}",
     ):
         with pytest.raises(ValueError):
             parse_secret_reference(invalid)

@@ -14,7 +14,29 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-_JSON_KEY = re.compile(r"[A-Za-z0-9_.-]{1,256}")
+_JSON_KEY = re.compile(r"[A-Za-z0-9_.-]{1,256}", re.ASCII)
+_AWS_PARTITION = r"aws(?:-[a-z0-9]+)*"
+_AWS_REGION = r"[a-z0-9-]{1,64}"
+_AWS_ACCOUNT_ID = r"[0-9]{12}"
+_SECRETS_MANAGER_NAME = r"[A-Za-z0-9/_+=.@-]{1,512}"
+_SECRETS_MANAGER_ARN_RESOURCE = r"[A-Za-z0-9/_+=.@-]{1,519}"
+_SECRETS_MANAGER_IDENTIFIER = re.compile(
+    rf"(?:{_SECRETS_MANAGER_NAME}|"
+    rf"arn:{_AWS_PARTITION}:secretsmanager:{_AWS_REGION}:"
+    rf"{_AWS_ACCOUNT_ID}:secret:{_SECRETS_MANAGER_ARN_RESOURCE})",
+    re.ASCII,
+)
+_SSM_PARAMETER_PATH = r"/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){0,14}"
+_SSM_PARAMETER_IDENTIFIER = re.compile(
+    rf"(?:{_SSM_PARAMETER_PATH}|"
+    rf"arn:{_AWS_PARTITION}:ssm:{_AWS_REGION}:{_AWS_ACCOUNT_ID}:"
+    rf"parameter/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){{0,14}})",
+    re.ASCII,
+)
+_SSM_LABEL = re.compile(r"[A-Za-z_.-][A-Za-z0-9_.-]{0,99}", re.ASCII)
+_SSM_PARAMETER_IDENTIFIER_MAX_LENGTH = 1_011
+_SSM_PARAMETER_REFERENCE_MAX_LENGTH = 2_048
+_SSM_VERSION_MAX = (1 << 63) - 1
 
 
 @dataclass(frozen=True)
@@ -24,16 +46,56 @@ class SecretReference:
     json_key: str | None = None
 
 
+def _valid_ssm_identifier(identifier: str) -> bool:
+    if (
+        len(identifier) > _SSM_PARAMETER_REFERENCE_MAX_LENGTH
+        or not identifier
+    ):
+        return False
+    if (
+        len(identifier) <= _SSM_PARAMETER_IDENTIFIER_MAX_LENGTH
+        and _SSM_PARAMETER_IDENTIFIER.fullmatch(identifier) is not None
+    ):
+        return True
+
+    base, separator, selector = identifier.rpartition(":")
+    if (
+        not separator
+        or len(base) > _SSM_PARAMETER_IDENTIFIER_MAX_LENGTH
+        or _SSM_PARAMETER_IDENTIFIER.fullmatch(base) is None
+    ):
+        return False
+    if selector.isascii() and selector.isdigit():
+        return (
+            len(selector) <= 19
+            and not selector.startswith("0")
+            and int(selector) <= _SSM_VERSION_MAX
+        )
+    return bool(
+        _SSM_LABEL.fullmatch(selector)
+        and not selector.lower().startswith(("aws", "ssm"))
+    )
+
+
 def parse_secret_reference(reference: str) -> SecretReference:
     """Validate one supported reference without contacting AWS."""
+    if not isinstance(reference, str):
+        raise ValueError("secret reference must be a string")
     value = reference.strip()
-    if not value or any(ord(char) < 0x20 or char.isspace() for char in value):
+    if (
+        not value
+        or value != reference
+        or any(ord(char) < 0x20 or char.isspace() for char in value)
+    ):
         raise ValueError("secret reference is empty or contains whitespace/control characters")
 
     if value.startswith("aws-secretsmanager://"):
         payload = value.removeprefix("aws-secretsmanager://")
         identifier, separator, json_key = payload.partition("#")
-        if not identifier or "#" in json_key:
+        if (
+            _SECRETS_MANAGER_IDENTIFIER.fullmatch(identifier) is None
+            or "#" in json_key
+        ):
             raise ValueError("invalid aws-secretsmanager secret reference")
         if separator and _JSON_KEY.fullmatch(json_key) is None:
             raise ValueError(
@@ -47,7 +109,7 @@ def parse_secret_reference(reference: str) -> SecretReference:
 
     if value.startswith("aws-ssm://"):
         identifier = value.removeprefix("aws-ssm://")
-        if not identifier or "#" in identifier:
+        if not _valid_ssm_identifier(identifier):
             raise ValueError("invalid aws-ssm parameter reference")
         return SecretReference(provider="ssm", identifier=identifier)
 
