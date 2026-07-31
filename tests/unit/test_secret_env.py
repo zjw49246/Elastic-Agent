@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,3 +89,37 @@ async def test_missing_json_key_fails_without_returning_other_plaintext():
 @pytest.mark.asyncio
 async def test_empty_reference_map_needs_no_aws_client():
     assert await resolve_secret_env({}) == {}
+
+
+@pytest.mark.asyncio
+async def test_explicit_region_is_used_when_constructing_aws_clients(monkeypatch):
+    calls = []
+    secrets = FakeSecrets()
+    ssm = FakeSSM()
+
+    def fake_client(service_name, *, region_name):
+        calls.append((service_name, region_name))
+        return secrets if service_name == "secretsmanager" else ssm
+
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        SimpleNamespace(client=fake_client),
+    )
+
+    resolved = await resolve_secret_env(
+        {
+            "TOKEN": "aws-secretsmanager://plain",
+            "PARAM": "aws-ssm:///prod/value",
+        },
+        region_name="ap-northeast-1",
+    )
+
+    assert resolved == {
+        "TOKEN": "plain-value",
+        "PARAM": "parameter-value",
+    }
+    assert calls == [
+        ("secretsmanager", "ap-northeast-1"),
+        ("ssm", "ap-northeast-1"),
+    ]

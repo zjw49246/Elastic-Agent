@@ -67,6 +67,7 @@ def _stringify_secret_value(value: object) -> str:
 def _resolve_sync(
     references: dict[str, str],
     *,
+    region_name: str | None = None,
     secrets_client=None,
     ssm_client=None,
 ) -> dict[str, str]:
@@ -80,9 +81,11 @@ def _resolve_sync(
         import boto3
 
         if needs_secrets and secrets_client is None:
-            secrets_client = boto3.client("secretsmanager")
+            secrets_client = boto3.client(
+                "secretsmanager", region_name=region_name,
+            )
         if needs_ssm and ssm_client is None:
-            ssm_client = boto3.client("ssm")
+            ssm_client = boto3.client("ssm", region_name=region_name)
 
     resolved: dict[str, str] = {}
     for name, reference in parsed.items():
@@ -124,6 +127,7 @@ def _resolve_sync(
 async def resolve_secret_env(
     references: dict[str, str],
     *,
+    region_name: str | None = None,
     secrets_client=None,
     ssm_client=None,
 ) -> dict[str, str]:
@@ -133,6 +137,7 @@ async def resolve_secret_env(
     return await asyncio.to_thread(
         _resolve_sync,
         dict(references),
+        region_name=region_name,
         secrets_client=secrets_client,
         ssm_client=ssm_client,
     )

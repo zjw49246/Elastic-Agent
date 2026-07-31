@@ -139,6 +139,7 @@ class FakeManager:
             provider=SimpleNamespace(
                 type="aws",
                 aws=SimpleNamespace(
+                    region="ap-northeast-1",
                     ssh_key_path="/tmp/key",
                     worker_instance_profile=worker_profile,
                 ),
@@ -3102,8 +3103,8 @@ async def test_resolve_secret_env_delegates_without_mutating_refs(
     references = {"TOKEN": "aws-ssm:///prod/token"}
     seen = []
 
-    async def fake_resolve(value):
-        seen.append(dict(value))
+    async def fake_resolve(value, *, region_name):
+        seen.append((dict(value), region_name))
         return {"TOKEN": "plaintext"}
 
     monkeypatch.setattr(
@@ -3116,7 +3117,7 @@ async def test_resolve_secret_env_delegates_without_mutating_refs(
 
     assert resolved == {"TOKEN": "plaintext"}
     assert references == {"TOKEN": "aws-ssm:///prod/token"}
-    assert seen == [references]
+    assert seen == [(references, "ap-northeast-1")]
 
 
 async def test_resolve_secret_env_rejects_plaintext_remote_worker_transport(

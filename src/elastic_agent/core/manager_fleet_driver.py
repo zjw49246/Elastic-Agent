@@ -3427,7 +3427,11 @@ raise SystemExit(code)
                 # Fail before calling Secrets Manager/SSM so plaintext never
                 # enters Manager memory when it cannot be transported safely.
                 raise ValueError(transport_error)
-        return await resolve_aws_secret_env(secret_env)
+        region_name = str(self._mgr.config.provider.aws.region).strip() or None
+        return await resolve_aws_secret_env(
+            secret_env,
+            region_name=region_name,
+        )
 
     async def stop_command(
         self,
