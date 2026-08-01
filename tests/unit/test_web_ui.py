@@ -107,6 +107,7 @@ class TestDashboardEndpoint:
 
         assert resp.status_code == 200
         assert resp.headers["cache-control"] == "no-store"
+        assert resp.headers["referrer-policy"] == "same-origin"
         assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
         assert resp.headers["x-frame-options"] == "DENY"
         assert 'id="email"' in resp.text

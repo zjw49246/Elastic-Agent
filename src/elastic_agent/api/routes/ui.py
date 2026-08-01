@@ -5516,6 +5516,14 @@ def _html(content: str) -> HTMLResponse:
     return HTMLResponse(content=content, headers=_UI_SECURITY_HEADERS)
 
 
+def _login_html(content: str) -> HTMLResponse:
+    # Chromium serializes a native form's Origin as ``null`` when its source
+    # page uses ``no-referrer``.  ``same-origin`` keeps cross-site referrers
+    # suppressed while preserving the exact Origin required for login CSRF.
+    headers = {**_UI_SECURITY_HEADERS, "Referrer-Policy": "same-origin"}
+    return HTMLResponse(content=content, headers=headers)
+
+
 async def _authenticated_ui_redirect(
     request: Request,
 ) -> RedirectResponse | None:
@@ -5538,7 +5546,9 @@ async def login_page(request: Request):
             destination = "/" if next_path == "/change-password" else next_path
             return _redirect("/change-password", next_path=destination)
         return _redirect(next_path)
-    return _html(_render_login_html(next_path, request.query_params.get("error")))
+    return _login_html(
+        _render_login_html(next_path, request.query_params.get("error"))
+    )
 
 
 @router.post("/login", include_in_schema=False)
