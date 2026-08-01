@@ -106,6 +106,153 @@ async def test_login_sets_opaque_host_cookie_without_echoing_password(browser_au
 
 
 @pytest.mark.asyncio
+async def test_native_login_sets_cookie_and_server_redirects(browser_auth):
+    response = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "next": "/fleet",
+        },
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/fleet"
+    assert response.headers["cache-control"] == "no-store"
+    assert ADMIN_PASSWORD not in response.text
+    assert ADMIN_PASSWORD not in response.headers["location"]
+    assert browser_auth.client.cookies.get(auth.SESSION_COOKIE_NAME)
+
+
+@pytest.mark.asyncio
+async def test_native_login_routes_temporary_password_to_change_page(browser_auth):
+    response = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": TEMP_EMAIL,
+            "password": TEMP_PASSWORD,
+            "next": "/batch",
+        },
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/change-password?next=%2Fbatch"
+    assert browser_auth.client.cookies.get(auth.SESSION_COOKIE_NAME)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_next",
+    ["https://attacker.example", "//attacker.example", "/fleet?escape=1", "/\\fleet"],
+)
+async def test_native_login_rejects_unsafe_next(browser_auth, unsafe_next):
+    response = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "next": unsafe_next,
+        },
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+@pytest.mark.asyncio
+async def test_native_login_error_uses_fixed_message_without_secret(browser_auth):
+    rejected_password = "rejected-native-form-password"
+    response = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": ADMIN_EMAIL,
+            "password": rejected_password,
+            "next": "/batch",
+        },
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/login?next=%2Fbatch&error=invalid_credentials"
+    )
+    assert rejected_password not in response.text
+    assert rejected_password not in response.headers["location"]
+    assert auth.SESSION_COOKIE_NAME not in response.headers.get("set-cookie", "")
+
+    page = await browser_auth.client.get(response.headers["location"])
+    assert page.status_code == 200
+    assert "邮箱或密码错误" in page.text
+    assert rejected_password not in page.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", [None, "https://attacker.example"])
+async def test_native_login_requires_exact_same_origin(browser_auth, origin):
+    headers = {} if origin is None else {"Origin": origin}
+    response = await browser_auth.client.post(
+        "/login",
+        headers=headers,
+        data={
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "next": "/",
+        },
+    )
+
+    assert response.status_code == 403
+    assert auth.SESSION_COOKIE_NAME not in response.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_native_login_rejects_duplicate_and_oversized_fields(browser_auth):
+    duplicate = await browser_auth.client.post(
+        "/login",
+        headers={
+            "Origin": ORIGIN,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        content=(
+            f"email={ADMIN_EMAIL}&email=second%40example.test&"
+            f"password={ADMIN_PASSWORD}&next=%2F"
+        ),
+    )
+    oversized = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={"email": ADMIN_EMAIL, "password": "x" * 70_000, "next": "/"},
+    )
+
+    assert duplicate.status_code == 303
+    assert duplicate.headers["location"] == (
+        "/login?next=%2F&error=invalid_request"
+    )
+    assert oversized.status_code == 303
+    assert oversized.headers["location"] == (
+        "/login?next=%2F&error=invalid_request"
+    )
+    assert auth.SESSION_COOKIE_NAME not in duplicate.headers.get("set-cookie", "")
+    assert auth.SESSION_COOKIE_NAME not in oversized.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_native_login_accepts_max_length_url_encoded_password(browser_auth):
+    response = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={"email": ADMIN_EMAIL, "password": "+" * 4096, "next": "/"},
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/login?next=%2F&error=invalid_credentials"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unknown_user_and_wrong_password_are_indistinguishable(browser_auth):
     unknown = await _login(
         browser_auth.client,
