@@ -6683,7 +6683,16 @@ class TestJobResults:
 
 class TestBatchConsoleUI:
     @pytest.mark.asyncio
-    async def test_batch_page_served(self, client):
+    async def test_batch_page_served(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    subject="batch-owner@example.test",
+                    must_change_password=False,
+                )
+            ),
+        )
         r = await client.get("/batch")
         assert r.status_code == 200
         assert "Batch Console" in r.text

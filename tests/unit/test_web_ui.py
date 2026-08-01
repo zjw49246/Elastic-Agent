@@ -7,7 +7,8 @@ import os
 import re
 import shutil
 import subprocess
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -50,10 +51,38 @@ async def ui_client():
     result = create_test_manager()
     from elastic_agent.api.app import create_app
     app = create_app(result.manager)
-    with patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}):
+    principal = SimpleNamespace(
+        subject="admin@example.test",
+        must_change_password=False,
+    )
+    with (
+        patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}),
+        patch(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ),
+    ):
         async with AsyncClient(
             transport=ASGITransport(app=app),
-            base_url="http://testserver",
+            base_url="https://testserver",
+        ) as client:
+            yield client, result
+
+
+@pytest.fixture
+async def anonymous_ui_client():
+    result = create_test_manager()
+    from elastic_agent.api.app import create_app
+
+    app = create_app(result.manager)
+    with patch(
+        "elastic_agent.api.routes.ui.get_session_principal",
+        new=AsyncMock(return_value=None),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="https://testserver",
+            follow_redirects=False,
         ) as client:
             yield client, result
 
@@ -68,6 +97,87 @@ class TestDashboardEndpoint:
         assert "text/html" in resp.headers["content-type"]
         assert "Batch Console" in resp.text
         assert "Submit Job" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_login_page_uses_account_credentials_without_defaults(
+        self, anonymous_ui_client
+    ):
+        client, _ = anonymous_ui_client
+        resp = await client.get("/login?next=%2Ffleet")
+
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store"
+        assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert 'id="email"' in resp.text
+        assert 'id="password"' in resp.text
+        assert "'/api/auth/login'" in resp.text
+        assert "credentials:'same-origin'" in resp.text
+        assert "LOGIN_NEXT_PATHS" in resp.text
+        assert "prefilled-admin@example.test" not in resp.text
+        assert "prefilled-test-password" not in resp.text
+        assert "Authorization" not in resp.text
+        assert "Bearer" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_authenticated_login_redirect_rejects_external_next(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        resp = await client.get(
+            "/login?next=https%3A%2F%2Fevil.example",
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+    @pytest.mark.asyncio
+    async def test_change_password_page_uses_csrf_and_safe_next(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/change-password?next=%2Fbatch")
+
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store"
+        assert "'/api/auth/me'" in resp.text
+        assert "'/api/auth/password'" in resp.text
+        assert "current_password:current.value" in resp.text
+        assert "new_password:next.value" in resp.text
+        assert "requestHeaders.set('X-CSRF-Token', csrfToken)" in resp.text
+        assert "credentials:'same-origin'" in resp.text
+        assert "PASSWORD_NEXT_PATHS" in resp.text
+        assert "prefilled-admin@example.test" not in resp.text
+        assert "prefilled-test-password" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_anonymous_change_password_redirects_to_login(
+        self, anonymous_ui_client
+    ):
+        client, _ = anonymous_ui_client
+        resp = await client.get("/change-password")
+
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/login?next=%2Fchange-password"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/batch", "/fleet"])
+    async def test_console_uses_cookie_csrf_authentication(self, ui_client, path):
+        client, _ = ui_client
+        html = (await client.get(path)).text
+
+        assert "async function authenticatedFetch" in html
+        assert "'/api/auth/me'" in html
+        assert "'/api/auth/logout'" in html
+        assert "credentials:'same-origin'" in html
+        assert "requestHeaders.set('X-CSRF-Token', csrfToken)" in html
+        assert 'id="currentUserEmail"' in html
+        assert "退出登录" in html
+        assert "sessionStorage.removeItem('ea_api_key')" in html
+        assert "sessionStorage.getItem('ea_api_key')" not in html
+        assert "sessionStorage.setItem('ea_api_key'" not in html
+        assert "Authorization" not in html
+        assert "Bearer" not in html
+        assert "请输入 API Key" not in html
 
     @pytest.mark.asyncio
     async def test_submit_job_form_has_ordered_sections_and_all_control_ids(
@@ -971,7 +1081,7 @@ process.stdout.write(JSON.stringify(Object.fromEntries(
             ), control_id
 
     @pytest.mark.asyncio
-    async def test_batch_console_does_not_persist_or_put_api_key_in_download_url(
+    async def test_batch_console_download_uses_authenticated_fetch_without_browser_key(
         self, ui_client
     ):
         client, _ = ui_client
@@ -979,8 +1089,15 @@ process.stdout.write(JSON.stringify(Object.fromEntries(
 
         assert "localStorage" not in html
         assert "results/download?api_key=" not in html
+        assert "sessionStorage.removeItem('ea_api_key')" in html
+        assert "sessionStorage.getItem('ea_api_key')" not in html
+        assert "sessionStorage.setItem('ea_api_key'" not in html
+        assert "Authorization" not in html
+        assert "Bearer" not in html
         assert "sessionStorage" in html
         assert "function esc(value)" in html
+        assert "const response = await authenticatedFetch(" in html
+        assert "credentials:'same-origin'" in html
         assert "Idempotency-Key" in html
         assert "downloadResults" in html
         assert "/cancel" in html
@@ -1819,10 +1936,40 @@ process.stdout.write(JSON.stringify({
         assert "scaleInNode" in html
 
     @pytest.mark.asyncio
-    async def test_no_auth_required_for_ui(self, ui_client):
+    async def test_authenticated_session_can_open_ui(self, ui_client):
         client, _ = ui_client
         resp = await client.get("/")
         assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/", "/batch", "/fleet", "/dashboard"])
+    async def test_anonymous_ui_redirects_to_login(
+        self, anonymous_ui_client, path
+    ):
+        client, _ = anonymous_ui_client
+        resp = await client.get(path)
+
+        assert resp.status_code == 303
+        assert resp.headers["location"].startswith("/login?next=")
+        assert "https" not in resp.headers["location"]
+
+    @pytest.mark.asyncio
+    async def test_must_change_password_session_cannot_open_console(
+        self, ui_client
+    ):
+        client, _ = ui_client
+        principal = SimpleNamespace(
+            subject="admin@example.test",
+            must_change_password=True,
+        )
+        with patch(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ):
+            resp = await client.get("/fleet", follow_redirects=False)
+
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/change-password?next=%2Ffleet"
 
     @pytest.mark.asyncio
     async def test_fleet_contains_api_calls(self, ui_client):
