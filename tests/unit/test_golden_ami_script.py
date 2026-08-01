@@ -48,6 +48,22 @@ def test_builder_installs_verifier_and_writes_manifest_schema() -> None:
         assert f'"{component}"' in source
 
 
+def test_builder_declares_docker_sandbox_profile_dependencies() -> None:
+    source = SCRIPT.read_text()
+
+    assert "python3-venv bubblewrap util-linux" in source
+    assert '"python3-venv", "bubblewrap", "util-linux"' in source
+    assert (
+        "$V system python3 python3-pip git curl rsync nodejs npm "
+        "python3-venv bubblewrap util-linux"
+    ) in source
+    assert (
+        '"EnvironmentProfiles", "Value": '
+        '"ubuntu-agent-v1,ubuntu-agent-docker-v1,'
+        'ubuntu-agent-docker-sandbox-v1"'
+    ) in source
+
+
 def test_builder_disables_background_updates_before_image_creation() -> None:
     source = SCRIPT.read_text()
     hardening = source.index(

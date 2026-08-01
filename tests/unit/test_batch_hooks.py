@@ -167,12 +167,100 @@ class TestAccountAllocator:
             "wrong-agent", "standard", account_id="a1", agent_type="codex"
         ) is None
 
+    async def test_oauth_constraint_bypasses_agent_api_store_and_probe(
+        self, tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        api_store = _FakeAgentApiStore(_api_acct())
+        api_store.list = AsyncMock(side_effect=AssertionError(
+            "oauth allocation must not enumerate Agent API accounts"
+        ))
+        api_store.fetch_usage = AsyncMock(side_effect=AssertionError(
+            "oauth allocation must not probe Agent API usage"
+        ))
+        alloc = AccountAllocator(native_store, api_store)
+
+        selected = await alloc.allocate(
+            "oauth-only-worker", "standard", agent_type="codex",
+            auth_kind="oauth",
+        )
+
+        assert selected is not None and selected.id == "a9"
+        api_store.list.assert_not_awaited()
+        api_store.fetch_usage.assert_not_awaited()
+
+    async def test_agent_api_constraint_never_falls_back_to_oauth(
+        self, tmp_path,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        api_store = _FakeAgentApiStore(_api_acct())
+        api_store.decision = {
+            "known": True, "available": False,
+            "reason": "quota_exhausted",
+        }
+        alloc = AccountAllocator(native_store, api_store)
+
+        selected = await alloc.allocate(
+            "api-only-worker", "standard", agent_type="codex",
+            auth_kind="agent_api",
+        )
+
+        assert selected is None
+        assert api_store.fetch_calls == 1
+
+    @pytest.mark.parametrize(
+        ("account_id", "auth_kind"),
+        [("a9", "agent_api"), ("cloudrouter-1", "oauth")],
+    )
+    async def test_explicit_account_must_match_auth_kind(
+        self, tmp_path, account_id, auth_kind,
+    ):
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        alloc = AccountAllocator(
+            native_store, _FakeAgentApiStore(_api_acct()),
+        )
+
+        claim = await alloc.reserve(
+            "wrong-auth-kind", "standard", account_id=account_id,
+            agent_type="codex", auth_kind=auth_kind,
+        )
+
+        assert claim is None
+
     async def test_group_and_enabled_filter(self, tmp_path):
         alloc = AccountAllocator(await _store(tmp_path, [
             _acct(1, group="other"), _acct(2, enabled=False), _acct(3),
         ]))
         got = await alloc.allocate("w1", "standard")
         assert got.id == "a3"
+
+    async def test_automatic_and_explicit_allocation_honor_exclusions(
+        self, tmp_path,
+    ):
+        alloc = AccountAllocator(await _store(
+            tmp_path, [_acct(1), _acct(2)],
+        ))
+
+        automatic = await alloc.allocate(
+            "automatic",
+            "standard",
+            excluded_account_ids={"a1"},
+        )
+        explicit = await alloc.allocate(
+            "explicit",
+            "standard",
+            account_id="a1",
+            excluded_account_ids={"a1"},
+        )
+
+        assert automatic is not None and automatic.id == "a2"
+        assert explicit is None
 
     async def test_release_worker_frees_account(self, tmp_path):
         alloc = AccountAllocator(await _store(tmp_path, [_acct(1)]))
@@ -1912,6 +2000,177 @@ class TestAgentApiCoordinator:
 
 
 class TestLoginHook:
+    @pytest.mark.parametrize(
+        ("failure_kind", "expected_next_account"),
+        [
+            ("hard_quota", "a2"),
+            ("auth_failure", "a2"),
+            (None, "a1"),
+            ("transient", "a1"),
+        ],
+    )
+    async def test_eip_fresh_login_quarantines_only_proven_account_failure(
+        self, tmp_path, failure_kind, expected_next_account,
+    ):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        store = await _store(tmp_path, [
+            _acct(1, agent_type="codex", password="first-password"),
+            _acct(2, agent_type="codex", password="second-password"),
+        ])
+        mgr = FakeManager(tmp_path, store)
+        allocator = AccountAllocator(store)
+        coordinator = LoginCoordinator(
+            mgr.connection_manager, mgr.event_bus, timeout=5,
+        )
+        hook = make_login_hook(mgr, allocator, coordinator)
+        first_claim = await allocator.reserve(
+            "job-1:0",
+            "standard",
+            account_id="a1",
+            agent_type="codex",
+            auth_kind="oauth",
+            allow_durable_binding=True,
+        )
+        assert first_claim is not None
+        spec = JobSpec(
+            name="eip-codex",
+            run=RunSpec(command="bench"),
+            account={
+                "agent_type": "codex",
+                "auth_kind": "oauth",
+                "binding": "eip",
+                "ids": ["a1"],
+            },
+            fanout={"workers": 1},
+        )
+
+        pending = asyncio.create_task(hook(
+            "worker-1",
+            spec,
+            "/home/ubuntu/.codex",
+            "a1",
+            first_claim.claim_id,
+        ))
+        await asyncio.sleep(0)
+        worker_id, message = mgr.connection_manager.sent[0]
+        result = {
+            "login_request_id": message.login_request_id,
+            "account_id": "a1",
+            "success": False,
+            "error": "Codex exec smoke test failed",
+            "cleanup_complete": True,
+        }
+        if failure_kind is not None:
+            result["failure_kind"] = failure_kind
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", worker_id, result)
+
+        outcome = await pending
+        assert outcome.success is False
+        assert outcome.failure_kind == (
+            failure_kind
+            if failure_kind in {"hard_quota", "auth_failure"}
+            else None
+        )
+        await allocator.release_claim(
+            first_claim.claim_id,
+            expected_owner="job-1:0",
+            expected_account_id="a1",
+        )
+        next_claim = await allocator.reserve(
+            "job-2:0",
+            "standard",
+            agent_type="codex",
+            auth_kind="oauth",
+            allow_durable_binding=True,
+        )
+
+        assert next_claim is not None
+        assert next_claim.account.id == expected_next_account
+
+    async def test_preclaimed_account_cannot_bypass_auth_kind_constraint(
+        self, tmp_path,
+    ):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        native_store = await _store(tmp_path, [])
+        account = _api_acct()
+        api_store = _FakeAgentApiStore(account)
+        mgr = FakeManager(tmp_path, native_store)
+        allocator = AccountAllocator(native_store, api_store)
+        claim = await allocator.reserve(
+            "worker-1", "standard", account_id=account.id,
+            agent_type="codex",
+        )
+        hook = make_login_hook(
+            mgr, allocator,
+            LoginCoordinator(
+                mgr.connection_manager, mgr.event_bus, timeout=5,
+            ),
+            AgentApiCoordinator(
+                mgr.connection_manager, mgr.event_bus, api_store, timeout=5,
+            ),
+        )
+
+        outcome = await hook(
+            "worker-1",
+            JobSpec(
+                name="oauth-only", run=RunSpec(command="x"),
+                account={"agent_type": "codex", "auth_kind": "oauth"},
+            ),
+            "/home/ubuntu/.codex", account.id, claim.claim_id,
+        )
+
+        assert outcome.success is False
+        assert "auth kind" in outcome.error
+        assert mgr.connection_manager.sent == []
+
+    async def test_oauth_constraint_uses_browser_login_without_api_lookup(
+        self, tmp_path,
+    ):
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        native_store = await _store(tmp_path, [
+            _acct(9, agent_type="codex", password="native-password"),
+        ])
+        api_store = _FakeAgentApiStore(_api_acct())
+        api_store.list = AsyncMock(side_effect=AssertionError(
+            "oauth login must not enumerate Agent API accounts"
+        ))
+        api_store.fetch_usage = AsyncMock(side_effect=AssertionError(
+            "oauth login must not probe Agent API usage"
+        ))
+        mgr = FakeManager(tmp_path, native_store)
+        hook = make_login_hook(
+            mgr, AccountAllocator(native_store, api_store),
+            LoginCoordinator(
+                mgr.connection_manager, mgr.event_bus, timeout=5,
+            ),
+            AgentApiCoordinator(
+                mgr.connection_manager, mgr.event_bus, api_store, timeout=5,
+            ),
+        )
+        spec = JobSpec(
+            name="oauth-only", run=RunSpec(command="x"),
+            account={"agent_type": "codex", "auth_kind": "oauth"},
+        )
+
+        pending = asyncio.create_task(
+            hook("worker-oauth", spec, "/home/ubuntu/.codex")
+        )
+        await asyncio.sleep(0)
+        worker_id, message = mgr.connection_manager.sent[0]
+        assert message.type == "ACCOUNT_LOGIN"
+        await mgr.event_bus.emit("ACCOUNT_LOGIN_RESULT", worker_id, {
+            "login_request_id": message.login_request_id,
+            "account_id": "a9", "success": True,
+        })
+
+        outcome = await pending
+        assert outcome.success is True and outcome.auth_kind == "oauth"
+        api_store.list.assert_not_awaited()
+        api_store.fetch_usage.assert_not_awaited()
+
     async def test_recovery_gate_blocks_preclaimed_api_before_key_send(
         self, tmp_path,
     ):
@@ -2251,6 +2510,29 @@ class TestBoundHooks:
         assert mgr.registry.removed == ["w1"]
         assert mgr.connection_manager.disconnected == ["w1"]
         assert await alloc.get_claim(attached.claim_id) is None
+
+    async def test_eip_reserve_enforces_auth_kind_before_durable_side_effect(
+        self, tmp_path,
+    ):
+        mgr, _alloc, (reserve, _attach, _release) = await self._setup(tmp_path)
+        spec = self._spec()
+        spec.account.auth_kind = "agent_api"
+
+        with pytest.raises(ValueError, match="could not reserve account 'a1'"):
+            await reserve("job-1", 0, spec, "a1")
+
+        assert mgr.binding_manager.calls == []
+
+    async def test_eip_automatic_reserve_skips_spec_exclusions(self, tmp_path):
+        mgr, _alloc, (reserve, _attach, _release) = await self._setup(tmp_path)
+        spec = self._spec()
+        spec.account.ids = []
+        spec.account.exclude_ids = ["a1"]
+
+        assignment = await reserve("job-1", 0, spec)
+
+        assert assignment.account_id == "a2"
+        assert mgr.binding_manager.calls[0][:2] == ("reserve", "a2")
 
     async def test_region_mismatch_rejected_before_claim(self, tmp_path):
         mgr, alloc, (reserve, _attach, _release) = await self._setup(tmp_path)
@@ -3071,6 +3353,37 @@ class TestProvisionHook:
 
 
 class TestWireBatchRouting:
+    async def test_oauth_exhaustion_quarantine_skips_account_for_next_job(
+        self, tmp_path,
+    ):
+        mgr = FakeManager(
+            tmp_path,
+            await _store(tmp_path, [_acct(1), _acct(2)]),
+        )
+        orch = wire_batch(mgr)
+        orch._worker_index["w1"] = "job-1"
+        orch.runtime_account_for_task = lambda *_args, **_kwargs: (
+            "a1", "oauth"
+        )
+        exhausted = []
+        orch.defer_exhausted = lambda worker_id, **kwargs: (
+            exhausted.append((worker_id, kwargs["task_id"])) or True
+        )
+
+        await mgr.event_bus.emit("RUN_EXHAUSTED", "w1", {
+            "task_id": "task-a",
+            "reason": "rate_limit",
+        })
+        next_claim = await orch._allocator.reserve(
+            "job-2:0",
+            "standard",
+            allow_durable_binding=True,
+        )
+
+        assert exhausted == [("w1", "task-a")]
+        assert await orch._allocator.is_quarantined("a1") is True
+        assert next_claim is not None and next_claim.account.id == "a2"
+
     async def test_runtime_tombstone_failure_does_not_block_lifecycle(
         self, tmp_path,
     ):

@@ -87,7 +87,8 @@ _S3_COLLECTION_DEADLINE_SECONDS = 1_800
 _COLLECTION_STAGING_RESERVATION_WAIT_SECONDS = 1_800
 _RECOVERY_STAGING_DEADLINE_SECONDS = 1800
 _RECOVERY_PREFLIGHT_DEADLINE_SECONDS = 30
-_RECOVERY_CONTRACT_VERSION = 2
+_RECOVERY_CONTRACT_VERSION = 3
+_LEGACY_RECOVERY_CONTRACT_VERSION = 2
 _WORKER_RECOVERY_DISK_RESERVE_BYTES = 10 * 1024 * 1024 * 1024
 _SUBPROCESS_TERMINATE_TIMEOUT_SECONDS = 5
 _SUBPROCESS_GROUP_REAP_TIMEOUT_SECONDS = 5
@@ -1176,25 +1177,40 @@ class ManagerFleetDriver:
             )
         ):
             raise RuntimeError("checkpoint set generation is invalid")
-        expected_set_metadata = {
+        expected_common_metadata = {
             "resolved_commit": source_spec.setup.resolved_commit,
-            "recovery_contract_version": _RECOVERY_CONTRACT_VERSION,
-            "recovery_contract_sha256": cls._checkpoint_contract_hash(
-                source_spec
-            ),
             "fanout_workers": source_spec.fanout.workers,
             "shard_by": source_spec.fanout.shard_by,
             "collect_paths": list(source_spec.collect.paths),
             "collect_exclude": list(source_spec.collect.exclude),
         }
         metadata = checkpoint_set.get("metadata")
-        if (
-            not isinstance(metadata, dict)
-            or any(
-                metadata.get(key) != value
-                for key, value in expected_set_metadata.items()
+        metadata_matches_common = (
+            isinstance(metadata, dict)
+            and all(
+                metadata.get(key) == value
+                for key, value in expected_common_metadata.items()
             )
-        ):
+        )
+        metadata_matches_current = (
+            metadata_matches_common
+            and metadata.get("recovery_contract_version")
+            == _RECOVERY_CONTRACT_VERSION
+            and metadata.get("recovery_contract_sha256")
+            == cls._checkpoint_contract_hash(source_spec)
+        )
+        metadata_matches_legacy_any = (
+            metadata_matches_common
+            and source_spec.account.auth_kind == "any"
+            and metadata.get("recovery_contract_version")
+            == _LEGACY_RECOVERY_CONTRACT_VERSION
+            and metadata.get("recovery_contract_sha256")
+            == cls._checkpoint_contract_hash(
+                source_spec,
+                contract_version=_LEGACY_RECOVERY_CONTRACT_VERSION,
+            )
+        )
+        if not (metadata_matches_current or metadata_matches_legacy_any):
             raise RuntimeError(
                 "checkpoint set metadata does not match source Job"
             )
@@ -2210,11 +2226,14 @@ raise SystemExit(code)
             "fanout_workers": source.fanout.workers,
             "shard_by": source.fanout.shard_by,
             "agent_type": source.account.agent_type,
+            "auth_kind": source.account.auth_kind,
             "model": source.account.model,
         }
 
     @classmethod
-    def _checkpoint_contract_hash(cls, spec: JobSpec) -> str:
+    def _checkpoint_contract_hash(
+        cls, spec: JobSpec, *, contract_version: int | None = None,
+    ) -> str:
         """Hash only versioned recovery invariants, not the evolving schema.
 
         Hashing ``JobSpec.model_dump()`` makes an old checkpoint unreadable
@@ -2229,9 +2248,25 @@ raise SystemExit(code)
         )
         if callable(recovery_source):
             source = recovery_source()
+        version = (
+            _RECOVERY_CONTRACT_VERSION
+            if contract_version is None
+            else contract_version
+        )
+        if version not in {
+            _LEGACY_RECOVERY_CONTRACT_VERSION,
+            _RECOVERY_CONTRACT_VERSION,
+        }:
+            raise ValueError(
+                f"unsupported recovery contract version {version}"
+            )
         contract = cls._workload_recovery_identity(source)
+        if version == _LEGACY_RECOVERY_CONTRACT_VERSION:
+            # v2 predates independent credential-source admission. Callers
+            # only accept it for the compatible ``auth_kind='any'`` default.
+            contract.pop("auth_kind")
         contract.update({
-            "schema_version": _RECOVERY_CONTRACT_VERSION,
+            "schema_version": version,
             "collect_paths": list(source.collect.paths),
             "collect_exclude": list(source.collect.exclude),
         })
@@ -2295,7 +2330,8 @@ raise SystemExit(code)
         ):
             raise RuntimeError(
                 "recovery source and target workload inputs must match "
-                "(environment, setup, datasets, run cwd/env, fanout, and model)"
+                "(environment, setup, datasets, run cwd/env, fanout, account "
+                "auth kind, and model)"
             )
         unavailable = (
             set(target_spec.recovery.paths)
@@ -2330,11 +2366,13 @@ raise SystemExit(code)
             if (
                 source_spec.account.agent_type
                 != target_spec.account.agent_type
+                or source_spec.account.auth_kind
+                != target_spec.account.auth_kind
                 or source_spec.account.model != target_spec.account.model
             ):
                 raise RuntimeError(
-                    "checkpoint recovery requires the same account agent_type "
-                    "and model as the source Job"
+                    "checkpoint recovery requires the same account agent_type, "
+                    "auth_kind, and model as the source Job"
                 )
         if target_spec.recovery.policy == "legacy_final_collection":
             raise RuntimeError(
@@ -2441,6 +2479,7 @@ raise SystemExit(code)
         reservation_objects = 0
         try:
             checkpoint_shards: dict[str, dict] = {}
+            checkpoint_contract_metadata: dict[str, object] = {}
             max_staging = _positive_env_bytes(
                 "ELASTIC_AGENT_MAX_RECOVERY_STAGING_BYTES",
                 _DEFAULT_MAX_RECOVERY_STAGING_BYTES,
@@ -2476,6 +2515,7 @@ raise SystemExit(code)
                         target_spec=spec,
                     )
                 )
+                checkpoint_contract_metadata = checkpoint_set["metadata"]
                 total_bytes = int(checkpoint_set["total_bytes"])
                 total_objects = int(checkpoint_set["total_objects"])
                 await self._reserve_recovery_staging(
@@ -2538,10 +2578,12 @@ raise SystemExit(code)
                     )
                     kwargs["expected_metadata"] = {
                         "resolved_commit": source_spec.setup.resolved_commit,
-                        "recovery_contract_version": _RECOVERY_CONTRACT_VERSION,
-                        "recovery_contract_sha256": (
-                            self._checkpoint_contract_hash(source_spec)
-                        ),
+                        "recovery_contract_version": checkpoint_contract_metadata[
+                            "recovery_contract_version"
+                        ],
+                        "recovery_contract_sha256": checkpoint_contract_metadata[
+                            "recovery_contract_sha256"
+                        ],
                         "shard_index": shard_index,
                     }
                     await _await_owned_thread(

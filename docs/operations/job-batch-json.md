@@ -6,7 +6,7 @@ JSON JobBatch 用于一次上传多份完整 `JobSpec`，由 Manager 按容量�
 
 1. 在 Batch Console 的“提交 Job”区域切换到“批量 JSON”。
 2. 选择本地 `.json` 文件并点击“解析并校验全部”。
-3. 检查 Job 数、总 Workers、Worker-hours、实例类型、并发量和逐项警告。
+3. 检查 Job 数、总 Workers、Worker-hours、实例类型、账号来源/组/绑定方式、并发量和逐项警告。
 4. 只有全部 Job 都通过服务端 preflight 后，页面才会开放确认按钮。
 5. 最后由管理员确认，才会接受批次并开始创建真实资源。
 

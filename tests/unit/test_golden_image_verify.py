@@ -24,7 +24,10 @@ def _manifest() -> dict:
             "system": {
                 "packages": {
                     "python3": "3.14.4-1",
+                    "python3-venv": "3.14.4-1",
                     "nodejs": "22.22.1-1",
+                    "bubblewrap": "0.11.0-1",
+                    "util-linux": "2.40.2-1",
                 },
             },
             "agents": {"claude": "2.1.181", "codex": "0.144.6"},
@@ -66,6 +69,30 @@ def test_system_requires_manifest_and_installed_versions(monkeypatch) -> None:
     installed["nodejs"] = "unexpected"
     with pytest.raises(golden.VerificationError, match="nodejs"):
         golden.verify_system(_manifest(), ["python3", "nodejs"])
+
+
+def test_system_requires_bwrap_command_but_only_records_util_linux(
+    monkeypatch,
+) -> None:
+    installed = {
+        "python3-venv": "3.14.4-1",
+        "bubblewrap": "0.11.0-1",
+        "util-linux": "2.40.2-1",
+    }
+    required: list[str] = []
+    monkeypatch.setattr(golden, "_dpkg_version", installed.__getitem__)
+    monkeypatch.setattr(
+        golden,
+        "_require_commands",
+        lambda commands: required.extend(commands),
+    )
+
+    golden.verify_system(
+        _manifest(),
+        ["python3-venv", "bubblewrap", "util-linux"],
+    )
+
+    assert required == ["bwrap"]
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from elastic_agent.core.job_spec import (
     DEFAULT_JOB_TTL_SECONDS,
     DEFAULT_RUN_TIMEOUT_SECONDS,
+    MAX_ACCOUNT_EXCLUDE_IDS,
     AccountSpec,
     EnvironmentSpec,
     JobSpec,
@@ -375,6 +376,15 @@ class TestEnvironmentAndSetup:
     def test_versioned_environment_profile_is_fixed(self):
         env = EnvironmentSpec(profile="ubuntu-agent-docker-v1")
         assert env.manifest()["docker"] is True
+        sandbox = EnvironmentSpec(
+            profile="ubuntu-agent-docker-sandbox-v1"
+        ).manifest()
+        assert sandbox["docker"] is True
+        assert sandbox["system_packages"][-3:] == [
+            "python3-venv",
+            "bubblewrap",
+            "util-linux",
+        ]
         with pytest.raises(ValidationError, match="unknown environment profile"):
             EnvironmentSpec(profile="latest")
 
@@ -915,10 +925,12 @@ class TestJobSpecDefaults:
         assert spec.fanout.shard_by == "hostname"
         assert spec.account.mode == "worker_local_login"
         assert spec.account.agent_type == "claude"
+        assert spec.account.auth_kind == "any"
         assert spec.account.model == ""
         assert spec.account.per_worker == 1
         assert spec.account.binding == "none"
         assert spec.account.ids == []
+        assert spec.account.exclude_ids == []
         assert spec.account.login_timeout_seconds == 900
         assert spec.rotation.strategy == "none"
         assert spec.run.shell is True
@@ -936,6 +948,34 @@ class TestJobSpecDefaults:
         )
 
         assert spec.account.agent_type == "codex"
+
+    @pytest.mark.parametrize("auth_kind", ["any", "oauth", "agent_api"])
+    def test_account_auth_kind_is_an_explicit_admission_constraint(
+        self, auth_kind,
+    ):
+        account = AccountSpec(auth_kind=auth_kind)
+
+        assert account.auth_kind == auth_kind
+
+    def test_unknown_account_auth_kind_is_rejected(self):
+        with pytest.raises(ValidationError):
+            AccountSpec(auth_kind="browser")
+
+    def test_account_exclusions_are_normalized_unique_and_non_overlapping(self):
+        account = AccountSpec(exclude_ids=[" a1 ", "a2", "a1", ""])
+
+        assert account.exclude_ids == ["a1", "a2"]
+        with pytest.raises(ValidationError, match="cannot overlap"):
+            AccountSpec(ids=["a1"], exclude_ids=["a1"])
+        with pytest.raises(ValidationError, match="invalid account reference"):
+            AccountSpec(exclude_ids=["bad account"])
+
+    def test_account_exclusion_history_is_bounded(self):
+        with pytest.raises(ValidationError):
+            AccountSpec(exclude_ids=[
+                f"account-{index}"
+                for index in range(MAX_ACCOUNT_EXCLUDE_IDS + 1)
+            ])
 
     def test_optional_agent_model_is_normalized_and_bounded(self):
         account = AccountSpec(model="  gpt-5.4  ")

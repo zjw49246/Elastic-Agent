@@ -223,17 +223,38 @@ class JobBatchLimits:
         )
 
 
-def manifest_fingerprint(manifest: JobBatchManifest) -> str:
-    """Hash the complete normalized private manifest for idempotency."""
-
+def _json_fingerprint(payload: object) -> str:
     canonical = json.dumps(
-        manifest.model_dump(mode="json"),
+        payload,
         ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def manifest_fingerprint(manifest: JobBatchManifest) -> str:
+    """Hash the complete normalized private manifest for idempotency."""
+
+    return _json_fingerprint(manifest.model_dump(mode="json"))
+
+
+def _journal_manifest_matches(
+    journal: dict[str, Any], requested_fingerprint: str,
+) -> bool:
+    """Compare a request to current or default-compatible legacy manifests."""
+
+    stored = journal["manifest_fingerprint"]
+    if hmac.compare_digest(stored, requested_fingerprint):
+        return True
+    try:
+        normalized = JobBatchManifest.model_validate(journal["manifest"])
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(
+        manifest_fingerprint(normalized), requested_fingerprint,
+    )
 
 
 def aggregate_manifest(manifest: JobBatchManifest) -> dict[str, Any]:
@@ -244,7 +265,7 @@ def aggregate_manifest(manifest: JobBatchManifest) -> dict[str, Any]:
         item.spec.fanout.workers * item.spec.ttl_seconds / 3_600
         for item in manifest.jobs
     )
-    account_groups: dict[tuple[str, str, str, str, str], int] = {}
+    account_groups: dict[tuple[str, str, str, str, str, str], int] = {}
     explicit_slots = 0
     for item in manifest.jobs:
         spec = item.spec
@@ -253,6 +274,7 @@ def aggregate_manifest(manifest: JobBatchManifest) -> dict[str, Any]:
         required = spec.fanout.workers * spec.account.per_worker
         key = (
             spec.account.agent_type,
+            spec.account.auth_kind,
             spec.account.group,
             spec.account.binding,
             spec.account.mode,
@@ -264,10 +286,11 @@ def aggregate_manifest(manifest: JobBatchManifest) -> dict[str, Any]:
     account_requirements = [
         {
             "agent_type": key[0],
-            "group": key[1],
-            "binding": key[2],
-            "mode": key[3],
-            "model": key[4] or None,
+            "auth_kind": key[1],
+            "group": key[2],
+            "binding": key[3],
+            "mode": key[4],
+            "model": key[5] or None,
             "required_slots": required,
         }
         for key, required in sorted(account_groups.items())
@@ -402,8 +425,7 @@ class JobBatchQueue:
         async with self._lock:
             existing = self._journals.get(job_batch_id)
             if existing is not None:
-                stored = existing["manifest_fingerprint"]
-                if not hmac.compare_digest(stored, fingerprint):
+                if not _journal_manifest_matches(existing, fingerprint):
                     raise JobBatchIdempotencyConflictError
                 return self._public_view(existing), True
 
@@ -455,9 +477,7 @@ class JobBatchQueue:
             existing = self._journals.get(job_batch_id)
             if existing is None:
                 return None
-            if not hmac.compare_digest(
-                existing["manifest_fingerprint"], fingerprint
-            ):
+            if not _journal_manifest_matches(existing, fingerprint):
                 raise JobBatchIdempotencyConflictError
             return self._public_view(existing)
 
@@ -955,7 +975,13 @@ class JobBatchQueue:
         manifest = JobBatchManifest.model_validate(payload.get("manifest"))
         if manifest.batch_id != payload.get("batch_id"):
             raise ValueError("Job batch journal manifest identity differs")
-        if manifest_fingerprint(manifest) != payload["manifest_fingerprint"]:
+        if not hmac.compare_digest(
+            manifest_fingerprint(manifest),
+            payload["manifest_fingerprint"],
+        ) and not hmac.compare_digest(
+            _json_fingerprint(payload["manifest"]),
+            payload["manifest_fingerprint"],
+        ):
             raise ValueError("Job batch journal manifest fingerprint differs")
         if payload.get("policy") != manifest.policy.model_dump(mode="json"):
             raise ValueError("Job batch journal policy differs")

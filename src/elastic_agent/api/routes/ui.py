@@ -967,6 +967,7 @@ _BATCH_HTML = """\
           <select id="jProfile" aria-describedby="jProfileHelp">
             <option value="ubuntu-agent-v1">标准 Agent 环境（ubuntu-agent-v1）</option>
             <option value="ubuntu-agent-docker-v1">预装 Docker 环境（ubuntu-agent-docker-v1）</option>
+            <option value="ubuntu-agent-docker-sandbox-v1">Docker + 隔离评分环境（ubuntu-agent-docker-sandbox-v1）</option>
           </select>
           <div class="field-help" id="jProfileHelp">版本化、不可变的通用环境；Job 专属依赖请在“代码与初始化”中安装。</div></div>
       </div>
@@ -1347,6 +1348,8 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       </div>
       <ul class="batch-instance-list" id="batchSummaryInstances"
           aria-label="实例类型分布"></ul>
+      <ul class="batch-instance-list" id="batchSummaryAccounts"
+          aria-label="账号池需求"></ul>
       <div class="batch-plan-items" id="batchJsonPlanItems"></div>
       <div class="batch-confirm-actions">
         <span class="muted" id="batchJsonConfirmHint">预检尚未通过，不会创建任何资源。</span>
@@ -1824,10 +1827,12 @@ function localBatchSummary(manifest) {
   let totalWorkers = 0;
   let totalWorkerHours = 0;
   const instanceTypes = {};
+  const accountPools = {};
   const jobs = Array.isArray(manifest?.jobs) ? manifest.jobs : [];
   for (const entry of jobs) {
     const spec = isBatchPlainObject(entry?.spec) ? entry.spec : {};
     const fanout = isBatchPlainObject(spec.fanout) ? spec.fanout : {};
+    const account = isBatchPlainObject(spec.account) ? spec.account : {};
     const workers = Number.isInteger(fanout.workers) && fanout.workers > 0
       ? fanout.workers : 1;
     const ttl = Number.isFinite(Number(spec.ttl_seconds)) && Number(spec.ttl_seconds) > 0
@@ -1837,6 +1842,29 @@ function localBatchSummary(manifest) {
     totalWorkers += workers;
     totalWorkerHours += workers * ttl / 3600;
     instanceTypes[instanceType] = Number(instanceTypes[instanceType] || 0) + workers;
+    const accountMode = typeof account.mode === 'string'
+      ? account.mode : 'worker_local_login';
+    if (accountMode !== 'none') {
+      const pool = {
+        agent_type: typeof account.agent_type === 'string'
+          ? account.agent_type : 'claude',
+        auth_kind: typeof account.auth_kind === 'string'
+          ? account.auth_kind : 'any',
+        group: typeof account.group === 'string' ? account.group : 'standard',
+        binding: typeof account.binding === 'string' ? account.binding : 'none',
+        mode: accountMode,
+        model: typeof account.model === 'string' && account.model
+          ? account.model : null,
+      };
+      const key = JSON.stringify(pool);
+      const perWorker = Number.isInteger(account.per_worker) && account.per_worker > 0
+        ? account.per_worker : 1;
+      accountPools[key] = {
+        ...pool,
+        required_slots: Number(accountPools[key]?.required_slots || 0)
+          + workers * perWorker,
+      };
+    }
   }
   const policy = isBatchPlainObject(manifest?.policy) ? manifest.policy : {};
   return {
@@ -1846,6 +1874,9 @@ function localBatchSummary(manifest) {
     max_active_jobs: Number.isInteger(policy.max_active_jobs)
       ? policy.max_active_jobs : 3,
     instance_types: instanceTypes,
+    account_requirements: {
+      by_pool: Object.values(accountPools),
+    },
   };
 }
 
@@ -2043,6 +2074,8 @@ function normalizedBatchSummary(summary, fallback) {
     max_active_jobs: Number.isFinite(Number(incoming.max_active_jobs))
       ? Number(incoming.max_active_jobs) : fallback.max_active_jobs,
     instance_types: instanceTypes,
+    account_requirements: isBatchPlainObject(incoming.account_requirements)
+      ? incoming.account_requirements : fallback.account_requirements,
   };
 }
 
@@ -2066,6 +2099,29 @@ function renderBatchSummary(summary) {
       const item = document.createElement('li');
       item.textContent = String(instanceType) + ' × ' + batchDisplayNumber(count, 0) + ' Workers';
       instances.append(item);
+    }
+  }
+  const accounts = document.getElementById('batchSummaryAccounts');
+  accounts.replaceChildren();
+  const pools = Array.isArray(summary.account_requirements?.by_pool)
+    ? summary.account_requirements.by_pool : [];
+  if (!pools.length) {
+    const item = document.createElement('li');
+    item.textContent = '账号池：无需托管登录或等待服务端计划';
+    accounts.append(item);
+  } else {
+    for (const pool of pools) {
+      if (!isBatchPlainObject(pool)) continue;
+      const item = document.createElement('li');
+      const model = pool.model ? ' · model=' + String(pool.model) : '';
+      item.textContent = '账号池：'
+        + String(pool.agent_type || 'claude') + '/'
+        + String(pool.auth_kind || 'any')
+        + ' · group=' + String(pool.group || 'standard')
+        + ' · binding=' + String(pool.binding || 'none')
+        + model
+        + ' · ' + batchDisplayNumber(pool.required_slots, 0) + ' slots';
+      accounts.append(item);
     }
   }
 }
@@ -3746,7 +3802,8 @@ async function recoverJob(rawSourceJobId, rawLatestGeneration) {
     if (generation === null) return;
     const command = window.prompt(
       '可选：输入新的续跑命令。\\n'
-      + '留空会使用来源 Job 的原命令；不要把密钥写入命令。',
+      + '留空时，服务器优先使用来源 Job 的 run.resume_command；'
+      + '未配置时才使用原命令。不要把密钥写入命令。',
       ''
     );
     if (command === null) return;

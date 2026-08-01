@@ -2099,7 +2099,43 @@ class TestHandleAccountLogin:
             item for item in sent if isinstance(item, AccountLoginResultMessage)
         )
         assert result.success is True
+        assert result.failure_kind is None
         assert runtime._account_login_otp_readers == {}
+
+    @pytest.mark.asyncio
+    async def test_codex_login_forwards_closed_account_failure_kind(
+        self, runtime,
+    ):
+        from elastic_agent.core.protocols.messages import AccountLoginResultMessage
+
+        sent = []
+        runtime._send_event = (
+            lambda message: sent.append(message) or asyncio.sleep(0)
+        )
+        login = AsyncMock(return_value={
+            "ok": False,
+            "error": "Codex exec smoke test failed",
+            "failure_kind": "hard_quota",
+            "logs": [],
+        })
+        message = self._msg(
+            agent_type="codex",
+            email_token="",
+            password="openai-secret",
+            config_dir="/root/.codex-a1",
+        )
+
+        with patch(
+            "elastic_agent.worker.login.codex_login.codex_login", new=login,
+        ):
+            await runtime._handle_account_login(message)
+
+        result = next(
+            item for item in sent if isinstance(item, AccountLoginResultMessage)
+        )
+        assert result.success is False
+        assert result.failure_kind == "hard_quota"
+        assert result.cleanup_complete is True
 
     @pytest.mark.asyncio
     async def test_codex_blank_home_uses_actual_runtime_user_home(

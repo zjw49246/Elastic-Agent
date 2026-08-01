@@ -203,7 +203,7 @@ class FakeCheckpointStore:
         self.prune_calls = []
         self.resolved_metadata = {
             "resolved_commit": "a" * 40,
-            "recovery_contract_version": 2,
+            "recovery_contract_version": 3,
             "recovery_contract_sha256": "",
             "fanout_workers": 2,
             "shard_by": "shard_index",
@@ -1024,7 +1024,7 @@ async def test_checkpoint_collection_uses_manager_snapshot_and_commits(
         "generation": "final",
         "metadata": {
             "resolved_commit": "a" * 40,
-            "recovery_contract_version": 2,
+            "recovery_contract_version": 3,
             "recovery_contract_sha256": (
                 driver._checkpoint_contract_hash(spec)
             ),
@@ -2852,6 +2852,178 @@ async def test_recovery_rejects_changed_workload_dataset_identity():
             source,
             target,
             source_quiescent=True,
+        )
+
+
+async def test_recovery_identity_binds_account_auth_kind():
+    base = {
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "account": {"agent_type": "codex", "auth_kind": "oauth"},
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    }
+    source = JobSpec.model_validate(base)
+    target = JobSpec.model_validate({
+        **base,
+        "name": "resume",
+        "run": {"command": "resume"},
+        "account": {**base["account"], "auth_kind": "agent_api"},
+        "collect": {},
+        "recovery": {
+            "policy": "checkpoint",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+    changed_auth_source = source.model_copy(update={
+        "account": source.account.model_copy(
+            update={"auth_kind": "agent_api"}
+        ),
+    })
+
+    assert ManagerFleetDriver._workload_recovery_identity(source)[
+        "auth_kind"
+    ] == "oauth"
+    assert (
+        ManagerFleetDriver._checkpoint_contract_hash(source)
+        != ManagerFleetDriver._checkpoint_contract_hash(changed_auth_source)
+    )
+    with pytest.raises(RuntimeError, match="workload inputs must match"):
+        ManagerFleetDriver._validate_recovery_contract(
+            {"submission_state": "failed"}, source, target,
+            source_quiescent=True,
+        )
+
+
+async def test_recovery_identity_does_not_bind_account_selection_history():
+    base = {
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "account": {
+            "agent_type": "codex",
+            "auth_kind": "oauth",
+            "ids": ["oauth-a"],
+        },
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    }
+    source = JobSpec.model_validate(base)
+    target = JobSpec.model_validate({
+        **base,
+        "name": "resume",
+        "run": {"command": "resume"},
+        "account": {
+            **base["account"],
+            "ids": [],
+            "exclude_ids": ["oauth-a"],
+        },
+        "collect": {},
+        "recovery": {
+            "policy": "checkpoint",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+        },
+    })
+
+    assert (
+        ManagerFleetDriver._workload_recovery_identity(source)
+        == ManagerFleetDriver._workload_recovery_identity(target)
+    )
+    selection_changed = source.model_copy(update={
+        "account": source.account.model_copy(update={
+            "ids": [],
+            "exclude_ids": ["oauth-a"],
+        }),
+    })
+    assert (
+        ManagerFleetDriver._checkpoint_contract_hash(source)
+        == ManagerFleetDriver._checkpoint_contract_hash(selection_changed)
+    )
+    ManagerFleetDriver._validate_recovery_contract(
+        {"submission_state": "failed"},
+        source,
+        target,
+        source_quiescent=True,
+    )
+
+
+async def test_v2_checkpoint_is_compatible_only_with_default_any_auth_kind():
+    source = JobSpec.model_validate({
+        "name": "source",
+        "setup": {
+            "repo": "https://github.com/example/bench.git",
+            "resolved_commit": "a" * 40,
+        },
+        "run": {"command": "capture"},
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "collect": {"paths": ["results"], "checkpoint": True},
+    })
+    target = JobSpec.model_validate({
+        "name": "resume",
+        "setup": {
+            "repo": source.setup.repo,
+            "resolved_commit": source.setup.resolved_commit,
+        },
+        "run": {"command": "resume"},
+        "fanout": {"workers": 1, "shard_by": "shard_index"},
+        "recovery": {
+            "policy": "checkpoint",
+            "source_job_id": "job-source",
+            "paths": ["results"],
+            "generation": "periodic-00000001",
+        },
+    })
+    checkpoint_set = {
+        "generation": "periodic-00000001",
+        "total_bytes": 1,
+        "total_objects": 1,
+        "metadata": {
+            "resolved_commit": source.setup.resolved_commit,
+            "recovery_contract_version": 2,
+            "recovery_contract_sha256": (
+                ManagerFleetDriver._checkpoint_contract_hash(
+                    source, contract_version=2,
+                )
+            ),
+            "fanout_workers": 1,
+            "shard_by": "shard_index",
+            "collect_paths": ["results"],
+            "collect_exclude": [],
+        },
+        "shards": [{
+            "worker_namespace": "shard-00000",
+            "generation": "periodic-00000001",
+            "manifest_sha256": "0" * 64,
+            "total_bytes": 1,
+            "total_objects": 1,
+        }],
+    }
+
+    shards = ManagerFleetDriver._validate_resolved_checkpoint_set(
+        checkpoint_set, source_spec=source, target_spec=target,
+    )
+    assert list(shards) == ["shard-00000"]
+
+    oauth_source = source.model_copy(update={
+        "account": source.account.model_copy(update={"auth_kind": "oauth"}),
+    })
+    checkpoint_set["metadata"]["recovery_contract_sha256"] = (
+        ManagerFleetDriver._checkpoint_contract_hash(
+            oauth_source, contract_version=2,
+        )
+    )
+    with pytest.raises(RuntimeError, match="metadata does not match"):
+        ManagerFleetDriver._validate_resolved_checkpoint_set(
+            checkpoint_set, source_spec=oauth_source, target_spec=target,
         )
 
 
