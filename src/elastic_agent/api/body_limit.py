@@ -10,6 +10,8 @@ import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from elastic_agent.core.job_batch import JOB_BATCH_MAX_BODY_BYTES
+
 DEFAULT_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 MIN_MAX_REQUEST_BODY_BYTES = 64 * 1024
 MAX_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
@@ -381,11 +383,16 @@ class RequestBodyLimitMiddleware:
         # Job submission fingerprints raw JSON before current-schema
         # validation. Keep its endpoint ceiling in front of buffering even
         # when the deployment-wide limit is configured as high as 64 MiB.
+        if scope.get("method") == "POST" and scope.get("path") == "/api/jobs":
+            return min(self.max_bytes, JOB_SUBMIT_MAX_BODY_BYTES)
         if (
             scope.get("method") == "POST"
-            and scope.get("path") == "/api/jobs"
+            and scope.get("path") in {
+                "/api/job-batches",
+                "/api/job-batches/plan",
+            }
         ):
-            return min(self.max_bytes, JOB_SUBMIT_MAX_BODY_BYTES)
+            return min(self.max_bytes, JOB_BATCH_MAX_BODY_BYTES)
         return self.max_bytes
 
     @staticmethod

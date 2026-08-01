@@ -630,6 +630,60 @@ _BATCH_HTML = """\
     background:color-mix(in srgb,var(--surface) 94%,transparent);
     box-shadow:0 8px 24px rgba(15,23,42,.11); backdrop-filter:blur(8px); }
   .form-actions .btn { margin:0; min-height:40px; }
+  .submission-tabs { display:flex; gap:8px; margin:0 0 12px; padding:5px;
+    width:max-content; max-width:100%; border:1px solid var(--border); border-radius:10px;
+    background:var(--surface); box-shadow:var(--shadow); }
+  .submission-tab { margin:0; background:transparent; color:var(--muted);
+    border:1px solid transparent; }
+  .submission-tab[aria-selected="true"] { color:#fff; background:var(--accent);
+    border-color:var(--accent); }
+  .batch-upload-row { display:grid; grid-template-columns:minmax(0,1fr) auto;
+    gap:10px; align-items:end; }
+  .batch-upload-row .btn { margin:0; min-height:40px; }
+  .batch-file-meta { margin-top:8px; overflow-wrap:anywhere; }
+  .batch-privacy-note { border:1px solid color-mix(in srgb,var(--green) 32%,var(--border));
+    background:color-mix(in srgb,var(--green) 6%,var(--surface)); border-radius:8px;
+    padding:9px 11px; margin:10px 0; color:var(--muted); font-size:.79rem;
+    line-height:1.5; }
+  .batch-alert { display:block; border:1px solid var(--border); border-radius:8px;
+    padding:9px 11px; margin-top:10px; white-space:pre-wrap; overflow-wrap:anywhere;
+    font-size:.8rem; line-height:1.45; }
+  .batch-alert-error { color:var(--red);
+    border-color:color-mix(in srgb,var(--red) 38%,var(--border));
+    background:color-mix(in srgb,var(--red) 7%,var(--surface)); }
+  .batch-alert-warning { color:var(--orange);
+    border-color:color-mix(in srgb,var(--orange) 42%,var(--border));
+    background:color-mix(in srgb,var(--orange) 7%,var(--surface)); }
+  .batch-alert-success { color:var(--green);
+    border-color:color-mix(in srgb,var(--green) 38%,var(--border));
+    background:color-mix(in srgb,var(--green) 7%,var(--surface)); }
+  .batch-summary-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr));
+    gap:8px; margin-top:12px; }
+  .batch-summary-stat { min-width:0; border:1px solid var(--border); border-radius:8px;
+    padding:9px; background:var(--surface-soft); }
+  .batch-summary-stat b { display:block; margin-top:3px; overflow-wrap:anywhere;
+    font-size:.95rem; font-variant-numeric:tabular-nums; }
+  .batch-instance-list { display:flex; flex-wrap:wrap; gap:6px; list-style:none;
+    margin:9px 0 0; }
+  .batch-instance-list li { border:1px solid var(--border); border-radius:999px;
+    padding:3px 8px; background:var(--surface-soft); font-size:.76rem; }
+  .batch-plan-items,.batch-receipt-items { display:grid; gap:8px; margin-top:10px; }
+  .batch-item { border:1px solid var(--border); border-radius:9px; padding:10px;
+    background:var(--surface-soft); min-width:0; }
+  .batch-item-head { display:flex; justify-content:space-between; align-items:flex-start;
+    gap:10px; }
+  .batch-item-title { min-width:0; overflow-wrap:anywhere; }
+  .batch-item-messages { margin:6px 0 0 19px; font-size:.78rem; line-height:1.45; }
+  .batch-item-messages li { margin-top:3px; overflow-wrap:anywhere; }
+  .batch-message-error { color:var(--red); }
+  .batch-message-warning { color:var(--orange); }
+  .batch-confirm-actions { display:flex; justify-content:flex-end; gap:8px;
+    align-items:center; margin-top:12px; }
+  .batch-confirm-actions .btn { margin:0; min-height:42px; }
+  .batch-receipt-head { display:flex; justify-content:space-between; align-items:flex-start;
+    gap:10px; margin-top:12px; }
+  .batch-receipt-identifiers { overflow-wrap:anywhere; }
+  [hidden] { display:none !important; }
   .plan-result { white-space:pre-wrap; background:var(--bg); border:1px solid var(--border);
     border-radius:7px; padding:10px; margin-top:0; font-size:.75rem; max-height:420px;
     overflow:auto; }
@@ -756,6 +810,8 @@ _BATCH_HTML = """\
     .otp-action-card.otp-minimized .otp-action-head { align-items:center;
       flex-direction:row; }
     .otp-controls { grid-template-columns:1fr; }
+    .batch-summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .batch-item-head,.batch-receipt-head { flex-direction:column; }
   }
   @media (max-width:620px) {
     input,select,textarea { min-height:44px; font-size:16px; }
@@ -765,6 +821,11 @@ _BATCH_HTML = """\
     .form-section { padding:8px 10px 12px; }
     .form-actions { position:static; display:grid; grid-template-columns:1fr; }
     .form-actions .btn { width:100%; min-height:44px; }
+    .submission-tabs { display:grid; width:100%; }
+    .batch-upload-row { grid-template-columns:1fr; }
+    .batch-upload-row .btn,.batch-confirm-actions .btn { width:100%; }
+    .batch-confirm-actions { display:grid; }
+    .batch-summary-grid { grid-template-columns:1fr; }
   }
 </style>
 </head>
@@ -881,7 +942,17 @@ _BATCH_HTML = """\
   </div>
 
   <!-- Job submission -->
-  <div class="card" id="jobSubmissionCard">
+  <div class="submission-tabs" role="tablist" aria-label="Job 提交方式">
+    <button type="button" class="btn submission-tab" id="singleSubmissionTab"
+            role="tab" aria-selected="true" aria-controls="jobSubmissionCard"
+            onclick="selectSubmissionMode('single')">单个 Job 表单</button>
+    <button type="button" class="btn submission-tab" id="batchJsonSubmissionTab"
+            role="tab" aria-selected="false" aria-controls="batchJsonSubmissionCard"
+            onclick="selectSubmissionMode('batch-json')">批量 JSON</button>
+  </div>
+
+  <div class="card" id="jobSubmissionCard" role="tabpanel"
+       aria-labelledby="singleSubmissionTab">
     <h2>提交 Job <span class="field-code">Submit Job</span></h2>
     <p class="section-intro">先完成必需项，再按任务需要展开高级设置。页面中的原始 JobSpec 字段名以小字标出。</p>
     <div class="job-form">
@@ -1229,6 +1300,73 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     </div>
   </div>
 
+  <div class="card" id="batchJsonSubmissionCard" role="tabpanel"
+       aria-labelledby="batchJsonSubmissionTab" hidden>
+    <h2>批量提交 Job <span class="field-code">Batch JSON</span></h2>
+    <p class="section-intro">
+      选择一个 schema v1 JSON 文件，先对全部 Job 做无副作用预检；只有全部有效后才会开放确认启动。
+      页面不会自动创建 Job。
+    </p>
+    <div class="batch-privacy-note">
+      文件不会作为附件上传，也不会持久保存到浏览器存储；仅在你点击预检或确认提交时，
+      将同一份 UTF-8 JSON 内容发送给 Manager。页面不会展示 <code>run.env</code> 或
+      <code>run.secret_env</code> 的值。
+    </div>
+    <div class="batch-upload-row">
+      <div class="field">
+        <label for="batchJsonFile">Job batch manifest（最大 2 MiB）</label>
+        <input id="batchJsonFile" type="file" accept=".json,application/json"
+               onchange="batchJsonFileChanged()" aria-describedby="batchJsonFormatHint">
+      </div>
+      <button type="button" class="btn btn-ghost" id="batchJsonPlanBtn"
+              onclick="planBatchJson()" disabled>解析并校验全部</button>
+    </div>
+    <div class="field-help" id="batchJsonFormatHint">
+      严格格式：<code>schema_version: 1</code>、<code>batch_id</code>、可选
+      <code>policy</code>，以及 <code>jobs: [{client_id, spec}]</code>。v1 policy 只支持
+      <code>max_active_jobs</code>（1–10）和 <code>on_job_failure: "continue"</code>。
+      <code>batch_id</code> 同时是幂等身份；修改内容后必须换一个新 batch_id。
+    </div>
+    <div class="batch-file-meta muted" id="batchJsonFileMeta" role="status"
+         aria-live="polite">尚未选择文件。</div>
+    <div id="batchJsonAlert" role="alert" hidden></div>
+
+    <section id="batchJsonPlanResult" aria-labelledby="batchJsonPlanTitle" hidden>
+      <h3 id="batchJsonPlanTitle" style="font-size:.95rem;margin-top:14px">批量预检结果</h3>
+      <div class="batch-summary-grid">
+        <div class="batch-summary-stat"><span class="muted">文件 SHA-256</span>
+          <b id="batchSummaryHash">--</b></div>
+        <div class="batch-summary-stat"><span class="muted">Jobs</span>
+          <b id="batchSummaryJobs">0</b></div>
+        <div class="batch-summary-stat"><span class="muted">总 Workers</span>
+          <b id="batchSummaryWorkers">0</b></div>
+        <div class="batch-summary-stat"><span class="muted">总 Worker-hours</span>
+          <b id="batchSummaryWorkerHours">0</b></div>
+        <div class="batch-summary-stat"><span class="muted">最大并发 Jobs</span>
+          <b id="batchSummaryConcurrency">0</b></div>
+      </div>
+      <ul class="batch-instance-list" id="batchSummaryInstances"
+          aria-label="实例类型分布"></ul>
+      <div class="batch-plan-items" id="batchJsonPlanItems"></div>
+      <div class="batch-confirm-actions">
+        <span class="muted" id="batchJsonConfirmHint">预检尚未通过，不会创建任何资源。</span>
+        <button type="button" class="btn" id="batchJsonSubmitBtn"
+                onclick="submitBatchJson()" disabled>确认启动批量 Jobs</button>
+      </div>
+    </section>
+
+    <section id="batchJsonReceipt" aria-labelledby="batchJsonReceiptTitle" hidden>
+      <div class="batch-receipt-head">
+        <div class="batch-receipt-identifiers">
+          <h3 id="batchJsonReceiptTitle" style="font-size:.95rem">批次提交回执</h3>
+          <div class="muted" id="batchJsonReceiptIds"></div>
+        </div>
+        <span class="badge b-pending" id="batchJsonReceiptState">--</span>
+      </div>
+      <div class="batch-receipt-items" id="batchJsonReceiptItems"></div>
+    </section>
+  </div>
+
   <!-- Jobs monitor -->
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
@@ -1421,6 +1559,896 @@ function toast(msg, type='success') {
   el.textContent = msg; el.className = 'toast show ' + type;
   setTimeout(() => el.className = 'toast', 3500);
 }
+
+// ---- Batch JSON submission ----
+const BATCH_JSON_MAX_BYTES = 2 * 1024 * 1024;
+const BATCH_JSON_MAX_JOBS = 100;
+const BATCH_JSON_PLACEHOLDERS = ['[REDACTED]', '[SECRET_REFERENCE]'];
+const batchJsonState = {
+  generation: 0,
+  manifest: null,
+  rawSource: '',
+  fileHash: '',
+  idempotencyKey: '',
+  plan: null,
+  summary: null,
+  planValid: false,
+  submitted: false,
+  jobBatchId: '',
+  batchTerminal: false,
+  refreshRunning: false,
+};
+
+function selectSubmissionMode(mode) {
+  const batchMode = mode === 'batch-json';
+  document.getElementById('jobSubmissionCard').hidden = batchMode;
+  document.getElementById('batchJsonSubmissionCard').hidden = !batchMode;
+  document.getElementById('singleSubmissionTab').setAttribute(
+    'aria-selected', String(!batchMode)
+  );
+  document.getElementById('batchJsonSubmissionTab').setAttribute(
+    'aria-selected', String(batchMode)
+  );
+}
+
+function isBatchPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function batchDisplayNumber(value, digits=2) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return '0';
+  return parsed.toLocaleString(undefined, {maximumFractionDigits: digits});
+}
+
+function setBatchAlert(message='', kind='error') {
+  const alert = document.getElementById('batchJsonAlert');
+  alert.replaceChildren();
+  if (!message) {
+    alert.hidden = true;
+    alert.className = '';
+    return;
+  }
+  alert.textContent = String(message);
+  alert.className = 'batch-alert batch-alert-' + (
+    kind === 'success' ? 'success' : kind === 'warning' ? 'warning' : 'error'
+  );
+  alert.hidden = false;
+}
+
+function batchHiddenEnvironmentValues() {
+  const hidden = new Set();
+  const jobs = Array.isArray(batchJsonState.manifest?.jobs)
+    ? batchJsonState.manifest.jobs : [];
+  for (const entry of jobs) {
+    const run = isBatchPlainObject(entry?.spec?.run) ? entry.spec.run : {};
+    for (const envName of ['env', 'secret_env']) {
+      const values = isBatchPlainObject(run[envName]) ? run[envName] : {};
+      for (const value of Object.values(values)) {
+        if (typeof value === 'string' && value) hidden.add(value);
+      }
+    }
+  }
+  return Array.from(hidden).sort((left, right) => right.length - left.length);
+}
+
+function safeBatchServerText(value) {
+  let textValue = typeof value === 'string' ? value : '';
+  for (const hidden of batchHiddenEnvironmentValues()) {
+    textValue = textValue.split(hidden).join('[已隐藏环境变量值]');
+  }
+  textValue = textValue
+    .replace(/\\b(?:sk|key)-[A-Za-z0-9_-]{12,}\\b/gi, '[已隐藏凭据]')
+    .replace(/\\s+/g, ' ')
+    .trim();
+  return textValue.slice(0, 800);
+}
+
+function batchIssueMessages(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  const messages = [];
+  for (const issue of values.slice(0, 100)) {
+    if (typeof issue === 'string') {
+      const safe = safeBatchServerText(issue);
+      if (safe) messages.push(safe);
+      continue;
+    }
+    if (!isBatchPlainObject(issue)) continue;
+    const location = Array.isArray(issue.loc)
+      ? issue.loc.map(part => String(part).slice(0, 100)).join('.') : '';
+    const message = safeBatchServerText(issue.msg || issue.message || issue.detail || '');
+    if (message) messages.push(location ? location + ': ' + message : message);
+  }
+  return messages;
+}
+
+function safeBatchHttpDetail(payload, statusCode) {
+  const detail = payload?.detail;
+  const messages = [];
+  if (isBatchPlainObject(detail)) {
+    messages.push(...batchIssueMessages(detail.message));
+    messages.push(...batchIssueMessages(detail.errors));
+    const items = Array.isArray(detail.items) ? detail.items : [];
+    for (const item of items.slice(0, 100)) {
+      const prefix = typeof item?.client_id === 'string'
+        ? String(item.client_id).slice(0, 128) + ': ' : '';
+      messages.push(...batchIssueMessages(item?.errors).map(message => prefix + message));
+    }
+  } else {
+    messages.push(...batchIssueMessages(detail || payload?.errors));
+  }
+  if (messages.length) return messages.join('\\n');
+  return '批量请求失败（HTTP ' + Number(statusCode || 0) + '）。';
+}
+
+async function batchJsonApi(method, path, body, extraHeaders={}, rawJson=false) {
+  const headers = new Headers(extraHeaders);
+  headers.set('Accept', 'application/json');
+  const options = {method, headers};
+  if (body !== undefined && body !== null) {
+    headers.set('Content-Type', 'application/json');
+    options.body = rawJson ? String(body) : JSON.stringify(body);
+  }
+  const response = await authenticatedFetch('/api' + path, options);
+  let payload = null;
+  try { payload = await response.json(); } catch (_) {}
+  if (!response.ok) {
+    const error = new Error(safeBatchHttpDetail(payload, response.status));
+    error.status = response.status;
+    throw error;
+  }
+  return payload || {};
+}
+
+function batchUnexpectedKeys(value, allowed, path, errors) {
+  if (!isBatchPlainObject(value)) return;
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      errors.push(path + ' 包含不支持的字段：' + String(key).slice(0, 120));
+    }
+  }
+}
+
+function findBatchPlaceholders(root) {
+  const findings = [];
+  const pending = [{value: root, path: 'spec'}];
+  while (pending.length && findings.length < 50) {
+    const current = pending.pop();
+    if (typeof current.value === 'string') {
+      const upper = current.value.toUpperCase();
+      for (const placeholder of BATCH_JSON_PLACEHOLDERS) {
+        if (upper.includes(placeholder)) findings.push(current.path + ' 含 ' + placeholder);
+      }
+    } else if (Array.isArray(current.value)) {
+      current.value.forEach((value, index) => pending.push({
+        value, path: current.path + '[' + index + ']'
+      }));
+    } else if (isBatchPlainObject(current.value)) {
+      for (const [key, value] of Object.entries(current.value)) {
+        pending.push({value, path: current.path + '.' + String(key).slice(0, 100)});
+      }
+    }
+  }
+  return findings;
+}
+
+function assertNoDuplicateJsonKeys(source) {
+  let position = 0;
+  const skipWhitespace = () => {
+    while (position < source.length && /\\s/.test(source[position])) position += 1;
+  };
+  const scanString = () => {
+    const start = position;
+    position += 1;
+    while (position < source.length) {
+      if (source[position] === '\\\\') {
+        position += 2;
+      } else if (source[position] === '"') {
+        position += 1;
+        return JSON.parse(source.slice(start, position));
+      } else {
+        position += 1;
+      }
+    }
+    throw new Error('JSON 字符串未闭合。');
+  };
+  const scanValue = depth => {
+    if (depth > 128) throw new Error('JSON 嵌套层级超过 128。');
+    skipWhitespace();
+    const token = source[position];
+    if (token === '"') {
+      scanString();
+      return;
+    }
+    if (token === '{') {
+      position += 1;
+      skipWhitespace();
+      const keys = new Set();
+      if (source[position] === '}') { position += 1; return; }
+      while (position < source.length) {
+        skipWhitespace();
+        const key = scanString();
+        if (keys.has(key)) {
+          throw new Error('JSON 中存在重复 object key；为避免歧义已拒绝该文件。');
+        }
+        keys.add(key);
+        skipWhitespace();
+        if (source[position] !== ':') throw new Error('JSON object 缺少冒号。');
+        position += 1;
+        scanValue(depth + 1);
+        skipWhitespace();
+        if (source[position] === '}') { position += 1; return; }
+        if (source[position] !== ',') throw new Error('JSON object 分隔符无效。');
+        position += 1;
+      }
+      throw new Error('JSON object 未闭合。');
+    }
+    if (token === '[') {
+      position += 1;
+      skipWhitespace();
+      if (source[position] === ']') { position += 1; return; }
+      while (position < source.length) {
+        scanValue(depth + 1);
+        skipWhitespace();
+        if (source[position] === ']') { position += 1; return; }
+        if (source[position] !== ',') throw new Error('JSON array 分隔符无效。');
+        position += 1;
+      }
+      throw new Error('JSON array 未闭合。');
+    }
+    const start = position;
+    while (position < source.length) {
+      const character = source[position];
+      if (/\\s/.test(character) || [',', '}', ']'].includes(character)) break;
+      position += 1;
+    }
+    if (position === start) throw new Error('JSON value 无效。');
+  };
+  scanValue(0);
+  skipWhitespace();
+  if (position !== source.length) throw new Error('JSON 根节点后存在多余内容。');
+}
+
+function suspiciousBatchEnvKeys(spec) {
+  const run = isBatchPlainObject(spec?.run) ? spec.run : {};
+  const env = isBatchPlainObject(run.env) ? run.env : {};
+  const suspicious = new RegExp(
+    '(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_?KEY|'
+    + 'ACCESS_?KEY|CREDENTIALS?|AUTH)(?:_|$)',
+    'i'
+  );
+  return Object.keys(env).filter(key => suspicious.test(key)).slice(0, 50);
+}
+
+function localBatchSummary(manifest) {
+  let totalWorkers = 0;
+  let totalWorkerHours = 0;
+  const instanceTypes = {};
+  const jobs = Array.isArray(manifest?.jobs) ? manifest.jobs : [];
+  for (const entry of jobs) {
+    const spec = isBatchPlainObject(entry?.spec) ? entry.spec : {};
+    const fanout = isBatchPlainObject(spec.fanout) ? spec.fanout : {};
+    const workers = Number.isInteger(fanout.workers) && fanout.workers > 0
+      ? fanout.workers : 1;
+    const ttl = Number.isFinite(Number(spec.ttl_seconds)) && Number(spec.ttl_seconds) > 0
+      ? Number(spec.ttl_seconds) : 172800;
+    const instanceType = typeof fanout.instance_type === 'string' && fanout.instance_type.trim()
+      ? fanout.instance_type.trim() : 'Manager 默认';
+    totalWorkers += workers;
+    totalWorkerHours += workers * ttl / 3600;
+    instanceTypes[instanceType] = Number(instanceTypes[instanceType] || 0) + workers;
+  }
+  const policy = isBatchPlainObject(manifest?.policy) ? manifest.policy : {};
+  return {
+    job_count: jobs.length,
+    total_workers: totalWorkers,
+    total_worker_hours: totalWorkerHours,
+    max_active_jobs: Number.isInteger(policy.max_active_jobs)
+      ? policy.max_active_jobs : 3,
+    instance_types: instanceTypes,
+  };
+}
+
+function validateBatchManifest(manifest) {
+  const validation = {errors: [], warnings: [], items: [], summary: localBatchSummary(manifest)};
+  if (!isBatchPlainObject(manifest)) {
+    validation.errors.push('JSON 顶层必须是 object。');
+    return validation;
+  }
+  batchUnexpectedKeys(
+    manifest,
+    new Set(['schema_version', 'batch_id', 'policy', 'jobs']),
+    'manifest',
+    validation.errors
+  );
+  if (manifest.schema_version !== 1) {
+    validation.errors.push('schema_version 必须严格等于 1。');
+  }
+  if (typeof manifest.batch_id !== 'string' || !manifest.batch_id.trim()) {
+    validation.errors.push('batch_id 必须是非空字符串。');
+  } else if (manifest.batch_id.length > 128) {
+    validation.errors.push('batch_id 不能超过 128 个字符。');
+  } else if (!/^[A-Za-z0-9._-]+$/.test(manifest.batch_id)) {
+    validation.errors.push('batch_id 只允许英文字母、数字、点、下划线和连字符。');
+  }
+  if (Object.prototype.hasOwnProperty.call(manifest, 'policy')) {
+    if (!isBatchPlainObject(manifest.policy)) {
+      validation.errors.push('policy 必须是 object。');
+    } else {
+      batchUnexpectedKeys(
+        manifest.policy,
+        new Set(['max_active_jobs', 'on_job_failure']),
+        'policy',
+        validation.errors
+      );
+      if (Object.prototype.hasOwnProperty.call(manifest.policy, 'max_active_jobs')
+          && (!Number.isInteger(manifest.policy.max_active_jobs)
+              || manifest.policy.max_active_jobs < 1
+              || manifest.policy.max_active_jobs > 10)) {
+        validation.errors.push('policy.max_active_jobs 必须是 1–10 的整数。');
+      }
+      if (Object.prototype.hasOwnProperty.call(manifest.policy, 'on_job_failure')
+          && manifest.policy.on_job_failure !== 'continue') {
+        validation.errors.push('schema v1 的 policy.on_job_failure 只支持 "continue"。');
+      }
+    }
+  }
+  if (!Array.isArray(manifest.jobs) || !manifest.jobs.length) {
+    validation.errors.push('jobs 必须是非空 array。');
+    return validation;
+  }
+  if (manifest.jobs.length > BATCH_JSON_MAX_JOBS) {
+    validation.errors.push('浏览器单次最多校验 100 个 Jobs。');
+  }
+  const clientIds = new Set();
+  manifest.jobs.slice(0, BATCH_JSON_MAX_JOBS).forEach((entry, index) => {
+    const item = {client_id: 'jobs[' + index + ']', name: '', valid: true,
+                  warnings: [], errors: []};
+    if (!isBatchPlainObject(entry)) {
+      item.errors.push('Job 项必须是 object。');
+    } else {
+      batchUnexpectedKeys(
+        entry, new Set(['client_id', 'spec']), 'jobs[' + index + ']', item.errors
+      );
+      if (typeof entry.client_id !== 'string' || !entry.client_id.trim()) {
+        item.errors.push('client_id 必须是非空字符串。');
+      } else {
+        item.client_id = entry.client_id;
+        if (entry.client_id.length > 128) {
+          item.errors.push('client_id 不能超过 128 个字符。');
+        } else if (!/^[A-Za-z0-9._-]+$/.test(entry.client_id)) {
+          item.errors.push('client_id 只允许英文字母、数字、点、下划线和连字符。');
+        } else if (clientIds.has(entry.client_id)) {
+          item.errors.push('client_id 在同一批次中必须唯一。');
+        }
+        clientIds.add(entry.client_id);
+      }
+      if (!isBatchPlainObject(entry.spec)) {
+        item.errors.push('spec 必须是完整 JobSpec object。');
+      } else {
+        item.name = typeof entry.spec.name === 'string' ? entry.spec.name : '';
+        item.errors.push(...findBatchPlaceholders(entry.spec).map(
+          finding => finding + ' 脱敏占位符；请重新填写真实 AWS Secret/SSM 引用。'
+        ));
+        const suspiciousKeys = suspiciousBatchEnvKeys(entry.spec);
+        if (suspiciousKeys.length) {
+          item.warnings.push(
+            '强警告：run.env 中疑似秘密字段 ' + suspiciousKeys.join(', ')
+            + '；请移到 run.secret_env 并使用 AWS 引用。字段值未显示。'
+          );
+        }
+      }
+    }
+    item.valid = item.errors.length === 0;
+    validation.items.push(item);
+  });
+  return validation;
+}
+
+async function sha256Hex(buffer) {
+  if (!window.crypto?.subtle) throw new Error('当前浏览器不支持安全 SHA-256。');
+  const digest = await window.crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function batchIdempotencyKey(batchId) {
+  const bytes = new TextEncoder().encode('batch-json-v1\\n' + String(batchId));
+  return 'batch-json-v1-' + await sha256Hex(bytes);
+}
+
+function clearBatchPlan() {
+  batchJsonState.manifest = null;
+  batchJsonState.rawSource = '';
+  batchJsonState.fileHash = '';
+  batchJsonState.idempotencyKey = '';
+  batchJsonState.plan = null;
+  batchJsonState.summary = null;
+  batchJsonState.planValid = false;
+  batchJsonState.submitted = false;
+  document.getElementById('batchJsonPlanResult').hidden = true;
+  document.getElementById('batchJsonPlanItems').replaceChildren();
+  updateBatchConfirmButton();
+}
+
+function clearBatchReceipt() {
+  batchJsonState.jobBatchId = '';
+  batchJsonState.batchTerminal = false;
+  const receipt = document.getElementById('batchJsonReceipt');
+  receipt.hidden = true;
+  document.getElementById('batchJsonReceiptIds').textContent = '';
+  document.getElementById('batchJsonReceiptItems').replaceChildren();
+}
+
+function batchJsonFileChanged() {
+  batchJsonState.generation += 1;
+  clearBatchPlan();
+  clearBatchReceipt();
+  setBatchAlert();
+  const file = document.getElementById('batchJsonFile').files[0];
+  const button = document.getElementById('batchJsonPlanBtn');
+  const meta = document.getElementById('batchJsonFileMeta');
+  if (!file) {
+    button.disabled = true;
+    meta.textContent = '尚未选择文件。';
+    return;
+  }
+  if (file.size > BATCH_JSON_MAX_BYTES) {
+    button.disabled = true;
+    meta.textContent = file.name + ' · ' + batchDisplayNumber(file.size) + ' bytes';
+    setBatchAlert('文件超过 2 MiB 上限，未读取。', 'error');
+    return;
+  }
+  button.disabled = file.size === 0;
+  meta.textContent = file.name + ' · ' + batchDisplayNumber(file.size) + ' bytes · 尚未读取';
+  if (file.size === 0) setBatchAlert('JSON 文件不能为空。', 'error');
+}
+
+function normalizedBatchSummary(summary, fallback) {
+  const incoming = isBatchPlainObject(summary) ? summary : {};
+  const totalWorkers = Number.isFinite(Number(incoming.total_workers))
+    ? Number(incoming.total_workers) : fallback.total_workers;
+  let instanceTypes = fallback.instance_types;
+  if (isBatchPlainObject(incoming.instance_types)) {
+    instanceTypes = incoming.instance_types;
+  } else if (Array.isArray(incoming.instance_types)) {
+    const effective = incoming.instance_types.filter(
+      value => typeof value === 'string' && value
+    );
+    const distribution = {...fallback.instance_types};
+    const defaultWorkers = Number(distribution['Manager 默认'] || 0);
+    delete distribution['Manager 默认'];
+    if (defaultWorkers) {
+      const unresolved = effective.filter(
+        instanceType => !Object.prototype.hasOwnProperty.call(distribution, instanceType)
+      );
+      if (unresolved.length === 1) {
+        distribution[unresolved[0]] = Number(distribution[unresolved[0]] || 0)
+          + defaultWorkers;
+      } else if (!unresolved.length && effective.length === 1) {
+        distribution[effective[0]] = Number(distribution[effective[0]] || 0)
+          + defaultWorkers;
+      } else {
+        distribution['Manager 默认'] = defaultWorkers;
+      }
+    }
+    instanceTypes = distribution;
+  }
+  return {
+    job_count: Number.isFinite(Number(incoming.job_count))
+      ? Number(incoming.job_count) : fallback.job_count,
+    total_workers: totalWorkers,
+    total_worker_hours: Number.isFinite(Number(incoming.total_worker_hours))
+      ? Number(incoming.total_worker_hours) : fallback.total_worker_hours,
+    max_active_jobs: Number.isFinite(Number(incoming.max_active_jobs))
+      ? Number(incoming.max_active_jobs) : fallback.max_active_jobs,
+    instance_types: instanceTypes,
+  };
+}
+
+function renderBatchSummary(summary) {
+  document.getElementById('batchSummaryHash').textContent = batchJsonState.fileHash || '--';
+  document.getElementById('batchSummaryJobs').textContent = batchDisplayNumber(summary.job_count, 0);
+  document.getElementById('batchSummaryWorkers').textContent = batchDisplayNumber(summary.total_workers, 0);
+  document.getElementById('batchSummaryWorkerHours').textContent =
+    batchDisplayNumber(summary.total_worker_hours);
+  document.getElementById('batchSummaryConcurrency').textContent =
+    batchDisplayNumber(summary.max_active_jobs, 0);
+  const instances = document.getElementById('batchSummaryInstances');
+  instances.replaceChildren();
+  const entries = Object.entries(summary.instance_types || {});
+  if (!entries.length) {
+    const item = document.createElement('li');
+    item.textContent = '实例类型：等待服务端计划';
+    instances.append(item);
+  } else {
+    for (const [instanceType, count] of entries) {
+      const item = document.createElement('li');
+      item.textContent = String(instanceType) + ' × ' + batchDisplayNumber(count, 0) + ' Workers';
+      instances.append(item);
+    }
+  }
+}
+
+function appendBatchMessages(container, messages, kind) {
+  for (const message of messages) {
+    const item = document.createElement('li');
+    item.className = kind === 'error' ? 'batch-message-error' : 'batch-message-warning';
+    item.textContent = (kind === 'error' ? '错误：' : '警告：') + safeBatchServerText(message);
+    container.append(item);
+  }
+}
+
+function renderBatchPlanItems(items) {
+  const container = document.getElementById('batchJsonPlanItems');
+  container.replaceChildren(document.createDocumentFragment());
+  for (const item of items) {
+    const card = document.createElement('article');
+    card.className = 'batch-item';
+    const head = document.createElement('div');
+    head.className = 'batch-item-head';
+    const title = document.createElement('div');
+    title.className = 'batch-item-title';
+    const client = document.createElement('b');
+    client.textContent = String(item.client_id || '未命名项');
+    title.append(client);
+    if (item.name) {
+      const name = document.createElement('div');
+      name.className = 'muted';
+      name.textContent = String(item.name);
+      title.append(name);
+    }
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + (item.valid
+      ? item.warnings.length ? 'b-rotating' : 'b-succeeded' : 'b-failed');
+    badge.textContent = item.valid
+      ? item.warnings.length ? 'VALID · WARNING' : 'VALID' : 'ERROR';
+    head.append(title, badge);
+    card.append(head);
+    if (item.warnings.length || item.errors.length) {
+      const messages = document.createElement('ul');
+      messages.className = 'batch-item-messages';
+      appendBatchMessages(messages, item.warnings, 'warning');
+      appendBatchMessages(messages, item.errors, 'error');
+      card.append(messages);
+    }
+    container.append(card);
+  }
+}
+
+function updateBatchConfirmButton() {
+  const button = document.getElementById('batchJsonSubmitBtn');
+  const hint = document.getElementById('batchJsonConfirmHint');
+  const summary = batchJsonState.summary;
+  button.disabled = !batchJsonState.planValid || batchJsonState.submitted;
+  if (!summary || !batchJsonState.planValid) {
+    button.textContent = '确认启动批量 Jobs';
+    hint.textContent = '预检尚未通过，不会创建任何资源。';
+    return;
+  }
+  const resourceText = batchDisplayNumber(summary.job_count, 0) + ' Jobs · '
+    + batchDisplayNumber(summary.total_workers, 0) + ' Workers · '
+    + batchDisplayNumber(summary.total_worker_hours) + ' Worker-hours';
+  button.textContent = batchJsonState.submitted
+    ? '此 manifest 已提交' : '确认启动 ' + resourceText;
+  hint.textContent = batchJsonState.submitted
+    ? '已收到服务器回执；请在下方查看队列状态。'
+    : '点击后才会创建资源；最大并发 ' + batchDisplayNumber(
+      summary.max_active_jobs, 0
+    ) + ' 个 Jobs。batch_id ' + String(batchJsonState.manifest?.batch_id || '')
+      + ' 是稳定幂等身份。';
+}
+
+function mergeBatchPlan(validation, plan) {
+  const serverItems = Array.isArray(plan?.items) ? plan.items : [];
+  return validation.items.map((localItem, index) => {
+    const serverItem = serverItems[index] || {};
+    const serverWarnings = batchIssueMessages(serverItem.warnings);
+    const serverErrors = batchIssueMessages(serverItem.errors);
+    const valid = localItem.valid && serverErrors.length === 0 && serverItem.valid === true;
+    return {
+      client_id: serverItem.client_id ?? localItem.client_id,
+      name: serverItem.name ?? localItem.name,
+      valid,
+      warnings: localItem.warnings.concat(serverWarnings),
+      errors: localItem.errors.concat(serverErrors),
+    };
+  });
+}
+
+function renderBatchPlan(validation, plan=null) {
+  const fallback = validation.summary;
+  const summary = normalizedBatchSummary(plan?.summary, fallback);
+  const items = plan ? mergeBatchPlan(validation, plan) : validation.items;
+  const globalErrors = validation.errors.concat(batchIssueMessages(plan?.errors));
+  const itemWarningSet = new Set(items.flatMap(item => item.warnings));
+  const globalWarnings = validation.warnings.concat(
+    batchIssueMessages(plan?.warnings).filter(warning => !itemWarningSet.has(warning))
+  );
+  batchJsonState.summary = summary;
+  renderBatchSummary(summary);
+  renderBatchPlanItems(items);
+  document.getElementById('batchJsonPlanResult').hidden = false;
+  const allItemsValid = items.length === fallback.job_count && items.every(item => item.valid);
+  batchJsonState.planValid = Boolean(
+    plan && plan.valid === true && globalErrors.length === 0 && allItemsValid
+  );
+  const warningCount = globalWarnings.length
+    + items.reduce((count, item) => count + item.warnings.length, 0);
+  if (globalErrors.length) {
+    setBatchAlert(globalErrors.join('\\n'), 'error');
+  } else if (plan && !batchJsonState.planValid) {
+    setBatchAlert('至少一个 Job 未通过预检；未创建任何资源。', 'error');
+  } else if (warningCount) {
+    setBatchAlert('全部 Job 有效，但有 ' + warningCount
+      + ' 条警告。请逐项检查后再确认；当前尚未创建资源。'
+      + (globalWarnings.length ? '\\n' + globalWarnings.join('\\n') : ''), 'warning');
+  } else if (plan) {
+    setBatchAlert('全部 Job 预检通过；当前尚未创建任何资源。', 'success');
+  }
+  updateBatchConfirmButton();
+}
+
+async function planBatchJson() {
+  const input = document.getElementById('batchJsonFile');
+  const file = input.files[0];
+  if (!file) {
+    setBatchAlert('请先选择 JSON 文件。', 'error');
+    return;
+  }
+  if (file.size === 0 || file.size > BATCH_JSON_MAX_BYTES) {
+    setBatchAlert('文件必须大于 0 bytes 且不超过 2 MiB。', 'error');
+    return;
+  }
+  const generation = ++batchJsonState.generation;
+  clearBatchPlan();
+  clearBatchReceipt();
+  const button = document.getElementById('batchJsonPlanBtn');
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = '正在解析与预检…';
+  try {
+    const bytes = await file.arrayBuffer();
+    if (generation !== batchJsonState.generation) return;
+    if (bytes.byteLength > BATCH_JSON_MAX_BYTES) {
+      throw new Error('UTF-8 JSON 内容超过 2 MiB 上限。');
+    }
+    const fileHash = await sha256Hex(bytes);
+    let source;
+    try {
+      source = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
+    } catch (_) {
+      throw new Error('文件必须是有效 UTF-8 JSON。');
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(source);
+    } catch (_) {
+      throw new Error('JSON 语法无效；请在本地编辑器修正后重新选择文件。');
+    }
+    assertNoDuplicateJsonKeys(source);
+    if (generation !== batchJsonState.generation) return;
+    batchJsonState.manifest = manifest;
+    batchJsonState.rawSource = source;
+    batchJsonState.fileHash = fileHash;
+    document.getElementById('batchJsonFileMeta').textContent =
+      file.name + ' · ' + batchDisplayNumber(file.size) + ' bytes · SHA-256 ' + fileHash;
+    const validation = validateBatchManifest(manifest);
+    renderBatchPlan(validation);
+    if (validation.errors.length || validation.items.some(item => !item.valid)) return;
+    const plan = await batchJsonApi('POST', '/job-batches/plan', source, {}, true);
+    if (generation !== batchJsonState.generation) return;
+    batchJsonState.plan = plan;
+    batchJsonState.idempotencyKey = await batchIdempotencyKey(manifest.batch_id);
+    renderBatchPlan(validation, plan);
+  } catch (error) {
+    if (generation === batchJsonState.generation) {
+      batchJsonState.planValid = false;
+      setBatchAlert(error.message || '批量预检失败。', 'error');
+      updateBatchConfirmButton();
+    }
+  } finally {
+    if (generation === batchJsonState.generation) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+}
+
+function batchReceiptStateClass(rawState) {
+  const state = String(rawState || '').toLowerCase();
+  if (['succeeded', 'completed', 'complete', 'terminal'].includes(state)) return 'b-succeeded';
+  if (['failed', 'error', 'partial_failure'].includes(state)) return 'b-failed';
+  if (['cancelled', 'canceled'].includes(state)) return 'b-cancelled';
+  if (['running', 'accepted'].includes(state)) return 'b-running';
+  return 'b-pending';
+}
+
+function batchReceiptIsTerminal(receipt) {
+  if (receipt?.done === true) return true;
+  return ['succeeded', 'completed', 'complete', 'terminal', 'failed', 'partial_failure',
+          'cancelled', 'canceled'].includes(String(receipt?.state || '').toLowerCase());
+}
+
+function renderBatchReceipt(receipt) {
+  const section = document.getElementById('batchJsonReceipt');
+  section.hidden = false;
+  const internalId = String(receipt?.job_batch_id || batchJsonState.jobBatchId || '');
+  const externalId = String(receipt?.batch_id || batchJsonState.manifest?.batch_id || '');
+  const ids = [];
+  if (externalId) ids.push('batch_id: ' + externalId);
+  if (internalId) ids.push('job_batch_id: ' + internalId);
+  if (receipt?.idempotent_replay === true) ids.push('幂等重放：是');
+  document.getElementById('batchJsonReceiptIds').textContent = ids.join(' · ');
+  const state = String(receipt?.state || 'accepted');
+  const items = Array.isArray(receipt?.items) ? receipt.items : [];
+  const failedItemCount = items.filter(item => (
+    String(item?.state || '').toLowerCase() === 'error'
+    || (
+      String(item?.state || '').toLowerCase() === 'terminal'
+      && String(item?.job_state || '').toLowerCase() === 'failed'
+    )
+  )).length;
+  const cancelledItemCount = items.filter(item => (
+    String(item?.state || '').toLowerCase() === 'terminal'
+    && ['cancelled', 'canceled'].includes(
+      String(item?.job_state || '').toLowerCase()
+    )
+  )).length;
+  const batchErrorCount = Math.max(
+    Number(receipt?.summary?.error || 0), failedItemCount
+  );
+  const terminalBatch = state.toLowerCase() === 'terminal';
+  const visualState = terminalBatch && batchErrorCount > 0
+    ? 'error'
+    : terminalBatch && cancelledItemCount > 0 ? 'cancelled' : state;
+  const stateBadge = document.getElementById('batchJsonReceiptState');
+  stateBadge.className = 'badge ' + batchReceiptStateClass(visualState);
+  stateBadge.textContent = terminalBatch && batchErrorCount > 0
+    ? state + ' · ' + batchDisplayNumber(batchErrorCount, 0) + ' error'
+    : terminalBatch && cancelledItemCount > 0
+      ? state + ' · ' + batchDisplayNumber(cancelledItemCount, 0) + ' cancelled'
+      : state;
+  const container = document.getElementById('batchJsonReceiptItems');
+  container.replaceChildren(document.createDocumentFragment());
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = '服务器尚未返回逐项回执，页面会继续轮询。';
+    container.append(empty);
+  }
+  for (const item of items) {
+    const card = document.createElement('article');
+    card.className = 'batch-item';
+    const head = document.createElement('div');
+    head.className = 'batch-item-head';
+    const title = document.createElement('div');
+    title.className = 'batch-item-title';
+    const client = document.createElement('b');
+    client.textContent = String(item?.client_id || '未命名项');
+    title.append(client);
+    if (item?.job_id) {
+      const jobId = document.createElement('div');
+      jobId.className = 'muted';
+      jobId.textContent = 'Job: ' + String(item.job_id);
+      title.append(jobId);
+    }
+    const itemState = String(item?.state || 'queued');
+    const terminalJobState = itemState === 'terminal' && item?.job_state
+      ? String(item.job_state) : '';
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + batchReceiptStateClass(terminalJobState || itemState);
+    badge.textContent = terminalJobState
+      ? itemState + ' · ' + terminalJobState : itemState;
+    head.append(title, badge);
+    card.append(head);
+    const itemErrors = batchIssueMessages(item?.error || item?.errors);
+    if (itemErrors.length) {
+      const messages = document.createElement('ul');
+      messages.className = 'batch-item-messages';
+      appendBatchMessages(messages, itemErrors, 'error');
+      card.append(messages);
+    }
+    container.append(card);
+  }
+}
+
+async function submitBatchJson() {
+  if (!batchJsonState.planValid || !batchJsonState.manifest
+      || !batchJsonState.rawSource || !batchJsonState.idempotencyKey
+      || !batchJsonState.summary) {
+    setBatchAlert('必须先重新解析并通过全部预检。', 'error');
+    return;
+  }
+  const summary = batchJsonState.summary;
+  const resourceText = batchDisplayNumber(summary.job_count, 0) + ' Jobs、'
+    + batchDisplayNumber(summary.total_workers, 0) + ' Workers、'
+    + batchDisplayNumber(summary.total_worker_hours) + ' Worker-hours';
+  if (!window.confirm('确认启动 ' + resourceText + '？\\n此操作会创建真实云资源。')) return;
+  const generation = batchJsonState.generation;
+  const rawSource = batchJsonState.rawSource;
+  const idempotencyKey = batchJsonState.idempotencyKey;
+  const button = document.getElementById('batchJsonSubmitBtn');
+  const planButton = document.getElementById('batchJsonPlanBtn');
+  const fileInput = document.getElementById('batchJsonFile');
+  button.disabled = true;
+  planButton.disabled = true;
+  fileInput.disabled = true;
+  button.textContent = '正在提交批次…';
+  try {
+    const receipt = await batchJsonApi('POST', '/job-batches', rawSource, {
+      'Idempotency-Key': idempotencyKey,
+    }, true);
+    const jobBatchId = String(receipt?.job_batch_id || '');
+    if (!jobBatchId) throw new Error('服务器回执缺少 job_batch_id，未改变本页幂等键，可安全重试。');
+    if (generation !== batchJsonState.generation
+        || rawSource !== batchJsonState.rawSource) {
+      toast('先前选择的批次已接收：' + jobBatchId, 'warning');
+      refreshJobs();
+      return;
+    }
+    batchJsonState.jobBatchId = jobBatchId;
+    batchJsonState.batchTerminal = batchReceiptIsTerminal(receipt);
+    batchJsonState.submitted = true;
+    renderBatchReceipt(receipt);
+    updateBatchConfirmButton();
+    setBatchAlert('服务器已接收批次；正在轮询逐项 queued / accepted / terminal / error 状态。', 'success');
+    toast('批次已接收：' + jobBatchId);
+    refreshJobs();
+    refreshAccounts(true);
+  } catch (error) {
+    if (generation !== batchJsonState.generation
+        || rawSource !== batchJsonState.rawSource) return;
+    const message = Number(error.status) === 409
+      ? '同一 batch_id 已经绑定到另一份 manifest。未创建重复批次；若这是新批次，请修改 batch_id 后重新预检。'
+      : error.message || '批次提交失败；原幂等键仍保留，可安全重试。';
+    setBatchAlert(message, 'error');
+  } finally {
+    fileInput.disabled = false;
+    if (generation === batchJsonState.generation) {
+      planButton.disabled = false;
+    }
+    if (generation === batchJsonState.generation && !batchJsonState.submitted) {
+      button.disabled = false;
+      updateBatchConfirmButton();
+    }
+  }
+}
+
+async function refreshActiveJobBatch() {
+  if (!batchJsonState.jobBatchId || batchJsonState.batchTerminal
+      || batchJsonState.refreshRunning) return;
+  const requestedId = batchJsonState.jobBatchId;
+  const requestedGeneration = batchJsonState.generation;
+  batchJsonState.refreshRunning = true;
+  try {
+    const receipt = await batchJsonApi(
+      'GET', '/job-batches/' + encodeURIComponent(requestedId)
+    );
+    if (batchJsonState.jobBatchId !== requestedId
+        || batchJsonState.generation !== requestedGeneration) return;
+    renderBatchReceipt(receipt);
+    batchJsonState.batchTerminal = batchReceiptIsTerminal(receipt);
+    if (batchJsonState.batchTerminal) {
+      toast('批次已进入终态：' + String(receipt?.state || 'completed'));
+      refreshJobs();
+    }
+  } catch (error) {
+    if (batchJsonState.jobBatchId === requestedId
+        && batchJsonState.generation === requestedGeneration) {
+      setBatchAlert(
+        '批次状态刷新失败，将自动重试：' + safeBatchServerText(error.message),
+        'warning'
+      );
+    }
+  } finally {
+    if (batchJsonState.jobBatchId === requestedId
+        && batchJsonState.generation === requestedGeneration) {
+      batchJsonState.refreshRunning = false;
+    }
+  }
+}
+
 function lines(id) {
   return document.getElementById(id).value.split('\\n').map(s => s.trim()).filter(Boolean);
 }
@@ -4144,6 +5172,9 @@ async function runDashboardPoll() {
   dashboardPollRunning = true;
   try {
     const refreshes = [refreshJobs(), refreshLoginAttempts()];
+    if (batchJsonState.jobBatchId && !batchJsonState.batchTerminal) {
+      refreshes.push(refreshActiveJobBatch());
+    }
     if (Date.now() - lastAccountsRefreshAt >= 15_000) {
       refreshes.push(refreshAccounts());
     }

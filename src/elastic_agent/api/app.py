@@ -98,6 +98,7 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
     )
     from elastic_agent.api.routes.files import router as files_router
     from elastic_agent.api.routes.health import router as health_router
+    from elastic_agent.api.routes.job_batches import router as job_batches_router
     from elastic_agent.api.routes.jobs import router as jobs_router
     from elastic_agent.api.routes.management_auth import (
         router as management_auth_router,
@@ -113,6 +114,7 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
     app.include_router(agent_api_accounts_router, prefix="/api")
     app.include_router(account_login_router, prefix="/api")
     app.include_router(jobs_router, prefix="/api")
+    app.include_router(job_batches_router, prefix="/api")
     app.include_router(ui_router)
 
     @app.websocket("/ws/runtime")
