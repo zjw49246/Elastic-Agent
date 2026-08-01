@@ -28,7 +28,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import urlparse
 
 from elastic_agent.core.batch_orchestrator import (
@@ -49,6 +49,7 @@ from elastic_agent.harness.generic import (
 logger = logging.getLogger(__name__)
 _AGENT_API_USAGE_REFRESH_CONCURRENCY = 16
 _AGENT_API_USAGE_REFRESH_TIMEOUT_SECONDS = 30.0
+AccountAuthKind = Literal["any", "oauth", "agent_api"]
 
 
 async def _await_cleanup_task(task: asyncio.Task) -> Any:
@@ -132,15 +133,23 @@ class AccountAllocator:
         *,
         refresh_agent_api_usage: bool = True,
         refresh_agent_api_ids: frozenset[str] | None = None,
+        auth_kind: AccountAuthKind = "any",
     ) -> list[Any]:
         """Return one claim namespace, with compatible Agent API keys first."""
 
         native = await self._store.list()
+        if auth_kind == "oauth":
+            # This is an operational isolation boundary, not just a later
+            # candidate filter: OAuth-only allocation must not enumerate or
+            # probe a provider-backed credential store at all.
+            return list(native)
+        if auth_kind not in {"any", "agent_api"}:
+            raise ValueError(f"unsupported account auth kind {auth_kind!r}")
         if (
             self._agent_api_store is None
             or not self._agent_api_admission()
         ):
-            return list(native)
+            return [] if auth_kind == "agent_api" else list(native)
         api_accounts = await self._agent_api_store.list()
         native_ids = {account.id for account in native}
         duplicate_ids = sorted(
@@ -212,6 +221,8 @@ class AccountAllocator:
             available_api_accounts.append(account)
         # CCM routes fresh sessions through a compatible API identity first and
         # falls back to native OAuth. Existing claimed sessions remain pinned.
+        if auth_kind == "agent_api":
+            return available_api_accounts
         return [*available_api_accounts, *native]
 
     @staticmethod
@@ -280,6 +291,7 @@ class AccountAllocator:
         self, owner: str, group: str, *, account_id: str = "",
         claim_id: str = "", excluded_account_ids: set[str] | None = None,
         agent_type: str = "claude", model: str = "",
+        auth_kind: AccountAuthKind = "any",
         allow_shared_agent_api: bool = False,
         allow_durable_binding: bool = False,
     ) -> AccountClaim | None:
@@ -315,7 +327,7 @@ class AccountAllocator:
                     continue
                 return None
             explicit_native = False
-            if account_id:
+            if account_id and auth_kind != "agent_api":
                 explicit_native = any(
                     account.id == account_id
                     for account in await self._store.list()
@@ -323,6 +335,7 @@ class AccountAllocator:
             if explicit_native:
                 refreshed_accounts = await self._accounts(
                     refresh_agent_api_usage=False,
+                    auth_kind=auth_kind,
                 )
             else:
                 refreshed_accounts = await self._accounts(
@@ -332,6 +345,7 @@ class AccountAllocator:
                         if account_id
                         else None
                     ),
+                    auth_kind=auth_kind,
                 )
             eligible_agent_api_ids = {
                 account.id
@@ -347,6 +361,7 @@ class AccountAllocator:
                     continue
                 accounts = await self._accounts(
                     refresh_agent_api_usage=False,
+                    auth_kind=auth_kind,
                 )
                 if account_id:
                     candidates = [
@@ -452,8 +467,10 @@ class AccountAllocator:
         group: str,
         *,
         account_id: str = "",
+        excluded_account_ids: set[str] | None = None,
         agent_type: str = "claude",
         model: str = "",
+        auth_kind: AccountAuthKind = "any",
     ) -> Any | None:
         """Backward-compatible worker allocation used by unbound jobs.
 
@@ -467,8 +484,10 @@ class AccountAllocator:
             worker_id,
             group,
             account_id=account_id,
+            excluded_account_ids=excluded_account_ids,
             agent_type=agent_type,
             model=model,
+            auth_kind=auth_kind,
             allow_shared_agent_api=True,
         )
         return claim.account if claim else None
@@ -962,11 +981,19 @@ class LoginCoordinator:
                 reason="worker_result_cleanup_uncertain",
             )
 
+        success = bool(data.get("success"))
+        failure_kind = data.get("failure_kind")
+        if (
+            success
+            or failure_kind not in {"hard_quota", "auth_failure"}
+        ):
+            failure_kind = None
         return LoginOutcome(
-            success=bool(data.get("success")),
+            success=success,
             account_id=account.id,
             account_email=account.email,
             config_dir=config_dir,
+            failure_kind=failure_kind,
             error=data.get("error"),
         )
 
@@ -1613,8 +1640,10 @@ def make_login_hook(
                 worker_id,
                 spec.account.group,
                 account_id=account_id,
+                excluded_account_ids=set(spec.account.exclude_ids),
                 agent_type=spec.account.agent_type,
                 model=spec.account.model,
+                auth_kind=spec.account.auth_kind,
             )
             if acct is None:
                 return LoginOutcome(
@@ -1622,7 +1651,24 @@ def make_login_hook(
                     error=f"no available account in group '{spec.account.group}'",
                 )
 
-        if getattr(acct, "auth_kind", "oauth") == "agent_api":
+        selected_auth_kind = getattr(acct, "auth_kind", "oauth")
+        if (
+            spec.account.auth_kind != "any"
+            and selected_auth_kind != spec.account.auth_kind
+        ):
+            return LoginOutcome(
+                success=False,
+                account_id=acct.id,
+                account_email=getattr(acct, "email", ""),
+                auth_kind=selected_auth_kind,
+                error=(
+                    f"account '{acct.id}' uses auth kind "
+                    f"'{selected_auth_kind}', not requested "
+                    f"'{spec.account.auth_kind}'"
+                ),
+            )
+
+        if selected_auth_kind == "agent_api":
             if not getattr(manager, "binding_recovery_ready", True):
                 return LoginOutcome(
                     success=False,
@@ -1673,7 +1719,7 @@ def make_login_hook(
                 "Could not snapshot Job context for login on worker %s",
                 worker_id,
             )
-        return await coordinator.login(
+        outcome = await coordinator.login(
             worker_id, acct, config_dir or spec.account.config_dir,
             provider=spec.account.__dict__.get("provider") if hasattr(spec.account, "__dict__") else None,
             # A legacy Claude worker cannot perform Codex's password/OTP flow;
@@ -1691,6 +1737,17 @@ def make_login_hook(
             job_name=job_name,
             shard_index=shard_index,
         )
+        if (
+            not outcome.success
+            and outcome.failure_kind in {"hard_quota", "auth_failure"}
+        ):
+            # The Worker inspected the isolated Codex smoke-test output and
+            # returned only a closed, non-secret classification.  Quarantine
+            # this exact OAuth identity before the EIP/ordinary claim can be
+            # released and selected by a following queued Job.  Generic and
+            # transient login failures deliberately remain reusable.
+            await allocator.quarantine(acct.id)
+        return outcome
 
     return login
 
@@ -1726,7 +1783,7 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
             )
 
         owner = f"{job_id}:{slot}"
-        attempted: set[str] = set()
+        attempted: set[str] = set(spec.account.exclude_ids)
         while True:
             claim = await allocator.reserve(
                 owner,
@@ -1735,6 +1792,7 @@ def make_bound_hooks(manager, allocator: AccountAllocator):
                 excluded_account_ids=attempted,
                 agent_type=spec.account.agent_type,
                 model=spec.account.model,
+                auth_kind=spec.account.auth_kind,
                 allow_durable_binding=True,
             )
             if claim is None:
@@ -2178,23 +2236,42 @@ def wire_batch(
         # ACK this durable event and resume the worker's sole WS receive loop.
         # A dynamic rotation's ACCOUNT_LOGIN_RESULT arrives on that same loop;
         # awaiting the login here would deadlock it until the 3600s timeout.
-        if data.get("reason") == "agent_api_auth_failure":
+        reason = data.get("reason")
+        task_id = data.get("task_id")
+        if reason in {"rate_limit", "auth_failure"}:
+            runtime_account = orch.runtime_account_for_task(
+                worker_id,
+                task_id=task_id,
+            )
+            if runtime_account is not None and runtime_account[1] == "oauth":
+                # OAuth has no provider-side durable tombstone. Keep the exact
+                # hard-failed identity out of subsequent queued Jobs for this
+                # Manager lifetime before the no-rotation branch releases its
+                # EIP claim during terminal cleanup.
+                try:
+                    await allocator.quarantine(runtime_account[0])
+                except Exception:
+                    logger.exception(
+                        "Could not quarantine exhausted OAuth account %s",
+                        runtime_account[0],
+                    )
+        if reason == "agent_api_auth_failure":
             await _bench_runtime_rejected_api_key(
                 worker_id,
-                task_id=data.get("task_id"),
+                task_id=task_id,
                 reason="runtime_invalid_api_key",
                 sticky=True,
             )
-        elif data.get("reason") == "agent_api_rate_limited":
+        elif reason == "agent_api_rate_limited":
             await _bench_runtime_rejected_api_key(
                 worker_id,
-                task_id=data.get("task_id"),
+                task_id=task_id,
                 reason="runtime_rate_limited",
                 sticky=False,
             )
         orch.defer_exhausted(
             worker_id,
-            task_id=data.get("task_id"),
+            task_id=task_id,
         )
 
     async def _on_exit(event_type, worker_id, data):

@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from elastic_agent.core.batch_orchestrator import (
+    CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
     BatchOrchestrator,
     LoginOutcome,
     WorkerAssignment,
@@ -735,6 +736,18 @@ class TestLaunch:
         ))
         assert d2.dispatched[0]["watch_exhaustion"] is True
 
+        d3 = FakeDriver()
+        await BatchOrchestrator(d3).launch(_spec(
+            run={
+                "command": "bench",
+                "resume_command": "bench --resume",
+            },
+            account={"binding": "eip"},
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        assert d3.dispatched[0]["watch_exhaustion"] is True
+
     async def test_bootstrap_failure_marks_failed_no_dispatch(self):
         d = FakeDriver()
         d.provision_ok = False
@@ -1257,6 +1270,31 @@ class TestRotation:
         started = await orch.on_worker_exhausted(job.job_id, wid)
         assert started is False
         assert job.runs[wid].phase == WorkerPhase.FAILED
+
+    async def test_eip_checkpoint_exhaustion_persists_recovery_proof(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            run={
+                "command": "bench",
+                "resume_command": "bench --resume",
+            },
+            account={"binding": "eip"},
+            fanout={"workers": 1, "shard_by": "shard_index"},
+            collect={"paths": ["results"], "checkpoint": True},
+        ))
+        run = next(iter(job.runs.values()))
+
+        started = await orch.on_worker_exhausted(
+            job.job_id,
+            run.worker_id,
+            task_id=run.task_id,
+        )
+
+        assert started is False
+        assert run.phase == WorkerPhase.FAILED
+        assert run.error == CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR
+        assert job.summary()["terminal_workers"][0]["account_id"] == "auto-0"
 
     async def test_max_rotations_enforced(self):
         d = FakeDriver()

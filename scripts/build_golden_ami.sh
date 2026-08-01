@@ -285,7 +285,8 @@ apt-get -o DPkg::Lock::Timeout=600 update -qq
 apt-get -o DPkg::Lock::Timeout=600 dist-upgrade -y -qq
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
   python3 python3-pip git curl rsync nodejs npm \
-  xvfb xdotool wget ca-certificates awscli docker.io docker-buildx
+  xvfb xdotool wget ca-certificates awscli docker.io docker-buildx \
+  python3-venv bubblewrap util-linux
 
 chrome_deb=/tmp/google-chrome-stable.deb
 curl --fail --location --silent --show-error "$CHROME_URL" -o "$chrome_deb"
@@ -370,6 +371,7 @@ def dpkg(name):
 system = [
     "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
     "xvfb", "xdotool", "wget", "ca-certificates", "awscli",
+    "python3-venv", "bubblewrap", "util-linux",
 ]
 runtime = [
     "pydantic", "pydantic-settings", "websockets", "httpx", "pyyaml",
@@ -434,7 +436,7 @@ CODEX_VERSION=$2
 PTY_COMMIT=$3
 SSH_USER=$4
 V=/usr/local/bin/elastic-agent-image-verify
-$V system python3 python3-pip git curl rsync nodejs npm
+$V system python3 python3-pip git curl rsync nodejs npm python3-venv bubblewrap util-linux
 $V agent claude "$CLAUDE_VERSION"
 $V agent codex "$CODEX_VERSION"
 $V login httpx websockets playwright
@@ -531,7 +533,7 @@ tags = [
     {"Key": "ManagedBy", "Value": "elastic-agent"},
     {"Key": "Role", "Value": "worker-golden"},
     {"Key": "ImageProfile", "Value": profile},
-    {"Key": "EnvironmentProfiles", "Value": "ubuntu-agent-v1,ubuntu-agent-docker-v1"},
+    {"Key": "EnvironmentProfiles", "Value": "ubuntu-agent-v1,ubuntu-agent-docker-v1,ubuntu-agent-docker-sandbox-v1"},
     {"Key": "SourceAmi", "Value": base},
     {"Key": "SourceCommit", "Value": commit},
     {"Key": "BuildTreeSHA256", "Value": tree_hash},

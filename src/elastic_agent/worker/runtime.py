@@ -3138,12 +3138,19 @@ class WorkerRuntime:
             )
         else:
             self._confirm_account_login_cleanup(msg)
+        failure_kind = result.get("failure_kind")
+        if (
+            success
+            or failure_kind not in {"hard_quota", "auth_failure"}
+        ):
+            failure_kind = None
         await self._send_event(AccountLoginResultMessage(
             login_request_id=msg.login_request_id,
             account_id=msg.account_id,
             slot_index=msg.slot_index,
             success=success,
             error=None if success else str(result.get("error") or "Codex login failed"),
+            failure_kind=failure_kind,
             cleanup_complete=True if not success else None,
         ))
 

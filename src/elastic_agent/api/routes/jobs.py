@@ -55,6 +55,7 @@ from elastic_agent.api.body_limit import (
     REQUEST_BODY_LIMIT_STATE_KEY,
 )
 from elastic_agent.core.batch_orchestrator import (
+    CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
     TERMINAL_WORKER_PHASES,
     JobSpecPersistenceError,
 )
@@ -81,6 +82,7 @@ logger = logging.getLogger(__name__)
 _submit_lock = asyncio.Lock()
 _job_action_locks_guard = threading.Lock()
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SAFE_ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}")
 _SAFE_RESUME_GENERATION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
@@ -1136,11 +1138,20 @@ def _persisted_job_view(
                 and "collection_error" in raw
             )
         )
+        raw_account_id = raw.get("account_id")
+        account_id = (
+            raw_account_id
+            if (
+                isinstance(raw_account_id, str)
+                and _SAFE_ACCOUNT_ID.fullmatch(raw_account_id) is not None
+            )
+            else ""
+        )
         terminal_workers.append({
             "worker_id": worker_id,
             "phase": str(raw.get("phase") or "failed"),
             "shard_index": shard_index,
-            "account_id": "",
+            "account_id": account_id,
             "account_email": "",
             "active_slot": 0,
             "accounts": [],
@@ -2285,12 +2296,19 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 resolved_checkpoint.get("generation")
             )
 
-    accounts = await mgr.account_store.list()
+    oauth_accounts = await mgr.account_store.list()
     agent_api_store = getattr(mgr, "agent_api_store", None)
-    if agent_api_store is not None:
+    agent_api_accounts = []
+    if (
+        agent_api_store is not None
+        and spec.account.mode != "none"
+        and (spec.account.auth_kind != "oauth" or bool(spec.account.ids))
+    ):
         # Local metadata only: Job plan is a pure read and must not make an
-        # upstream CloudRouter request or claim an identity.
-        accounts = [*(await agent_api_store.list()), *accounts]
+        # upstream CloudRouter request or claim an identity. Automatic
+        # OAuth-only planning also skips even this local API namespace read.
+        agent_api_accounts = await agent_api_store.list()
+    accounts = [*agent_api_accounts, *oauth_accounts]
     binding_manager = getattr(mgr, "binding_manager", None)
     durable_binding_ids = {
         binding.account_id
@@ -2327,6 +2345,11 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             }
         return agent_api_store.availability_decision(account.id)
 
+    def matches_auth_kind(account) -> bool:
+        requested = spec.account.auth_kind
+        actual = getattr(account, "auth_kind", "oauth")
+        return requested == "any" or actual == requested
+
     if spec.account.mode != "none":
         by_id = {account.id: account for account in accounts}
         for account_id in spec.account.ids:
@@ -2335,6 +2358,13 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 raise HTTPException(422, f"selected account {account_id!r} does not exist")
             if not account.enabled:
                 raise HTTPException(422, f"selected account {account_id!r} is disabled")
+            if not matches_auth_kind(account):
+                actual = getattr(account, "auth_kind", "oauth")
+                raise HTTPException(
+                    422,
+                    f"selected account {account_id!r} uses auth kind "
+                    f"{actual!r}, not requested {spec.account.auth_kind!r}",
+                )
             if (
                 spec.account.binding == "none"
                 and account_id in durable_binding_ids
@@ -2393,6 +2423,7 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                 account for account in accounts
                 if account.enabled
                 and account.group == spec.account.group
+                and account.id not in spec.account.exclude_ids
                 and (
                     spec.account.binding != "none"
                     or account.id not in durable_binding_ids
@@ -2402,6 +2433,7 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
                     spec.account.agent_type,
                     spec.account.model,
                 )
+                and matches_auth_kind(account)
                 and agent_api_decision(account).get("available") is not False
             ]
             required = spec.fanout.workers * spec.account.per_worker
@@ -2512,6 +2544,19 @@ async def _preflight_job(mgr, spec: JobSpec) -> dict:
             {"uri": dataset.uri, "dest": dataset.dest}
             for dataset in dataset_preview
         ],
+        "account": {
+            "agent_type": spec.account.agent_type,
+            "auth_kind": spec.account.auth_kind,
+            "group": spec.account.group,
+            "mode": spec.account.mode,
+            "binding": spec.account.binding,
+            "required_slots": (
+                0 if spec.account.mode == "none"
+                else spec.fanout.workers * spec.account.per_worker
+            ),
+            "explicit": bool(spec.account.ids),
+            "excluded": len(spec.account.exclude_ids),
+        },
         "run": {
             "command": command_preview,
             "cwd": spec.resolved_cwd(),
@@ -2931,6 +2976,8 @@ def _build_checkpoint_recovery_spec(
     source_job_id: str,
     source_payload: dict,
     request: RecoveryJobRequest,
+    *,
+    exclude_terminal_accounts: bool = True,
 ) -> dict[str, object]:
     """Clone the private source spec and apply the narrow recovery whitelist."""
 
@@ -2961,6 +3008,44 @@ def _build_checkpoint_recovery_spec(
         )
 
     target = source_spec.model_dump(mode="json")
+    terminal_summary = source_payload.get("terminal_summary")
+    raw_workers = (
+        terminal_summary.get("terminal_workers")
+        if isinstance(terminal_summary, dict)
+        else None
+    )
+    exhaustion_proven = bool(
+        exclude_terminal_accounts
+        and isinstance(raw_workers, list)
+        and any(
+            isinstance(worker, dict)
+            and worker.get("error") == CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR
+            for worker in raw_workers
+        )
+    )
+    if exhaustion_proven:
+        # Recovery is a fresh allocation attempt. Carry the source lineage's
+        # durable exclusion history forward, then add every non-secret account
+        # identity observed in this source attempt's terminal worker summary.
+        # Clear explicit selection because pinning the just-used identity would
+        # conflict with the fail-closed exclusion and defeat automatic retry.
+        account_exclusions = list(source_spec.account.exclude_ids)
+        for worker in raw_workers:
+            if (
+                not isinstance(worker, dict)
+                or worker.get("error") != CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR
+            ):
+                continue
+            account_id = worker.get("account_id")
+            if (
+                isinstance(account_id, str)
+                and _SAFE_ACCOUNT_ID.fullmatch(account_id) is not None
+            ):
+                account_exclusions.append(account_id)
+        account = target["account"]
+        assert isinstance(account, dict)
+        account["ids"] = []
+        account["exclude_ids"] = list(dict.fromkeys(account_exclusions))
     target["recovery"] = {
         "policy": "checkpoint",
         "source_job_id": source_job_id,
@@ -2970,6 +3055,12 @@ def _build_checkpoint_recovery_spec(
     run = target["run"]
     if request.run.command is not None:
         run["command"] = request.run.command
+    elif source_spec.run.resume_command:
+        # A failed EIP-bound Mode-B Job cannot rotate on the same Worker. If
+        # the application declared its exact checkpoint continuation, prefer
+        # that durable private command over replaying the original workload.
+        # Operators can still provide an explicit override in the request.
+        run["command"] = source_spec.run.resume_command
     if request.run.timeout is not None:
         run["timeout"] = request.run.timeout
     if request.ttl_seconds is not None:
@@ -3093,6 +3184,7 @@ def _build_suspended_resume_spec(
         source_job_id,
         source_payload,
         recovery_request,
+        exclude_terminal_accounts=False,
     )
     # The resumed attempt's base command is already the application's complete
     # resume command. A later credential rotation must rerun that same base,

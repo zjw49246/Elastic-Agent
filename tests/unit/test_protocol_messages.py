@@ -624,6 +624,23 @@ class TestWorkerToManagerMessages:
 
         assert isinstance(restored, AccountLoginResultMessage)
         assert restored.cleanup_complete is None
+        assert restored.failure_kind is None
+
+    @pytest.mark.parametrize("failure_kind", ["hard_quota", "auth_failure"])
+    def test_account_login_result_failure_kind_roundtrip(self, failure_kind):
+        msg = AccountLoginResultMessage(
+            login_request_id="login-1",
+            account_id="codex-a",
+            slot_index=0,
+            success=False,
+            failure_kind=failure_kind,
+            cleanup_complete=True,
+        )
+
+        restored = parse_message(msg.model_dump_json())
+
+        assert isinstance(restored, AccountLoginResultMessage)
+        assert restored.failure_kind == failure_kind
 
     def test_account_login_cancel_roundtrip(self):
         msg = AccountLoginCancelMessage(

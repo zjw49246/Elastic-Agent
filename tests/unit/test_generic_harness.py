@@ -116,6 +116,23 @@ class TestBootstrapSteps:
         )]
         assert "docker-install" in names
 
+    def test_docker_sandbox_profile_installs_namespace_tools_before_runtime(self):
+        spec = _spec(
+            environment={"profile": "ubuntu-agent-docker-sandbox-v1"}
+        )
+        steps = compile_bootstrap_steps(
+            spec,
+            manager_url="u",
+            auth_token="t",
+            worker_id="w",
+        )
+        names = [step.name for step in steps]
+        system_init = next(step for step in steps if step.name == "system-init")
+        assert "bubblewrap" in system_init.command
+        assert "util-linux" in system_init.command
+        assert names.index("system-init") < names.index("docker-install")
+        assert names.index("docker-install") < names.index("runtime-deploy")
+
     def test_structured_setup_steps_run_as_job_user_with_own_policy(self):
         spec = _spec(setup={
             "steps": [{

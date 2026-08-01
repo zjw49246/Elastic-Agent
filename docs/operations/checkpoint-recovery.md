@@ -49,10 +49,11 @@ resume command:
 }
 ```
 
-`run.resume_command` is optional for ordinary/manual checkpoint recovery. It is
-required only when Elastic must offer the live **中断并保存进度** action and
-later construct a one-click continuation without guessing how an opaque
-command resumes.
+`run.resume_command` is optional for ordinary/manual checkpoint recovery. When
+present, a manual recovery request that omits `run.command` uses this declared
+continuation instead of replaying the original command. It is also required
+when Elastic must offer the live **中断并保存进度** action and later construct a
+one-click continuation without guessing how an opaque command resumes.
 
 Checkpoint mode requires `ELASTIC_AGENT_RESULTS_S3_BUCKET`. It always stages a
 Manager-side exact snapshot; Worker-direct mutable uploads are not used as
@@ -170,7 +171,22 @@ Content-Type: application/json
 }
 ```
 
-`generation`, `run.command`, `run.timeout`, and `ttl_seconds` are optional.
+`generation`, `run.command`, `run.timeout`, and `ttl_seconds` are optional. If
+`run.command` is omitted, the Manager uses the source's private
+`run.resume_command` when configured, otherwise it falls back to the original
+command.
+
+When an EIP checkpoint Job has terminal proof of hard OAuth exhaustion,
+recovery also clears explicit `account.ids` and appends the terminal account to
+the copied JobSpec's `account.exclude_ids`. Prior exclusions are retained, so
+each recovery attempt durably excludes every exhausted account in its lineage.
+Ordinary failures and recoveries without that exact proof keep the original
+account-selection constraints unchanged. The running Manager also quarantines
+the exhausted OAuth account before finalizing the source Job, preventing later
+queued Jobs from selecting it in the same process. That quarantine is
+in-memory and resets on Manager restart; the recovery lineage's persisted
+`exclude_ids` remains authoritative across restarts.
+
 Everything else is copied from the source's private persisted JobSpec. This is
 important because Job detail deliberately redacts ordinary environment values,
 setup-step environment values, and secret references; the browser cannot and

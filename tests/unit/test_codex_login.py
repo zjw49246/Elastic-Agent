@@ -306,8 +306,36 @@ async def test_failed_smoke_test_is_login_failure_and_restores_auth(tmp_path, mo
 
     assert result["ok"] is False
     assert "smoke" in result["error"].lower()
+    assert "failure_kind" not in result
     assert auth_path.read_bytes() == old_auth
     assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["hard_quota", "auth_failure"])
+async def test_smoke_account_failure_returns_closed_classification(
+    tmp_path, monkeypatch, failure_kind,
+):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+
+    async def drive_browser(**kwargs):
+        _write_auth(kwargs["auth_path"], "user@example.com")
+
+    _spawned, _process, smoke = _install_login_fakes(
+        monkeypatch, drive_browser=drive_browser,
+    )
+    smoke.side_effect = login_module.CodexSmokeAccountError(failure_kind)
+
+    result = await login_module.codex_login(
+        email="user@example.com",
+        password="openai-password",
+        codex_home=str(home),
+    )
+
+    assert result["ok"] is False
+    assert result["failure_kind"] == failure_kind
+    assert not (home / "auth.json").exists()
 
 
 @pytest.mark.asyncio
@@ -1160,6 +1188,60 @@ async def test_smoke_test_requires_zero_exit_status(monkeypatch):
     assert "OPENAI_API_KEY" not in calls[0][1]["env"]
     assert "OPENAI_BASE_URL" not in calls[0][1]["env"]
     assert logs == ["Smoke test rc=7"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "failure_kind"),
+    [
+        (b"You hit your usage limit", "hard_quota"),
+        (b"You are not logged in; please log in", "auth_failure"),
+    ],
+)
+async def test_smoke_test_classifies_only_proven_account_failures(
+    monkeypatch, output, failure_kind,
+):
+    class Process:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", output
+
+    monkeypatch.setattr(
+        login_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=Process()),
+    )
+
+    with pytest.raises(login_module.CodexSmokeAccountError) as failure:
+        await login_module._smoke_test(
+            "/usr/bin/codex", "/tmp/codex-home", []
+        )
+
+    assert failure.value.failure_kind == failure_kind
+
+
+@pytest.mark.asyncio
+async def test_smoke_test_transient_overload_is_not_account_failure(monkeypatch):
+    class Process:
+        returncode = 1
+
+        async def communicate(self):
+            return (
+                b"",
+                b"Server is temporarily limiting requests "
+                b"(not your usage limit)",
+            )
+
+    monkeypatch.setattr(
+        login_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=Process()),
+    )
+
+    assert await login_module._smoke_test(
+        "/usr/bin/codex", "/tmp/codex-home", []
+    ) is False
 
 
 @pytest.mark.asyncio

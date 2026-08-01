@@ -46,7 +46,11 @@ DEFAULT_JOB_TTL_SECONDS = 172_800
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
 DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
 MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
+MAX_ACCOUNT_EXCLUDE_IDS = 100
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ACCOUNT_REFERENCE_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}"
+)
 _UNSTABLE_HOSTNAME_RE = re.compile(
     r"\{\{\s*hostname\s*\}\}"
     r"|\$\(\s*hostname\b[^)]*\)"
@@ -157,6 +161,21 @@ ENVIRONMENT_PROFILES: dict[str, dict[str, Any]] = {
         "system_packages": [
             "python3", "python3-pip", "python3-venv", "git", "curl",
             "rsync", "nodejs", "npm",
+        ],
+    },
+    "ubuntu-agent-docker-sandbox-v1": {
+        "id": "ubuntu-agent-docker-sandbox-v1",
+        "os_family": "ubuntu",
+        "runtime": "elastic-agent",
+        "agent_cli": "version-pinned",
+        "browser_login": True,
+        "docker": True,
+        # Trusted scorer processes use an unprivileged user/network namespace
+        # around Bubblewrap. Keep this separate: adding packages to the older
+        # Docker profile would silently change replayed Jobs.
+        "system_packages": [
+            "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
+            "python3-venv", "bubblewrap", "util-linux",
         ],
     },
 }
@@ -554,6 +573,10 @@ class AccountSpec(StrictSpecModel):
     # environment used by the later run.  Keep Claude as the compatibility
     # default for existing JobSpec payloads.
     agent_type: Literal["claude", "codex"] = "claude"
+    # Independent credential-source admission. ``any`` preserves the existing
+    # API-first/fallback-to-OAuth behavior; constrained modes must never select
+    # an identity from the other credential source.
+    auth_kind: Literal["any", "oauth", "agent_api"] = "any"
     # Optional exact model admission for Agent API accounts. OAuth identities
     # have no locally discoverable catalog, so this is an API-provider routing
     # constraint rather than a CLI model override.
@@ -572,6 +595,14 @@ class AccountSpec(StrictSpecModel):
     # worker; an empty list lets the allocator choose from ``group``.
     binding: Literal["none", "eip"] = "none"
     ids: list[str] = Field(default_factory=list)
+    # Automatic recovery appends the non-secret account IDs used by each
+    # completed source attempt here. Selection must never hand an already
+    # exhausted identity back to a later attempt. Keep the history bounded so
+    # a long lineage cannot grow its private JobSpec without limit.
+    exclude_ids: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_ACCOUNT_EXCLUDE_IDS,
+    )
     # Browser automation only. Manager coordination has a larger fixed budget
     # so OTP waits, identity validation, smoke testing, and cleanup cannot race
     # this deadline.
@@ -641,6 +672,36 @@ class AccountSpec(StrictSpecModel):
             if account_id:
                 normalized.append(account_id)
         return normalized
+
+    @field_validator("exclude_ids")
+    @classmethod
+    def normalize_exclude_ids(cls, ids: list[str]) -> list[str]:
+        """Normalize a bounded set while retaining stable serialized order."""
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_id in ids:
+            account_id = raw_id.strip()
+            if not account_id:
+                continue
+            if _ACCOUNT_REFERENCE_RE.fullmatch(account_id) is None:
+                raise ValueError(
+                    "account.exclude_ids contains an invalid account reference"
+                )
+            if account_id not in seen:
+                normalized.append(account_id)
+                seen.add(account_id)
+        return normalized
+
+    @model_validator(mode="after")
+    def selected_and_excluded_ids_do_not_overlap(self) -> AccountSpec:
+        overlap = set(self.ids).intersection(self.exclude_ids)
+        if overlap:
+            raise ValueError(
+                "account.ids and account.exclude_ids cannot overlap: "
+                + ", ".join(sorted(overlap))
+            )
+        return self
 
 
 class RotationSpec(StrictSpecModel):
