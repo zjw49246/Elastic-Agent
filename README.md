@@ -971,10 +971,12 @@ spec in `sessionStorage`. After refresh or form edits, the console recommends
 replaying that exact pair and does not wait for mutable provider defaults;
 discarding it to create a new Key requires a separate double confirmation.
 The original strict download endpoint remains available to API clients that
-prefer a prebuilt archive and an HTTP error before response headers. API keys
-are accepted only in
-the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
-`sessionStorage` and strips legacy query-string credentials. REST includes
+prefer a prebuilt archive and an HTTP error before response headers. Browser
+users sign in with a management administrator account; the UI uses an opaque
+`HttpOnly`, `Secure`, `SameSite=Strict` session cookie plus CSRF protection and
+never stores an API key. Existing automation may continue to use a service key
+in the `Authorization: Bearer` header; query-string credentials are rejected.
+REST includes
 `/api/accounts`, `/api/agent-api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}` (including
 the redacted submission snapshot), `/api/jobs/{job_id}/logs`, and
@@ -1006,6 +1008,7 @@ ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME
 ELASTIC_AGENT_AWS_MAX_INSTANCES
 ELASTIC_AGENT_STATE_DIR
 ELASTIC_AGENT_MANAGER_URL
+ELASTIC_AGENT_PUBLIC_ORIGIN
 ELASTIC_AGENT_FRAMEWORK_SRC
 ELASTIC_AGENT_SERVER_HOST
 ELASTIC_AGENT_SERVER_PORT
@@ -1038,7 +1041,25 @@ This makes a healthy process proof that it is using the dedicated EC2 instance
 role rather than same-account static/admin credentials. The configured state
 directory must be created as the service user with mode `0700` before starting;
 the unit asserts that path exists and exposes readiness only after its local
-health check succeeds.
+health check succeeds. Production startup also fails closed until that state
+directory contains at least one enabled management administrator. Bootstrap or
+rotate an administrator without placing its password in argv or shell history:
+
+```bash
+read -rsp 'Initial administrator password: ' EA_INITIAL_ADMIN_PASSWORD
+printf '%s\n' "$EA_INITIAL_ADMIN_PASSWORD" |
+  uv run python -m elastic_agent.management_auth_cli \
+    --state-file /home/ubuntu/.elastic-agent-demo/management-users.json \
+    upsert --email owner@example.com --password-stdin --temporary
+unset EA_INITIAL_ADMIN_PASSWORD
+```
+
+`--temporary` forces a password change on the first browser login. The state
+file stores only an Argon2id hash and is maintained as mode `0600`; do not place
+the initial password in source, EnvironmentFiles, JobSpec, or chat. The browser
+origin is pinned by `ELASTIC_AGENT_PUBLIC_ORIGIN` and must be a clean HTTPS
+origin. Worker `/ws/runtime` tokens and Job agent credentials remain separate
+machine/delegation trust boundaries.
 
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,

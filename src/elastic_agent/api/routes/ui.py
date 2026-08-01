@@ -7,10 +7,27 @@ Shows node list, status cards, and supports manual operations
 
 from __future__ import annotations
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from elastic_agent.api.auth import get_session_principal
 
 router = APIRouter(tags=["ui"])
+
+_UI_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    ),
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
@@ -20,6 +37,13 @@ _DASHBOARD_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elastic-Agent Dashboard</title>
 <script>
+  try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
+  { const legacyUrl = new URL(window.location.href);
+    if (legacyUrl.searchParams.has('api_key')) {
+      legacyUrl.searchParams.delete('api_key');
+      history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
+    }
+  }
   document.documentElement.dataset.theme =
     sessionStorage.getItem('ea_theme') === 'dark' ? 'dark' : 'light';
 </script>
@@ -138,6 +162,9 @@ _DASHBOARD_HTML = """\
       <a href="/batch" id="navBatch" style="color:var(--accent);text-decoration:none;margin-right:12px">Batch Console →</a>
       <a href="#" id="fleetThemeToggle" onclick="toggleFleetTheme();return false"
         style="color:var(--accent);text-decoration:none;margin-right:12px">切换深色</a>
+      <span id="currentUserEmail" style="margin-right:8px">--</span>
+      <a href="#" id="fleetLogout" onclick="logout();return false"
+        style="color:var(--accent);text-decoration:none;margin-right:12px">退出登录</a>
       Auto-refresh: <span id="refreshInterval">5s</span>
       &middot; Last: <span id="lastRefresh">--</span>
     </div>
@@ -189,30 +216,73 @@ _DASHBOARD_HTML = """\
 <div class="toast" id="toast"></div>
 
 <script>
-// Never accept bearer credentials in URLs (browser history/referrer/server logs)
-// and keep them only for this tab/session rather than durable localStorage.
-const _params = new URLSearchParams(window.location.search);
-if (_params.has('api_key')) {
-  _params.delete('api_key');
-  history.replaceState(null, '', window.location.pathname + (_params.size ? '?' + _params : ''));
-}
-let API_KEY = sessionStorage.getItem('ea_api_key') || '';
-if (!API_KEY) {
-  const k = (window.prompt('请输入 API Key：') || '').trim();
-  if (k) { sessionStorage.setItem('ea_api_key', k); API_KEY = k; }
-}
-const headers = API_KEY ? {'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json'}
-                        : {'Content-Type': 'application/json'};
-
 {const nb = document.getElementById('navBatch'); if (nb) nb.href = '/';}
 
 let refreshTimer = null;
 let nodesRefreshRunning = false;
 
+const AUTHENTICATED_UI_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard']);
+let csrfToken = '';
+function safeCurrentUiPath() {
+  return AUTHENTICATED_UI_PATHS.has(window.location.pathname)
+    ? window.location.pathname : '/';
+}
+function redirectToLogin() {
+  const next = encodeURIComponent(safeCurrentUiPath());
+  window.location.assign('/login?next=' + next);
+}
+async function initializeAuthentication() {
+  const response = await fetch('/api/auth/me', {
+    credentials:'same-origin', headers:{'Accept':'application/json'},
+  });
+  if (response.status === 401) {
+    redirectToLogin();
+    throw new Error('登录已失效');
+  }
+  if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+  const session = await response.json();
+  if (session.must_change_password === true) {
+    window.location.assign(
+      '/change-password?next=' + encodeURIComponent(safeCurrentUiPath())
+    );
+    throw new Error('需要先修改初始密码');
+  }
+  csrfToken = String(session.csrf_token || '');
+  document.getElementById('currentUserEmail').textContent = session.email || '';
+  return session;
+}
+const authenticationReady = initializeAuthentication();
+async function authenticatedFetch(input, init={}) {
+  await authenticationReady;
+  const options = {...init, credentials:'same-origin'};
+  const method = String(options.method || 'GET').toUpperCase();
+  const requestHeaders = new Headers(options.headers || {});
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    requestHeaders.set('X-CSRF-Token', csrfToken);
+  }
+  options.headers = requestHeaders;
+  const response = await fetch(input, options);
+  if (response.status === 401) redirectToLogin();
+  return response;
+}
+async function logout() {
+  try {
+    const response = await authenticatedFetch('/api/auth/logout', {method:'POST'});
+    if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+    window.location.assign('/login');
+  } catch (error) {
+    toast('退出失败：' + error.message, 'error');
+  }
+}
+
 async function api(method, path, body) {
-  const opts = {method, headers: {...headers}};
-  if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch('/api' + path, opts);
+  const requestHeaders = new Headers({'Accept':'application/json'});
+  const opts = {method, headers:requestHeaders};
+  if (body !== undefined && body !== null) {
+    requestHeaders.set('Content-Type', 'application/json');
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await authenticatedFetch('/api' + path, opts);
   if (!resp.ok) {
     const err = await resp.text();
     throw new Error(`${resp.status}: ${err}`);
@@ -430,6 +500,13 @@ _BATCH_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elastic-Agent Batch Console</title>
 <script>
+  try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
+  { const legacyUrl = new URL(window.location.href);
+    if (legacyUrl.searchParams.has('api_key')) {
+      legacyUrl.searchParams.delete('api_key');
+      history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
+    }
+  }
   document.documentElement.dataset.theme =
     sessionStorage.getItem('ea_theme') === 'dark' ? 'dark' : 'light';
 </script>
@@ -755,7 +832,9 @@ _BATCH_HTML = """\
       &nbsp;·&nbsp;
       <a href="#" onclick="toggleTheme();return false" id="themeToggle">切换深色</a>
       &nbsp;·&nbsp;
-      <a href="#" onclick="forgetKey();return false" style="color:var(--muted)">换 Key</a>
+      <span id="currentUserEmail" class="muted">--</span>
+      &nbsp;·&nbsp;
+      <a href="#" onclick="logout();return false" style="color:var(--muted)">退出登录</a>
     </div>
   </header>
 
@@ -1328,18 +1407,6 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
 <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
-const _params = new URLSearchParams(window.location.search);
-if (_params.has('api_key')) {
-  _params.delete('api_key');
-  history.replaceState(null, '', window.location.pathname + (_params.size ? '?' + _params : ''));
-}
-let API_KEY = sessionStorage.getItem('ea_api_key') || '';
-if (!API_KEY) {
-  const k = (window.prompt('请输入 API Key：') || '').trim();
-  if (k) { sessionStorage.setItem('ea_api_key', k); API_KEY = k; }
-}
-const headers = API_KEY ? {'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}
-                        : {'Content-Type':'application/json'};
 {const nav = document.getElementById('navFleet'); if (nav) nav.href = '/fleet';}
 let eipBindingTouched = false;
 let resumeCommandTouched = false;
@@ -1401,7 +1468,59 @@ function parsePendingJobSpec(pending) {
   return spec;
 }
 window._pendingJobSubmission = loadPendingJobSubmission();
-function forgetKey() { sessionStorage.removeItem('ea_api_key'); location.href = '/'; }
+const AUTHENTICATED_UI_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard']);
+let csrfToken = '';
+function safeCurrentUiPath() {
+  return AUTHENTICATED_UI_PATHS.has(window.location.pathname)
+    ? window.location.pathname : '/';
+}
+function redirectToLogin() {
+  const next = encodeURIComponent(safeCurrentUiPath());
+  window.location.assign('/login?next=' + next);
+}
+async function initializeAuthentication() {
+  const response = await fetch('/api/auth/me', {
+    credentials:'same-origin', headers:{'Accept':'application/json'},
+  });
+  if (response.status === 401) {
+    redirectToLogin();
+    throw new Error('登录已失效');
+  }
+  if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+  const session = await response.json();
+  if (session.must_change_password === true) {
+    window.location.assign(
+      '/change-password?next=' + encodeURIComponent(safeCurrentUiPath())
+    );
+    throw new Error('需要先修改初始密码');
+  }
+  csrfToken = String(session.csrf_token || '');
+  document.getElementById('currentUserEmail').textContent = session.email || '';
+  return session;
+}
+const authenticationReady = initializeAuthentication();
+async function authenticatedFetch(input, init={}) {
+  await authenticationReady;
+  const options = {...init, credentials:'same-origin'};
+  const method = String(options.method || 'GET').toUpperCase();
+  const requestHeaders = new Headers(options.headers || {});
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    requestHeaders.set('X-CSRF-Token', csrfToken);
+  }
+  options.headers = requestHeaders;
+  const response = await fetch(input, options);
+  if (response.status === 401) redirectToLogin();
+  return response;
+}
+async function logout() {
+  try {
+    const response = await authenticatedFetch('/api/auth/logout', {method:'POST'});
+    if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+    window.location.assign('/login');
+  } catch (error) {
+    toast('退出失败：' + error.message, 'error');
+  }
+}
 function updateThemeLabel() {
   const button = document.getElementById('themeToggle');
   if (button) button.textContent =
@@ -1414,9 +1533,14 @@ function toggleTheme() {
   updateThemeLabel();
 }
 async function api(method, path, body, extraHeaders={}) {
-  const opts = {method, headers:{...headers, ...extraHeaders}};
-  if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch('/api' + path, opts);
+  const requestHeaders = new Headers(extraHeaders);
+  requestHeaders.set('Accept', 'application/json');
+  const opts = {method, headers:requestHeaders};
+  if (body !== undefined && body !== null) {
+    requestHeaders.set('Content-Type', 'application/json');
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await authenticatedFetch('/api' + path, opts);
   if (!resp.ok) {
     const error = new Error(`${resp.status}: ${await resp.text()}`);
     error.status = resp.status;
@@ -4024,9 +4148,9 @@ async function downloadResults(rawJobId) {
     state.phase = 'preparing';
     repaintResultDownload(jobId, state, true);
     toast('正在准备结果压缩包；按钮会显示传输量，点击可取消。');
-    const response = await fetch(
+    const response = await authenticatedFetch(
       '/api/jobs/' + encodeURIComponent(jobId) + '/results/download/stream',
-      {headers: {...headers}, signal: state.controller.signal}
+      {signal: state.controller.signal}
     );
     if (!response.ok) {
       throw new Error(`${response.status}: ${await response.text()}`);
@@ -5083,25 +5207,333 @@ refreshAccounts(); refreshResults(); runDashboardPoll();
 """
 
 
+_LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · Elastic-Agent</title>
+<style>
+  :root { color-scheme:light; --bg:#eef4ff; --surface:#fff; --border:#d7dee9;
+    --text:#172033; --muted:#5b6678; --accent:#2563eb; --red:#c62828; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:20px;
+    background:linear-gradient(145deg,var(--bg),#f8fafc); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+  main { width:min(100%,420px); background:var(--surface); border:1px solid var(--border);
+    border-radius:14px; padding:28px; box-shadow:0 20px 55px rgba(36,49,73,.12); }
+  h1 { margin:0 0 6px; font-size:1.55rem; }
+  p { margin:0 0 22px; color:var(--muted); line-height:1.5; }
+  label { display:block; margin:12px 0 6px; font-size:.88rem; font-weight:600; }
+  input { width:100%; min-height:44px; border:1px solid var(--border); border-radius:8px;
+    padding:9px 11px; color:var(--text); background:#fff; font:inherit; }
+  input:focus { outline:3px solid rgba(37,99,235,.18); border-color:var(--accent); }
+  button { width:100%; min-height:44px; margin-top:20px; border:0; border-radius:8px;
+    background:var(--accent); color:#fff; cursor:pointer; font-family:inherit;
+    font-size:.95rem; font-weight:600; }
+  button:disabled { opacity:.58; cursor:not-allowed; }
+  #message { min-height:1.4em; margin:14px 0 0; color:var(--red); font-size:.86rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Elastic-Agent</h1>
+  <p>使用管理员账号登录控制台。</p>
+  <form id="loginForm">
+    <label for="email">邮箱</label>
+    <input id="email" name="email" type="email" autocomplete="username"
+           maxlength="320" placeholder="name@example.com" required autofocus>
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" maxlength="4096" required>
+    <button id="submitButton" type="submit">登录</button>
+    <div id="message" role="alert" aria-live="polite"></div>
+  </form>
+</main>
+<script>
+try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
+{ const legacyUrl = new URL(window.location.href);
+  if (legacyUrl.searchParams.has('api_key')) {
+    legacyUrl.searchParams.delete('api_key');
+    history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
+  }
+}
+const LOGIN_NEXT_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard', '/change-password']);
+function safeNextPath() {
+  const candidate = new URLSearchParams(window.location.search).get('next') || '/';
+  return LOGIN_NEXT_PATHS.has(candidate) ? candidate : '/';
+}
+function errorDetail(payload, fallback) {
+  return typeof payload?.detail === 'string' ? payload.detail : fallback;
+}
+document.getElementById('loginForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = document.getElementById('submitButton');
+  const message = document.getElementById('message');
+  const email = document.getElementById('email').value.trim();
+  const passwordInput = document.getElementById('password');
+  message.textContent = '';
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/auth/login', {
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/json', 'Accept':'application/json'},
+      body:JSON.stringify({email, password:passwordInput.value}),
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_) {}
+    passwordInput.value = '';
+    if (!response.ok) {
+      throw new Error(errorDetail(payload, '邮箱或密码错误'));
+    }
+    const next = safeNextPath();
+    if (payload.must_change_password === true) {
+      const destination = next === '/change-password' ? '/' : next;
+      window.location.assign('/change-password?next=' + encodeURIComponent(destination));
+    } else {
+      window.location.assign(next);
+    }
+  } catch (error) {
+    passwordInput.value = '';
+    message.textContent = error.message || '登录失败，请重试';
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+_CHANGE_PASSWORD_HTML = """\
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>修改密码 · Elastic-Agent</title>
+<style>
+  :root { color-scheme:light; --bg:#eef4ff; --surface:#fff; --border:#d7dee9;
+    --text:#172033; --muted:#5b6678; --accent:#2563eb; --red:#c62828;
+    --green:#16803c; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:20px;
+    background:linear-gradient(145deg,var(--bg),#f8fafc); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+  main { width:min(100%,440px); background:var(--surface); border:1px solid var(--border);
+    border-radius:14px; padding:28px; box-shadow:0 20px 55px rgba(36,49,73,.12); }
+  h1 { margin:0 0 6px; font-size:1.45rem; }
+  p { margin:0 0 20px; color:var(--muted); line-height:1.5; }
+  label { display:block; margin:12px 0 6px; font-size:.88rem; font-weight:600; }
+  input { width:100%; min-height:44px; border:1px solid var(--border); border-radius:8px;
+    padding:9px 11px; color:var(--text); background:#fff; font:inherit; }
+  input:focus { outline:3px solid rgba(37,99,235,.18); border-color:var(--accent); }
+  button { width:100%; min-height:44px; margin-top:20px; border:0; border-radius:8px;
+    background:var(--accent); color:#fff; cursor:pointer; font-family:inherit;
+    font-size:.95rem; font-weight:600; }
+  button:disabled { opacity:.58; cursor:not-allowed; }
+  #message { min-height:1.4em; margin:14px 0 0; color:var(--red); font-size:.86rem; }
+  #accountEmail { font-weight:600; color:var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <h1>修改密码</h1>
+  <p>当前账号：<span id="accountEmail">--</span><br>首次登录必须先更换初始密码。</p>
+  <form id="passwordForm">
+    <label for="currentPassword">当前密码</label>
+    <input id="currentPassword" type="password" autocomplete="current-password"
+           maxlength="4096" required autofocus>
+    <label for="newPassword">新密码</label>
+    <input id="newPassword" type="password" autocomplete="new-password"
+           minlength="12" maxlength="4096" required>
+    <label for="confirmPassword">确认新密码</label>
+    <input id="confirmPassword" type="password" autocomplete="new-password"
+           minlength="12" maxlength="4096" required>
+    <button id="submitButton" type="submit">保存新密码</button>
+    <div id="message" role="alert" aria-live="polite"></div>
+  </form>
+</main>
+<script>
+try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
+{ const legacyUrl = new URL(window.location.href);
+  if (legacyUrl.searchParams.has('api_key')) {
+    legacyUrl.searchParams.delete('api_key');
+    history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
+  }
+}
+const PASSWORD_NEXT_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard']);
+let csrfToken = '';
+function safeNextPath() {
+  const candidate = new URLSearchParams(window.location.search).get('next') || '/';
+  return PASSWORD_NEXT_PATHS.has(candidate) ? candidate : '/';
+}
+function loginRedirect() {
+  window.location.assign('/login?next=' + encodeURIComponent('/change-password'));
+}
+async function initializeAuthentication() {
+  const response = await fetch('/api/auth/me', {
+    credentials:'same-origin', headers:{'Accept':'application/json'},
+  });
+  if (response.status === 401) {
+    loginRedirect();
+    throw new Error('登录已失效');
+  }
+  if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+  const session = await response.json();
+  csrfToken = String(session.csrf_token || '');
+  document.getElementById('accountEmail').textContent = session.email || '';
+  return session;
+}
+const authenticationReady = initializeAuthentication();
+async function authenticatedFetch(input, init={}) {
+  await authenticationReady;
+  const options = {...init, credentials:'same-origin'};
+  const method = String(options.method || 'GET').toUpperCase();
+  const requestHeaders = new Headers(options.headers || {});
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    requestHeaders.set('X-CSRF-Token', csrfToken);
+  }
+  options.headers = requestHeaders;
+  const response = await fetch(input, options);
+  if (response.status === 401) loginRedirect();
+  return response;
+}
+function errorDetail(payload, fallback) {
+  return typeof payload?.detail === 'string' ? payload.detail : fallback;
+}
+document.getElementById('passwordForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = document.getElementById('submitButton');
+  const message = document.getElementById('message');
+  const current = document.getElementById('currentPassword');
+  const next = document.getElementById('newPassword');
+  const confirm = document.getElementById('confirmPassword');
+  message.textContent = '';
+  if (next.value !== confirm.value) {
+    message.textContent = '两次输入的新密码不一致';
+    return;
+  }
+  if (next.value === current.value) {
+    message.textContent = '新密码不能与当前密码相同';
+    return;
+  }
+  button.disabled = true;
+  try {
+    const response = await authenticatedFetch('/api/auth/password', {
+      method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json'},
+      body:JSON.stringify({current_password:current.value, new_password:next.value}),
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_) {}
+    current.value = ''; next.value = ''; confirm.value = '';
+    if (!response.ok) {
+      throw new Error(errorDetail(payload, '修改密码失败'));
+    }
+    window.location.assign(safeNextPath());
+  } catch (error) {
+    current.value = ''; next.value = ''; confirm.value = '';
+    message.textContent = error.message || '修改密码失败，请重试';
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+_SAFE_UI_NEXT_PATHS = frozenset(
+    {"/", "/batch", "/fleet", "/dashboard", "/change-password"}
+)
+
+
+def _safe_ui_next(raw_next: str | None, *, default: str = "/") -> str:
+    """Return only a known local UI path so redirects cannot leave this origin."""
+    return raw_next if raw_next in _SAFE_UI_NEXT_PATHS else default
+
+
+def _principal_requires_password_change(principal: object) -> bool:
+    if isinstance(principal, dict):
+        return principal.get("must_change_password") is True
+    return getattr(principal, "must_change_password", False) is True
+
+
+def _redirect(path: str, *, next_path: str | None = None) -> RedirectResponse:
+    location = path
+    if next_path is not None:
+        location += "?" + urlencode({"next": _safe_ui_next(next_path)})
+    return RedirectResponse(location, status_code=303, headers=_UI_SECURITY_HEADERS)
+
+
+def _html(content: str) -> HTMLResponse:
+    return HTMLResponse(content=content, headers=_UI_SECURITY_HEADERS)
+
+
+async def _authenticated_ui_redirect(
+    request: Request,
+) -> RedirectResponse | None:
+    """Redirect anonymous and first-login sessions before rendering app HTML."""
+    principal = await get_session_principal(request)
+    if principal is None:
+        return _redirect("/login", next_path=request.url.path)
+    if _principal_requires_password_change(principal):
+        return _redirect("/change-password", next_path=request.url.path)
+    return None
+
+
+@router.get("/login", response_class=HTMLResponse, include_in_schema=False)
+async def login_page(request: Request):
+    """Render the public account login form, or leave if already signed in."""
+    next_path = _safe_ui_next(request.query_params.get("next"))
+    principal = await get_session_principal(request)
+    if principal is not None:
+        if _principal_requires_password_change(principal):
+            destination = "/" if next_path == "/change-password" else next_path
+            return _redirect("/change-password", next_path=destination)
+        return _redirect(next_path)
+    return _html(_LOGIN_HTML)
+
+
+@router.get("/change-password", response_class=HTMLResponse, include_in_schema=False)
+async def change_password_page(request: Request):
+    """Render the password-change form for an authenticated account."""
+    principal = await get_session_principal(request)
+    if principal is None:
+        return _redirect("/login", next_path="/change-password")
+    return _html(_CHANGE_PASSWORD_HTML)
+
+
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root_batch():
-    """Serve the legacy Batch Console as the stable rollback surface."""
-    return HTMLResponse(content=_BATCH_HTML)
+async def root_batch(request: Request):
+    """Serve the authenticated legacy Batch Console rollback surface."""
+    if redirect := await _authenticated_ui_redirect(request):
+        return redirect
+    return _html(_BATCH_HTML)
 
 
 @router.get("/batch", response_class=HTMLResponse, include_in_schema=False)
-async def batch_console():
-    """Alias for the stable legacy Batch Console."""
-    return HTMLResponse(content=_BATCH_HTML)
+async def batch_console(request: Request):
+    """Alias for the authenticated legacy Batch Console."""
+    if redirect := await _authenticated_ui_redirect(request):
+        return redirect
+    return _html(_BATCH_HTML)
 
 
 @router.get("/fleet", response_class=HTMLResponse, include_in_schema=False)
-async def fleet_dashboard():
-    """Serve the stable legacy Fleet Dashboard."""
-    return HTMLResponse(content=_DASHBOARD_HTML)
+async def fleet_dashboard(request: Request):
+    """Serve the authenticated legacy Fleet Dashboard."""
+    if redirect := await _authenticated_ui_redirect(request):
+        return redirect
+    return _html(_DASHBOARD_HTML)
 
 
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard_alt():
-    """Alias for the stable legacy Fleet Dashboard."""
-    return HTMLResponse(content=_DASHBOARD_HTML)
+async def dashboard_alt(request: Request):
+    """Alias for the Fleet Dashboard."""
+    if redirect := await _authenticated_ui_redirect(request):
+        return redirect
+    return _html(_DASHBOARD_HTML)

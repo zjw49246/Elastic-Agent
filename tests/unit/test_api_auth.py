@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
 from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elastic_agent.api.app import create_app
-from elastic_agent.api.auth import get_api_keys, reset_api_keys
+from elastic_agent.api.auth import require_api_key, reset_api_keys
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceConfig, InstanceState
 from elastic_agent.manager.manager import ElasticAgentManager
@@ -131,6 +130,14 @@ class TestAuthBearerHeader:
             headers={"Authorization": f"bearer {API_KEY}"},
         )
         assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_legacy_dependency_returns_explicit_service_token(self):
+        request = AsyncMock()
+        request.headers = {"authorization": f"Bearer {API_KEY}"}
+        request.cookies = {}
+
+        assert await require_api_key(request) == API_KEY
 
 
 class TestAuthQueryParam:
