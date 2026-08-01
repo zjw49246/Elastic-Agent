@@ -7,12 +7,18 @@ Shows node list, status cards, and supports manual operations
 
 from __future__ import annotations
 
-from urllib.parse import urlencode
+from html import escape
+from urllib.parse import parse_qs, urlencode
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import ValidationError
 
-from elastic_agent.api.auth import get_session_principal
+from elastic_agent.api.auth import get_session_principal, require_same_origin
+from elastic_agent.api.routes.management_auth import (
+    LoginRequest,
+    create_browser_session,
+)
 
 router = APIRouter(tags=["ui"])
 
@@ -4206,15 +4212,16 @@ _LOGIN_HTML = """\
 <main>
   <h1>Elastic-Agent</h1>
   <p>使用管理员账号登录控制台。</p>
-  <form id="loginForm">
+  <form id="loginForm" method="post" action="/login">
+    <input name="next" type="hidden" value="__LOGIN_NEXT__">
     <label for="email">邮箱</label>
     <input id="email" name="email" type="email" autocomplete="username"
-           maxlength="320" placeholder="name@example.com" required autofocus>
+           maxlength="254" placeholder="name@example.com" required autofocus>
     <label for="password">密码</label>
     <input id="password" name="password" type="password"
            autocomplete="current-password" maxlength="4096" required>
     <button id="submitButton" type="submit">登录</button>
-    <div id="message" role="alert" aria-live="polite"></div>
+    <div id="message" role="alert" aria-live="polite">__LOGIN_MESSAGE__</div>
   </form>
 </main>
 <script>
@@ -4225,48 +4232,6 @@ try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
     history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
   }
 }
-const LOGIN_NEXT_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard', '/change-password']);
-function safeNextPath() {
-  const candidate = new URLSearchParams(window.location.search).get('next') || '/';
-  return LOGIN_NEXT_PATHS.has(candidate) ? candidate : '/';
-}
-function errorDetail(payload, fallback) {
-  return typeof payload?.detail === 'string' ? payload.detail : fallback;
-}
-document.getElementById('loginForm').addEventListener('submit', async event => {
-  event.preventDefault();
-  const button = document.getElementById('submitButton');
-  const message = document.getElementById('message');
-  const email = document.getElementById('email').value.trim();
-  const passwordInput = document.getElementById('password');
-  message.textContent = '';
-  button.disabled = true;
-  try {
-    const response = await fetch('/api/auth/login', {
-      method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json', 'Accept':'application/json'},
-      body:JSON.stringify({email, password:passwordInput.value}),
-    });
-    let payload = {};
-    try { payload = await response.json(); } catch (_) {}
-    passwordInput.value = '';
-    if (!response.ok) {
-      throw new Error(errorDetail(payload, '邮箱或密码错误'));
-    }
-    const next = safeNextPath();
-    if (payload.must_change_password === true) {
-      const destination = next === '/change-password' ? '/' : next;
-      window.location.assign('/change-password?next=' + encodeURIComponent(destination));
-    } else {
-      window.location.assign(next);
-    }
-  } catch (error) {
-    passwordInput.value = '';
-    message.textContent = error.message || '登录失败，请重试';
-  } finally {
-    button.disabled = false;
-  }
-});
 </script>
 </body>
 </html>
@@ -4415,6 +4380,15 @@ document.getElementById('passwordForm').addEventListener('submit', async event =
 _SAFE_UI_NEXT_PATHS = frozenset(
     {"/", "/batch", "/fleet", "/dashboard", "/change-password"}
 )
+_LOGIN_ERROR_MESSAGES = {
+    "invalid_credentials": "邮箱或密码错误",
+    "invalid_request": "请填写有效的邮箱和密码",
+    "rate_limited": "登录尝试过多，请稍后重试",
+    "unavailable": "管理员认证暂不可用，请稍后重试",
+}
+# A 4,096-character password can expand to roughly 48 KiB when non-ASCII UTF-8
+# bytes are percent-encoded by application/x-www-form-urlencoded.
+_MAX_LOGIN_FORM_BYTES = 64 * 1024
 
 
 def _safe_ui_next(raw_next: str | None, *, default: str = "/") -> str:
@@ -4428,10 +4402,79 @@ def _principal_requires_password_change(principal: object) -> bool:
     return getattr(principal, "must_change_password", False) is True
 
 
-def _redirect(path: str, *, next_path: str | None = None) -> RedirectResponse:
+def _render_login_html(next_path: str, error_code: str | None = None) -> str:
+    """Render only allowlisted values into the otherwise static login page."""
+
+    safe_next = _safe_ui_next(next_path)
+    message = _LOGIN_ERROR_MESSAGES.get(error_code or "", "")
+    return _LOGIN_HTML.replace("__LOGIN_NEXT__", escape(safe_next, quote=True)).replace(
+        "__LOGIN_MESSAGE__",
+        escape(message),
+    )
+
+
+async def _parse_login_form(request: Request) -> tuple[LoginRequest, str]:
+    content_type = (
+        request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    )
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "application/x-www-form-urlencoded required",
+        )
+
+    declared_size = request.headers.get("content-length")
+    if declared_size:
+        try:
+            parsed_size = int(declared_size)
+            if parsed_size < 0 or parsed_size > _MAX_LOGIN_FORM_BYTES:
+                raise ValueError("login form is too large")
+        except ValueError as exc:
+            raise ValueError("invalid login form size") from exc
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_LOGIN_FORM_BYTES:
+            raise ValueError("login form is too large")
+        body.extend(chunk)
+    try:
+        fields = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=3,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("invalid login form") from exc
+    if set(fields) - {"email", "password", "next"} or any(
+        len(values) != 1 for values in fields.values()
+    ):
+        raise ValueError("invalid login form fields")
+
+    next_path = _safe_ui_next((fields.get("next") or [None])[0])
+    incoming = LoginRequest.model_validate(
+        {
+            "email": (fields.get("email") or [""])[0],
+            "password": (fields.get("password") or [""])[0],
+        }
+    )
+    return incoming, next_path
+
+
+def _redirect(
+    path: str,
+    *,
+    next_path: str | None = None,
+    error_code: str | None = None,
+) -> RedirectResponse:
     location = path
+    query: dict[str, str] = {}
     if next_path is not None:
-        location += "?" + urlencode({"next": _safe_ui_next(next_path)})
+        query["next"] = _safe_ui_next(next_path)
+    if error_code is not None:
+        query["error"] = error_code
+    if query:
+        location += "?" + urlencode(query)
     return RedirectResponse(location, status_code=303, headers=_UI_SECURITY_HEADERS)
 
 
@@ -4461,7 +4504,52 @@ async def login_page(request: Request):
             destination = "/" if next_path == "/change-password" else next_path
             return _redirect("/change-password", next_path=destination)
         return _redirect(next_path)
-    return _html(_LOGIN_HTML)
+    return _html(_render_login_html(next_path, request.query_params.get("error")))
+
+
+@router.post("/login", include_in_schema=False)
+async def browser_login(request: Request):
+    """Authenticate through native browser navigation and a server-side 303."""
+
+    require_same_origin(request)
+    try:
+        incoming, next_path = await _parse_login_form(request)
+    except (ValidationError, ValueError):
+        return _redirect(
+            "/login",
+            next_path="/",
+            error_code="invalid_request",
+        )
+
+    response = _redirect("/")
+    try:
+        principal = await create_browser_session(incoming, request, response)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            raise
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            error_code = "invalid_credentials"
+        elif exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            error_code = "rate_limited"
+        else:
+            error_code = "unavailable"
+        failed = _redirect(
+            "/login",
+            next_path=next_path,
+            error_code=error_code,
+        )
+        if exc.headers and "Retry-After" in exc.headers:
+            failed.headers["Retry-After"] = exc.headers["Retry-After"]
+        return failed
+
+    if _principal_requires_password_change(principal):
+        destination = "/" if next_path == "/change-password" else next_path
+        response.headers["Location"] = "/change-password?" + urlencode(
+            {"next": destination}
+        )
+    else:
+        response.headers["Location"] = next_path
+    return response
 
 
 @router.get("/change-password", response_class=HTMLResponse, include_in_schema=False)

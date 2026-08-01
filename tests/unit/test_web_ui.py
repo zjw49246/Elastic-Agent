@@ -111,9 +111,10 @@ class TestDashboardEndpoint:
         assert resp.headers["x-frame-options"] == "DENY"
         assert 'id="email"' in resp.text
         assert 'id="password"' in resp.text
-        assert "'/api/auth/login'" in resp.text
-        assert "credentials:'same-origin'" in resp.text
-        assert "LOGIN_NEXT_PATHS" in resp.text
+        assert '<form id="loginForm" method="post" action="/login">' in resp.text
+        assert 'name="next" type="hidden" value="/fleet"' in resp.text
+        assert "'/api/auth/login'" not in resp.text
+        assert "event.preventDefault()" not in resp.text
         assert "prefilled-admin@example.test" not in resp.text
         assert "prefilled-test-password" not in resp.text
         assert "Authorization" not in resp.text

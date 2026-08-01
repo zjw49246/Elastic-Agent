@@ -177,13 +177,18 @@ def _password_change_identity(request: Request) -> str:
     return "password-change:" + hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-@router.post("/login")
-async def login(
+async def create_browser_session(
     incoming: LoginRequest,
     request: Request,
     response: Response,
-) -> dict:
-    _require_json(request)
+) -> AuthPrincipal:
+    """Verify an administrator and attach a new browser session to *response*.
+
+    Both the JSON API and the native HTML form use this single authentication
+    path so rate limiting, session fixation protection, and cookie policy cannot
+    drift between them.
+    """
+
     require_same_origin(request)
     source = _direct_peer(request)
     try:
@@ -236,6 +241,17 @@ async def login(
     _set_session_cookie(response, token)
     response.headers.update(_NO_STORE_HEADERS)
     logger.info("Management user logged in: %s", user.email)
+    return principal
+
+
+@router.post("/login")
+async def login(
+    incoming: LoginRequest,
+    request: Request,
+    response: Response,
+) -> dict:
+    _require_json(request)
+    principal = await create_browser_session(incoming, request, response)
     return _principal_payload(principal)
 
 
