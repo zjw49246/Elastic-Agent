@@ -909,6 +909,94 @@ async def test_failed_collection_attempt_preserves_last_complete_snapshot(
     assert not (workers / ".shard-00000.backup").exists()
 
 
+async def test_collection_publish_removes_read_only_previous_snapshot(
+    tmp_path,
+):
+    workers = tmp_path / "workers"
+    destination = workers / "shard-00000"
+    locked = destination / "results" / "agent-snapshot" / "task"
+    locked.mkdir(parents=True)
+    (locked / "task.yaml").write_text("old")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "preserved.txt"
+    marker.write_text("preserved")
+    outside.chmod(0o500)
+    (locked / "outside-link").symlink_to(outside, target_is_directory=True)
+    (locked.parent).chmod(0o555)
+    locked.chmod(0o555)
+
+    attempt = workers / ".shard-00000.attempt-test"
+    (attempt / "results").mkdir(parents=True)
+    (attempt / "results" / "new.txt").write_text("complete")
+
+    ManagerFleetDriver._install_collection_attempt(attempt, destination)
+
+    assert (destination / "results" / "new.txt").read_text() == "complete"
+    assert not (workers / ".shard-00000.backup").exists()
+    assert marker.read_text() == "preserved"
+    assert (outside.stat().st_mode & 0o777) == 0o500
+    outside.chmod(0o700)
+
+
+async def test_new_collection_attempt_cleans_read_only_crash_backup(
+    tmp_path,
+):
+    workers = tmp_path / "workers"
+    destination = workers / "shard-00000"
+    destination.mkdir(parents=True)
+    backup_task = (
+        workers / ".shard-00000.backup" / "results" / "snapshot" / "task"
+    )
+    backup_task.mkdir(parents=True)
+    (backup_task / "task.yaml").write_text("old")
+    backup_task.parent.chmod(0o555)
+    backup_task.chmod(0o555)
+
+    attempt = ManagerFleetDriver._new_collection_attempt(
+        workers,
+        "shard-00000",
+    )
+
+    assert attempt.is_dir()
+    assert not (workers / ".shard-00000.backup").exists()
+
+
+async def test_partial_collection_cleanup_removes_read_only_directories(
+    tmp_path,
+):
+    attempt = tmp_path / ".shard-00000.attempt-test"
+    locked = attempt / "results" / "snapshot" / "task"
+    locked.mkdir(parents=True)
+    (locked / "task.yaml").write_text("partial")
+    locked.parent.chmod(0o555)
+    locked.chmod(0o555)
+
+    ManagerFleetDriver._cleanup_partial_collection_path(attempt)
+
+    assert not attempt.exists()
+
+
+async def test_partial_collection_cleanup_propagates_mode_errors(
+    tmp_path,
+    monkeypatch,
+):
+    attempt = tmp_path / ".shard-00000.attempt-test"
+    locked = attempt / "results" / "snapshot"
+    locked.mkdir(parents=True)
+    locked.chmod(0o555)
+
+    def fail_chmod(*_args, **_kwargs):
+        raise OSError("simulated chmod failure")
+
+    monkeypatch.setattr(os, "chmod", fail_chmod)
+
+    with pytest.raises(OSError, match="simulated chmod failure"):
+        ManagerFleetDriver._cleanup_partial_collection_path(attempt)
+
+    assert attempt.exists()
+
+
 async def test_worker_direct_s3_uses_isolated_prefix_and_manifest(
     tmp_path, monkeypatch,
 ):

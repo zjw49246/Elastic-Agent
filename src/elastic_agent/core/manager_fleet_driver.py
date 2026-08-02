@@ -2096,6 +2096,83 @@ raise SystemExit(code)
         return total_bytes, total_objects
 
     @staticmethod
+    def _remove_collection_tree(path: Path) -> None:
+        """Remove a Manager-owned collection tree without following links.
+
+        ``rsync -a`` intentionally preserves workload directory modes.  A
+        Docker-produced snapshot can therefore contain ``0555`` directories,
+        but POSIX deletion requires write and execute permission on each
+        parent.  Relax only directories inside the private tree already chosen
+        for deletion; regular-file modes are irrelevant and symlinks are never
+        followed.  The rsync process is reaped before callers reach cleanup,
+        so the worker cannot race this traversal.
+        """
+
+        try:
+            root_stat = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+        ):
+            raise RuntimeError("unsafe Manager collection cleanup tree")
+
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise RuntimeError("safe Manager collection cleanup is unsupported")
+        open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        open_flags |= getattr(os, "O_CLOEXEC", 0)
+        root_fd = os.open(path, open_flags)
+        try:
+            opened_root_stat = os.fstat(root_fd)
+            if not os.path.samestat(root_stat, opened_root_stat):
+                raise RuntimeError("Manager collection cleanup tree changed")
+            root_mode = stat.S_IMODE(opened_root_stat.st_mode)
+            required_root_mode = root_mode | 0o700
+            if required_root_mode != root_mode:
+                os.fchmod(root_fd, required_root_mode)
+
+            def raise_walk_error(error: OSError) -> None:
+                raise error
+
+            for _root, dirnames, _filenames, directory_fd in os.fwalk(
+                ".",
+                topdown=True,
+                onerror=raise_walk_error,
+                follow_symlinks=False,
+                dir_fd=root_fd,
+            ):
+                directory_mode = stat.S_IMODE(
+                    os.fstat(directory_fd).st_mode
+                )
+                required_directory_mode = directory_mode | 0o700
+                if required_directory_mode != directory_mode:
+                    os.fchmod(directory_fd, required_directory_mode)
+                real_directories = []
+                for name in dirnames:
+                    entry_stat = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        continue
+                    entry_mode = stat.S_IMODE(entry_stat.st_mode)
+                    required_entry_mode = entry_mode | 0o700
+                    if required_entry_mode != entry_mode:
+                        os.chmod(
+                            name,
+                            required_entry_mode,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    real_directories.append(name)
+                dirnames[:] = real_directories
+        finally:
+            os.close(root_fd)
+        shutil.rmtree(path)
+
+    @staticmethod
     def _cleanup_partial_collection_path(path: Path) -> None:
         """Remove an uncommitted rsync destination without following links."""
 
@@ -2106,7 +2183,7 @@ raise SystemExit(code)
         if stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(
             path_stat.st_mode
         ):
-            shutil.rmtree(path)
+            ManagerFleetDriver._remove_collection_tree(path)
         else:
             path.unlink()
 
@@ -2126,7 +2203,7 @@ raise SystemExit(code)
             if backup.is_symlink() or not backup.is_dir():
                 raise RuntimeError("unsafe Manager collection backup")
             if destination.exists():
-                shutil.rmtree(backup)
+                ManagerFleetDriver._remove_collection_tree(backup)
             else:
                 os.replace(backup, destination)
         prefix = f".{namespace}.attempt-"
@@ -2182,7 +2259,7 @@ raise SystemExit(code)
                 os.replace(backup, destination)
             raise
         if moved_old:
-            shutil.rmtree(backup)
+            ManagerFleetDriver._remove_collection_tree(backup)
 
     @staticmethod
     def _workload_recovery_identity(spec: JobSpec) -> dict:
