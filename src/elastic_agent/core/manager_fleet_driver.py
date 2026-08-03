@@ -4305,6 +4305,11 @@ sleep 1
             # permit unbounded reuse of the same Manager disk and inodes.
             raise
         except BaseException:
+            # The rsync child has settled, so this tree is now static.  Even if
+            # cleanup itself fails, real disk and inode consumption remains
+            # visible to the statvfs checks in the next reservation.  Retaining
+            # the full logical allowance as well would leak capacity forever.
+            reservation_safe_to_release = True
             if (
                 attempt is not None
                 and attempt.exists()
@@ -4314,7 +4319,6 @@ sleep 1
                     self._cleanup_partial_collection_path,
                     attempt,
                 )
-            reservation_safe_to_release = True
             raise
         finally:
             if reservation_safe_to_release:

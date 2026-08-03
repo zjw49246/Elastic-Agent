@@ -616,15 +616,35 @@ class S3CheckpointStore:
             if descriptor >= 0:
                 os.close(descriptor)
             source.close()
-            cleaned = not snapshot.exists()
-            try:
-                snapshot.unlink()
-            except FileNotFoundError:
-                cleaned = True
-            if reserved and cleaned:
-                with self._snapshot_budget_lock:
-                    self._snapshot_reserved_bytes -= opened_stat.st_size
+            if reserved:
+                self._remove_snapshot_and_release_budget(
+                    snapshot,
+                    opened_stat.st_size,
+                )
             raise
+
+    def _remove_snapshot_and_release_budget(
+        self,
+        snapshot: Path,
+        size: int,
+    ) -> None:
+        """Delete one owned snapshot before returning its byte reservation.
+
+        The reservation accounts for a file that may exist on disk.  Return it
+        only after unlink succeeds (or the exact private path is already gone),
+        and fail closed if the in-memory accounting is inconsistent.
+        """
+
+        try:
+            snapshot.unlink()
+        except FileNotFoundError:
+            pass
+        with self._snapshot_budget_lock:
+            if size > self._snapshot_reserved_bytes:
+                raise CheckpointError(
+                    "checkpoint snapshot byte budget accounting underflow"
+                )
+            self._snapshot_reserved_bytes -= size
 
     def _head_blob(self, key: str) -> dict[str, Any] | None:
         try:
@@ -877,14 +897,10 @@ class S3CheckpointStore:
                                 cancel_event=cancel_event,
                             )
                     finally:
-                        cleaned = not snapshot.exists()
-                        try:
-                            snapshot.unlink()
-                        except FileNotFoundError:
-                            cleaned = True
-                        if cleaned:
-                            with self._snapshot_budget_lock:
-                                self._snapshot_reserved_bytes -= size
+                        self._remove_snapshot_and_release_budget(
+                            snapshot,
+                            size,
+                        )
                     files.append({
                         "path": relative,
                         "size": size,

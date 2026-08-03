@@ -909,6 +909,58 @@ async def test_failed_collection_attempt_preserves_last_complete_snapshot(
     assert not (workers / ".shard-00000.backup").exists()
 
 
+async def test_reaped_collection_cleanup_failure_releases_reservation(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", raising=False)
+    manager = FakeManager(tmp_path)
+
+    class FailingProcess:
+        returncode = 23
+
+        def __init__(self, destination):
+            self.destination = Path(destination)
+
+        async def communicate(self):
+            self.destination.mkdir(parents=True, exist_ok=True)
+            (self.destination / "partial.txt").write_text("partial")
+            return b"", b"simulated rsync failure"
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_subprocess(*args, **_kwargs):
+        return FailingProcess(args[-1])
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver."
+        "asyncio.create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(
+        ManagerFleetDriver,
+        "_cleanup_partial_collection_path",
+        staticmethod(
+            lambda _path: (_ for _ in ()).throw(
+                OSError("simulated cleanup failure")
+            )
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated cleanup failure"):
+        await ManagerFleetDriver(manager).collect(
+            "worker-a", _spec(tmp_path), "job-1",
+        )
+
+    assert manager._collection_staging_reservations == {}
+    assert list(
+        (
+            Path(manager.collected_root)
+            / "job-1/workers"
+        ).glob(".shard-00000.attempt-*")
+    )
+
+
 async def test_collection_publish_removes_read_only_previous_snapshot(
     tmp_path,
 ):

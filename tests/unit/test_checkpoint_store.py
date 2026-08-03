@@ -1079,6 +1079,35 @@ def test_checkpoint_snapshot_uses_controlled_root_and_cleans_it(
 
     assert snapshots.is_dir()
     assert list(snapshots.iterdir()) == []
+    assert store._snapshot_reserved_bytes == 0
+
+
+def test_checkpoint_snapshot_budget_is_reused_between_files(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "first.bin").write_bytes(b"four")
+    (source / "results" / "second.bin").write_bytes(b"more")
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        max_snapshot_bytes=4,
+        snapshot_free_reserve_bytes=0,
+    )
+
+    manifest = store.commit(
+        job_id="job-reuse-snapshot-budget",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g1",
+    )
+
+    assert [entry["size"] for entry in manifest["files"]] == [4, 4]
+    assert store._snapshot_reserved_bytes == 0
 
 
 def test_checkpoint_snapshot_enforces_single_file_limit(tmp_path: Path):
@@ -1189,6 +1218,7 @@ def test_checkpoint_snapshot_never_copies_growth_beyond_open_size(
 
     assert read_sizes == [4, 1]
     assert client.operations == []
+    assert store._snapshot_reserved_bytes == 0
 
 
 def test_checkpoint_blob_upload_concurrency_is_bounded(tmp_path: Path):
