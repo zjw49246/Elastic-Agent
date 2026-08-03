@@ -22,6 +22,7 @@ from elastic_agent.core.job_spec_store import (
     update_job_state,
 )
 from elastic_agent.core.manager_fleet_driver import (
+    _RECOVERY_DOCKER_QUIESCE,
     ManagerFleetDriver,
     _terminate_subprocess,
     _UnsettledSubprocessError,
@@ -1912,6 +1913,178 @@ async def test_recovered_worker_quiescence_fails_closed(
         ).quiesce_recovered_worker(
             "worker-a", "job-1", _spec(tmp_path),
         )
+
+
+async def _run_recovery_docker_quiesce(
+    tmp_path,
+    *,
+    service_active: bool,
+    info_rc: int,
+    service_active_after_probe: bool | None = None,
+    has_container: bool = False,
+    second_ps_rc: int = 0,
+):
+    script = f"""set -Eeuo pipefail
+stop_and_mask() {{
+  printf 'stop:%s\\n' "$1"
+  printf 'stop:%s\\n' "$1" >> "$DOCKER_LOG"
+}}
+verify_unit() {{ printf 'verify:%s\\n' "$1"; }}
+systemctl() {{
+  if [ "$1" = "is-active" ]; then
+    active="$DOCKER_SERVICE_ACTIVE"
+    if [ -e "$DOCKER_INFO_PROBED" ]; then
+      active="$DOCKER_SERVICE_ACTIVE_AFTER_PROBE"
+    fi
+    [ "$active" = "1" ]
+    return
+  fi
+  return 0
+}}
+docker() {{
+  case "$1" in
+    info)
+      : > "$DOCKER_INFO_PROBED"
+      return "$DOCKER_INFO_RC"
+      ;;
+    ps)
+      ps_count=0
+      if [ -e "$DOCKER_PS_COUNT" ]; then
+        read -r ps_count < "$DOCKER_PS_COUNT"
+      fi
+      ps_count=$((ps_count + 1))
+      printf '%s\\n' "$ps_count" > "$DOCKER_PS_COUNT"
+      if [ "$ps_count" = "2" ] && [ "$DOCKER_SECOND_PS_RC" != "0" ]; then
+        return "$DOCKER_SECOND_PS_RC"
+      fi
+      if [ "$DOCKER_HAS_CONTAINER" = "1" ] && [ "$ps_count" = "1" ]; then
+        printf 'container-one\\n'
+      fi
+      ;;
+    rm)
+      printf 'remove:%s\\n' "$4"
+      printf 'removed:%s\\n' "$4" >> "$DOCKER_LOG"
+      ;;
+    *) return 1 ;;
+  esac
+}}
+{_RECOVERY_DOCKER_QUIESCE}
+"""
+    env = {
+        **os.environ,
+        "DOCKER_SERVICE_ACTIVE": "1" if service_active else "0",
+        "DOCKER_SERVICE_ACTIVE_AFTER_PROBE": (
+            "1"
+            if (
+                service_active
+                if service_active_after_probe is None
+                else service_active_after_probe
+            )
+            else "0"
+        ),
+        "DOCKER_INFO_RC": str(info_rc),
+        "DOCKER_HAS_CONTAINER": "1" if has_container else "0",
+        "DOCKER_SECOND_PS_RC": str(second_ps_rc),
+        "DOCKER_INFO_PROBED": str(tmp_path / "docker-info-probed"),
+        "DOCKER_PS_COUNT": str(tmp_path / "docker-ps-count"),
+        "DOCKER_LOG": str(tmp_path / "docker-log"),
+    }
+    process = await asyncio.create_subprocess_exec(
+        "/bin/bash",
+        "-c",
+        script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await process.communicate()
+    return (
+        process.returncode,
+        stdout.decode(),
+        stderr.decode(),
+        Path(env["DOCKER_LOG"]),
+    )
+
+
+async def test_recovery_docker_quiesce_ignores_stale_socket_without_daemon(
+    tmp_path,
+):
+    rc, stdout, stderr, docker_log = await _run_recovery_docker_quiesce(
+        tmp_path,
+        service_active=False,
+        info_rc=1,
+    )
+
+    assert rc == 0, stderr
+    assert "stop:docker.socket" in stdout
+    assert "stop:docker.service" in stdout
+    assert "verify:containerd.socket" in stdout
+    assert "removed:" not in docker_log.read_text()
+    assert "/run/docker.sock" not in _RECOVERY_DOCKER_QUIESCE
+    assert "/var/run/docker.sock" not in _RECOVERY_DOCKER_QUIESCE
+
+
+async def test_recovery_docker_quiesce_rejects_active_unreachable_daemon(
+    tmp_path,
+):
+    rc, _stdout, stderr, docker_log = await _run_recovery_docker_quiesce(
+        tmp_path,
+        service_active=True,
+        info_rc=1,
+    )
+
+    assert rc != 0
+    assert "service is active but the daemon is unreachable" in stderr
+    assert "removed:" not in docker_log.read_text()
+
+
+async def test_recovery_docker_quiesce_rereads_service_after_failed_probe(
+    tmp_path,
+):
+    rc, stdout, stderr, docker_log = await _run_recovery_docker_quiesce(
+        tmp_path,
+        service_active=True,
+        service_active_after_probe=False,
+        info_rc=1,
+    )
+
+    assert rc == 0, stderr
+    assert "stop:docker.service" in stdout
+    assert "daemon is unreachable" not in stderr
+    assert "removed:" not in docker_log.read_text()
+
+
+async def test_recovery_docker_quiesce_removes_reachable_non_systemd_containers(
+    tmp_path,
+):
+    rc, _stdout, stderr, docker_log = await _run_recovery_docker_quiesce(
+        tmp_path,
+        service_active=False,
+        info_rc=0,
+        has_container=True,
+    )
+
+    assert rc == 0, stderr
+    events = docker_log.read_text()
+    assert events.index("removed:container-one") < events.index(
+        "stop:docker.service"
+    )
+
+
+async def test_recovery_docker_quiesce_rejects_failed_cleanup_verification(
+    tmp_path,
+):
+    rc, _stdout, stderr, docker_log = await _run_recovery_docker_quiesce(
+        tmp_path,
+        service_active=False,
+        info_rc=0,
+        has_container=True,
+        second_ps_rc=1,
+    )
+
+    assert rc != 0
+    assert "Cannot verify Docker container cleanup" in stderr
+    assert "removed:container-one" in docker_log.read_text()
 
 
 async def test_recovery_staging_budget_is_atomic_across_jobs(

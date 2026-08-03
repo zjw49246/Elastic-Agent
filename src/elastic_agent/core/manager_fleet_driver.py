@@ -315,6 +315,54 @@ time.sleep(1)
 inspect_once()
 """
 
+_RECOVERY_DOCKER_QUIESCE = r"""
+# Stopping an activating socket can also stop docker.service while leaving the
+# socket inode behind. Treat daemon reachability, not that stale path, as the
+# authority for container enumeration; the host process scan below remains the
+# final proof that an unreachable/inactive daemon has no surviving writers.
+stop_and_mask docker.socket
+docker_reachable=0
+if command -v docker >/dev/null 2>&1; then
+  if docker info >/dev/null 2>&1; then
+    docker_reachable=1
+  # The socket stop above can finish tearing down docker.service while the
+  # probe is in flight. Re-read its state after a failed probe instead of
+  # rejecting recovery based on a stale pre-probe observation.
+  elif systemctl is-active --quiet docker.service; then
+    echo "Docker service is active but the daemon is unreachable" >&2
+    exit 1
+  fi
+elif systemctl is-active --quiet docker.service; then
+  echo "Docker service is active but the CLI is unavailable" >&2
+  exit 1
+fi
+if [ "$docker_reachable" = "1" ]; then
+  if ! ids="$(docker ps -aq --no-trunc)"; then
+    echo "Cannot enumerate Docker containers before cleanup" >&2
+    exit 1
+  fi
+  while IFS= read -r container_id; do
+    [ -z "$container_id" ] && continue
+    docker rm -f -- "$container_id" >/dev/null
+  done <<< "$ids"
+  if ! remaining="$(docker ps -aq --no-trunc)"; then
+    echo "Cannot verify Docker container cleanup" >&2
+    exit 1
+  fi
+  [ -z "$remaining" ] || {
+    echo "Docker containers remained after forced removal" >&2
+    exit 1
+  }
+fi
+for unit in docker.service containerd.service containerd.socket; do
+  stop_and_mask "$unit"
+done
+for unit in \
+  docker.socket docker.service containerd.service containerd.socket; do
+  verify_unit "$unit"
+done
+"""
+
 
 class _UnsettledSubprocessError(RuntimeError):
     """A child may still be able to mutate its Manager-local staging tree."""
@@ -3729,35 +3777,7 @@ for unit in "${{framework[@]}}"; do
   verify_unit "$unit"
 done
 
-stop_and_mask docker.socket
-docker_needed=0
-if systemctl is-active --quiet docker.service \
-  || [ -S /run/docker.sock ] || [ -S /var/run/docker.sock ]; then
-  docker_needed=1
-fi
-if [ "$docker_needed" = "1" ]; then
-  command -v docker >/dev/null 2>&1 || {{
-    echo "Docker is active but the CLI is unavailable" >&2
-    exit 1
-  }}
-  docker info >/dev/null
-  ids="$(docker ps -aq --no-trunc)"
-  while IFS= read -r container_id; do
-    [ -z "$container_id" ] && continue
-    docker rm -f -- "$container_id" >/dev/null
-  done <<< "$ids"
-  [ -z "$(docker ps -aq --no-trunc)" ] || {{
-    echo "Docker containers remained after forced removal" >&2
-    exit 1
-  }}
-fi
-for unit in docker.service containerd.service containerd.socket; do
-  stop_and_mask "$unit"
-done
-for unit in \
-  docker.socket docker.service containerd.service containerd.socket; do
-  verify_unit "$unit"
-done
+{_RECOVERY_DOCKER_QUIESCE}
 
 sleep 1
 {scanner}
