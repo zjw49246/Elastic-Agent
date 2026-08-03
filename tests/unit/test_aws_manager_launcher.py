@@ -165,6 +165,16 @@ def test_production_allowlist_covers_common_x86_worker_families():
     assert set(iam_types) == actual
 
 
+def test_production_job_batch_global_limit_is_50():
+    settings = {
+        line.partition("=")[0]: line.partition("=")[2]
+        for line in AWS_ENV.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+
+    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "50"
+
+
 def test_manager_policy_and_cutover_pin_real_key_pair_name():
     policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
     launch = next(

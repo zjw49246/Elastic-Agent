@@ -38,7 +38,10 @@ JOB_BATCH_SCHEMA_VERSION = 1
 JOB_BATCH_JOURNAL_SCHEMA_VERSION = 1
 JOB_BATCH_MAX_BODY_BYTES = 2 * 1024 * 1024
 JOB_BATCH_ABSOLUTE_MAX_ITEMS = 100
-JOB_BATCH_MAX_ACTIVE_JOBS = 10
+# One manifest stays intentionally small, while a Manager may schedule across
+# several independent manifests up to the deployment-wide concurrency limit.
+JOB_BATCH_POLICY_MAX_ACTIVE_JOBS = 10
+JOB_BATCH_GLOBAL_MAX_ACTIVE_JOBS = 50
 JOB_BATCH_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
 JOB_BATCH_LIST_DEFAULT_LIMIT = 200
 JOB_BATCH_LIST_MAX_LIMIT = 500
@@ -85,7 +88,11 @@ class StrictBatchModel(BaseModel):
 
 
 class JobBatchPolicy(StrictBatchModel):
-    max_active_jobs: int = Field(default=3, ge=1, le=JOB_BATCH_MAX_ACTIVE_JOBS)
+    max_active_jobs: int = Field(
+        default=3,
+        ge=1,
+        le=JOB_BATCH_POLICY_MAX_ACTIVE_JOBS,
+    )
     on_job_failure: Literal["continue"] = "continue"
 
 
@@ -219,7 +226,7 @@ class JobBatchLimits:
             "ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS",
             default=3,
             minimum=1,
-            maximum=JOB_BATCH_MAX_ACTIVE_JOBS,
+            maximum=JOB_BATCH_GLOBAL_MAX_ACTIVE_JOBS,
         )
 
 

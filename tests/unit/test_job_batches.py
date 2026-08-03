@@ -272,6 +272,39 @@ async def batch_client(
 
 
 class TestJobBatchValidationAndPlan:
+    def test_global_limit_accepts_50_without_expanding_manifest_policy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "50")
+
+        limits = JobBatchLimits()
+
+        assert limits.global_max_active_jobs == 50
+        JobBatchManifest.model_validate(
+            _manifest(_spec("policy-ten"), max_active_jobs=10)
+        )
+        with pytest.raises(ValueError) as exc_info:
+            JobBatchManifest.model_validate(
+                _manifest(_spec("policy-eleven"), max_active_jobs=11)
+            )
+        assert "max_active_jobs" in str(exc_info.value)
+        assert "10" in str(exc_info.value)
+
+    def test_global_limit_rejects_values_above_50(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "51")
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS must be between 1 and 50"
+            ),
+        ):
+            JobBatchLimits()
+
     def test_account_aggregation_keeps_auth_kinds_in_separate_pools(self):
         def account_spec(name: str, auth_kind: str) -> dict[str, object]:
             return {
