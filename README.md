@@ -366,14 +366,14 @@ in the UI.
 
 ApexRouter `/usage` reports per-key `used` values but shared-group
 `remaining`, `limits`, and `concurrency`; Elastic keeps those scopes separate
-and excludes the key when any shared limit is exhausted. An explicit `null`
-pair for one window's `remaining` and `limit` means that shared window is
-unlimited; limited and unlimited windows may coexist, while missing,
-asymmetric-null, or invalid values fail closed. ApexRouter does not currently
-supply an expiry time. At runtime, Apex authentication failures and explicit
-quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
-failures are treated as transient provider errors rather than proof that the
-individual key is exhausted.
+and excludes the key when any shared limit is exhausted. An explicitly present
+`null` value in one window's `limits` entry means that shared window is
+unlimited; its `remaining` value is not used for admission. Limited and
+unlimited windows may coexist, while a missing limit or invalid finite values
+fail closed. ApexRouter does not currently supply an expiry time. At runtime,
+Apex authentication failures and explicit quota exhaustion rotate credentials,
+while ordinary HTTP `429` and `500`/`502` failures are treated as transient
+provider errors rather than proof that the individual key is exhausted.
 
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent

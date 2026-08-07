@@ -3,8 +3,8 @@
 ApexRouter exposes the native Codex model catalog rather than an
 OpenAI-compatible ``data[].id`` list.  It is intentionally Codex-only and its
 quota response combines per-key usage with shared group limits; those values
-must remain separate when deciding availability.  An explicit null/null
-remaining-limit pair marks one shared window as unlimited.
+must remain separate when deciding availability.  An explicit null limit marks
+one shared window as unlimited.
 """
 
 from __future__ import annotations
@@ -154,19 +154,13 @@ def _normalise_apex_usage(
         has_limit = window_id in raw_limits
         raw_window_remaining = raw_remaining.get(window_id)
         raw_window_limit = raw_limits.get(window_id)
-        unlimited = (
-            has_remaining
-            and has_limit
-            and raw_window_remaining is None
-            and raw_window_limit is None
-        )
-        # Apex documents every fixed window. Missing or asymmetric values are
-        # not enough to prove availability, while an explicit null/null pair
-        # is its sentinel for a window with no shared quota.
+        unlimited = has_limit and raw_window_limit is None
+        # Apex documents every fixed limit. A present null limit is the
+        # authoritative sentinel for a window with no shared quota; remaining
+        # is not an admission signal for that window.
         if (
             key_used is None
             or key_used < 0
-            or not has_remaining
             or not has_limit
         ):
             raise AgentApiUpstreamError("invalid_usage_response")
@@ -187,6 +181,8 @@ def _normalise_apex_usage(
             )
             continue
 
+        if not has_remaining:
+            raise AgentApiUpstreamError("invalid_usage_response")
         remaining = _decimal(raw_window_remaining)
         limit = _decimal(raw_window_limit)
         if (

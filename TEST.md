@@ -236,9 +236,9 @@ The focused suite covers:
 - CloudRouter and Codex-only ApexRouter Agent API provider registration,
   fixed-endpoint 15-second wall-clock-bounded no-redirect Bearer model/usage
   requests, Apex's pinned-Codex-version native model catalog and distinct
-  per-key usage/shared-group quota normalization, including explicit-null
-  unlimited windows, mixed limited/unlimited windows, and asymmetric-null
-  fail-closed behavior,
+  per-key usage/shared-group quota normalization, including authoritative
+  null-limit unlimited windows, mixed limited/unlimited windows, and missing
+  or invalid finite-limit fail-closed behavior,
   30-second/concurrency-16 automatic pool refresh with unfinished-key OAuth
   fallback, one shared 60-second usage→key-delivery→Worker-ACK deadline,
   Claude/Codex model projection,
