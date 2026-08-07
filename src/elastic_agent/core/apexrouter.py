@@ -3,7 +3,8 @@
 ApexRouter exposes the native Codex model catalog rather than an
 OpenAI-compatible ``data[].id`` list.  It is intentionally Codex-only and its
 quota response combines per-key usage with shared group limits; those values
-must remain separate when deciding availability.
+must remain separate when deciding availability.  An explicit null/null
+remaining-limit pair marks one shared window as unlimited.
 """
 
 from __future__ import annotations
@@ -149,24 +150,57 @@ def _normalise_apex_usage(
     exhausted = False
     for window_id, label, unit in _WINDOW_DEFINITIONS:
         key_used = _decimal(raw_used.get(window_id))
-        remaining = _decimal(raw_remaining.get(window_id))
-        limit = _decimal(raw_limits.get(window_id))
+        has_remaining = window_id in raw_remaining
+        has_limit = window_id in raw_limits
+        raw_window_remaining = raw_remaining.get(window_id)
+        raw_window_limit = raw_limits.get(window_id)
+        unlimited = (
+            has_remaining
+            and has_limit
+            and raw_window_remaining is None
+            and raw_window_limit is None
+        )
+        # Apex documents every fixed window. Missing or asymmetric values are
+        # not enough to prove availability, while an explicit null/null pair
+        # is its sentinel for a window with no shared quota.
         if (
             key_used is None
-            or remaining is None
-            or limit is None
             or key_used < 0
+            or not has_remaining
+            or not has_limit
+        ):
+            raise AgentApiUpstreamError("invalid_usage_response")
+
+        parsed_key_used = _json_number(key_used)
+        key_usage[window_id] = parsed_key_used
+        if unlimited:
+            windows.append(
+                {
+                    "id": window_id,
+                    "label": label,
+                    "unit": unit,
+                    "currency": unit,
+                    "scope": "group",
+                    "unlimited": True,
+                    "key_used": parsed_key_used,
+                }
+            )
+            continue
+
+        remaining = _decimal(raw_window_remaining)
+        limit = _decimal(raw_window_limit)
+        if (
+            remaining is None
+            or limit is None
             or remaining < 0
             or limit < 0
             or remaining > limit
         ):
             raise AgentApiUpstreamError("invalid_usage_response")
 
-        parsed_key_used = _json_number(key_used)
         parsed_remaining = _json_number(remaining)
         parsed_limit = _json_number(limit)
         parsed_group_used = _json_number(limit - remaining)
-        key_usage[window_id] = parsed_key_used
         windows.append(
             {
                 "id": window_id,

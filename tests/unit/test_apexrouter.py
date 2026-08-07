@@ -177,6 +177,100 @@ async def test_apex_usage_keeps_key_usage_separate_from_shared_group_quota(
 
 
 @pytest.mark.asyncio
+async def test_apex_null_shared_group_windows_are_unlimited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter()
+    payload = _active_usage_payload()
+    for window_id in (
+        "requests_5h",
+        "requests_day",
+        "tokens_day",
+        "tokens_month",
+    ):
+        payload["remaining"][window_id] = None
+        payload["limits"][window_id] = None
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(return_value=payload),
+    )
+
+    snapshot = await adapter.fetch_usage("apex-1", "lck-private")
+
+    assert snapshot["state"] == "active"
+    assert snapshot["available"] is True
+    assert snapshot["concurrency"] == 20
+    assert snapshot["key_usage"] == payload["used"]
+    assert len(snapshot["windows"]) == 4
+    assert all(window["unlimited"] is True for window in snapshot["windows"])
+    assert all("limit" not in window for window in snapshot["windows"])
+    assert all("remaining" not in window for window in snapshot["windows"])
+    assert all("utilization" not in window for window in snapshot["windows"])
+
+
+@pytest.mark.asyncio
+async def test_apex_usage_supports_mixed_limited_and_unlimited_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter()
+    payload = _active_usage_payload()
+    payload["remaining"]["requests_5h"] = None
+    payload["limits"]["requests_5h"] = None
+    payload["remaining"]["tokens_day"] = None
+    payload["limits"]["tokens_day"] = None
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(return_value=payload),
+    )
+
+    snapshot = await adapter.fetch_usage("apex-1", "lck-private")
+
+    windows = {window["id"]: window for window in snapshot["windows"]}
+    assert windows["requests_5h"]["unlimited"] is True
+    assert windows["requests_5h"]["key_used"] == 3
+    assert windows["tokens_day"]["unlimited"] is True
+    assert windows["requests_day"]["limit"] == 50_000
+    assert windows["requests_day"]["remaining"] == 49_000
+    assert windows["tokens_month"]["used"] == 10_000_000
+    assert snapshot["state"] == "active"
+    assert snapshot["available"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remaining", "limit"),
+    [
+        (None, 100),
+        (100, None),
+        ("invalid", 100),
+        (100, "invalid"),
+    ],
+)
+async def test_apex_usage_rejects_asymmetric_or_invalid_window_values(
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: object,
+    limit: object,
+) -> None:
+    adapter = ApexRouterAdapter()
+    payload = _active_usage_payload()
+    payload["remaining"]["requests_5h"] = remaining
+    payload["limits"]["requests_5h"] = limit
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(return_value=payload),
+    )
+
+    with pytest.raises(
+        AgentApiUpstreamError,
+        match="invalid_usage_response",
+    ):
+        await adapter.fetch_usage("apex-1", "lck-private")
+
+
+@pytest.mark.asyncio
 async def test_apex_partial_shared_group_usage_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
