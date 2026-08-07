@@ -1,6 +1,6 @@
 # PROGRESS — 经验教训沉淀
 
-## 2026-08-07 ApexRouter 不限额窗口准入（commit `8bbd2df`）
+## 2026-08-07 ApexRouter 不限额窗口准入（commits `8bbd2df`, `017149e`）
 
 **问题**：ApexRouter 用固定窗口的 `remaining=null`、`limit=null` 表示该共享窗口
 没有额度上限。Elastic-Agent 原先要求两者都是非负数字，因此把有效的不限额 Key
@@ -9,7 +9,7 @@
 **解决**：仅把字段存在且成对显式为 `null` 的窗口归一化为 `unlimited=true`，保留
 该 Key 的独立 usage 和共享 concurrency。受限与不限额窗口可以混合；字段缺失、单边
 `null`、非法/负数、remaining 超过 limit 以及 concurrency 耗尽仍严格 fail closed。
-README、测试指南和架构说明同步记录该 provider 语义。
+该规则与 CC-Manager PR #98 对齐；README、测试指南和架构说明同步记录该 provider 语义。
 
 **避免复发**：共享额度必须按 provider 的显式 sentinel 解释；修复假阴性时不能把
 “无法证明有限额”泛化成“不限额”。每种 sentinel 都应同时覆盖正常、混合、非对称和
