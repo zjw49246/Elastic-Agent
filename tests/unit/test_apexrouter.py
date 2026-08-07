@@ -177,7 +177,7 @@ async def test_apex_usage_keeps_key_usage_separate_from_shared_group_quota(
 
 
 @pytest.mark.asyncio
-async def test_apex_null_shared_group_limits_are_unlimited(
+async def test_apex_null_shared_group_windows_are_unlimited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = ApexRouterAdapter()
@@ -239,62 +239,16 @@ async def test_apex_usage_supports_mixed_limited_and_unlimited_windows(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("remaining", [None, 0, 100])
-async def test_apex_null_limit_is_authoritative_for_unlimited_window(
-    monkeypatch: pytest.MonkeyPatch,
-    remaining: object,
-) -> None:
-    adapter = ApexRouterAdapter()
-    payload = _active_usage_payload()
-    payload["remaining"]["requests_5h"] = remaining
-    payload["limits"]["requests_5h"] = None
-    monkeypatch.setattr(
-        adapter,
-        "_request_json",
-        AsyncMock(return_value=payload),
-    )
-
-    snapshot = await adapter.fetch_usage("apex-1", "lck-private")
-
-    window = next(
-        item
-        for item in snapshot["windows"]
-        if item["id"] == "requests_5h"
-    )
-    assert window["unlimited"] is True
-    assert "remaining" not in window
-
-
-@pytest.mark.asyncio
-async def test_apex_null_limit_does_not_require_remaining_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = ApexRouterAdapter()
-    payload = _active_usage_payload()
-    del payload["remaining"]["requests_5h"]
-    payload["limits"]["requests_5h"] = None
-    monkeypatch.setattr(
-        adapter,
-        "_request_json",
-        AsyncMock(return_value=payload),
-    )
-
-    snapshot = await adapter.fetch_usage("apex-1", "lck-private")
-
-    assert snapshot["state"] == "active"
-    assert snapshot["windows"][0]["unlimited"] is True
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("remaining", "limit"),
     [
         (None, 100),
+        (100, None),
         ("invalid", 100),
         (100, "invalid"),
     ],
 )
-async def test_apex_limited_usage_rejects_null_or_invalid_window_values(
+async def test_apex_usage_rejects_asymmetric_or_invalid_window_values(
     monkeypatch: pytest.MonkeyPatch,
     remaining: object,
     limit: object,
