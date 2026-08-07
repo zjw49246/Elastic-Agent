@@ -1,5 +1,24 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-07 ApexRouter 不限额窗口准入（commit `8bbd2df`）
+
+**问题**：ApexRouter 用固定窗口的 `remaining=null`、`limit=null` 表示该共享窗口
+没有额度上限。Elastic-Agent 原先要求两者都是非负数字，因此把有效的不限额 Key
+归为 `invalid_usage_response`，usage probe 后无法进入 Codex Agent API 调度。
+
+**解决**：仅把字段存在且成对显式为 `null` 的窗口归一化为 `unlimited=true`，保留
+该 Key 的独立 usage 和共享 concurrency。受限与不限额窗口可以混合；字段缺失、单边
+`null`、非法/负数、remaining 超过 limit 以及 concurrency 耗尽仍严格 fail closed。
+README、测试指南和架构说明同步记录该 provider 语义。
+
+**避免复发**：共享额度必须按 provider 的显式 sentinel 解释；修复假阴性时不能把
+“无法证明有限额”泛化成“不限额”。每种 sentinel 都应同时覆盖正常、混合、非对称和
+缺字段四类测试，避免放宽门禁。
+
+**验证**：先用红测试复现全不限额和混合窗口被拒绝，修复后 Apex/Agent API 定向
+`71 passed`，完整套件 `2877 passed / 12 skipped / 0 failed`；Ruff、
+`git diff --check` 通过。claude-pty lock 与远端 main 同为 `7d5a0e5`。
+
 ## 2026-07-29 Job 人工冷中断与一键续跑（commit `192430b`）
 
 **问题**：已有恢复能力只覆盖 runtime/连接重启和实例丢失后的新 Job 恢复，没有一个由
