@@ -112,6 +112,7 @@ uv run pytest -q \
   tests/unit/test_request_body_limit.py \
   tests/unit/test_bootstrap_steps.py \
   tests/unit/test_web_ui.py
+  tests/unit/test_ui_v2.py       # UI v2 static shell, /api/ui/summary, frontend source invariants
 ```
 
 The focused suite covers:
@@ -491,3 +492,19 @@ OpenAI password.
 Generic IMAP is not implemented. For cross-host workers, set
 `ELASTIC_AGENT_MANAGER_URL=wss://...`; the plaintext override is for trusted
 test networks only.
+
+## UI v2 tests
+
+- Python (`tests/unit/test_ui_v2.py`): static shell routes under `/ui-v2/*`
+  (MIME, nosniff, CSP, SPA fallback boundaries, path traversal), the
+  Bearer-protected `GET /api/ui/summary` aggregate response, and static
+  source invariants for the v2 JS (no `innerHTML`, no localStorage/Service
+  Worker, API Key confined to `auth.js`, EIP decommission-before-delete order,
+  Idempotency-Key usage).
+- JavaScript (`node --test tests/ui_v2/`): pure-module tests for
+  `js/core/job-spec.js` — JobSpec builder/validator parity with
+  `core/job_spec.py` (TTL vs run timeout, EIP account counts, Codex
+  config_dir, checkpoint/recovery rules, secret env references, S3 dataset
+  parsing) and the per-intent Idempotency-Key state machine.
+- Import graph: `python scripts/build_ui_v2.py --check` validates that every
+  ES-module import resolves inside `src/elastic_agent/api/ui_v2/`.

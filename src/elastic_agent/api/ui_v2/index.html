@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
+<title>Elastic-Agent 控制台</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#ea-main">跳到主内容</a>
+
+<div id="ea-app" class="app-shell" data-state="booting">
+  <header class="app-bar">
+    <button type="button" id="navToggle" class="icon-btn nav-toggle" aria-expanded="false" aria-controls="ea-nav">
+      <span class="icon-glyph" aria-hidden="true">☰</span>
+      <span class="sr-only">打开导航</span>
+    </button>
+    <span class="app-brand">Elastic-Agent</span>
+    <div class="app-status" id="appStatus" role="status" aria-live="polite"></div>
+    <div class="app-bar-actions">
+      <button type="button" id="otpJump" class="chip chip-otp" hidden>OTP <span id="otpCount">0</span></button>
+      <button type="button" id="themeToggle" class="icon-btn"><span class="icon-glyph" aria-hidden="true">◐</span><span class="sr-only">切换主题</span></button>
+      <button type="button" id="authButton" class="btn btn-ghost">换 Key</button>
+    </div>
+  </header>
+
+  <div class="nav-scrim" id="navScrim" hidden></div>
+
+  <nav class="app-nav" id="ea-nav" aria-label="主导航">
+    <ul class="nav-list" id="navList"></ul>
+    <div class="nav-footer">
+      <span class="nav-version" id="navVersion"></span>
+    </div>
+  </nav>
+
+  <main class="app-main" id="ea-main" tabindex="-1">
+    <div id="pageRoot" class="page-root"></div>
+  </main>
+</div>
+
+<div id="toastRegion" class="toast-region" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="dialogRoot" class="dialog-root"></div>
+
+<script type="module" src="js/app.js"></script>
+<noscript><p class="noscript">Elastic-Agent 控制台需要启用 JavaScript。</p></noscript>
+</body>
+</html>

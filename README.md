@@ -833,6 +833,18 @@ file, then published under a SHA-256 content address. The same bytes are
 idempotent; new bytes cannot overwrite or delete the code referenced by an old
 Job. Prefer declarative JobSpec for untrusted submitters.
 
+**UI v2 (preview)**: a new multi-page console is served at `/ui-v2/` (routes:
+`/ui-v2/overview`, `/ui-v2/accounts`, `/ui-v2/accounts/new`, `/ui-v2/jobs/new`,
+`/ui-v2/jobs`, `/ui-v2/jobs/{id}`, `/ui-v2/results`, `/ui-v2/fleet`). It is a
+native ES-module SPA with a persistent navigation shell, page-scoped polling,
+deep links and mobile support; the legacy `/batch` and `/fleet` pages remain
+unchanged as the rollback entry points. The static bundle can also be built for
+CDN canary deployment with `python scripts/build_ui_v2.py --out dist/ui-v2`
+(content-hashed assets + manifest; see `docs/ui-v2-implementation-plan.md`).
+The Manager additionally exposes `GET /api/ui/summary` (Bearer-protected)
+returning aggregate counts only — no identifiers, no S3 scans — for the shell's
+status bar and the overview page.
+
 **Frontend**: the Batch Console at `/batch` uses a light theme by default, with
 an optional session-scoped dark theme. The Job submission form keeps the
 JobSpec wire format unchanged while grouping inputs into eight numbered
