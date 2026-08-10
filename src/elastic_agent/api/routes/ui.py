@@ -4049,25 +4049,33 @@ refreshAccounts(); refreshResults(); runDashboardPoll();
 """
 
 
-@router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root_batch():
-    """Root serves the Batch Console — the primary surface (accounts, jobs)."""
-    return HTMLResponse(content=_BATCH_HTML)
+@router.get("/", include_in_schema=False)
+async def root_redirect():
+    """Root redirects to the UI v2 overview."""
+    from starlette.responses import RedirectResponse
+
+    return RedirectResponse("/ui-v2/overview", status_code=302)
 
 
-@router.get("/batch", response_class=HTMLResponse, include_in_schema=False)
-async def batch_console():
-    """Alias for the Batch Console."""
-    return HTMLResponse(content=_BATCH_HTML)
+@router.get("/batch", include_in_schema=False)
+async def batch_redirect():
+    """Batch Console replaced by UI v2."""
+    from starlette.responses import RedirectResponse
+
+    return RedirectResponse("/ui-v2/overview", status_code=302)
 
 
-@router.get("/fleet", response_class=HTMLResponse, include_in_schema=False)
-async def fleet_dashboard():
-    """Serve the Fleet Dashboard (nodes, scaling)."""
-    return HTMLResponse(content=_DASHBOARD_HTML)
+@router.get("/fleet", include_in_schema=False)
+async def fleet_redirect():
+    """Fleet Dashboard replaced by UI v2."""
+    from starlette.responses import RedirectResponse
+
+    return RedirectResponse("/ui-v2/fleet", status_code=302)
 
 
-@router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard_alt():
-    """Alias for the Fleet Dashboard."""
-    return HTMLResponse(content=_DASHBOARD_HTML)
+@router.get("/dashboard", include_in_schema=False)
+async def dashboard_redirect():
+    """Dashboard replaced by UI v2."""
+    from starlette.responses import RedirectResponse
+
+    return RedirectResponse("/ui-v2/fleet", status_code=302)
