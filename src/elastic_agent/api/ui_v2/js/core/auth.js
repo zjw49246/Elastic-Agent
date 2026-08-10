@@ -38,6 +38,13 @@ export function scrubUrlCredentials() {
 
 export function initAuth() {
   scrubUrlCredentials();
+  // Server-injected token (no manual input needed when behind Cloudflare Access).
+  const meta = document.querySelector('meta[name="ea-auth-token"]');
+  const injected = meta ? (meta.getAttribute('content') || '').trim() : '';
+  if (injected) {
+    currentKey = injected;
+    return true;
+  }
   let stored = '';
   try {
     stored = window.sessionStorage.getItem(STORAGE_KEY) || '';

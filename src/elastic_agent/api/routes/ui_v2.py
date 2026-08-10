@@ -24,9 +24,9 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
-from elastic_agent.api.auth import require_api_key
+from elastic_agent.api.auth import get_api_keys, require_api_key
 
 router = APIRouter(tags=["ui-v2"])
 
@@ -79,21 +79,29 @@ def _resolve_asset(rel_path: str) -> Path:
     return candidate
 
 
-def _serve_index() -> FileResponse:
+def _serve_index() -> HTMLResponse:
     index = UI_V2_ROOT / "index.html"
     if not index.is_file():
         raise HTTPException(404, "UI v2 assets are not installed")
-    return FileResponse(index, media_type="text/html", headers=_INDEX_HEADERS)
+    html = index.read_text(encoding="utf-8")
+    keys = get_api_keys()
+    token = keys[0] if keys else ""
+    html = html.replace(
+        '<meta name="ea-auth-token" content="">',
+        f'<meta name="ea-auth-token" content="{token}">',
+        1,
+    )
+    return HTMLResponse(content=html, headers=_INDEX_HEADERS)
 
 
 @router.get("/ui-v2", include_in_schema=False)
 @router.get("/ui-v2/", include_in_schema=False)
-async def ui_v2_root() -> FileResponse:
+async def ui_v2_root():
     return _serve_index()
 
 
 @router.get("/ui-v2/{rest:path}", include_in_schema=False)
-async def ui_v2_assets(rest: str) -> FileResponse:
+async def ui_v2_assets(rest: str):
     """Serve static assets; unknown paths fall back to the SPA shell.
 
     The fallback only exists under ``/ui-v2/*`` — ``/api/*`` and ``/ws/*`` are
