@@ -711,3 +711,18 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 与本次文件无关。
 
 **发布状态**：代码已提交，未部署、未重载、未重启当前服务；运行中 Job/实例未被触碰。
+
+## 2026-08-10 UI v2 多页控制台（commit `fd4723a`）
+
+**改动**：实现 `docs/ui-v2-implementation-plan.md` 的 Phase 1（静态 App Shell + core 模块）和 Phase 2（所有页面迁移），合计 24 个 ES Module + 1 个后端路由模块 + 1 个构建脚本。
+
+**关键设计决定**：
+- 不引入 Node 运行时依赖；原生 ES Modules + History API，无 React/Vue/build chain。`scripts/build_ui_v2.py` 是纯 Python 的 import 校验 + 内容哈希工具。
+- 秘密从结构上不可入 store：`store.js` 的 `NEVER_STORE` 列表在 `setState` 时递归拒绝 password/api_key/email_token/otp/secret_env key，让测试可以断言"任何页面代码调用 setState 都不可能泄漏秘密到全局状态"。
+- Job 表单是纯函数模块 `job-spec.js`（validateJobForm + buildJobSpec），不依赖 DOM，直接用 Node test runner 做 17 个单测，覆盖 EIP/checkpoint/recovery/codex/rotation 等交叉约束。
+
+**避免的坑**：
+1. 测试 JS 源码中 `localStorage` 关键字时，注释中的 prose 也会命中。解法：改用 `re.search(r"localStorage\s*[.\[(]", source)` 只匹配实际 API 调用。
+2. `/api/ui/summary` 要避免为 badge 做全量 S3 扫描或历史 journal 读取。解法：只读内存 `BatchJob.summary()` + registry `list_all()` + 账号 store `list()`，5 秒缓存。
+3. SPA fallback 必须只在 `/ui-v2/*` 内生效，不能接管 `/api/*` 或 `/ws/*`。解法：在 `app.py` 中先注册全部 API 路由再注册 ui_v2 路由；测试用 `test_spa_fallback_never_claims_api_or_ws` 断言。
+4. pre-existing test failures (test_pty_backend/test_worker_agent_api) 是因为 worktree 缺少 `claude-pty` 可选依赖，与本次改动无关（已在 main 分支同样失败）。
