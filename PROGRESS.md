@@ -726,3 +726,11 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 2. `/api/ui/summary` 要避免为 badge 做全量 S3 扫描或历史 journal 读取。解法：只读内存 `BatchJob.summary()` + registry `list_all()` + 账号 store `list()`，5 秒缓存。
 3. SPA fallback 必须只在 `/ui-v2/*` 内生效，不能接管 `/api/*` 或 `/ws/*`。解法：在 `app.py` 中先注册全部 API 路由再注册 ui_v2 路由；测试用 `test_spa_fallback_never_claims_api_or_ws` 断言。
 4. pre-existing test failures (test_pty_backend/test_worker_agent_api) 是因为 worktree 缺少 `claude-pty` 可选依赖，与本次改动无关（已在 main 分支同样失败）。
+
+## 2026-08-11 JSON 批量任务端到端接入（commit `60870fd`）
+
+**问题**：UI v2 已出现 JSON 批量入口，但 `main` 没有对应的持久化 JobBatch API；页面还会重序列化原始 JSON、每次重试生成新的幂等键、提交后不跟踪终态。静态 HTML 同时注入 API key，旧 `/batch` 回退入口也被重定向，形成安全和回滚风险。
+
+**解决**：接入持久化 JobBatch 队列、plan/submit/status API、进程重启恢复、逐 Job 独立调度与全局 50 个活跃任务上限。UI v2 对同一份原始 UTF-8 字节执行预检和提交，严格拒绝重复键及超过 2 MiB/100 项的输入；以 batch id 派生稳定幂等键，显式确认后提交并轮询到终态。API key 只保留在内存/sessionStorage/Bearer header，不再写入公开 HTML；旧 Batch/Fleet 页面继续作为可用回退面。
+
+**验证**：完整 Python 套件 **2931 passed / 12 skipped / 0 failed**；UI v2 Node 测试 **23 passed**；新增和修改的核心 Python 文件 Ruff、UI 构建/import 检查及 `git diff --check` 全部通过。
