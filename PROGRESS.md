@@ -833,3 +833,9 @@ header，导航显示当前管理员并提供退出登录。服务端 Bearer API
 **验证**：完整 Python 套件 **3036 passed / 12 skipped / 0 failed**；UI v2 Node 测试
 **26 passed**；管理员认证、UI v2、JobBatch、AWS 启动等定向测试 **448 passed**，相关 Python
 文件 Ruff、UI 构建/import 与 `git diff --check` 均通过。
+
+**登录落点修复（commit `847b8e9`）**：线上发现访问者误带 `/ui-v2/、` 时，安全 `next`
+校验正确拒绝该路径，却回退到了旧 `/` 控制台。登录和首次改密的缺省/非法落点现统一为
+`/ui-v2/overview`，根地址的匿名登录流程也进入当前 UI v2；合法深层路由继续原样恢复，旧
+`/batch`、`/fleet` 回滚入口和所有业务模块不变。管理员/UI 专项 **107 passed**，Node
+**26 passed**，Ruff、UI import 和 `git diff --check` 通过。
