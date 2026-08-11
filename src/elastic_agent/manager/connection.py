@@ -33,6 +33,7 @@ from elastic_agent.core.protocols.messages import (
     ReadFileMessage,
     RegisterSyncMappingMessage,
     SendInputMessage,
+    SensitiveInputMessage,
     StatusMessage,
     StopMessage,
     UnregisterSyncMappingMessage,
@@ -509,6 +510,17 @@ class WorkerConnectionManager:
 
     async def send_input(self, worker_id: str, task_id: str, payload: str) -> None:
         await self.send_command(worker_id, SendInputMessage(task_id=task_id, payload=payload))
+
+    async def send_sensitive_input(
+        self, worker_id: str, task_id: str, payload_base64: str,
+    ) -> None:
+        await self.send_command(
+            worker_id,
+            SensitiveInputMessage(
+                task_id=task_id,
+                payload_base64=payload_base64,
+            ),
+        )
 
     async def register_sync_mapping(
         self,

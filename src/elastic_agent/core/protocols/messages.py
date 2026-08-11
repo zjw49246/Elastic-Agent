@@ -112,6 +112,20 @@ class SendInputMessage(Message):
     payload: str
 
 
+class SensitiveInputMessage(Message):
+    """Manager -> Worker: one secret-bearing, base64-encoded stdin frame.
+
+    This is distinct from interactive input so representations and validation
+    errors cannot echo the payload into Manager/worker logs.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    type: Literal["SENSITIVE_INPUT"] = "SENSITIVE_INPUT"
+    task_id: str
+    payload_base64: str = Field(repr=False, min_length=1, max_length=400_000)
+
+
 class RegisterSyncMappingMessage(Message):
     type: Literal["REGISTER_SYNC_MAPPING"] = "REGISTER_SYNC_MAPPING"
     task_id: str
@@ -444,6 +458,7 @@ ManagerToWorkerMessage = Annotated[
         HealthCheckMessage,
         UploadFileMessage,
         SendInputMessage,
+        SensitiveInputMessage,
         RegisterSyncMappingMessage,
         UnregisterSyncMappingMessage,
         ForceSyncMessage,
@@ -493,6 +508,7 @@ AnyMessage = Annotated[
         HealthCheckMessage,
         UploadFileMessage,
         SendInputMessage,
+        SensitiveInputMessage,
         RegisterSyncMappingMessage,
         UnregisterSyncMappingMessage,
         ForceSyncMessage,

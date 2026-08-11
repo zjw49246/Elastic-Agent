@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import codecs
 import errno
 import hashlib
@@ -332,6 +334,22 @@ class TaskSupervisorClient:
             "op": "stdin",
             "task_id": task_id,
             "payload": payload,
+        })
+
+    async def write_stdin_base64_once(
+        self, task_id: str, payload_base64: str,
+    ) -> None:
+        """Write one opaque binary frame and close the task's stdin.
+
+        The base64 envelope keeps secret-bearing bytes out of JSON decoding and
+        log formatting paths.  The supervisor decodes only at the final pipe
+        boundary and closes stdin so a one-shot reader cannot wait forever.
+        """
+
+        await self._request({
+            "op": "stdin_base64_once",
+            "task_id": task_id,
+            "payload_base64": payload_base64,
         })
 
     async def mark_exhaustion(
@@ -720,6 +738,31 @@ class TaskSupervisorServer:
             if not isinstance(payload, str) or len(payload.encode()) > 1024 * 1024:
                 raise TaskSupervisorError("invalid stdin payload")
             await self._write_stdin(task_id, payload)
+            return {"ok": True}
+        if op == "stdin_base64_once":
+            task_id = self._parse_task_id(request.get("task_id"))
+            payload_base64 = request.get("payload_base64")
+            if (
+                not isinstance(payload_base64, str)
+                or not payload_base64
+                or len(payload_base64) > 400_000
+            ):
+                raise TaskSupervisorError("invalid binary stdin payload")
+            try:
+                decoded = bytearray(
+                    base64.b64decode(payload_base64, validate=True)
+                )
+            except (binascii.Error, ValueError) as exc:
+                raise TaskSupervisorError(
+                    "invalid binary stdin payload"
+                ) from exc
+            try:
+                if not decoded or len(decoded) > 256 * 1024:
+                    raise TaskSupervisorError("invalid binary stdin payload")
+                await self._write_stdin_once(task_id, decoded)
+            finally:
+                for index in range(len(decoded)):
+                    decoded[index] = 0
             return {"ok": True}
         if op == "mark_exhaustion":
             task_id = self._parse_task_id(request.get("task_id"))
@@ -1384,6 +1427,28 @@ class TaskSupervisorServer:
         async with lock:
             process.stdin.write((payload + "\n").encode())
             await process.stdin.drain()
+
+    async def _write_stdin_once(
+        self, task_id: str, payload: bytearray,
+    ) -> None:
+        task = await self._get_task(task_id)
+        process = task.process
+        if (
+            task.descriptor.state != "running"
+            or process is None
+            or process.stdin is None
+            or process.returncode is not None
+        ):
+            raise TaskSupervisorError("task stdin is unavailable")
+        lock = task.stdin_lock or asyncio.Lock()
+        task.stdin_lock = lock
+        async with lock:
+            process.stdin.write(payload)
+            await process.stdin.drain()
+            process.stdin.close()
+            wait_closed = getattr(process.stdin, "wait_closed", None)
+            if callable(wait_closed):
+                await wait_closed()
 
     async def _mark_exhaustion(
         self,

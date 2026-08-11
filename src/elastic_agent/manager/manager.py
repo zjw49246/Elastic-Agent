@@ -148,6 +148,7 @@ class ElasticAgentManager:
         from elastic_agent.core.account_store import AccountStore
         from elastic_agent.core.agent_api import AgentApiAccountStore
         from elastic_agent.core.binding_manager import BindingManager
+        from elastic_agent.core.ephemeral_stdin import EphemeralStdinLeaseStore
 
         self.account_store = AccountStore(
             str(_Path(config.registry.path).with_name("accounts.json"))
@@ -216,6 +217,7 @@ class ElasticAgentManager:
         from elastic_agent.core.job_batch import JobBatchQueue
 
         self.job_batch_queue = JobBatchQueue(self)
+        self.ephemeral_stdin_leases = EphemeralStdinLeaseStore()
 
         # Optional S3 result upload: collected/<job_id>/ → s3://<bucket>/<prefix>/.
         # Enabled by ELASTIC_AGENT_RESULTS_S3_BUCKET.
@@ -435,6 +437,7 @@ class ElasticAgentManager:
                 await self._batch.shutdown()
             except Exception:  # noqa: BLE001
                 logger.exception("Batch shutdown failed")
+        self.ephemeral_stdin_leases.close()
 
         durable_tasks: list[asyncio.Task] = []
         if self._binding_recovery_task is not None:
@@ -2719,6 +2722,7 @@ class ElasticAgentManager:
             persist_spec_hook=self._persist_batch_job_spec,
             job_state_hook=self._update_batch_job_state,
             interrupt_intent_hook=self._update_batch_interrupt_intent,
+            stdin_lease_store=self.ephemeral_stdin_leases,
         )
         self._batch._allocator = allocator
 

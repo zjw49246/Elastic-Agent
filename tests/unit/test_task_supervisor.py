@@ -345,6 +345,38 @@ async def test_stdin_and_explicit_stop_survive_socket_boundary(supervisor):
 
 
 @pytest.mark.asyncio
+async def test_binary_stdin_is_decoded_exactly_and_closed(supervisor):
+    import base64
+    import hashlib
+
+    _server, client, _state_dir, _log_dir = supervisor
+    payload = b"RBWORK01\x00\x01\xffsecret-frame"
+    await client.launch(SupervisedTaskLaunch(
+        task_id="binary-stdin",
+        command=[
+            sys.executable,
+            "-u",
+            "-c",
+            "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())",
+        ],
+        cwd=os.getcwd(),
+        env=dict(os.environ),
+        timeout_seconds=10,
+    ))
+    await client.write_stdin_base64_once(
+        "binary-stdin", base64.b64encode(payload).decode("ascii")
+    )
+
+    records, terminal = await _wait_for_terminal(client, "binary-stdin")
+
+    assert terminal["exit_code"] == 0
+    assert any(
+        record["data"] == hashlib.sha256(payload).hexdigest()
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signalling only")
 async def test_cooperative_process_signal_does_not_escalate_or_hit_child(
     supervisor,

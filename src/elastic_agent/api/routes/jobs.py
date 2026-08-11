@@ -8,6 +8,8 @@ Harness code uploads so the "upload code" path has somewhere to land.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 import errno
 import functools
@@ -19,8 +21,10 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import stat
+import struct
 import tarfile
 import tempfile
 import threading
@@ -54,12 +58,17 @@ from elastic_agent.core.batch_orchestrator import (
     TERMINAL_WORKER_PHASES,
     JobSpecPersistenceError,
 )
+from elastic_agent.core.ephemeral_stdin import (
+    MAX_EPHEMERAL_STDIN_TTL_SECONDS,
+    EphemeralStdinLeaseError,
+)
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import (
     JOB_REQUEST_FINGERPRINT_ALGORITHM,
     JOB_REQUEST_FINGERPRINT_SCHEMA,
     load_job_spec_journal,
 )
+from elastic_agent.core.manager_fleet_driver import sensitive_transport_error
 from elastic_agent.core.secure_store import (
     atomic_write_private,
     fsync_directory,
@@ -139,6 +148,39 @@ RESULT_ARCHIVE_SPOOL_MAX_BYTES = 20 * 1024 * 1024 * 1024
 RESULT_ARCHIVE_DISK_SAFETY_BYTES = 512 * 1024 * 1024
 RESULT_ARCHIVE_STALE_SECONDS = 24 * 60 * 60
 HARNESS_UPLOAD_MAX_BYTES = 1024 * 1024
+RUN_BENCHMARK_STDIN_MAGIC = b"RBWORK01"
+RUN_BENCHMARK_FRAME_HEADER = struct.Struct(">8sII")
+RUN_BENCHMARK_MAX_PUBLIC_BYTES = 64 * 1024
+RUN_BENCHMARK_MAX_KEY_BYTES = 8 * 1024
+RUN_BENCHMARK_MAX_WALL_SECONDS = 10_800
+RUN_BENCHMARK_REPOSITORY = "git@github.com:panjose/Run-Benchmark.git"
+RUN_BENCHMARK_HARNESSES = frozenset({
+    "codex-api", "claude-code", "kimi-code", "mimo-code", "openhands",
+    "openai-chat",
+})
+_RUN_BENCHMARK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_RUN_BENCHMARK_DIGEST = re.compile(r"[0-9a-f]{64}")
+_RUN_BENCHMARK_COMMIT = re.compile(r"[0-9a-f]{40,64}")
+
+
+class RunBenchmarkJobRequest(BaseModel):
+    """Narrow trusted bridge from Run-Benchmark into dynamic fleet Jobs."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    run_id: str = Field(min_length=1, max_length=128)
+    resolved_commit: str = Field(min_length=40, max_length=64)
+    worker_release_digest: str = Field(min_length=64, max_length=64)
+    input_digest: str = Field(min_length=64, max_length=64)
+    input_uri: str = Field(min_length=1, max_length=1024)
+    instance_digest: str = Field(min_length=64, max_length=64)
+    harness_id: str = Field(min_length=1, max_length=128)
+    wall_time_seconds: int = Field(ge=60, le=RUN_BENCHMARK_MAX_WALL_SECONDS)
+    credential_frame: str = Field(
+        repr=False,
+        min_length=1,
+        max_length=400_000,
+    )
 
 # Archive producers perform long-lived blocking S3 reads. Keep them off
 # asyncio's shared default executor so concurrent downloads cannot starve
@@ -1458,6 +1500,304 @@ def _validated_job_spec(payload: dict[str, object]) -> JobSpec:
         raise RequestValidationError(errors) from exc
 
 
+def _validate_job_stdin_protocol(
+    spec: JobSpec, *, allow_stdin_protocol: bool,
+) -> JobSpec:
+    if spec.run.stdin_protocol != "none" and not allow_stdin_protocol:
+        raise HTTPException(
+            422,
+            "run.stdin_protocol is reserved for a trusted server-side constructor",
+        )
+    return spec
+
+
+def _strict_json_object(encoded: bytes, *, label: str) -> dict[str, object]:
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate field")
+            result[key] = value
+        return result
+
+    def reject(_value: str) -> None:
+        raise ValueError(f"{label} contains a non-finite number")
+
+    try:
+        value = json.loads(
+            encoded.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique,
+            parse_constant=reject,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(422, f"{label} is invalid") from exc
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) for key in value
+    ):
+        raise HTTPException(422, f"{label} must be a JSON object")
+    return value
+
+
+def _decode_run_benchmark_frame(
+    encoded: str,
+) -> tuple[bytearray, dict[str, object]]:
+    try:
+        frame = bytearray(base64.b64decode(encoded, validate=True))
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(422, "credential frame is invalid") from exc
+    try:
+        if len(frame) < RUN_BENCHMARK_FRAME_HEADER.size:
+            raise HTTPException(422, "credential frame is invalid")
+        magic, public_size, secret_size = RUN_BENCHMARK_FRAME_HEADER.unpack(
+            frame[: RUN_BENCHMARK_FRAME_HEADER.size]
+        )
+        expected_size = (
+            RUN_BENCHMARK_FRAME_HEADER.size + public_size + secret_size
+        )
+        if (
+            magic != RUN_BENCHMARK_STDIN_MAGIC
+            or public_size > RUN_BENCHMARK_MAX_PUBLIC_BYTES
+            or not 1 <= secret_size <= RUN_BENCHMARK_MAX_KEY_BYTES
+            or len(frame) != expected_size
+        ):
+            raise HTTPException(422, "credential frame is invalid")
+        public_start = RUN_BENCHMARK_FRAME_HEADER.size
+        secret_start = public_start + public_size
+        secret = frame[secret_start:]
+        if any(byte < 0x21 or byte > 0x7E for byte in secret):
+            raise HTTPException(422, "credential frame is invalid")
+        public = _strict_json_object(
+            bytes(frame[public_start:secret_start]),
+            label="credential frame public request",
+        )
+        return frame, public
+    except BaseException:
+        for index in range(len(frame)):
+            frame[index] = 0
+        raise
+
+
+def _safe_run_benchmark_text(
+    value: object, label: str, *, maximum: int = 1024,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise HTTPException(422, f"credential frame {label} is invalid")
+    return value
+
+
+def _validate_run_benchmark_public_request(
+    envelope: RunBenchmarkJobRequest,
+    public: dict[str, object],
+) -> dict[str, object]:
+    required = {
+        "instance_id", "instance_digest", "harness_id",
+        "model", "server_id", "tags", "data_tag", "worker_release_digest",
+        "credential_mode",
+    }
+    optional = {
+        "accepted_timeout", "effort", "api_protocol", "api_base", "instance_ref",
+    }
+    if set(public) - required - optional or required - set(public):
+        raise HTTPException(
+            422, "credential frame public request schema is invalid"
+        )
+    string_fields = {
+        field: _safe_run_benchmark_text(public[field], field)
+        for field in required - {"tags"}
+    }
+    if (
+        string_fields["server_id"] != "elastic"
+        or string_fields["harness_id"] != envelope.harness_id
+        or string_fields["instance_digest"] != envelope.instance_digest
+        or string_fields["worker_release_digest"]
+        != envelope.worker_release_digest
+        or string_fields["credential_mode"] != "ephemeral_per_run"
+    ):
+        raise HTTPException(
+            422, "credential frame public request binding does not match"
+        )
+    if envelope.harness_id not in RUN_BENCHMARK_HARNESSES:
+        raise HTTPException(422, "Run-Benchmark harness is not allowed")
+    if (
+        _RUN_BENCHMARK_ID.fullmatch(string_fields["instance_id"]) is None
+        or _RUN_BENCHMARK_ID.fullmatch(string_fields["harness_id"]) is None
+        or _RUN_BENCHMARK_DIGEST.fullmatch(string_fields["instance_digest"])
+        is None
+        or _RUN_BENCHMARK_DIGEST.fullmatch(
+            string_fields["worker_release_digest"]
+        )
+        is None
+    ):
+        raise HTTPException(422, "credential frame public request is invalid")
+    tags = public["tags"]
+    if (
+        not isinstance(tags, list)
+        or len(tags) > 32
+        or any(
+            not isinstance(tag, str)
+            or not tag
+            or len(tag) > 128
+            or tag != tag.strip()
+            for tag in tags
+        )
+        or len(tags) != len(set(tags))
+    ):
+        raise HTTPException(422, "credential frame tags are invalid")
+    accepted_timeout = public.get("accepted_timeout")
+    if accepted_timeout is not None and type(accepted_timeout) is not bool:
+        raise HTTPException(422, "credential frame accepted_timeout is invalid")
+    effort = public.get("effort")
+    if effort is not None:
+        _safe_run_benchmark_text(effort, "effort", maximum=128)
+    if public.get("instance_ref") is not None:
+        _safe_run_benchmark_text(public["instance_ref"], "instance_ref")
+    protocol = public.get("api_protocol")
+    base = public.get("api_base")
+    if (protocol is None) != (base is None):
+        raise HTTPException(422, "credential frame route is incomplete")
+    if protocol is not None:
+        protocol_value = _safe_run_benchmark_text(
+            protocol, "api_protocol", maximum=64
+        )
+        base_value = _safe_run_benchmark_text(base, "api_base", maximum=2048)
+        parsed = urlsplit(base_value)
+        if (
+            protocol_value
+            not in {
+                "openai_responses", "openai", "anthropic", "kimi",
+                "google-genai", "vertexai", "gemini", "openrouter",
+            }
+            or parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise HTTPException(422, "credential frame route is invalid")
+    return public
+
+
+def _run_benchmark_job_spec(
+    request: RunBenchmarkJobRequest,
+    public: dict[str, object],
+) -> dict[str, object]:
+    bucket = os.environ.get("ELASTIC_AGENT_RESULTS_S3_BUCKET", "").strip()
+    if not bucket:
+        raise HTTPException(
+            503, "Run-Benchmark input storage is not configured"
+        )
+    expected_uri = (
+        f"s3://{bucket}/jobs/datasets/run-benchmark/v1/sha256/"
+        f"{request.input_digest}/"
+    )
+    if request.input_uri != expected_uri:
+        raise HTTPException(422, "Run-Benchmark input URI is not canonical")
+    if (
+        _RUN_BENCHMARK_ID.fullmatch(request.run_id) is None
+        or _RUN_BENCHMARK_COMMIT.fullmatch(request.resolved_commit) is None
+        or any(
+            _RUN_BENCHMARK_DIGEST.fullmatch(value) is None
+            for value in (
+                request.worker_release_digest,
+                request.input_digest,
+                request.instance_digest,
+            )
+        )
+    ):
+        raise HTTPException(422, "Run-Benchmark envelope is invalid")
+
+    runtime_root = "elastic-runtime"
+    input_root = "elastic-input"
+    venv_python = ".elastic-runtime-venv/bin/python"
+    common = [
+        "--data-root", runtime_root,
+        "--input-root", input_root,
+        "--run-id", request.run_id,
+        "--input-digest", request.input_digest,
+        "--instance-digest", request.instance_digest,
+        "--worker-release-digest", request.worker_release_digest,
+    ]
+    prepare_args = [
+        venv_python,
+        "-m", "run_benchmark.elastic_worker", "prepare",
+        "--source-root", ".",
+        *common,
+        "--harness-id", request.harness_id,
+        "--model", str(public["model"]),
+    ]
+    if public.get("effort") is not None:
+        prepare_args.extend(("--effort", str(public["effort"])))
+    if public.get("api_protocol") is not None:
+        prepare_args.extend((
+            "--api-protocol", str(public["api_protocol"]),
+            "--api-base", str(public["api_base"]),
+        ))
+    setup_command = " && ".join((
+        "python3 -m venv .elastic-runtime-venv",
+        ".elastic-runtime-venv/bin/python -m pip install "
+        "--disable-pip-version-check .",
+        shlex.join(prepare_args),
+    ))
+    exact_source = f"{runtime_root}/releases/{request.worker_release_digest}/src"
+    execute_args = [
+        "env", f"PYTHONPATH={exact_source}", venv_python,
+        "-m", "run_benchmark.elastic_worker", "execute",
+        *common,
+        "--wall-time-seconds", str(request.wall_time_seconds),
+    ]
+    run_timeout = request.wall_time_seconds + 900
+    ttl_seconds = min(
+        int(MAX_EPHEMERAL_STDIN_TTL_SECONDS),
+        max(3600, request.wall_time_seconds + 10_800),
+    )
+    return {
+        "name": f"run-benchmark-{request.run_id}",
+        "environment": {"profile": "ubuntu-agent-docker-v2"},
+        "setup": {
+            "repo": RUN_BENCHMARK_REPOSITORY,
+            "ref": "main",
+            "resolved_commit": request.resolved_commit,
+            "target_dir": "/opt/elastic-agent/run-benchmark",
+            "deliver": "manager_rsync",
+            "needs_docker": True,
+            "steps": [{
+                "name": "prepare-sealed-run-benchmark-runtime",
+                "command": setup_command,
+                "timeout": 7200,
+                "retries": 0,
+            }],
+            "s3_datasets": [{"uri": request.input_uri, "dest": (
+                "/opt/elastic-agent/run-benchmark/" + input_root
+            )}],
+        },
+        "run": {
+            "command": shlex.join(execute_args),
+            "cwd": ".",
+            "timeout": run_timeout,
+            "shell": False,
+            "stdin_protocol": "run_benchmark_v1",
+            "env": {},
+            "secret_env": {},
+        },
+        "account": {"mode": "none", "binding": "none"},
+        "rotation": {"strategy": "none"},
+        "fanout": {"workers": 1, "shard_by": "none"},
+        "collect": {
+            "paths": [f"{runtime_root}/results"],
+            "interval_seconds": 0,
+        },
+        "completion": {"on_process_exit": 0},
+        "ttl_seconds": ttl_seconds,
+    }
+
+
 def _journal_request_match(
     payload: dict,
     raw_request: dict[str, object],
@@ -2171,6 +2511,7 @@ def _pin_preflight_checkpoint_generation(
 @router.post("/jobs/plan")
 async def plan_job(spec: JobSpec) -> dict:
     """Validate and preview a Job without persistence/cloud/account mutation."""
+    _validate_job_stdin_protocol(spec, allow_stdin_protocol=False)
     return await _preflight_job(_mgr(), spec)
 
 
@@ -2200,6 +2541,77 @@ async def submit_job(
     return await _submit_job_payload(raw_request, idempotency_key)
 
 
+@router.post("/jobs/run-benchmark", status_code=201)
+async def submit_run_benchmark_job(
+    request: RunBenchmarkJobRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key"
+    ),
+) -> dict:
+    """Launch one sealed Run-Benchmark attempt on an ephemeral Worker.
+
+    This endpoint is intentionally narrower than ``POST /jobs``: repository,
+    command, environment, S3 namespace, fan-out, account mode, and collection
+    paths are all Manager-owned.  Only the one-shot binary credential frame is
+    delegated to the process-local lease store.
+    """
+
+    if idempotency_key is None or not idempotency_key.strip():
+        raise HTTPException(422, "Idempotency-Key is required")
+    mgr = _mgr()
+    transport_error = sensitive_transport_error(
+        mgr, feature="Run-Benchmark credential input"
+    )
+    if transport_error:
+        raise HTTPException(503, transport_error)
+
+    frame, public = _decode_run_benchmark_frame(request.credential_frame)
+    adopted = False
+    try:
+        public = _validate_run_benchmark_public_request(request, public)
+        raw_spec = _run_benchmark_job_spec(request, public)
+        identity_request = request.model_dump(
+            mode="json", exclude={"credential_frame"}
+        )
+        identity_request["request_kind"] = "run-benchmark-v1"
+
+        async def install_lease(job, recovered_prepared: bool) -> None:
+            nonlocal adopted
+            if recovered_prepared:
+                raise HTTPException(
+                    409,
+                    "prepared Run-Benchmark Job lost its ephemeral credential; "
+                    "submit a new attempt with a new Idempotency-Key",
+                )
+            try:
+                mgr.ephemeral_stdin_leases.put(
+                    job.job_id,
+                    frame,
+                    ttl_seconds=float(raw_spec["ttl_seconds"]),
+                )
+            except EphemeralStdinLeaseError as exc:
+                raise HTTPException(
+                    503, "ephemeral credential lease is unavailable"
+                ) from exc
+            adopted = True
+
+        async def discard_lease(job) -> None:
+            mgr.ephemeral_stdin_leases.discard(job.job_id)
+
+        return await _submit_job_payload(
+            raw_spec,
+            idempotency_key,
+            identity_request=identity_request,
+            before_submit=install_lease,
+            on_submit_error=discard_lease,
+            allow_stdin_protocol=True,
+        )
+    finally:
+        if not adopted:
+            for index in range(len(frame)):
+                frame[index] = 0
+
+
 async def _submit_job_payload(
     raw_request: dict[str, object] | None,
     idempotency_key: str | None,
@@ -2208,6 +2620,13 @@ async def _submit_job_payload(
     raw_request_factory: (
         Callable[[], Awaitable[dict[str, object]]] | None
     ) = None,
+    before_submit: (
+        Callable[[object, bool], Awaitable[None]] | None
+    ) = None,
+    on_submit_error: (
+        Callable[[object], Awaitable[None]] | None
+    ) = None,
+    allow_stdin_protocol: bool = False,
 ) -> dict:
     """Run one JobSpec through the canonical submit path.
 
@@ -2248,7 +2667,10 @@ async def _submit_job_payload(
         if raw_request is None:
             assert raw_request_factory is not None
             raw_request = await raw_request_factory()
-        spec = _validated_job_spec(raw_request)
+        spec = _validate_job_stdin_protocol(
+            _validated_job_spec(raw_request),
+            allow_stdin_protocol=allow_stdin_protocol,
+        )
         plan = await _preflight_job(mgr, spec)
         spec = _pin_preflight_checkpoint_generation(spec, plan)
 
@@ -2349,10 +2771,14 @@ async def _submit_job_payload(
             if raw_request is None:
                 assert raw_request_factory is not None
                 raw_request = await raw_request_factory()
-            spec = _validated_job_spec(raw_request)
+            spec = _validate_job_stdin_protocol(
+                _validated_job_spec(raw_request),
+                allow_stdin_protocol=allow_stdin_protocol,
+            )
             plan = await _preflight_job(mgr, spec)
             spec = _pin_preflight_checkpoint_generation(spec, plan)
 
+        job = None
         try:
             # The raw request fingerprint is carried into the very first
             # atomic prepared journal, before registration, account claims, or
@@ -2361,11 +2787,25 @@ async def _submit_job_payload(
             job.request_fingerprint = fingerprint
             if deterministic_id:
                 job.job_id = deterministic_id
+            if before_submit is not None:
+                await before_submit(job, recovered_prepared)
             await mgr.batch.submit_prepared(job)
+        except HTTPException:
+            if job is not None and on_submit_error is not None:
+                await on_submit_error(job)
+            raise
         except JobSpecPersistenceError as exc:
+            if job is not None and on_submit_error is not None:
+                await on_submit_error(job)
             raise HTTPException(500, str(exc)) from exc
         except NotImplementedError as exc:
+            if job is not None and on_submit_error is not None:
+                await on_submit_error(job)
             raise HTTPException(503, str(exc)) from exc
+        except BaseException:
+            if job is not None and on_submit_error is not None:
+                await on_submit_error(job)
+            raise
         detail = _job_detail(job)
         if recovered_prepared:
             detail["idempotent_replay"] = True

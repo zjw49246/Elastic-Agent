@@ -230,6 +230,36 @@ resolved immediately before dispatch and is never returned by the Job API.
 Cross-host secret delivery requires `ELASTIC_AGENT_MANAGER_URL=wss://...`;
 plaintext WebSocket delivery is rejected before Secrets Manager/SSM is read.
 
+### Trusted Run-Benchmark dynamic execution
+
+Run-Benchmark API-key trajectories use a narrower server-owned constructor:
+
+```text
+POST /api/jobs/run-benchmark
+```
+
+The caller supplies an exact Run-Benchmark commit/release identity, sealed S3
+input identity, public harness route, wall-time, and one `RBWORK01` credential
+frame. `Idempotency-Key` is mandatory. The Manager fixes the repository,
+`manager_rsync` delivery, `ubuntu-agent-docker-v2` environment, single Worker,
+setup/run commands, `account.mode=none`, S3 namespace, and final collect path;
+the ordinary `/api/jobs` and `/api/jobs/plan` routes reject the reserved
+`run.stdin_protocol` value.
+
+The frame is never stored in JobSpec or its request fingerprint. It is adopted
+by a bounded process-local `bytearray` lease, consumed once only after the exact
+task process starts, sent over the required WSS transport, decoded at the task
+supervisor, written as binary stdin, and immediately closed for EOF. Buffers are
+overwritten after send and on discard, expiry, failure, or Manager shutdown.
+A Manager restart deliberately loses an unconsumed lease; a durable `prepared`
+Job cannot be resumed with an old credential and requires a new attempt.
+
+The shared bucket must expose only
+`jobs/datasets/run-benchmark/v1/sha256/<digest>/` to the Worker instance role.
+Workers read sealed inputs with IAM credentials and write only their normal
+per-Job result prefix. Provider keys never enter S3, cloud-init, checkpoint,
+environment variables, command arguments, disk, or logs.
+
 `setup.repo` must be a remote HTTP(S), SSH/Git, or scp-style Git URL and may not
 contain embedded HTTP credentials, query parameters, or fragments. Use
 `worker_clone` only for a repository the Worker can clone without a Manager
