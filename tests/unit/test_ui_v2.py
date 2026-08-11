@@ -79,6 +79,21 @@ class TestStaticShell:
         assert css.headers["content-type"].startswith("text/css")
 
     @pytest.mark.asyncio
+    async def test_deep_route_shell_uses_ui_v2_rooted_assets(self, ui_client):
+        client, _ = ui_client
+        shell = await client.get("/ui-v2/jobs/batch")
+        assert shell.status_code == 200
+        assert 'href="/ui-v2/assets/app.css"' in shell.text
+        assert 'src="/ui-v2/js/app.js"' in shell.text
+
+        css = await client.get("/ui-v2/assets/app.css")
+        js = await client.get("/ui-v2/js/app.js")
+        assert css.status_code == 200
+        assert css.headers["content-type"].startswith("text/css")
+        assert js.status_code == 200
+        assert js.headers["content-type"].startswith("text/javascript")
+
+    @pytest.mark.asyncio
     async def test_path_traversal_is_rejected(self, ui_client):
         client, _ = ui_client
         for path in (
