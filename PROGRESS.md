@@ -1,5 +1,17 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Runtime Elastic fleet policy（commit `d59fa2a`）
+
+**问题**：未来 EC2 的默认 instance type、根盘大小和最大实例数只能通过静态 Manager 配置调整；
+Run-Benchmark 管理员无法热更新，恢复检查还把默认根盘硬编码为 40 GiB。
+
+**解决**：新增 owner-only、原子持久的 runtime fleet policy 及认证 GET/PUT API。scale-out 和恢复预算
+统一读取当前策略；最大实例数同时统计 controller-owned 节点、lease placeholder 与创建中实例，降低上限
+不会中断 active Job，更新只影响后续创建。旧 embedded caller 仍只能在进程内进一步收紧上限。
+
+**验证**：完整套件 **2956 passed / 12 skipped / 0 failed**；相关 Python Ruff 与
+`git diff --check` 通过。
+
 ## 2026-08-11 Run-Benchmark sub-minute wall time (commits `4eb2dfa`, downstream `2b53dc7`)
 
 **问题**：Run-Benchmark instance 合法接受 30 秒等正整数预算，但 Manager envelope 和动态 Worker 都把
