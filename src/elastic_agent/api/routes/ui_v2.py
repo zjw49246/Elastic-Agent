@@ -33,6 +33,8 @@ from elastic_agent.api.auth import get_session_principal, require_api_key
 router = APIRouter(tags=["ui-v2"])
 
 UI_V2_ROOT = Path(__file__).resolve().parent.parent / "ui_v2"
+UI_V2_ASSET_REVISION = "admin-session-v1"
+_REVISIONED_ASSET_PREFIX = f"rev/{UI_V2_ASSET_REVISION}/"
 
 # Only these static types exist in the bundle; anything else 404s.
 _ALLOWED_SUFFIXES = {
@@ -63,6 +65,13 @@ _ASSET_HEADERS = {
     # the CDN build (scripts/build_ui_v2.py) rewrites to hashed names with
     # long-lived caching instead.
     "Cache-Control": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+}
+
+_REVISIONED_ASSET_HEADERS = {
+    # The revision is changed whenever deployed UI source changes, so every
+    # module in the relative-import graph may be cached under this namespace.
+    "Cache-Control": "public, max-age=31536000, immutable",
     "X-Content-Type-Options": "nosniff",
 }
 
@@ -114,7 +123,25 @@ async def ui_v2_assets(rest: str, request: Request):
     The fallback only exists under ``/ui-v2/*`` — ``/api/*`` and ``/ws/*`` are
     mounted before this router and are never claimed by the SPA.
     """
-    # Explicit asset paths (with an allowed suffix) are served as files.
+    # A revisioned namespace changes the URL of the entry point and every
+    # relative ES-module import together.  This bypasses stale browser/CDN
+    # copies even when an edge policy overrides the origin's no-cache header.
+    if rest.startswith("rev/"):
+        if not rest.startswith(_REVISIONED_ASSET_PREFIX):
+            raise HTTPException(404, "Unknown UI asset revision")
+        revisioned_path = rest.removeprefix(_REVISIONED_ASSET_PREFIX)
+        if "." not in revisioned_path.rsplit("/", 1)[-1]:
+            raise HTTPException(404, "Not found")
+        asset = _resolve_asset(revisioned_path)
+        media_type = _ALLOWED_SUFFIXES[asset.suffix]
+        return FileResponse(
+            asset,
+            media_type=media_type,
+            headers=_REVISIONED_ASSET_HEADERS,
+        )
+
+    # Explicit unversioned asset paths remain available for local tooling and
+    # old open tabs, but the current shell no longer references them.
     if "." in rest.rsplit("/", 1)[-1]:
         asset = _resolve_asset(rest)
         media_type = _ALLOWED_SUFFIXES[asset.suffix]

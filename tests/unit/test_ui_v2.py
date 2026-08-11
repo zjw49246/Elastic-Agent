@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from elastic_agent.api.routes.ui_v2 import UI_V2_ROOT, reset_summary_cache
+from elastic_agent.api.routes.ui_v2 import (
+    UI_V2_ASSET_REVISION,
+    UI_V2_ROOT,
+    reset_summary_cache,
+)
 from elastic_agent.testing import create_test_manager
 
 pytestmark = pytest.mark.level0
@@ -98,15 +102,24 @@ class TestStaticShell:
         client, _ = ui_client
         shell = await client.get("/ui-v2/jobs/batch")
         assert shell.status_code == 200
-        assert 'href="/ui-v2/assets/app.css"' in shell.text
-        assert 'src="/ui-v2/js/app.js"' in shell.text
+        prefix = f"/ui-v2/rev/{UI_V2_ASSET_REVISION}"
+        assert f'href="{prefix}/assets/app.css"' in shell.text
+        assert f'src="{prefix}/js/app.js"' in shell.text
 
-        css = await client.get("/ui-v2/assets/app.css")
-        js = await client.get("/ui-v2/js/app.js")
+        css = await client.get(f"{prefix}/assets/app.css")
+        js = await client.get(f"{prefix}/js/app.js")
         assert css.status_code == 200
         assert css.headers["content-type"].startswith("text/css")
         assert js.status_code == 200
         assert js.headers["content-type"].startswith("text/javascript")
+        assert "immutable" in js.headers["cache-control"]
+        assert "initAuth, hasSession" in js.text
+        assert "promptForKey" not in js.text
+
+        stale_revision = await client.get(
+            "/ui-v2/rev/older-api-key-ui/js/app.js"
+        )
+        assert stale_revision.status_code == 404
 
     @pytest.mark.asyncio
     async def test_path_traversal_is_rejected(self, ui_client):
