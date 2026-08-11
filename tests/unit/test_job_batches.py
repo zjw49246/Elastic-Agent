@@ -27,7 +27,11 @@ from elastic_agent.core.batch_orchestrator import (
     WorkerRun,
 )
 from elastic_agent.core.config import ElasticAgentConfig
-from elastic_agent.core.job_batch import JobBatchLimits, JobBatchManifest
+from elastic_agent.core.job_batch import (
+    JobBatchLimits,
+    JobBatchManifest,
+    JobBatchQueue,
+)
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
 from elastic_agent.core.providers.base import (
     CloudProvider,
@@ -784,6 +788,71 @@ class TestJobBatchSubmissionAndQueue:
 
 
 class TestJobBatchDurability:
+    def test_terminal_future_jobspec_journal_is_read_only_compatible(self):
+        manifest = JobBatchManifest.model_validate(
+            _manifest(_spec("future-terminal"), batch_id="future-terminal")
+        )
+        raw_manifest = manifest.model_dump(mode="json")
+        raw_spec = raw_manifest["jobs"][0]["spec"]
+        raw_spec["environment"]["profile"] = "future-profile-v1"
+        raw_spec["account"]["auth_kind"] = "agent_api"
+        raw_spec["account"]["exclude_ids"] = []
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                raw_manifest,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        journal = {
+            "journal_schema_version": 1,
+            "job_batch_id": "batch-" + "a" * 32,
+            "batch_id": "future-terminal",
+            "manifest_fingerprint": fingerprint,
+            "manifest": raw_manifest,
+            "policy": manifest.policy.model_dump(mode="json"),
+            "state": "terminal",
+            "created_at": "2026-08-11T00:00:00+00:00",
+            "updated_at": "2026-08-11T00:01:00+00:00",
+            "plan_summary": {},
+            "items": [
+                {
+                    "client_id": "client-001",
+                    "name": "future-terminal",
+                    "state": "terminal",
+                    "job_id": "job-" + "b" * 32,
+                    "job_state": "succeeded",
+                    "error": None,
+                    "accepted_at": "2026-08-11T00:00:10+00:00",
+                    "completed_at": "2026-08-11T00:01:00+00:00",
+                }
+            ],
+        }
+
+        JobBatchQueue._validate_journal(
+            journal,
+            expected_id=journal["job_batch_id"],
+            allow_terminal_compat=True,
+        )
+
+        nonterminal = copy.deepcopy(journal)
+        nonterminal["state"] = "running"
+        nonterminal["items"][0].update(
+            state="queued",
+            job_id=None,
+            job_state=None,
+            accepted_at=None,
+            completed_at=None,
+        )
+        with pytest.raises(ValueError):
+            JobBatchQueue._validate_journal(
+                nonterminal,
+                expected_id=nonterminal["job_batch_id"],
+                allow_terminal_compat=True,
+            )
+
     @pytest.mark.asyncio
     async def test_queued_item_resumes_after_restart_when_capacity_is_released(self, tmp_path: Path):
         from elastic_agent.core.job_spec_store import update_job_state

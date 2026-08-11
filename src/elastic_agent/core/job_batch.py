@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import load_job_spec_journal
@@ -233,14 +233,86 @@ class JobBatchLimits:
 def manifest_fingerprint(manifest: JobBatchManifest) -> str:
     """Hash the complete normalized private manifest for idempotency."""
 
+    return _raw_manifest_fingerprint(manifest.model_dump(mode="json"))
+
+
+def _raw_manifest_fingerprint(manifest: object) -> str:
     canonical = json.dumps(
-        manifest.model_dump(mode="json"),
+        manifest,
         ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _terminal_manifest_identities(
+    payload: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Validate an immutable terminal manifest without parsing its JobSpec.
+
+    A terminal batch can outlive the JobSpec revision that created it.  Its
+    Jobs will never be dispatched again, so startup only needs the signed-by-
+    hash envelope and item identities used by the public history view.  Active
+    batches remain bound to the current strict JobSpec model.
+    """
+
+    if payload.get("state") != "terminal":
+        raise ValueError("Job batch compatibility is terminal-only")
+    raw_manifest = payload.get("manifest")
+    if not isinstance(raw_manifest, dict) or set(raw_manifest) != {
+        "schema_version",
+        "batch_id",
+        "policy",
+        "jobs",
+    }:
+        raise ValueError("terminal Job batch manifest has invalid fields")
+    batch_id = raw_manifest.get("batch_id")
+    if (
+        raw_manifest.get("schema_version") != JOB_BATCH_SCHEMA_VERSION
+        or not isinstance(batch_id, str)
+        or _SAFE_PUBLIC_ID.fullmatch(batch_id) is None
+        or batch_id != payload.get("batch_id")
+    ):
+        raise ValueError("terminal Job batch manifest identity is invalid")
+    policy = JobBatchPolicy.model_validate(raw_manifest.get("policy"))
+    normalized_policy = policy.model_dump(mode="json")
+    if (
+        raw_manifest.get("policy") != normalized_policy
+        or payload.get("policy") != normalized_policy
+    ):
+        raise ValueError("terminal Job batch manifest policy differs")
+    jobs = raw_manifest.get("jobs")
+    if (
+        not isinstance(jobs, list)
+        or not jobs
+        or len(jobs) > JOB_BATCH_ABSOLUTE_MAX_ITEMS
+    ):
+        raise ValueError("terminal Job batch manifest items are invalid")
+
+    identities: list[tuple[str, str]] = []
+    seen_client_ids: set[str] = set()
+    for item in jobs:
+        if not isinstance(item, dict) or set(item) != {"client_id", "spec"}:
+            raise ValueError("terminal Job batch manifest item fields are invalid")
+        client_id = item.get("client_id")
+        spec = item.get("spec")
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if (
+            not isinstance(client_id, str)
+            or _SAFE_PUBLIC_ID.fullmatch(client_id) is None
+            or client_id in seen_client_ids
+            or not isinstance(name, str)
+        ):
+            raise ValueError("terminal Job batch manifest item identity is invalid")
+        seen_client_ids.add(client_id)
+        identities.append((client_id, name))
+
+    fingerprint = _raw_manifest_fingerprint(raw_manifest)
+    if not hmac.compare_digest(fingerprint, payload["manifest_fingerprint"]):
+        raise ValueError("terminal Job batch manifest fingerprint differs")
+    return identities
 
 
 def aggregate_manifest(manifest: JobBatchManifest) -> dict[str, Any]:
@@ -908,7 +980,11 @@ class JobBatchQueue:
                 raise RuntimeError(f"Job batch journal is too large: {path.name}")
             with path.open("r", encoding="utf-8") as stream:
                 payload = json.load(stream)
-            self._validate_journal(payload, expected_id=path.stem)
+            self._validate_journal(
+                payload,
+                expected_id=path.stem,
+                allow_terminal_compat=True,
+            )
             journals[payload["job_batch_id"]] = payload
         return journals
 
@@ -929,7 +1005,12 @@ class JobBatchQueue:
         )
 
     @staticmethod
-    def _validate_journal(payload: Any, *, expected_id: str) -> None:
+    def _validate_journal(
+        payload: Any,
+        *,
+        expected_id: str,
+        allow_terminal_compat: bool = False,
+    ) -> None:
         if not isinstance(payload, dict):
             raise ValueError("Job batch journal must be an object")
         required = {
@@ -959,17 +1040,30 @@ class JobBatchQueue:
             or _FINGERPRINT.fullmatch(payload["manifest_fingerprint"]) is None
         ):
             raise ValueError("Job batch journal identity/state is invalid")
-        manifest = JobBatchManifest.model_validate(payload.get("manifest"))
-        if manifest.batch_id != payload.get("batch_id"):
-            raise ValueError("Job batch journal manifest identity differs")
-        if manifest_fingerprint(manifest) != payload["manifest_fingerprint"]:
-            raise ValueError("Job batch journal manifest fingerprint differs")
-        if payload.get("policy") != manifest.policy.model_dump(mode="json"):
-            raise ValueError("Job batch journal policy differs")
+        try:
+            manifest = JobBatchManifest.model_validate(payload.get("manifest"))
+        except ValidationError:
+            if not allow_terminal_compat:
+                raise
+            requested_identities = _terminal_manifest_identities(payload)
+            manifest = None
+        else:
+            if manifest.batch_id != payload.get("batch_id"):
+                raise ValueError("Job batch journal manifest identity differs")
+            if manifest_fingerprint(manifest) != payload["manifest_fingerprint"]:
+                raise ValueError("Job batch journal manifest fingerprint differs")
+            if payload.get("policy") != manifest.policy.model_dump(mode="json"):
+                raise ValueError("Job batch journal policy differs")
+            requested_identities = [
+                (item.client_id, item.spec.name) for item in manifest.jobs
+            ]
         items = payload.get("items")
-        if not isinstance(items, list) or len(items) != len(manifest.jobs):
+        if (
+            not isinstance(items, list)
+            or len(items) != len(requested_identities)
+        ):
             raise ValueError("Job batch journal items are invalid")
-        for stored, requested in zip(items, manifest.jobs, strict=True):
+        for stored, requested in zip(items, requested_identities, strict=True):
             if not isinstance(stored, dict) or set(stored) != {
                 "client_id",
                 "name",
@@ -982,11 +1076,13 @@ class JobBatchQueue:
             }:
                 raise ValueError("Job batch journal item fields are invalid")
             if (
-                stored.get("client_id") != requested.client_id
-                or stored.get("name") != requested.spec.name
+                stored.get("client_id") != requested[0]
+                or stored.get("name") != requested[1]
                 or stored.get("state") not in _ITEM_STATES
             ):
                 raise ValueError("Job batch journal item identity/state is invalid")
+            if manifest is None and stored["state"] not in {"terminal", "error"}:
+                raise ValueError("compatible Job batch item is not terminal")
             job_id = stored.get("job_id")
             if job_id is not None and (
                 not isinstance(job_id, str)
