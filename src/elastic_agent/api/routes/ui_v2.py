@@ -33,7 +33,7 @@ from elastic_agent.api.auth import get_session_principal, require_api_key
 router = APIRouter(tags=["ui-v2"])
 
 UI_V2_ROOT = Path(__file__).resolve().parent.parent / "ui_v2"
-UI_V2_ASSET_REVISION = "admin-session-v3"
+UI_V2_ASSET_REVISION = "admin-session-v4"
 _REVISIONED_ASSET_PREFIX = f"rev/{UI_V2_ASSET_REVISION}/"
 
 # Only these static types exist in the bundle; anything else 404s.

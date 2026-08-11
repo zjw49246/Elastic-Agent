@@ -170,15 +170,90 @@ export function parseBatchSource(source) {
   return manifest;
 }
 
-export async function batchIdempotencyKey(batchId) {
-  if (!globalThis.crypto || !globalThis.crypto.subtle) {
-    throw new Error('当前环境不支持安全 SHA-256，无法生成稳定幂等键。');
+const PENDING_BATCH_INTENT_KEY = 'ea_pending_job_batch_v2';
+const BATCH_SUBMISSION_KEY = /^batch-json-v2-[0-9a-f]{64}$/;
+
+async function sha256Hex(value, cryptoApi) {
+  if (!cryptoApi || !cryptoApi.subtle) {
+    throw new Error('当前环境不支持安全 SHA-256，无法保护提交重试。');
   }
-  const bytes = new TextEncoder().encode(`batch-json-v1\n${String(batchId)}`);
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  const bytes = new TextEncoder().encode(String(value));
+  const digest = await cryptoApi.subtle.digest('SHA-256', bytes);
   const hex = Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, '0')).join('');
-  return `batch-json-v1-${hex}`;
+  return hex;
+}
+
+function newSubmissionKey(cryptoApi) {
+  if (!cryptoApi || typeof cryptoApi.getRandomValues !== 'function') {
+    throw new Error('当前环境不支持安全随机数，无法创建批次运行身份。');
+  }
+  const bytes = new Uint8Array(32);
+  cryptoApi.getRandomValues(bytes);
+  const hex = Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `batch-json-v2-${hex}`;
+}
+
+function defaultStorage() {
+  try { return globalThis.sessionStorage || null; } catch (_) { return null; }
+}
+
+/**
+ * Claim one execution identity for this exact source.
+ *
+ * The identity is random for every intentional run, while the pending record
+ * lets a reload after an uncertain response safely retry the same request.
+ * Only a source digest and the non-secret idempotency key are persisted.
+ */
+export async function claimBatchSubmissionIntent(source, {
+  cryptoApi = globalThis.crypto,
+  storage = defaultStorage(),
+} = {}) {
+  const sourceFingerprint = await sha256Hex(source, cryptoApi);
+  if (storage) {
+    try {
+      const existing = JSON.parse(storage.getItem(PENDING_BATCH_INTENT_KEY) || 'null');
+      if (
+        existing
+        && existing.source_fingerprint === sourceFingerprint
+        && BATCH_SUBMISSION_KEY.test(String(existing.idempotency_key || ''))
+      ) {
+        return {
+          idempotencyKey: existing.idempotency_key,
+          sourceFingerprint,
+          recovered: true,
+        };
+      }
+    } catch (_) { /* malformed or unavailable storage starts a fresh intent */ }
+  }
+
+  const idempotencyKey = newSubmissionKey(cryptoApi);
+  if (storage) {
+    try {
+      storage.setItem(PENDING_BATCH_INTENT_KEY, JSON.stringify({
+        source_fingerprint: sourceFingerprint,
+        idempotency_key: idempotencyKey,
+      }));
+    } catch (_) { /* in-memory retry protection still applies */ }
+  }
+  return { idempotencyKey, sourceFingerprint, recovered: false };
+}
+
+export function clearBatchSubmissionIntent(intent, {
+  storage = defaultStorage(),
+} = {}) {
+  if (!storage || !intent) return;
+  try {
+    const existing = JSON.parse(storage.getItem(PENDING_BATCH_INTENT_KEY) || 'null');
+    if (
+      existing
+      && existing.source_fingerprint === intent.sourceFingerprint
+      && existing.idempotency_key === intent.idempotencyKey
+    ) {
+      storage.removeItem(PENDING_BATCH_INTENT_KEY);
+    }
+  } catch (_) { /* best effort after a definitive response */ }
 }
 
 export function batchReceiptIsTerminal(receipt) {

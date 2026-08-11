@@ -266,12 +266,14 @@ class TestFrontendSourceInvariants:
             UI_V2_ROOT / "js" / "pages" / "job-new.js"
         ).read_text(encoding="utf-8")
 
-    def test_job_batch_uses_raw_stable_intent_and_status_polling(self):
+    def test_job_batch_uses_per_run_recoverable_intent_and_status_polling(self):
         page = (UI_V2_ROOT / "js" / "pages" / "job-batch.js").read_text(encoding="utf-8")
         core = (UI_V2_ROOT / "js" / "core" / "job-batch.js").read_text(encoding="utf-8")
         assert "postJsonText('/job-batches/plan', source" in page
         assert "postJsonText('/job-batches', intent.source" in page
-        assert "batchIdempotencyKey(manifest.batch_id)" in page
+        assert "claimBatchSubmissionIntent(intent.source)" in page
+        assert "clearBatchSubmissionIntent(intent.submissionIntent)" in page
+        assert "batch-json-v2-" in core
         assert "job_batch_id" in page
         assert "get(`/job-batches/${" in page
         assert "receiptPoller.stop()" in page

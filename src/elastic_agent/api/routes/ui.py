@@ -1327,7 +1327,8 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
       严格格式：<code>schema_version: 1</code>、<code>batch_id</code>、可选
       <code>policy</code>，以及 <code>jobs: [{client_id, spec}]</code>。v1 policy 只支持
       <code>max_active_jobs</code>（1–10）和 <code>on_job_failure: "continue"</code>。
-      <code>batch_id</code> 同时是幂等身份；修改内容后必须换一个新 batch_id。
+      <code>batch_id</code> 是显示标识，<code>client_id</code> 只需在单个批次内唯一；
+      每次明确提交会创建新的运行身份，网络中断重试才复用同一个幂等键。
     </div>
     <div class="batch-file-meta muted" id="batchJsonFileMeta" role="status"
          aria-live="polite">尚未选择文件。</div>
@@ -1987,9 +1988,48 @@ async function sha256Hex(buffer) {
     .map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function batchIdempotencyKey(batchId) {
-  const bytes = new TextEncoder().encode('batch-json-v1\\n' + String(batchId));
-  return 'batch-json-v1-' + await sha256Hex(bytes);
+const BATCH_PENDING_INTENT_STORAGE_KEY = 'ea_pending_job_batch_v2';
+
+function newBatchIdempotencyKey() {
+  if (!window.crypto?.getRandomValues) {
+    throw new Error('当前浏览器不支持安全随机数，无法创建批次运行身份。');
+  }
+  const bytes = new Uint8Array(32);
+  window.crypto.getRandomValues(bytes);
+  return 'batch-json-v2-' + Array.from(bytes)
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function batchIdempotencyKey(fileHash) {
+  try {
+    const pending = JSON.parse(
+      sessionStorage.getItem(BATCH_PENDING_INTENT_STORAGE_KEY) || 'null'
+    );
+    if (pending?.file_hash === fileHash
+        && /^batch-json-v2-[0-9a-f]{64}$/.test(String(pending.idempotency_key || ''))) {
+      return pending.idempotency_key;
+    }
+  } catch (_) { /* malformed or unavailable storage starts a fresh intent */ }
+  const key = newBatchIdempotencyKey();
+  try {
+    sessionStorage.setItem(BATCH_PENDING_INTENT_STORAGE_KEY, JSON.stringify({
+      file_hash: fileHash,
+      idempotency_key: key,
+    }));
+  } catch (_) { /* in-memory retry protection still applies */ }
+  return key;
+}
+
+function clearBatchIdempotencyKey(fileHash, idempotencyKey) {
+  try {
+    const pending = JSON.parse(
+      sessionStorage.getItem(BATCH_PENDING_INTENT_STORAGE_KEY) || 'null'
+    );
+    if (pending?.file_hash === fileHash
+        && pending?.idempotency_key === idempotencyKey) {
+      sessionStorage.removeItem(BATCH_PENDING_INTENT_STORAGE_KEY);
+    }
+  } catch (_) { /* best effort after a definitive response */ }
 }
 
 function clearBatchPlan() {
@@ -2299,7 +2339,7 @@ async function planBatchJson() {
     const plan = await batchJsonApi('POST', '/job-batches/plan', source, {}, true);
     if (generation !== batchJsonState.generation) return;
     batchJsonState.plan = plan;
-    batchJsonState.idempotencyKey = await batchIdempotencyKey(manifest.batch_id);
+    batchJsonState.idempotencyKey = await batchIdempotencyKey(fileHash);
     renderBatchPlan(validation, plan);
   } catch (error) {
     if (generation === batchJsonState.generation) {
@@ -2441,6 +2481,7 @@ async function submitBatchJson() {
     }, true);
     const jobBatchId = String(receipt?.job_batch_id || '');
     if (!jobBatchId) throw new Error('服务器回执缺少 job_batch_id，未改变本页幂等键，可安全重试。');
+    clearBatchIdempotencyKey(batchJsonState.fileHash, idempotencyKey);
     if (generation !== batchJsonState.generation
         || rawSource !== batchJsonState.rawSource) {
       toast('先前选择的批次已接收：' + jobBatchId, 'warning');
@@ -2460,7 +2501,7 @@ async function submitBatchJson() {
     if (generation !== batchJsonState.generation
         || rawSource !== batchJsonState.rawSource) return;
     const message = Number(error.status) === 409
-      ? '同一 batch_id 已经绑定到另一份 manifest。未创建重复批次；若这是新批次，请修改 batch_id 后重新预检。'
+      ? '本次待恢复提交的幂等键与另一份 manifest 冲突；请重新选择文件并预检。'
       : error.message || '批次提交失败；原幂等键仍保留，可安全重试。';
     setBatchAlert(message, 'error');
   } finally {

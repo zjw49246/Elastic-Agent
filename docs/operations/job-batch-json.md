@@ -127,9 +127,14 @@ manifest 只保存在当前页面内存中，不写入 `localStorage` 或 `sessi
 
 ## 幂等与状态
 
-Console 用 `batch_id` 派生稳定的 `Idempotency-Key`。网络超时后，用原文件重试不会重复创建 Job；同一 `batch_id` 改了内容会收到 `409`，要启动新的逻辑批次必须显式更换 `batch_id`。
+Console 为每次管理员明确提交生成新的随机 `Idempotency-Key`，所以相同的
+`batch_id` 和 `client_id` 可以重复运行。一次提交在收到确定回执前会把源文件摘要和
+幂等键保存在当前标签页的 `sessionStorage`；网络超时或页面重载后用原文件重试，
+仍会恢复该键而不会重复创建 Job。收到确定的成功回执后记录会删除，下一次预检并
+提交同一份 JSON 会创建一组新 Job。
 
-直接调用 API 时，调用方必须自行保存并复用同一个 `Idempotency-Key`：
+直接调用 API 时，调用方必须为每次新运行生成新 `Idempotency-Key`，并只在该次
+请求结果不确定时保存、复用原键：
 
 ```bash
 curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches/plan" \

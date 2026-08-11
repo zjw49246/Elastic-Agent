@@ -686,6 +686,34 @@ class TestJobBatchSubmissionAndQueue:
         assert len(set(batch.started)) == len(batch.started)
 
     @pytest.mark.asyncio
+    async def test_same_batch_and_client_ids_can_start_a_distinct_run(
+        self,
+        batch_client,
+    ):
+        client, _, _ = batch_client
+        manifest = _manifest(_spec("repeatable"), batch_id="repeatable-batch")
+
+        first = await client.post(
+            "/api/job-batches",
+            json=manifest,
+            headers={"Idempotency-Key": "repeatable-run-one"},
+        )
+        second = await client.post(
+            "/api/job-batches",
+            json=manifest,
+            headers={"Idempotency-Key": "repeatable-run-two"},
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["batch_id"] == second.json()["batch_id"]
+        assert first.json()["items"][0]["client_id"] == (
+            second.json()["items"][0]["client_id"]
+        )
+        assert first.json()["job_batch_id"] != second.json()["job_batch_id"]
+        assert second.json().get("idempotent_replay") is not True
+
+    @pytest.mark.asyncio
     async def test_detail_and_list_never_echo_job_secrets(self, batch_client):
         client, _, batch = batch_client
         marker = "batch-secret-which-must-never-echo"
