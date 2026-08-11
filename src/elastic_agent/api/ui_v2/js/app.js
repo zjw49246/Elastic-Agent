@@ -29,6 +29,7 @@ const ROUTES = [
   { name: 'accounts', pattern: '/accounts', load: () => import('./pages/accounts.js') },
   { name: 'account-new', pattern: '/accounts/new', load: () => import('./pages/account-new.js') },
   { name: 'job-new', pattern: '/jobs/new', load: () => import('./pages/job-new.js') },
+  { name: 'job-batch', pattern: '/jobs/batch', load: () => import('./pages/job-batch.js') },
   { name: 'jobs', pattern: '/jobs', load: () => import('./pages/jobs.js') },
   { name: 'job-detail', pattern: '/jobs/:jobId', load: () => import('./pages/job-detail.js') },
   { name: 'results', pattern: '/results', load: () => import('./pages/results.js') },

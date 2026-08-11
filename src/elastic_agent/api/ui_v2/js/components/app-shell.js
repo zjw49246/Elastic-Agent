@@ -9,6 +9,7 @@ export const NAV_ITEMS = [
   { name: 'overview', path: '/overview', label: '总览' },
   { name: 'accounts', path: '/accounts', label: '账号' },
   { name: 'job-new', path: '/jobs/new', label: '＋ 提交 Job', primary: true },
+  { name: 'job-batch', path: '/jobs/batch', label: '批量提交' },
   { name: 'jobs', path: '/jobs', label: 'Jobs', count: 'jobs' },
   { name: 'results', path: '/results', label: '结果' },
   { name: 'fleet', path: '/fleet', label: 'Workers', count: 'workers' },
