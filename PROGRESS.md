@@ -818,3 +818,18 @@ sandbox profile 映射到当前 Docker profile 做完整结构校验，账号类
 **验证**：完整 Python 套件 **2945 passed / 12 skipped / 0 failed**；API/JobBatch/UI
 定向回归 **244 passed**，新增成功、非法值、秘密脱敏和重提拒绝测试均通过；Ruff 与
 `git diff --check` 通过。
+
+## 2026-08-11 UI v2 管理员账号登录合并（commit `7f1a97f`）
+
+**分支边界**：从 `main` 的 `4a147e7` 新建 `feat/admin-account-auth-v2`，只移植管理员
+账号认证的三个提交并适配当前 UI v2；没有合并或改写 `main`，暂不创建 PR。
+
+**解决**：浏览器控制台改用 Argon2 管理员账号、Secure/HttpOnly/SameSite Session Cookie、
+内存 CSRF token 和同源校验；匿名或首次改密访问 UI v2 深层路由时，服务端 303 到登录或改密
+页面并保留安全的 `next`。UI v2 删除管理 API Key 输入、sessionStorage 持久化和 Authorization
+header，导航显示当前管理员并提供退出登录。服务端 Bearer API Key 继续只服务自动化调用，
+没有删除既有接口兼容性；AWS 启动前会验证管理员用户和 public origin 配置。
+
+**验证**：完整 Python 套件 **3036 passed / 12 skipped / 0 failed**；UI v2 Node 测试
+**26 passed**；管理员认证、UI v2、JobBatch、AWS 启动等定向测试 **448 passed**，相关 Python
+文件 Ruff、UI 构建/import 与 `git diff --check` 均通过。
