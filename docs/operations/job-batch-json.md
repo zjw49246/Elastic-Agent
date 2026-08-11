@@ -145,9 +145,12 @@ curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches/plan" \
 curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches" \
   -H "Authorization: Bearer $ELASTIC_AGENT_API_KEY" \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: ai4sci-codex-replay-20260801-a' \
+  -H "Idempotency-Key: $ELASTIC_AGENT_RUN_KEY" \
   --data-binary @job-batch.json
 ```
+
+其中 `ELASTIC_AGENT_RUN_KEY` 应在一次新运行开始时生成（例如 UUID），并持久保存到该次
+请求获得确定回执；不要把稳定的 `batch_id` 直接当作所有运行共用的 Key。
 
 状态含义：
 

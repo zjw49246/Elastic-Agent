@@ -898,12 +898,15 @@ status bar and the overview page.
 
 The v2 batch page accepts or uploads one strict schema-v1 JSON manifest. It
 sends the same raw UTF-8 bytes to `POST /api/job-batches/plan` and, after an
-explicit resource confirmation, to `POST /api/job-batches`. A stable
-Idempotency-Key derived from `batch_id` makes an uncertain network retry safe;
-the page then polls `GET /api/job-batches/{job_batch_id}` until every item is
-terminal or errored. The schema permits at most 100 Jobs, while the deployment
-default is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits
-are reported by preflight. Browser operators use the management administrator
+explicit resource confirmation, to `POST /api/job-batches`. Every intentional
+run gets a new random `Idempotency-Key`, so the same `batch_id` and `client_id`
+values may be run again. Until a definitive receipt arrives, the tab retains
+only the source digest and non-secret key in `sessionStorage`; retrying the
+same source after a network failure or reload safely reuses that key. The page
+then polls `GET /api/job-batches/{job_batch_id}` until every item is terminal
+or errored. The schema permits at most 100 Jobs, while the deployment default
+is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits are
+reported by preflight. Browser operators use the management administrator
 login; the opaque session stays in a Secure/HttpOnly cookie and the CSRF token
 is held only in page memory. Service API keys remain available for automation.
 
