@@ -187,8 +187,10 @@ whole-prefix `sync`. Destination parent paths are computed and quoted without
 shell word splitting, including spaces, globs, and single quotes.
 
 The AWS worker instance profile must grant `s3:GetObject` for the exact dataset
-prefix. The production policy limits that read grant to `jobs/datasets/*`;
-result objects remain unreadable and undeletable from workers.
+prefix. Recursive prefix inputs also require `s3:ListBucket`, conditioned to
+`jobs/datasets`, `jobs/datasets/`, and `jobs/datasets/*`. The production policy
+does not permit listing result prefixes; result objects remain unreadable and
+undeletable from workers.
 
 `environment.profile` selects a versioned common platform definition maintained
 by the framework. Jobs add only their repository, setup steps, datasets, run

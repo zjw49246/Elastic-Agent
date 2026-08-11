@@ -1,5 +1,15 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Worker dataset prefix listing
+
+**问题**：Worker role 虽允许 `GetObject` 读取 `jobs/datasets/*`，但递归
+`aws s3 sync` 会先调用 `ListObjectsV2`。真实动态 smoke 完成 EC2、bootstrap 和 WSS 后，在
+`prepare` 前按设计以 `AccessDenied` 失败关闭。
+
+**解决**：仅当 `s3:prefix` 是 `jobs/datasets`、`jobs/datasets/` 或
+`jobs/datasets/*` 时允许 `s3:ListBucket`；结果前缀仍不可列举，结果对象仍不可读取/删除。生产更新前
+用 IAM simulator 同时证明 dataset allow 与 result deny。
+
 ## 2026-08-11 Run-Benchmark S3 dataset/setup ordering
 
 **问题**：真实无模型 smoke 已通过 IAM、私网 SSH 和四步 host bootstrap，但 Manager 的固定顺序是
