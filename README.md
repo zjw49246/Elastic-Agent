@@ -259,6 +259,13 @@ overwritten after send and on discard, expiry, failure, or Manager shutdown.
 A Manager restart deliberately loses an unconsumed lease; a durable `prepared`
 Job cannot be resumed with an old credential and requires a new attempt.
 
+Manager provisioning orders repository setup before S3 dataset sync. The
+constructor therefore installs the exact package during setup, then runs the
+fixed `elastic_worker prepare && elastic_worker execute` chain after S3 sync.
+The credential frame can wait only in that trusted process's stdin pipe:
+`prepare` never reads stdin, and `execute` is the first reader after the input
+seal, release, instance, image, and wall-time bindings have all passed.
+
 The shared bucket must expose only
 `jobs/datasets/run-benchmark/v1/sha256/<digest>/` to the Worker instance role.
 Workers read sealed inputs with IAM credentials and write only their normal

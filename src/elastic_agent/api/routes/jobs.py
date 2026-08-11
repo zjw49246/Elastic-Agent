@@ -1743,7 +1743,6 @@ def _run_benchmark_job_spec(
         "python3 -m venv .elastic-runtime-venv",
         ".elastic-runtime-venv/bin/python -m pip install "
         "--disable-pip-version-check .",
-        shlex.join(prepare_args),
     ))
     exact_source = f"{runtime_root}/releases/{request.worker_release_digest}/src"
     execute_args = [
@@ -1753,6 +1752,13 @@ def _run_benchmark_job_spec(
         "--wall-time-seconds", str(request.wall_time_seconds),
     ]
     run_timeout = request.wall_time_seconds + 900
+    # Manager delivery order is code -> setup steps -> S3 datasets -> run.
+    # Keep dependency installation in setup, but perform the sealed input,
+    # release, and image attestation at the start of the trusted run process.
+    # The one-shot stdin frame may already be waiting in that process pipe;
+    # ``prepare`` never reads stdin and ``execute`` becomes the first reader
+    # only after every attestation succeeds.
+    run_command = f"{shlex.join(prepare_args)} && exec {shlex.join(execute_args)}"
     ttl_seconds = min(
         int(MAX_EPHEMERAL_STDIN_TTL_SECONDS),
         max(3600, request.wall_time_seconds + 10_800),
@@ -1778,10 +1784,10 @@ def _run_benchmark_job_spec(
             )}],
         },
         "run": {
-            "command": shlex.join(execute_args),
+            "command": run_command,
             "cwd": ".",
             "timeout": run_timeout,
-            "shell": False,
+            "shell": True,
             "stdin_protocol": "run_benchmark_v1",
             "env": {},
             "secret_env": {},

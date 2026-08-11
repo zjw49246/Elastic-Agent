@@ -1630,6 +1630,15 @@ class TestJobsAPI:
         assert job.spec.setup.resolved_commit == "a" * 40
         assert job.spec.setup.s3_datasets[0].uri == request["input_uri"]
         assert job.spec.run.stdin_protocol == "run_benchmark_v1"
+        assert job.spec.run.shell is True
+        assert "elastic_worker prepare" not in job.spec.setup.steps[0].command
+        assert "python3 -m venv .elastic-runtime-venv" in (
+            job.spec.setup.steps[0].command
+        )
+        prepare_position = job.spec.run.command.index("elastic_worker prepare")
+        execute_position = job.spec.run.command.index("elastic_worker execute")
+        assert prepare_position < execute_position
+        assert " && exec " in job.spec.run.command
         assert job.spec.run.secret_env == {}
         assert job.spec.account.mode == "none"
         assert job.spec.fanout.workers == 1

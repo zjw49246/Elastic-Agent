@@ -1,5 +1,15 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Run-Benchmark S3 dataset/setup ordering
+
+**问题**：真实无模型 smoke 已通过 IAM、私网 SSH 和四步 host bootstrap，但 Manager 的固定顺序是
+`code → setup → S3 dataset → run`，constructor 却在 setup step 执行 `elastic_worker prepare`，导致
+`_SEAL.json` 尚未下载就按设计失败并回收实例。
+
+**解决**：setup 只创建 venv 并安装 exact package；固定 run command 改为 `prepare && exec execute`。
+Manager 在进程启动后发送的一次性 frame 只在 trusted stdin pipe 等待，prepare 不读取 stdin，execute 在
+seal/release/instance/image/wall-time 全部证明后才首次读取。保留通用 dataset 顺序，避免影响其他 Job。
+
 ## 2026-08-11 Tokyo A dynamic Worker KeyPair binding
 
 **问题**：无模型 smoke 的首台 EC2 进入 running 后无法 SSH；Worker SG 的 Manager-SG 私网规则正确，但
