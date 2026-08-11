@@ -232,6 +232,14 @@ class TestFrontendSourceInvariants:
         assert 'type="module"' in html
         assert "onclick=" not in html
 
+    def test_layout_has_page_rhythm_and_responsive_chrome(self):
+        css = (UI_V2_ROOT / "assets" / "app.css").read_text(encoding="utf-8")
+        assert ".page-root > * + * { margin-top: 20px; }" in css
+        assert ".page-root > [role=\"status\"] > * + *" in css
+        assert ".icon-btn.nav-toggle { display: none; }" in css
+        assert ".app-status { display: none; }" in css
+        assert ".card { padding: 17px; }" in css
+
     def test_download_urls_never_carry_key(self):
         source = (UI_V2_ROOT / "js" / "core" / "downloads.js").read_text(encoding="utf-8")
         assert "api_key" not in source
