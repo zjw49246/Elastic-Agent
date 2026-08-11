@@ -845,3 +845,7 @@ header，导航显示当前管理员并提供退出登录。服务端 Bearer API
 现引用统一 revision namespace，入口及所有相对 ES module import 一次换代；旧打开页仍可读
 旧路径，当前页面不会再命中旧图。CDN 正式构建会先移除源站 revision，再生成原有内容哈希。
 管理员/UI 专项 **107 passed**、Node **26 passed**，并验证 26-module CDN 构建成功。
+
+**规范入口修复（commit `bb39f25`）**：根地址 `/` 现始终 303 到 `/ui-v2/`，不再因已有
+管理员 Session 而渲染旧 Batch Console；旧界面仅保留在显式 `/batch`、`/fleet` 回滚路径。
+管理员/UI 专项 **107 passed**、Node **26 passed**，Ruff 与 `git diff --check` 通过。
