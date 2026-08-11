@@ -1,5 +1,17 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Run-Benchmark dedicated input namespace（commit `03a880b`）
+
+**问题**：专用 `/api/jobs/run-benchmark` constructor 把 S3 input URI 固定在 Elastic-Agent 旧
+`jobs/datasets/run-benchmark/v1/sha256` namespace，阻止 Run-Benchmark 将全部数据迁入自身独立桶结构。
+
+**解决**：增加严格校验的 `RUN_BENCHMARK_S3_INPUT_PREFIX`，生产绑定
+`run-benchmark/v1/instances/sha256`；未配置部署才保留旧前缀兼容。Manager 继续要求 input bucket 与执行
+result bucket 精确一致，并拒绝 prefix escape 或不规范配置。
+
+**验证**：完整套件 **2956 passed / 12 skipped / 0 failed**；相关 Ruff、compileall 与
+`git diff --check` 通过。
+
 ## 2026-08-11 Runtime Elastic fleet policy（commit `d59fa2a`）
 
 **问题**：未来 EC2 的默认 instance type、根盘大小和最大实例数只能通过静态 Manager 配置调整；
