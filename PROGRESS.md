@@ -839,3 +839,9 @@ header，导航显示当前管理员并提供退出登录。服务端 Bearer API
 `/ui-v2/overview`，根地址的匿名登录流程也进入当前 UI v2；合法深层路由继续原样恢复，旧
 `/batch`、`/fleet` 回滚入口和所有业务模块不变。管理员/UI 专项 **107 passed**，Node
 **26 passed**，Ruff、UI import 和 `git diff --check` 通过。
+
+**静态资源换代修复（commit `5c8be80`）**：Cloudflare 的 4 小时 Browser Cache TTL 会忽略
+未哈希源文件的 `no-cache`，导致新 Session shell 仍加载旧 API Key `app.js`。Manager shell
+现引用统一 revision namespace，入口及所有相对 ES module import 一次换代；旧打开页仍可读
+旧路径，当前页面不会再命中旧图。CDN 正式构建会先移除源站 revision，再生成原有内容哈希。
+管理员/UI 专项 **107 passed**、Node **26 passed**，并验证 26-module CDN 构建成功。
