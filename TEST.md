@@ -377,8 +377,9 @@ The focused suite covers:
   store, stdin-only bootstrap CLI, indistinguishable invalid credentials,
   bounded login attempts, opaque Secure/HttpOnly/SameSite browser sessions,
   exact-origin CSRF enforcement, first-login password rotation, logout/replay
-  rejection, local-only UI redirects, and legacy Bearer service-token
-  compatibility. Worker `/ws/runtime` token tests remain independent.
+  rejection, local-only UI/UI v2 deep-link redirects, in-memory-only UI v2 CSRF,
+  retired browser API-key cleanup, and legacy Bearer service-token compatibility.
+  Worker `/ws/runtime` token tests remain independent.
 
 ## Management API smoke test
 

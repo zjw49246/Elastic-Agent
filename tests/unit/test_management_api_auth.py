@@ -126,6 +126,43 @@ async def test_native_login_sets_cookie_and_server_redirects(browser_auth):
 
 
 @pytest.mark.asyncio
+async def test_ui_v2_deep_link_requires_login_and_is_restored(browser_auth):
+    anonymous = await browser_auth.client.get("/ui-v2/jobs/batch")
+
+    assert anonymous.status_code == 303
+    assert anonymous.headers["location"] == (
+        "/login?next=%2Fui-v2%2Fjobs%2Fbatch"
+    )
+
+    login = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "next": "/ui-v2/jobs/batch",
+        },
+    )
+
+    assert login.status_code == 303
+    assert login.headers["location"] == "/ui-v2/jobs/batch"
+    shell = await browser_auth.client.get("/ui-v2/jobs/batch")
+    assert shell.status_code == 200
+    assert "Elastic-Agent 控制台" in shell.text
+
+
+@pytest.mark.asyncio
+async def test_ui_v2_assets_remain_public_without_exposing_state(browser_auth):
+    css = await browser_auth.client.get("/ui-v2/assets/app.css")
+    javascript = await browser_auth.client.get("/ui-v2/js/app.js")
+
+    assert css.status_code == 200
+    assert javascript.status_code == 200
+    assert "text/css" in css.headers["content-type"]
+    assert "text/javascript" in javascript.headers["content-type"]
+
+
+@pytest.mark.asyncio
 async def test_native_login_routes_temporary_password_to_change_page(browser_auth):
     response = await browser_auth.client.post(
         "/login",

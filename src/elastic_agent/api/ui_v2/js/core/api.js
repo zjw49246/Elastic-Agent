@@ -1,11 +1,11 @@
 /**
  * Manager REST client.
  *
- * Adds the Bearer header, decodes JSON, and converts failures into ApiError
- * objects that carry status/method/path but never the request body.
+ * Sends the HttpOnly administrator-session cookie plus an in-memory CSRF
+ * header, decodes JSON, and converts failures into secret-safe ApiError values.
  */
 
-import { authHeader } from './auth.js';
+import { csrfHeader } from './auth.js';
 import { ApiError, isAbort } from './errors.js';
 
 const API_ROOT = '/api';
@@ -94,9 +94,9 @@ export async function request(method, path, options = {}) {
   const url = buildUrl(path, query);
   const init = {
     method,
-    headers: { Accept: 'application/json', ...authHeader(), ...headers },
+    headers: { Accept: 'application/json', ...csrfHeader(method), ...headers },
     signal,
-    credentials: 'omit',
+    credentials: 'same-origin',
     cache: 'no-store',
     referrerPolicy: 'no-referrer',
   };
@@ -121,7 +121,7 @@ export async function request(method, path, options = {}) {
       unauthorizedNotified = true;
       try { unauthorizedHandler(); } catch (_) { /* ignore */ }
     }
-    throw new ApiError({ status: 401, method, path, message: '认证失败：API Key 无效或已更换。' });
+    throw new ApiError({ status: 401, method, path, message: '管理员登录已失效，请重新登录。' });
   }
 
   if (!response.ok) {
@@ -147,14 +147,14 @@ export const postJsonText = (path, rawBody, options = {}) => request('POST', pat
 export const put = (path, body, options = {}) => request('PUT', path, { ...options, body });
 export const del = (path, options) => request('DELETE', path, options);
 
-/** Raw authenticated fetch — used by streaming downloads. */
+/** Raw cookie-authenticated fetch — used by streaming downloads. */
 export function rawFetch(path, options = {}) {
   const url = buildUrl(path, options.query);
   return fetch(url, {
     method: options.method || 'GET',
-    headers: { ...authHeader(), ...(options.headers || {}) },
+    headers: { ...csrfHeader(options.method || 'GET'), ...(options.headers || {}) },
     signal: options.signal,
-    credentials: 'omit',
+    credentials: 'same-origin',
     cache: 'no-store',
     referrerPolicy: 'no-referrer',
   });

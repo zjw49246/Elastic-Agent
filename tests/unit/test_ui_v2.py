@@ -8,7 +8,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -26,7 +27,21 @@ async def ui_client():
 
     app = create_app(result.manager)
     reset_summary_cache()
-    with patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}):
+    principal = SimpleNamespace(
+        subject="admin@example.test",
+        must_change_password=False,
+    )
+    with (
+        patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}),
+        patch(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ),
+        patch(
+            "elastic_agent.api.routes.ui_v2.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ),
+    ):
         from elastic_agent.api import auth
 
         auth.reset_api_keys()
@@ -43,7 +58,7 @@ AUTH = {"Authorization": "Bearer test-key"}
 
 class TestStaticShell:
     @pytest.mark.asyncio
-    async def test_ui_v2_serves_index_without_auth(self, ui_client):
+    async def test_ui_v2_serves_index_for_authenticated_admin(self, ui_client):
         client, _ = ui_client
         for path in (
             "/ui-v2", "/ui-v2/", "/ui-v2/overview",
@@ -168,9 +183,9 @@ class TestFrontendSourceInvariants:
             assert re.search(r"serviceWorker\s*[.\[(]", source) is None, module
             assert re.search(r"indexedDB\s*[.\[(]", source) is None, module
 
-    def test_api_key_stays_in_auth_module(self):
-        # Only auth.js touches the sessionStorage slot or builds the Bearer
-        # header value; other modules go through authHeader()/rawFetch().
+    def test_admin_session_uses_cookie_and_in_memory_csrf(self):
+        # Retired browser API keys are only removed. The opaque session stays in
+        # an HttpOnly cookie; only auth.js holds the page-lifetime CSRF token.
         for module in self._all_js():
             source = module.read_text(encoding="utf-8")
             if module.name == "auth.js":
@@ -179,9 +194,19 @@ class TestFrontendSourceInvariants:
             assert "Bearer ${" not in source, module
 
         auth_source = (UI_V2_ROOT / "js" / "core" / "auth.js").read_text(encoding="utf-8")
+        api_source = (UI_V2_ROOT / "js" / "core" / "api.js").read_text(encoding="utf-8")
+        assert "sessionStorage.removeItem('ea_api_key')" in auth_source
+        assert "sessionStorage.getItem('ea_api_key')" not in auth_source
+        assert "sessionStorage.setItem('ea_api_key'" not in auth_source
+        assert "X-CSRF-Token" in auth_source
+        assert "credentials: 'same-origin'" in api_source
+        assert "Authorization" not in api_source
         assert "ea-auth-token" not in auth_source
         assert "querySelector('meta" not in auth_source
-        assert "ea-auth-token" not in (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
+        html = (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
+        assert "ea-auth-token" not in html
+        assert "退出登录" in html
+        assert "换 Key" not in html
 
     def test_index_has_no_inline_script(self):
         html = (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")

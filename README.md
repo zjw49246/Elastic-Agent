@@ -898,8 +898,9 @@ Idempotency-Key derived from `batch_id` makes an uncertain network retry safe;
 the page then polls `GET /api/job-batches/{job_batch_id}` until every item is
 terminal or errored. The schema permits at most 100 Jobs, while the deployment
 default is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits
-are reported by preflight. API keys are never rendered into the public static
-shell; operators enter one per tab and it is kept only in memory/sessionStorage.
+are reported by preflight. Browser operators use the management administrator
+login; the opaque session stays in a Secure/HttpOnly cookie and the CSRF token
+is held only in page memory. Service API keys remain available for automation.
 
 **Frontend**: the v2 console uses a light theme by default, with an optional
 session-scoped dark theme. The Job submission form keeps the JobSpec wire

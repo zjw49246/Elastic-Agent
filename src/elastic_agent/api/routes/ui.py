@@ -7,6 +7,7 @@ Shows node list, status cards, and supports manual operations
 
 from __future__ import annotations
 
+import re
 from html import escape
 from urllib.parse import parse_qs, urlencode
 
@@ -5412,7 +5413,26 @@ document.getElementById('passwordForm').addEventListener('submit', async event =
 
 
 _SAFE_UI_NEXT_PATHS = frozenset(
-    {"/", "/batch", "/fleet", "/dashboard", "/change-password"}
+    {
+        "/",
+        "/batch",
+        "/fleet",
+        "/dashboard",
+        "/change-password",
+        "/ui-v2",
+        "/ui-v2/",
+        "/ui-v2/overview",
+        "/ui-v2/accounts",
+        "/ui-v2/accounts/new",
+        "/ui-v2/jobs/new",
+        "/ui-v2/jobs/batch",
+        "/ui-v2/jobs",
+        "/ui-v2/results",
+        "/ui-v2/fleet",
+    }
+)
+_SAFE_UI_V2_JOB_DETAIL = re.compile(
+    r"/ui-v2/jobs/[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
 _LOGIN_ERROR_MESSAGES = {
     "invalid_credentials": "邮箱或密码错误",
@@ -5427,7 +5447,14 @@ _MAX_LOGIN_FORM_BYTES = 64 * 1024
 
 def _safe_ui_next(raw_next: str | None, *, default: str = "/") -> str:
     """Return only a known local UI path so redirects cannot leave this origin."""
-    return raw_next if raw_next in _SAFE_UI_NEXT_PATHS else default
+    if raw_next in _SAFE_UI_NEXT_PATHS:
+        return raw_next
+    if (
+        isinstance(raw_next, str)
+        and _SAFE_UI_V2_JOB_DETAIL.fullmatch(raw_next) is not None
+    ):
+        return raw_next
+    return default
 
 
 def _principal_requires_password_change(principal: object) -> bool:

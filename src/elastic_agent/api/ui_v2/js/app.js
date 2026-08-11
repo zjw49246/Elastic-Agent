@@ -2,18 +2,18 @@
  * Elastic-Agent UI v2 entry point.
  *
  * Boot order is fixed (see docs/ui-v2-implementation-plan.md §7.2):
- *   1. scrub api_key from the URL
- *   2. init auth (key stays module-private)
+ *   1. scrub retired URL/storage credentials
+ *   2. validate the HttpOnly administrator session and retain CSRF in memory
  *   3. install safe global error handlers
  *   4. build router + shell
  *   5. restore the deep link
- *   6. prompt for a key when missing, then continue to the original route
+ *   6. redirect expired sessions to login while preserving the deep link
  *   7. start the global health/OTP pollers
  *   8. mount the page and start its own loaders
  */
 
-import { initAuth, hasKey, setKey, forgetKey, scrubUrlCredentials } from './core/auth.js';
-import { get, onUnauthorized, resetUnauthorizedLatch } from './core/api.js';
+import { initAuth, hasSession, setSession, clearSession } from './core/auth.js';
+import { get, post, onUnauthorized } from './core/api.js';
 import { installGlobalErrorHandlers, describeError, isAbort } from './core/errors.js';
 import { Router, detectBase } from './core/router.js';
 import { createPoller, stopAllPollers } from './core/poller.js';
@@ -21,7 +21,6 @@ import { setState, getState } from './core/store.js';
 import { cancelAllDownloads } from './core/downloads.js';
 import { el, clear } from './core/dom.js';
 import { AppShell } from './components/app-shell.js';
-import { showDialog } from './components/dialog.js';
 import { toastError } from './components/toast.js';
 
 const ROUTES = [
@@ -44,12 +43,10 @@ let shell = null;
 let router = null;
 let currentPage = null;
 let globalPollers = [];
-let authPromise = null;
 let navigationToken = 0;
 
 async function boot() {
-  scrubUrlCredentials();
-  const authed = initAuth();
+  initAuth();
   installGlobalErrorHandlers((message) => toastError(message));
   onUnauthorized(() => handleUnauthorized());
 
@@ -59,17 +56,27 @@ async function boot() {
     onNavigate: (route) => { void handleNavigate(route); },
   });
 
-  shell = new AppShell({ router, onAuthClick: () => promptForKey({ replace: false }) }).mount();
-  setState({ authed });
+  shell = new AppShell({ router, onAuthClick: () => { void logout(); } }).mount();
+  setState({ authed: false, principal: null });
+
+  let session;
+  try {
+    session = await get('/auth/me');
+  } catch (error) {
+    if (Number(error && error.status) === 401) return;
+    renderPageError(error);
+    return;
+  }
+  if (session.must_change_password === true) {
+    redirectToPasswordChange();
+    return;
+  }
+  const principal = setSession(session);
+  setState({ authed: true, principal });
 
   document.getElementById('ea-app').dataset.state = 'ready';
   router.start();
-
-  if (!authed) {
-    await promptForKey({ initial: true });
-  } else {
-    startGlobalPollers();
-  }
+  startGlobalPollers();
 }
 
 async function handleNavigate(route) {
@@ -143,94 +150,52 @@ function renderPageError(error) {
 function handleUnauthorized() {
   stopAllPollers();
   globalPollers = [];
-  setState({ authed: false });
-  void promptForKey({ reason: 'API Key 无效或已更换，请重新输入。' });
+  clearSession();
+  setState({ authed: false, principal: null });
+  redirectToLogin();
 }
 
-function promptForKey({ initial = false, reason = '' } = {}) {
-  if (authPromise) return authPromise;
-  authPromise = (async () => {
-    const input = el('input', {
-      type: 'password',
-      autocomplete: 'off',
-      'aria-label': '管理 API Key',
-      placeholder: 'ELASTIC_AGENT_EXTERNAL_API_KEYS 中的一项',
-    });
-    const status = el('p', { class: 'err small' });
-    const body = [
-      el('p', { class: 'muted small', text: reason || '控制台使用管理员 API Key 访问 Manager REST API。Key 仅保存在本标签页的 sessionStorage 中，只通过 Authorization 请求头发送。' }),
-      el('div', { class: 'field' }, [el('label', { for: 'authKeyInput', text: 'API Key' }), input]),
-      status,
-    ];
-    input.id = 'authKeyInput';
+function safeUiPath() {
+  const path = window.location.pathname;
+  return path === '/ui-v2' || path.startsWith('/ui-v2/')
+    ? path
+    : '/ui-v2/overview';
+}
 
-    const actions = [
-      {
-        label: '保存并继续',
-        kind: 'primary',
-        value: 'saved',
-        autofocus: true,
-        onClick: async () => {
-          const value = input.value.trim();
-          if (!value) {
-            status.textContent = '请输入 API Key。';
-            return false;
-          }
-          setKey(value);
-          input.value = '';
-          try {
-            await get('/health');
-            resetUnauthorizedLatch();
-            return true;
-          } catch (error) {
-            if (Number(error && error.status) === 401) {
-              forgetKey();
-              status.textContent = 'API Key 无效。';
-              return false;
-            }
-            // Non-auth failures (503/network) should not discard a good key.
-            return true;
-          }
-        },
-      },
-    ];
-    if (!initial && hasKey()) {
-      actions.unshift({
-        label: '忘记当前 Key',
-        kind: 'danger',
-        value: 'forgotten',
-        onClick: () => {
-          cancelAllDownloads();
-          stopAllPollers();
-          globalPollers = [];
-          forgetKey();
-          setState({ authed: false, health: null, summary: null, loginAttempts: [] });
-          return true;
-        },
-      });
-    }
+function redirectToLogin() {
+  window.location.replace(`/login?next=${encodeURIComponent(safeUiPath())}`);
+}
 
-    const result = await showDialog({
-      title: '需要 API Key',
-      body,
-      actions,
-      dismissible: !initial,
+function redirectToPasswordChange() {
+  window.location.replace(`/change-password?next=${encodeURIComponent(safeUiPath())}`);
+}
+
+async function logout() {
+  cancelAllDownloads();
+  stopAllPollers();
+  globalPollers = [];
+  try {
+    await post('/auth/logout', {});
+  } catch (error) {
+    if (Number(error && error.status) !== 401) toastError(describeError(error));
+  } finally {
+    clearSession();
+    setState({
+      authed: false,
+      principal: null,
+      health: null,
+      summary: null,
+      loginAttempts: [],
     });
-    input.value = '';
-    if (result === 'saved' && hasKey()) {
-      setState({ authed: true });
-      startGlobalPollers();
-    }
-    return result;
-  })().finally(() => { authPromise = null; });
-  return authPromise;
+    redirectToLogin();
+  }
 }
 
 // --------------------------------------------------------- global pollers
 
 function startGlobalPollers() {
   stopGlobalPollers();
-  if (!hasKey()) return;
+  if (!hasSession()) return;
 
   const health = createPoller({
     name: 'health',

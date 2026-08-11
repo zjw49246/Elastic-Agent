@@ -1,22 +1,15 @@
 /**
- * API Key custody.
+ * Browser administrator-session custody.
  *
- * The key lives in a module-private variable plus ``sessionStorage`` only.
- * It is never written to localStorage, a cookie, the DOM, a query string or a
- * download URL; ``api.js`` is the only consumer and it only sends it as an
- * ``Authorization: Bearer`` header.
+ * The opaque session token is held only by the browser's Secure, HttpOnly
+ * cookie.  This module keeps the non-secret principal and CSRF token in memory
+ * for the current page lifetime; neither value is persisted in web storage.
  */
 
-const STORAGE_KEY = 'ea_api_key';
+let currentPrincipal = null;
+let currentCsrfToken = '';
 
-let currentKey = '';
-const listeners = new Set();
-
-/**
- * Strip any ``api_key`` present in the URL before it can be read as a
- * credential. The value is discarded, not adopted: URLs leak through history,
- * referrers and proxy logs, so a key that arrived that way is already burnt.
- */
+/** Remove retired URL credentials and the legacy sessionStorage API-key slot. */
 export function scrubUrlCredentials() {
   let removed = false;
   const url = new URL(window.location.href);
@@ -33,53 +26,44 @@ export function scrubUrlCredentials() {
   if (removed) {
     window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
   }
+  try { window.sessionStorage.removeItem('ea_api_key'); } catch (_) { /* best effort */ }
   return removed;
 }
 
 export function initAuth() {
   scrubUrlCredentials();
-  let stored = '';
-  try {
-    stored = window.sessionStorage.getItem(STORAGE_KEY) || '';
-  } catch (_) {
-    stored = '';
+  clearSession();
+}
+
+export function setSession(payload) {
+  if (!payload || typeof payload !== 'object') throw new TypeError('invalid administrator session');
+  const email = typeof payload.email === 'string' ? payload.email.trim() : '';
+  const role = typeof payload.role === 'string' ? payload.role : '';
+  const csrfToken = typeof payload.csrf_token === 'string' ? payload.csrf_token : '';
+  if (!email || role !== 'admin' || csrfToken.length < 32) {
+    throw new TypeError('invalid administrator session');
   }
-  currentKey = typeof stored === 'string' ? stored.trim() : '';
-  return Boolean(currentKey);
+  currentPrincipal = Object.freeze({ email, role });
+  currentCsrfToken = csrfToken;
+  return currentPrincipal;
 }
 
-export function hasKey() {
-  return Boolean(currentKey);
+export function clearSession() {
+  currentPrincipal = null;
+  currentCsrfToken = '';
 }
 
-/** Only ``api.js`` should call this. */
-export function authHeader() {
-  return currentKey ? { Authorization: `Bearer ${currentKey}` } : {};
+export function hasSession() {
+  return currentPrincipal !== null && currentCsrfToken.length >= 32;
 }
 
-export function setKey(value) {
-  currentKey = typeof value === 'string' ? value.trim() : '';
-  try {
-    if (currentKey) window.sessionStorage.setItem(STORAGE_KEY, currentKey);
-    else window.sessionStorage.removeItem(STORAGE_KEY);
-  } catch (_) {
-    /* private mode: memory-only key is still usable for this tab */
-  }
-  emit();
-  return currentKey;
+export function sessionPrincipal() {
+  return currentPrincipal;
 }
 
-export function forgetKey() {
-  setKey('');
-}
-
-export function onAuthChange(listener) {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-function emit() {
-  for (const listener of Array.from(listeners)) {
-    try { listener(hasKey()); } catch (_) { /* never break the caller */ }
-  }
+/** Only api.js should call this for same-origin state-changing requests. */
+export function csrfHeader(method) {
+  const normalized = String(method || 'GET').toUpperCase();
+  if (['GET', 'HEAD', 'OPTIONS'].includes(normalized)) return {};
+  return currentCsrfToken ? { 'X-CSRF-Token': currentCsrfToken } : {};
 }
