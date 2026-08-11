@@ -1,5 +1,14 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Tokyo A dynamic Worker KeyPair binding
+
+**问题**：无模型 smoke 的首台 EC2 进入 running 后无法 SSH；Worker SG 的 Manager-SG 私网规则正确，但
+生产 env 使用 `interview-key`，本地 PEM 实际匹配 `panyuexi`。切换 env 后，Manager role 的精确
+RunInstances resource whitelist 又按预期拒绝未列出的 `panyuexi`。
+
+**解决**：新 Worker 统一为 `panyuexi + /home/ubuntu/panyuexi.pem`；IAM policy 精确增加 `panyuexi` ARN，
+同时保留旧 `interview-key` 作为回滚，不使用通配符。测试同时绑定 env、runbook 和两个精确 ARN。
+
 ## 2026-08-11 Run-Benchmark 一次性凭据动态 Job 通道
 
 **问题**：通用 JobSpec 的 `run.secret_env` 会持久化 secret reference，无法满足 Run-Benchmark API Key

@@ -157,20 +157,28 @@ def test_production_job_batch_global_limit_is_50():
     assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "50"
 
 
-def test_manager_policy_and_cutover_pin_real_key_pair_name():
+def test_manager_policy_and_cutover_pin_active_and_rollback_key_pair_names():
     policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
     launch = next(
         statement
         for statement in policy["Statement"]
         if statement["Sid"] == "LaunchWithPinnedInfrastructure"
     )
-    expected = (
+    rollback = (
         "arn:aws:ec2:ap-northeast-1:297645381734:"
         "key-pair/interview-key"
     )
+    active = (
+        "arn:aws:ec2:ap-northeast-1:297645381734:"
+        "key-pair/panyuexi"
+    )
+    environment = AWS_ENV.read_text(encoding="utf-8")
 
-    assert expected in launch["Resource"]
-    assert expected in IAM_CUTOVER.read_text(encoding="utf-8")
+    assert rollback in launch["Resource"]
+    assert active in launch["Resource"]
+    assert active in IAM_CUTOVER.read_text(encoding="utf-8")
+    assert "ELASTIC_AGENT_AWS_KEY_PAIR_NAME=panyuexi" in environment
+    assert "ELASTIC_AGENT_AWS_SSH_KEY_PATH=/home/ubuntu/panyuexi.pem" in environment
     assert not any("key-pair/key-" in resource for resource in launch["Resource"])
 
 
