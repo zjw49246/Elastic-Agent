@@ -5656,11 +5656,9 @@ async def change_password_page(request: Request):
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root_batch(request: Request):
-    """Serve the authenticated legacy Batch Console rollback surface."""
-    if redirect := await _authenticated_ui_redirect(request):
-        return redirect
-    return _html(_BATCH_HTML)
+async def root_ui_v2():
+    """Make the current UI v2 the canonical browser entry point."""
+    return _redirect("/ui-v2/")
 
 
 @router.get("/batch", response_class=HTMLResponse, include_in_schema=False)

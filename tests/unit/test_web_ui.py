@@ -89,12 +89,17 @@ async def anonymous_ui_client():
 
 class TestDashboardEndpoint:
     @pytest.mark.asyncio
-    async def test_root_returns_batch_console(self, ui_client):
-        # Root now serves the Batch Console (primary surface).
+    async def test_root_redirects_to_current_ui_v2(self, ui_client):
         client, _ = ui_client
         resp = await client.get("/")
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/ui-v2/"
+
+    @pytest.mark.asyncio
+    async def test_legacy_batch_console_remains_at_explicit_path(self, ui_client):
+        client, _ = ui_client
+        resp = await client.get("/batch")
         assert resp.status_code == 200
-        assert "text/html" in resp.headers["content-type"]
         assert "Batch Console" in resp.text
         assert "Submit Job" in resp.text
 
@@ -1941,10 +1946,11 @@ process.stdout.write(JSON.stringify({
     async def test_authenticated_session_can_open_ui(self, ui_client):
         client, _ = ui_client
         resp = await client.get("/")
-        assert resp.status_code == 200
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/ui-v2/"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("path", ["/", "/batch", "/fleet", "/dashboard"])
+    @pytest.mark.parametrize("path", ["/batch", "/fleet", "/dashboard"])
     async def test_anonymous_ui_redirects_to_login(
         self, anonymous_ui_client, path
     ):
@@ -1956,16 +1962,14 @@ process.stdout.write(JSON.stringify({
         assert "https" not in resp.headers["location"]
 
     @pytest.mark.asyncio
-    async def test_anonymous_root_login_targets_current_ui_v2(
+    async def test_anonymous_root_redirects_directly_to_current_ui_v2(
         self, anonymous_ui_client
     ):
         client, _ = anonymous_ui_client
         resp = await client.get("/")
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == (
-            "/login?next=%2Fui-v2%2Foverview"
-        )
+        assert resp.headers["location"] == "/ui-v2/"
 
     @pytest.mark.asyncio
     async def test_must_change_password_session_cannot_open_console(
@@ -2001,7 +2005,8 @@ class TestDashboardIntegration:
     async def test_ui_and_api_coexist(self, ui_client):
         client, _ = ui_client
         ui_resp = await client.get("/")
-        assert ui_resp.status_code == 200
+        assert ui_resp.status_code == 303
+        assert ui_resp.headers["location"] == "/ui-v2/"
         api_resp = await client.get(
             "/api/nodes",
             headers={"Authorization": "Bearer test-key"},

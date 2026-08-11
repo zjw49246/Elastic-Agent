@@ -147,7 +147,9 @@ class TestStaticShell:
         client, _ = ui_client
         assert (await client.get("/batch")).status_code == 200
         assert (await client.get("/fleet")).status_code == 200
-        assert "Batch Console" in (await client.get("/")).text
+        root = await client.get("/")
+        assert root.status_code == 303
+        assert root.headers["location"] == "/ui-v2/"
 
 
 class TestUiSummary:
