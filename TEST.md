@@ -45,6 +45,20 @@ denial, the versioned common x86_64 production instance allowlist, and AMI avail
 architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
 explicit Canonical break-glass path.
 
+Validate the private hot fleet policy, authenticated REST surface, and
+future-instance application without cloud calls:
+
+```bash
+uv run pytest -q \
+  tests/unit/test_fleet_policy.py \
+  tests/unit/test_api.py \
+  tests/unit/test_manager.py::TestScaleOut
+```
+
+These tests cover owner-only `0700/0600` state, strict schema and symlink
+rejection, authenticated GET/PUT, atomic reload, active/in-flight accounting,
+legacy in-process tightening, and application to later instance creation.
+
 Validate the trusted Run-Benchmark lease/dispatch boundary without cloud or
 model calls:
 

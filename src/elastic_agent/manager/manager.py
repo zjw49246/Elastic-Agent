@@ -17,6 +17,12 @@ from typing import TYPE_CHECKING, Any
 from elastic_agent.core.agent_type import AgentType
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.event_bus import EventBus
+from elastic_agent.core.fleet_policy import (
+    FleetRuntimePolicy,
+    FleetRuntimePolicyError,
+    FleetRuntimePolicyStore,
+    validated_policy,
+)
 from elastic_agent.core.job_log_store import JobLogStore
 from elastic_agent.core.log_event_parser import LogEventParser
 from elastic_agent.core.operations_logger import OperationsLogger
@@ -149,6 +155,29 @@ class ElasticAgentManager:
         from elastic_agent.core.agent_api import AgentApiAccountStore
         from elastic_agent.core.binding_manager import BindingManager
         from elastic_agent.core.ephemeral_stdin import EphemeralStdinLeaseStore
+
+        provider_cfg = config.provider
+        configured_instance_type = (
+            provider_cfg.aliyun.instance_type
+            if provider_cfg.type == "aliyun"
+            else provider_cfg.aws.default_instance_type
+        )
+        configured_max_instances = (
+            provider_cfg.aliyun.max_instances
+            if provider_cfg.type == "aliyun"
+            else provider_cfg.aws.max_instances
+        )
+        self.fleet_runtime_policy_store = FleetRuntimePolicyStore(
+            _Path(config.registry.path).with_name("fleet-runtime-policy.json"),
+            defaults=validated_policy(
+                default_instance_type=configured_instance_type,
+                default_root_disk_gb=40,
+                max_instances=configured_max_instances,
+            ),
+        )
+        self._apply_fleet_runtime_policy(
+            self.fleet_runtime_policy_store.snapshot()
+        )
 
         self.account_store = AccountStore(
             str(_Path(config.registry.path).with_name("accounts.json"))
@@ -2807,20 +2836,91 @@ class ElasticAgentManager:
                 placeholders += 1
         return len(owned_ids) + placeholders
 
+    def _apply_fleet_runtime_policy(self, policy: FleetRuntimePolicy) -> None:
+        """Project the durable policy onto legacy config readers."""
+
+        provider_cfg = self.config.provider
+        if provider_cfg.type == "aliyun":
+            provider_cfg.aliyun.instance_type = policy.default_instance_type
+            provider_cfg.aliyun.max_instances = policy.max_instances
+        else:
+            provider_cfg.aws.default_instance_type = policy.default_instance_type
+            provider_cfg.aws.max_instances = policy.max_instances
+
+    async def get_fleet_runtime_policy(self) -> dict[str, Any]:
+        """Return non-secret policy plus a live, fail-closed capacity count."""
+
+        async with self._instance_capacity_lock:
+            policy = self.fleet_runtime_policy_store.snapshot()
+            active = await self._owned_instance_capacity_usage()
+            inflight = self._inflight_instance_creates
+        return {
+            "schema_version": 1,
+            "provider": self.config.provider.type,
+            **policy.to_dict(),
+            "active_instances": active,
+            "inflight_instance_creates": inflight,
+            "available_instance_slots": max(
+                0, policy.max_instances - active - inflight
+            ),
+            "applies_to": "future_instances",
+        }
+
+    async def update_fleet_runtime_policy(
+        self,
+        *,
+        default_instance_type: object,
+        default_root_disk_gb: object,
+        max_instances: object,
+    ) -> dict[str, Any]:
+        """Atomically persist hot defaults without disturbing active workers."""
+
+        async with self._instance_capacity_lock:
+            try:
+                policy = self.fleet_runtime_policy_store.update(
+                    default_instance_type=default_instance_type,
+                    default_root_disk_gb=default_root_disk_gb,
+                    max_instances=max_instances,
+                )
+            except FleetRuntimePolicyError:
+                raise
+            self._apply_fleet_runtime_policy(policy)
+            active = await self._owned_instance_capacity_usage()
+            inflight = self._inflight_instance_creates
+        return {
+            "schema_version": 1,
+            "provider": self.config.provider.type,
+            **policy.to_dict(),
+            "active_instances": active,
+            "inflight_instance_creates": inflight,
+            "available_instance_slots": max(
+                0, policy.max_instances - active - inflight
+            ),
+            "applies_to": "future_instances",
+        }
+
     async def _reserve_instance_capacity(
         self, count: int, tags: dict[str, str] | None
     ) -> int:
         """Atomically reserve non-lease create slots; return reserved count."""
         if count < 1:
             raise ValueError("scale_out count must be at least 1")
-        provider_cfg = self.config.provider
-        limit = (
-            provider_cfg.aliyun.max_instances
-            if provider_cfg.type == "aliyun"
-            else provider_cfg.aws.max_instances
-        )
         requested_lease_id = str((tags or {}).get("ElasticAgentLease") or "")
         async with self._instance_capacity_lock:
+            provider_cfg = self.config.provider
+            configured_limit = (
+                provider_cfg.aliyun.max_instances
+                if provider_cfg.type == "aliyun"
+                else provider_cfg.aws.max_instances
+            )
+            # Keep the longstanding in-process config lowering contract for
+            # embedded callers while the durable policy remains authoritative
+            # for production hot updates. A direct config mutation may only
+            # tighten, never bypass, the persisted maximum.
+            limit = min(
+                self.fleet_runtime_policy_store.snapshot().max_instances,
+                configured_limit,
+            )
             used = await self._owned_instance_capacity_usage()
             # A bound lease without an instance is already included as a
             # planned slot. The matching one-instance scale call consumes that
@@ -2850,15 +2950,18 @@ class ElasticAgentManager:
         spot: bool = False,
         tags: dict[str, str] | None = None,
     ) -> list[NodeRecord]:
+        policy = self.fleet_runtime_policy_store.snapshot()
+        resolved_instance_type = instance_type or policy.default_instance_type
+        resolved_disk_gb = disk_gb or policy.default_root_disk_gb
         reserved_capacity = await self._reserve_instance_capacity(count, tags)
         try:
             async with self._instance_lifecycle_lock:
                 return await self._scale_out_unchecked(
                     count=count,
-                    instance_type=instance_type,
+                    instance_type=resolved_instance_type,
                     region=region,
                     name_prefix=name_prefix,
-                    disk_gb=disk_gb,
+                    disk_gb=resolved_disk_gb,
                     spot=spot,
                     tags=tags,
                 )

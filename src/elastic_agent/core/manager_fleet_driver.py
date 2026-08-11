@@ -1151,9 +1151,8 @@ class ManagerFleetDriver:
         )
         return checkpoint_set
 
-    @classmethod
     def _validate_resolved_checkpoint_set(
-        cls,
+        self,
         checkpoint_set: dict,
         *,
         source_spec: JobSpec,
@@ -1183,7 +1182,7 @@ class ManagerFleetDriver:
         expected_set_metadata = {
             "resolved_commit": source_spec.setup.resolved_commit,
             "recovery_contract_version": _RECOVERY_CONTRACT_VERSION,
-            "recovery_contract_sha256": cls._checkpoint_contract_hash(
+            "recovery_contract_sha256": self._checkpoint_contract_hash(
                 source_spec
             ),
             "fanout_workers": source_spec.fanout.workers,
@@ -1261,12 +1260,15 @@ class ManagerFleetDriver:
             raise RuntimeError(
                 "checkpoint set total object count is invalid"
             )
-        root_disk_gb = target_spec.fanout.disk_gb or 40
+        policy_store = getattr(self._mgr, "fleet_runtime_policy_store", None)
+        policy = policy_store.snapshot() if policy_store is not None else None
+        default_root_disk_gb = getattr(policy, "default_root_disk_gb", 40)
+        root_disk_gb = target_spec.fanout.disk_gb or default_root_disk_gb
         usable_root_bytes = (
             root_disk_gb * 1024 * 1024 * 1024
             - _WORKER_RECOVERY_DISK_RESERVE_BYTES
         )
-        worker_wrapper_objects = cls._worker_recovery_wrapper_objects(
+        worker_wrapper_objects = self._worker_recovery_wrapper_objects(
             list(target_spec.recovery.paths),
         )
         oversized_shards = [
@@ -1302,7 +1304,7 @@ class ManagerFleetDriver:
             "ELASTIC_AGENT_MAX_RECOVERY_STAGING_TOTAL_OBJECTS",
             max_objects,
         )
-        _, wrapper_objects = cls._recovery_wrapper_object_counts(
+        _, wrapper_objects = self._recovery_wrapper_object_counts(
             list(target_spec.recovery.paths),
             target_spec.fanout.workers,
         )

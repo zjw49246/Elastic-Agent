@@ -20,6 +20,7 @@ Elastic-Agent is a Python library that provides:
   receive the high-priority `delivery_manuscript` role
 - **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
+- **Hot fleet policy** — Authenticated `GET/PUT /api/fleet-policy` updates the default instance type, root disk, and global instance ceiling for future workers without interrupting active Jobs
 - **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
 
 ## Usage
@@ -39,6 +40,23 @@ manager = ElasticAgentManager(
 )
 app = manager.create_app()
 ```
+
+The Manager persists hot fleet defaults in its private state directory as
+`fleet-runtime-policy.json` with mode `0600`. The API requires the normal
+Manager bearer and accepts all three fields atomically:
+
+```json
+{
+  "default_instance_type": "t3.large",
+  "default_root_disk_gb": 40,
+  "max_instances": 30
+}
+```
+
+Updates affect only future instance creation. Per-Job instance/disk overrides
+remain available, while the runtime maximum continues to bound the total
+controller-owned and in-flight fleet. Lowering the maximum below current usage
+does not terminate active workers; it blocks new creation until usage falls.
 
 ## PTY mode (claude-pty)
 
