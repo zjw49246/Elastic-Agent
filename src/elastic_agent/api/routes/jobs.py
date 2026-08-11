@@ -168,6 +168,12 @@ RUN_BENCHMARK_HARNESSES = frozenset({
 _RUN_BENCHMARK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _RUN_BENCHMARK_DIGEST = re.compile(r"[0-9a-f]{64}")
 _RUN_BENCHMARK_COMMIT = re.compile(r"[0-9a-f]{40,64}")
+_RUN_BENCHMARK_S3_PREFIX_PART = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
+_RUN_BENCHMARK_INPUT_PREFIX_DEFAULT = (
+    "jobs/datasets/run-benchmark/v1/sha256"
+)
 
 
 class RunBenchmarkJobRequest(BaseModel):
@@ -1663,6 +1669,24 @@ def _safe_run_benchmark_text(
     return value
 
 
+def _run_benchmark_input_prefix() -> str:
+    value = os.environ.get(
+        "RUN_BENCHMARK_S3_INPUT_PREFIX",
+        _RUN_BENCHMARK_INPUT_PREFIX_DEFAULT,
+    )
+    if (
+        not value
+        or value != value.strip("/")
+        or len(value.encode("utf-8", errors="strict")) > 512
+        or any(
+            _RUN_BENCHMARK_S3_PREFIX_PART.fullmatch(part) is None
+            for part in PurePosixPath(value).parts
+        )
+    ):
+        raise HTTPException(500, "Run-Benchmark input storage prefix is invalid")
+    return value
+
+
 def _validate_run_benchmark_public_request(
     envelope: RunBenchmarkJobRequest,
     public: dict[str, object],
@@ -1766,7 +1790,7 @@ def _run_benchmark_job_spec(
             503, "Run-Benchmark input storage is not configured"
         )
     expected_uri = (
-        f"s3://{bucket}/jobs/datasets/run-benchmark/v1/sha256/"
+        f"s3://{bucket}/{_run_benchmark_input_prefix()}/"
         f"{request.input_digest}/"
     )
     if request.input_uri != expected_uri:

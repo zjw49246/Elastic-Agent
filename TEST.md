@@ -73,6 +73,7 @@ uv run pytest -q \
 These tests prove one-shot/TTL/close zeroization, command-before-secret ordering,
 missing-lease process stop, exact binary stdin plus EOF, WSS gating, dedicated
 server-owned Job construction, public JobSpec rejection of the reserved stdin
+protocol, configurable exact Run-Benchmark S3 input prefix binding,
 protocol, exact `1–10,800` second wall-time propagation including sub-minute
 tasks, post-S3 `prepare && execute` ordering, deterministic idempotency, and absence of the frame, key, or
 secret-derived digest from the durable Job journal.

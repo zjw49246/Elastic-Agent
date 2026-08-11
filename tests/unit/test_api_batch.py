@@ -1614,9 +1614,18 @@ class TestJobsAPI:
         self, client, manager, monkeypatch,
     ):
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
+        monkeypatch.setenv(
+            "RUN_BENCHMARK_S3_INPUT_PREFIX",
+            "run-benchmark/v1/instances/sha256",
+        )
         monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
         manager.config.provider.aws.worker_instance_profile = "worker-profile"
         request = self._run_benchmark_request()
+        request["input_uri"] = (
+            "s3://results/run-benchmark/v1/instances/sha256/"
+            + "d" * 64
+            + "/"
+        )
 
         response = await client.post(
             "/api/jobs/run-benchmark",

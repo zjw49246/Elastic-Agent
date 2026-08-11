@@ -291,11 +291,14 @@ The credential frame can wait only in that trusted process's stdin pipe:
 `prepare` never reads stdin, and `execute` is the first reader after the input
 seal, release, instance, image, and wall-time bindings have all passed.
 
-The shared bucket must expose only
-`jobs/datasets/run-benchmark/v1/sha256/<digest>/` to the Worker instance role.
-Workers read sealed inputs with IAM credentials and write only their normal
-per-Job result prefix. Provider keys never enter S3, cloud-init, checkpoint,
-environment variables, command arguments, disk, or logs.
+The dedicated Run-Benchmark deployment sets `RUN_BENCHMARK_S3_INPUT_PREFIX` and
+the Manager rejects any input URI outside that exact prefix. Production uses
+`run-benchmark/v1/instances/sha256/<digest>/` in the Run-Benchmark-owned bucket;
+the legacy default `jobs/datasets/run-benchmark/v1/sha256` remains only for
+backward-compatible deployments. Workers read sealed inputs with IAM
+credentials and write only their configured execution/checkpoint prefixes.
+Provider keys never enter S3, cloud-init, checkpoint, environment variables,
+command arguments, disk, or logs.
 
 `setup.repo` must be a remote HTTP(S), SSH/Git, or scp-style Git URL and may not
 contain embedded HTTP credentials, query parameters, or fragments. Use
