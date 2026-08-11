@@ -772,3 +772,12 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 **解决**：接入持久化 JobBatch 队列、plan/submit/status API、进程重启恢复、逐 Job 独立调度与全局 50 个活跃任务上限。UI v2 对同一份原始 UTF-8 字节执行预检和提交，严格拒绝重复键及超过 2 MiB/100 项的输入；以 batch id 派生稳定幂等键，显式确认后提交并轮询到终态。API key 只保留在内存/sessionStorage/Bearer header，不再写入公开 HTML；旧 Batch/Fleet 页面继续作为可用回退面。
 
 **验证**：完整 Python 套件 **2931 passed / 12 skipped / 0 failed**；UI v2 Node 测试 **23 passed**；新增和修改的核心 Python 文件 Ruff、UI 构建/import 检查及 `git diff --check` 全部通过。
+## 2026-08-11 UI v2 深层路由刷新资源修复（commit `b5672d1`）
+
+**问题**：SPA shell 用相对路径 `assets/app.css` 和 `js/app.js`。直接打开 `/ui-v2/` 正常，但刷新 `/ui-v2/jobs/batch` 等深层 History-API 路由时，浏览器改为请求 `/ui-v2/jobs/assets/app.css` 与 `/ui-v2/jobs/js/app.js`，两者 404，页面只剩未隐藏的无障碍文本和无样式导航。
+
+**解决**：入口资源固定为 `/ui-v2/assets/app.css` 与 `/ui-v2/js/app.js`；构建器继续在该根路径内替换内容哈希文件名。新增深层路由 shell 回归测试，同时验证根路径 CSS/JS 的状态和 MIME。
+
+**避免复发**：SPA fallback 测试不能只断言深层 URL 返回 HTML，还必须验证该 HTML 引用的静态入口从任意路由都解析到同一应用根。
+
+**验证**：完整 Python 套件 **2940 passed / 12 skipped / 0 failed**；UI v2 Python 专项 **19 passed**、Node 测试 **23 passed**；内容哈希构建、Ruff 与 `git diff --check` 通过。
