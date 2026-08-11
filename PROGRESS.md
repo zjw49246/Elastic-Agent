@@ -849,3 +849,9 @@ header，导航显示当前管理员并提供退出登录。服务端 Bearer API
 **规范入口修复（commit `bb39f25`）**：根地址 `/` 现始终 303 到 `/ui-v2/`，不再因已有
 管理员 Session 而渲染旧 Batch Console；旧界面仅保留在显式 `/batch`、`/fleet` 回滚路径。
 管理员/UI 专项 **107 passed**、Node **26 passed**，Ruff 与 `git diff --check` 通过。
+
+**响应式视觉整理（commit `dece80c`）**：以 1440px 总览/Job 表单和 390px 手机实机渲染
+复核布局，统一页面 20px（移动端 16px）纵向节奏、卡片内边距、网格和表单分组间距；修复统计
+网格紧贴下一卡片、桌面误显汉堡按钮、移动顶栏状态溢出及标题常驻焦点框。静态资源 revision
+升为 `admin-session-v2` 立即换代缓存。管理员/UI 专项 **108 passed**、Node **26 passed**，
+Ruff、UI import、截图复核与 `git diff --check` 通过。
