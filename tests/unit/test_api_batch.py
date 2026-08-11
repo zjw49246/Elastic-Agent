@@ -3171,6 +3171,99 @@ class TestJobsAPI:
         assert detail.json()["spec"]["account"]["mode"] == "manager_distribute"
 
     @pytest.mark.asyncio
+    async def test_get_known_future_snapshot_fields_are_read_only_compatible(
+        self, client, manager,
+    ):
+        job_id = self._seed_job_journal(
+            manager,
+            "known-future-config-snapshot",
+            "succeeded",
+        )
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["spec"]["environment"]["profile"] = (
+            "ubuntu-agent-docker-sandbox-v1"
+        )
+        payload["spec"]["account"]["auth_kind"] = "agent_api"
+        payload["spec"]["account"]["exclude_ids"] = ["retired-account"]
+        payload["spec"]["run"]["env"] = {"RUN_TOKEN": "plaintext-secret"}
+        payload["spec"]["run"]["secret_env"] = {
+            "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
+        }
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 200
+        projected = detail.json()["spec"]
+        assert projected["environment"]["profile"] == (
+            "ubuntu-agent-docker-sandbox-v1"
+        )
+        assert projected["account"]["auth_kind"] == "agent_api"
+        assert projected["account"]["exclude_ids"] == ["retired-account"]
+        assert projected["run"]["env"] == {"RUN_TOKEN": "[REDACTED]"}
+        assert projected["run"]["secret_env"] == {
+            "SECRET_TOKEN": "[SECRET_REFERENCE]",
+        }
+        assert "plaintext-secret" not in detail.text
+        assert "aws-secretsmanager" not in detail.text
+
+        resubmit = await client.post(f"/api/jobs/{job_id}/resubmit")
+        assert resubmit.status_code == 500
+        assert "invalid persisted spec" in resubmit.json()["detail"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mutate", "sensitive_value"),
+        [
+            (
+                lambda spec: spec["account"].update({
+                    "auth_kind": "private-auth-kind",
+                }),
+                "private-auth-kind",
+            ),
+            (
+                lambda spec: spec["account"].update({
+                    "exclude_ids": ["private/unsafe-account"],
+                }),
+                "private/unsafe-account",
+            ),
+            (
+                lambda spec: spec["environment"].update({
+                    "profile": "private-future-profile",
+                }),
+                "private-future-profile",
+            ),
+        ],
+    )
+    async def test_get_unknown_future_snapshot_values_fail_closed(
+        self, client, manager, mutate, sensitive_value,
+    ):
+        job_id = self._seed_job_journal(
+            manager,
+            "unknown-future-" + hashlib.sha256(
+                sensitive_value.encode("utf-8"),
+            ).hexdigest()[:12],
+            "succeeded",
+        )
+        journal = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{job_id}.json"
+        )
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        mutate(payload["spec"])
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+
+        detail = await client.get(f"/api/jobs/{job_id}")
+
+        assert detail.status_code == 500
+        assert "persisted Job config is unavailable" in detail.json()["detail"]
+        assert sensitive_value not in detail.text
+
+    @pytest.mark.asyncio
     async def test_get_historical_snapshot_uses_bounded_job_scoped_lease_query(
         self, client, manager, monkeypatch,
     ):

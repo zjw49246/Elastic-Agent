@@ -84,6 +84,13 @@ _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_RESUME_GENERATION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+_SAFE_PERSISTED_ACCOUNT_REFERENCE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}"
+)
+_READ_ONLY_SANDBOX_PROFILE = "ubuntu-agent-docker-sandbox-v1"
+_READ_ONLY_SANDBOX_VALIDATION_PROFILE = "ubuntu-agent-docker-v2"
+_READ_ONLY_ACCOUNT_AUTH_KINDS = frozenset({"any", "oauth", "agent_api"})
+_READ_ONLY_MAX_EXCLUDED_ACCOUNTS = 100
 _PERSISTED_JOB_STATES = {
     "prepared", "launching", "running", "suspending", "suspended",
     "succeeded", "failed", "cancelled",
@@ -1261,9 +1268,11 @@ def _api_spec_projection(spec: JobSpec | dict) -> dict:
     response. ``exclude_unset`` preserves old snapshots without inventing
     defaults that did not exist when they were written.
 
-    ``manager_distribute`` is the one explicitly known read-only legacy value.
-    It is mapped only for structural validation and then restored in the
-    projection; current submissions and resubmits continue to reject it.
+    A small allowlist covers values written by known adjacent JobSpec revisions:
+    ``manager_distribute``, the sandbox environment profile, and account
+    selection metadata. They are mapped or removed only for structural
+    validation and then restored in the projection. Current submissions and
+    resubmits continue to reject them.
     """
 
     if isinstance(spec, JobSpec):
@@ -1273,24 +1282,87 @@ def _api_spec_projection(spec: JobSpec | dict) -> dict:
 
     candidate = copy.deepcopy(spec)
     legacy_manager_distribution = False
-    account = candidate.get("account")
+    read_only_sandbox_profile = False
+    read_only_auth_kind: str | None = None
+    read_only_exclude_ids: list[str] | None = None
+
+    environment = candidate.get("environment")
     if (
-        isinstance(account, dict)
-        and account.get("mode") == "manager_distribute"
+        isinstance(environment, dict)
+        and environment.get("profile") == _READ_ONLY_SANDBOX_PROFILE
     ):
-        account["mode"] = "worker_local_login"
-        legacy_manager_distribution = True
+        environment["profile"] = _READ_ONLY_SANDBOX_VALIDATION_PROFILE
+        read_only_sandbox_profile = True
+
+    account = candidate.get("account")
     try:
+        if isinstance(account, dict):
+            if account.get("mode") == "manager_distribute":
+                account["mode"] = "worker_local_login"
+                legacy_manager_distribution = True
+
+            if "auth_kind" in account:
+                auth_kind = account.pop("auth_kind")
+                if (
+                    not isinstance(auth_kind, str)
+                    or auth_kind not in _READ_ONLY_ACCOUNT_AUTH_KINDS
+                ):
+                    raise ValueError("invalid persisted account auth kind")
+                read_only_auth_kind = auth_kind
+
+            if "exclude_ids" in account:
+                excluded = account.pop("exclude_ids")
+                if (
+                    not isinstance(excluded, list)
+                    or len(excluded) > _READ_ONLY_MAX_EXCLUDED_ACCOUNTS
+                ):
+                    raise ValueError("invalid persisted excluded account list")
+                normalized: list[str] = []
+                seen: set[str] = set()
+                for raw_account_id in excluded:
+                    if not isinstance(raw_account_id, str):
+                        raise ValueError("invalid persisted excluded account")
+                    account_id = raw_account_id.strip()
+                    if not account_id:
+                        continue
+                    if _SAFE_PERSISTED_ACCOUNT_REFERENCE.fullmatch(account_id) is None:
+                        raise ValueError("unsafe persisted excluded account")
+                    if account_id not in seen:
+                        seen.add(account_id)
+                        normalized.append(account_id)
+                read_only_exclude_ids = normalized
+
         validated = JobSpec.model_validate(candidate)
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError("persisted JobSpec is incompatible with the API schema") from exc
 
     projected = validated.model_dump(mode="json", exclude_unset=True)
-    if legacy_manager_distribution:
+    if read_only_sandbox_profile:
+        projected_environment = projected.get("environment")
+        if not isinstance(projected_environment, dict):
+            raise ValueError("persisted legacy environment section is invalid")
+        projected_environment["profile"] = _READ_ONLY_SANDBOX_PROFILE
+
+    if (
+        legacy_manager_distribution
+        or read_only_auth_kind is not None
+        or read_only_exclude_ids is not None
+    ):
         projected_account = projected.get("account")
         if not isinstance(projected_account, dict):
             raise ValueError("persisted legacy account section is invalid")
-        projected_account["mode"] = "manager_distribute"
+        if legacy_manager_distribution:
+            projected_account["mode"] = "manager_distribute"
+        if read_only_auth_kind is not None:
+            projected_account["auth_kind"] = read_only_auth_kind
+        if read_only_exclude_ids is not None:
+            selected = projected_account.get("ids", [])
+            if not isinstance(selected, list):
+                raise ValueError("persisted selected account list is invalid")
+            overlap = set(read_only_exclude_ids).intersection(selected)
+            if overlap:
+                raise ValueError("persisted account selection lists overlap")
+            projected_account["exclude_ids"] = read_only_exclude_ids
     return projected
 
 
