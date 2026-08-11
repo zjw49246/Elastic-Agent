@@ -800,3 +800,21 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 **避免复发**：持久 journal 的可执行恢复与只读历史恢复必须分层；前者严格绑定当前 schema，后者应在完整性和终态证明后保持前向可读，不能让旧历史阻断整个控制面启动。
 
 **验证**：完整 Python 套件 **2941 passed / 12 skipped / 0 failed**；JobBatch + UI v2 专项 **48 passed**，Ruff 与 `git diff --check` 通过；生产 121 份 journal 均为 terminal、679 个 terminal item + 57 个 error item，且原始 canonical 指纹 **121/121** 匹配。
+
+## 2026-08-11 历史 JobSpec 相邻版本只读投影（commit `27a38df`）
+
+**问题**：生产机有 3 份终态 Job journal 由相邻 JobSpec 版本写入，包含 sandbox
+environment profile 以及账号 `auth_kind`/`exclude_ids`。新 Manager 能正常启动和列出任务，
+但详情 API 用当前 schema 严格投影时返回 500，旧监控因此持续报错。
+
+**解决**：只在历史详情的 schema-aware 脱敏投影中 allowlist 这几个已知字段和值；先将
+sandbox profile 映射到当前 Docker profile 做完整结构校验，账号类型、排除列表数量、字符集、
+去重和选中/排除冲突也逐项校验，再恢复只读展示值。未知字段和值继续 fail closed，所有秘密
+仍脱敏；提交、预检和重提完全不走兼容投影，因此未知版本配置不能被执行。
+
+**避免复发**：持久历史的读取兼容必须与执行 schema 分离；兼容范围按具体字段和值 allowlist，
+不能通过放宽 Pydantic `extra=forbid` 或直接回显原始 journal 实现。
+
+**验证**：完整 Python 套件 **2945 passed / 12 skipped / 0 failed**；API/JobBatch/UI
+定向回归 **244 passed**，新增成功、非法值、秘密脱敏和重提拒绝测试均通过；Ruff 与
+`git diff --check` 通过。
