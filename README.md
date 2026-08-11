@@ -253,6 +253,11 @@ setup/run commands, `account.mode=none`, S3 namespace, and final collect path;
 the ordinary `/api/jobs` and `/api/jobs/plan` routes reject the reserved
 `run.stdin_protocol` value.
 
+The wall-time is the instance's exact positive budget in the inclusive
+`1–10,800` second range. The Manager and Worker must preserve it exactly; they
+neither clamp sub-minute smoke/debug tasks to 60 seconds nor reject those tasks
+before credential consumption.
+
 The frame is never stored in JobSpec or its request fingerprint. It is adopted
 by a bounded process-local `bytearray` lease, consumed once only after the exact
 task process starts, sent over the required WSS transport, decoded at the task

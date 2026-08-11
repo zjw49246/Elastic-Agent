@@ -184,7 +184,7 @@ class RunBenchmarkJobRequest(BaseModel):
     input_uri: str = Field(min_length=1, max_length=1024)
     instance_digest: str = Field(min_length=64, max_length=64)
     harness_id: str = Field(min_length=1, max_length=128)
-    wall_time_seconds: int = Field(ge=60, le=RUN_BENCHMARK_MAX_WALL_SECONDS)
+    wall_time_seconds: int = Field(ge=1, le=RUN_BENCHMARK_MAX_WALL_SECONDS)
     credential_frame: str = Field(
         repr=False,
         min_length=1,

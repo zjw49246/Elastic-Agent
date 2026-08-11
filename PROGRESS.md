@@ -1,5 +1,13 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-11 Run-Benchmark sub-minute wall time (commits `4eb2dfa`, downstream `2b53dc7`)
+
+**问题**：Run-Benchmark instance 合法接受 30 秒等正整数预算，但 Manager envelope 和动态 Worker 都把
+最小值硬编码为 60 秒，真实 smoke 因而在读取 Key、创建 Job、启动 EC2 或模型调用前返回 422。
+
+**解决**：双端统一精确的 `1–10,800` 秒契约并补回归；Manager 构造的命令与 Worker manifest 继续严格
+相等验证，禁止用 clamp 偷偷改变用户预算。
+
 ## 2026-08-11 Worker dataset prefix listing
 
 **问题**：Worker role 虽允许 `GetObject` 读取 `jobs/datasets/*`，但递归
