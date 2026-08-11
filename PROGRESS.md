@@ -781,3 +781,12 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 **避免复发**：SPA fallback 测试不能只断言深层 URL 返回 HTML，还必须验证该 HTML 引用的静态入口从任意路由都解析到同一应用根。
 
 **验证**：完整 Python 套件 **2940 passed / 12 skipped / 0 failed**；UI v2 Python 专项 **19 passed**、Node 测试 **23 passed**；内容哈希构建、Ruff 与 `git diff --check` 通过。
+## 2026-08-11 JobBatch 终态 journal 跨 JobSpec 版本恢复（commit `ff40a7a`）
+
+**问题**：生产机保留 121 份全部终态的 JobBatch journal，它们由一版超前 JobSpec 写入，包含当前 `main` 不认识的 profile/账号字段。新 Manager 启动时用当前严格 JobSpec 重解析所有历史 manifest，导致应用启动失败，尽管这些批次永远不会再次调度。
+
+**解决**：写入和所有非终态恢复继续严格绑定当前 JobSpec；仅加载“批次终态且每项均为 terminal/error”的历史记录时，允许把 JobSpec 当作不可执行的 opaque payload，同时严格校验 journal/envelope 字段、policy、ID 唯一性、item 映射及原始 canonical SHA-256 指纹。这样保留历史查询而不会运行未知 schema。
+
+**避免复发**：持久 journal 的可执行恢复与只读历史恢复必须分层；前者严格绑定当前 schema，后者应在完整性和终态证明后保持前向可读，不能让旧历史阻断整个控制面启动。
+
+**验证**：完整 Python 套件 **2941 passed / 12 skipped / 0 failed**；JobBatch + UI v2 专项 **48 passed**，Ruff 与 `git diff --check` 通过；生产 121 份 journal 均为 terminal、679 个 terminal item + 57 个 error item，且原始 canonical 指纹 **121/121** 匹配。
