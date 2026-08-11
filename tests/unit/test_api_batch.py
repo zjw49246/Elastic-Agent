@@ -1657,6 +1657,27 @@ class TestJobsAPI:
         assert manager.ephemeral_stdin_leases.contains(job.job_id)
 
     @pytest.mark.asyncio
+    async def test_run_benchmark_bridge_preserves_positive_subminute_wall_time(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
+        monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
+        manager.config.provider.aws.worker_instance_profile = "worker-profile"
+        request = self._run_benchmark_request()
+        request["wall_time_seconds"] = 30
+
+        response = await client.post(
+            "/api/jobs/run-benchmark",
+            json=request,
+            headers={"Idempotency-Key": "run-benchmark-short-timeout"},
+        )
+
+        assert response.status_code == 201, response.text
+        job = manager.batch.get_job(response.json()["job_id"])
+        assert "--wall-time-seconds 30" in job.spec.run.command
+        assert job.spec.run.timeout == 930
+
+    @pytest.mark.asyncio
     async def test_run_benchmark_bridge_is_idempotent_without_persisting_secret_digest(
         self, client, manager, monkeypatch,
     ):
