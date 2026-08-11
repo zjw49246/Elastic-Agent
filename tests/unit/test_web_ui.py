@@ -132,7 +132,7 @@ class TestDashboardEndpoint:
         )
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/"
+        assert resp.headers["location"] == "/ui-v2/overview"
 
     @pytest.mark.asyncio
     async def test_change_password_page_uses_csrf_and_safe_next(self, ui_client):
@@ -1954,6 +1954,18 @@ process.stdout.write(JSON.stringify({
         assert resp.status_code == 303
         assert resp.headers["location"].startswith("/login?next=")
         assert "https" not in resp.headers["location"]
+
+    @pytest.mark.asyncio
+    async def test_anonymous_root_login_targets_current_ui_v2(
+        self, anonymous_ui_client
+    ):
+        client, _ = anonymous_ui_client
+        resp = await client.get("/")
+
+        assert resp.status_code == 303
+        assert resp.headers["location"] == (
+            "/login?next=%2Fui-v2%2Foverview"
+        )
 
     @pytest.mark.asyncio
     async def test_must_change_password_session_cannot_open_console(

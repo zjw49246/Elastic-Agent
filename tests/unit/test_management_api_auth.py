@@ -152,6 +152,30 @@ async def test_ui_v2_deep_link_requires_login_and_is_restored(browser_auth):
 
 
 @pytest.mark.asyncio
+async def test_native_login_invalid_ui_v2_path_falls_back_to_ui_v2(browser_auth):
+    page = await browser_auth.client.get("/login?next=%2Fui-v2%2F%E3%80%81")
+
+    assert page.status_code == 200
+    assert (
+        'name="next" type="hidden" value="/ui-v2/overview"'
+        in page.text
+    )
+
+    login = await browser_auth.client.post(
+        "/login",
+        headers={"Origin": ORIGIN},
+        data={
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "next": "/ui-v2/、",
+        },
+    )
+
+    assert login.status_code == 303
+    assert login.headers["location"] == "/ui-v2/overview"
+
+
+@pytest.mark.asyncio
 async def test_ui_v2_assets_remain_public_without_exposing_state(browser_auth):
     css = await browser_auth.client.get("/ui-v2/assets/app.css")
     javascript = await browser_auth.client.get("/ui-v2/js/app.js")
@@ -196,7 +220,7 @@ async def test_native_login_rejects_unsafe_next(browser_auth, unsafe_next):
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/"
+    assert response.headers["location"] == "/ui-v2/overview"
 
 
 @pytest.mark.asyncio
@@ -265,11 +289,11 @@ async def test_native_login_rejects_duplicate_and_oversized_fields(browser_auth)
 
     assert duplicate.status_code == 303
     assert duplicate.headers["location"] == (
-        "/login?next=%2F&error=invalid_request"
+        "/login?next=%2Fui-v2%2Foverview&error=invalid_request"
     )
     assert oversized.status_code == 303
     assert oversized.headers["location"] == (
-        "/login?next=%2F&error=invalid_request"
+        "/login?next=%2Fui-v2%2Foverview&error=invalid_request"
     )
     assert auth.SESSION_COOKIE_NAME not in duplicate.headers.get("set-cookie", "")
     assert auth.SESSION_COOKIE_NAME not in oversized.headers.get("set-cookie", "")

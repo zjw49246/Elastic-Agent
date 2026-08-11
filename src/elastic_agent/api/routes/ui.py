@@ -5330,11 +5330,20 @@ try { sessionStorage.removeItem('ea_api_key'); } catch (_) {}
     history.replaceState(null, '', legacyUrl.pathname + legacyUrl.search + legacyUrl.hash);
   }
 }
-const PASSWORD_NEXT_PATHS = new Set(['/', '/batch', '/fleet', '/dashboard']);
+const DEFAULT_PASSWORD_NEXT = '/ui-v2/overview';
+const PASSWORD_NEXT_PATHS = new Set([
+  '/', '/batch', '/fleet', '/dashboard',
+  '/ui-v2', '/ui-v2/', '/ui-v2/overview', '/ui-v2/accounts',
+  '/ui-v2/accounts/new', '/ui-v2/jobs/new', '/ui-v2/jobs/batch',
+  '/ui-v2/jobs', '/ui-v2/results', '/ui-v2/fleet',
+]);
+const PASSWORD_JOB_DETAIL = /^[/]ui-v2[/]jobs[/][A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 let csrfToken = '';
 function safeNextPath() {
-  const candidate = new URLSearchParams(window.location.search).get('next') || '/';
-  return PASSWORD_NEXT_PATHS.has(candidate) ? candidate : '/';
+  const candidate = new URLSearchParams(window.location.search).get('next') ||
+    DEFAULT_PASSWORD_NEXT;
+  return PASSWORD_NEXT_PATHS.has(candidate) || PASSWORD_JOB_DETAIL.test(candidate)
+    ? candidate : DEFAULT_PASSWORD_NEXT;
 }
 function loginRedirect() {
   window.location.assign('/login?next=' + encodeURIComponent('/change-password'));
@@ -5443,9 +5452,14 @@ _LOGIN_ERROR_MESSAGES = {
 # A 4,096-character password can expand to roughly 48 KiB when non-ASCII UTF-8
 # bytes are percent-encoded by application/x-www-form-urlencoded.
 _MAX_LOGIN_FORM_BYTES = 64 * 1024
+_DEFAULT_UI_NEXT = "/ui-v2/overview"
 
 
-def _safe_ui_next(raw_next: str | None, *, default: str = "/") -> str:
+def _safe_ui_next(
+    raw_next: str | None,
+    *,
+    default: str = _DEFAULT_UI_NEXT,
+) -> str:
     """Return only a known local UI path so redirects cannot leave this origin."""
     if raw_next in _SAFE_UI_NEXT_PATHS:
         return raw_next
@@ -5555,11 +5569,14 @@ async def _authenticated_ui_redirect(
     request: Request,
 ) -> RedirectResponse | None:
     """Redirect anonymous and first-login sessions before rendering app HTML."""
+    next_path = (
+        _DEFAULT_UI_NEXT if request.url.path == "/" else request.url.path
+    )
     principal = await get_session_principal(request)
     if principal is None:
-        return _redirect("/login", next_path=request.url.path)
+        return _redirect("/login", next_path=next_path)
     if _principal_requires_password_change(principal):
-        return _redirect("/change-password", next_path=request.url.path)
+        return _redirect("/change-password", next_path=next_path)
     return None
 
 
@@ -5570,7 +5587,11 @@ async def login_page(request: Request):
     principal = await get_session_principal(request)
     if principal is not None:
         if _principal_requires_password_change(principal):
-            destination = "/" if next_path == "/change-password" else next_path
+            destination = (
+                _DEFAULT_UI_NEXT
+                if next_path == "/change-password"
+                else next_path
+            )
             return _redirect("/change-password", next_path=destination)
         return _redirect(next_path)
     return _login_html(
@@ -5588,11 +5609,11 @@ async def browser_login(request: Request):
     except (ValidationError, ValueError):
         return _redirect(
             "/login",
-            next_path="/",
+            next_path=_DEFAULT_UI_NEXT,
             error_code="invalid_request",
         )
 
-    response = _redirect("/")
+    response = _redirect(_DEFAULT_UI_NEXT)
     try:
         principal = await create_browser_session(incoming, request, response)
     except HTTPException as exc:
@@ -5614,7 +5635,9 @@ async def browser_login(request: Request):
         return failed
 
     if _principal_requires_password_change(principal):
-        destination = "/" if next_path == "/change-password" else next_path
+        destination = (
+            _DEFAULT_UI_NEXT if next_path == "/change-password" else next_path
+        )
         response.headers["Location"] = "/change-password?" + urlencode(
             {"next": destination}
         )
