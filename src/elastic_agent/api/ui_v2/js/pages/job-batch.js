@@ -1,229 +1,323 @@
-/**
- * Batch submit — paste or upload a JSON manifest to create multiple Jobs.
- *
- * Uses ``POST /api/job-batches/plan`` for preflight and
- * ``POST /api/job-batches`` with an ``Idempotency-Key`` header for submission.
- *
- * Manifest schema (server-side ``JobBatchManifest``):
- * {
- *   "schema_version": 1,
- *   "batch_id": "my-batch-20260810",
- *   "policy": { "max_active_jobs": 3, "on_job_failure": "continue" },
- *   "jobs": [
- *     { "client_id": "task-1", "spec": { <JobSpec> } },
- *     ...
- *   ]
- * }
- */
+/** Strict JSON JobBatch planning, durable submission and status tracking. */
 
 import { el, clear } from '../core/dom.js';
-import { post } from '../core/api.js';
-import { describeError } from '../core/errors.js';
+import { get, postJsonText } from '../core/api.js';
+import { describeError, isAbort } from '../core/errors.js';
+import { createPoller } from '../core/poller.js';
+import {
+  JOB_BATCH_DEFAULT_MAX_ITEMS,
+  JOB_BATCH_MAX_BYTES,
+  JOB_BATCH_SCHEMA_MAX_ITEMS,
+  batchIdempotencyKey,
+  batchReceiptIsTerminal,
+  parseBatchSource,
+} from '../core/job-batch.js';
+import { confirmDialog } from '../components/dialog.js';
 import { toastError, toastSuccess } from '../components/toast.js';
 
 export function createPage({ router, container }) {
   const nodes = {};
+  let generation = 0;
+  let disposed = false;
+  let planning = false;
   let submitting = false;
+  let requestController = null;
+  let receiptPoller = null;
+  let planned = null; // exact {source, manifest, plan, idempotencyKey}
+  let receipt = null;
 
   function mount() {
     container.appendChild(buildLayout());
   }
 
-  function dispose() {}
+  function dispose() {
+    disposed = true;
+    generation += 1;
+    if (requestController) requestController.abort();
+    if (receiptPoller) receiptPoller.stop();
+  }
+
+  function stopReceiptPolling() {
+    if (receiptPoller) receiptPoller.stop();
+    receiptPoller = null;
+  }
+
+  function invalidateSource({ clearOutput = true } = {}) {
+    generation += 1;
+    planned = null;
+    receipt = null;
+    stopReceiptPolling();
+    nodes.submitBtn.disabled = true;
+    nodes.submitBtn.textContent = '确认并提交';
+    if (clearOutput) clear(nodes.output);
+  }
+
+  function setBusy(value) {
+    nodes.input.disabled = value;
+    nodes.file.disabled = value;
+    nodes.exampleBtn.disabled = value;
+    nodes.planBtn.disabled = value;
+    nodes.submitBtn.disabled = value || !planned || planned.plan.valid !== true || Boolean(receipt);
+  }
 
   async function plan() {
-    const manifest = parseInput();
-    if (!manifest) return;
-    nodes.planBtn.disabled = true;
-    nodes.planBtn.textContent = '校验中…';
+    if (planning || submitting) return;
+    const source = nodes.input.value;
+    let manifest;
     try {
-      const result = await post('/job-batches/plan', manifest);
-      renderPlan(result);
-      if (result.valid) toastSuccess(`批量计划校验通过：${result.items?.length || 0} 个 Job。`);
-      else toastError('批量计划校验不通过，请查看下方详情。');
+      manifest = parseBatchSource(source);
     } catch (error) {
-      renderError(describeError(error));
-      toastError(describeError(error));
+      renderError(error.message);
+      toastError(error.message);
+      nodes.input.focus();
+      return;
+    }
+
+    const token = generation;
+    planning = true;
+    setBusy(true);
+    nodes.planBtn.textContent = '校验中…';
+    requestController = new AbortController();
+    try {
+      const idempotencyKey = await batchIdempotencyKey(manifest.batch_id);
+      const result = await postJsonText('/job-batches/plan', source, {
+        signal: requestController.signal,
+      });
+      if (disposed || token !== generation || source !== nodes.input.value) return;
+      planned = { source, manifest, plan: result, idempotencyKey };
+      receipt = null;
+      renderPlan(result);
+      if (result.valid === true) {
+        toastSuccess(`批量计划校验通过：${result.items?.length || 0} 个 Job。`);
+      } else {
+        toastError('批量计划校验不通过，请查看逐项详情。');
+      }
+    } catch (error) {
+      if (!isAbort(error) && token === generation) {
+        renderError(describeError(error));
+        toastError(describeError(error));
+      }
     } finally {
-      nodes.planBtn.disabled = false;
-      nodes.planBtn.textContent = '校验计划';
+      if (token === generation && !disposed) {
+        planning = false;
+        requestController = null;
+        nodes.planBtn.textContent = '校验计划';
+        setBusy(false);
+      }
     }
   }
 
   async function submit() {
-    if (submitting) return;
-    const manifest = parseInput();
-    if (!manifest) return;
+    if (submitting || planning || !planned || planned.plan.valid !== true) return;
+    if (nodes.input.value !== planned.source) {
+      invalidateSource();
+      renderError('JSON 已在预检后发生变化，请重新校验。');
+      return;
+    }
 
-    // Generate idempotency key
-    const key = (crypto.randomUUID && crypto.randomUUID())
-      || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const summary = planned.plan.summary || {};
+    const confirmed = await confirmDialog({
+      title: '确认启动批量 Jobs',
+      message: `将接受 ${summary.job_count ?? planned.manifest.jobs.length} 个 Job、`
+        + `${summary.total_workers ?? '—'} 个 Workers，最大并发 `
+        + `${summary.max_active_jobs ?? planned.manifest.policy?.max_active_jobs ?? 3} 个 Job。`
+        + '提交后会创建真实资源。',
+      confirmLabel: '确认提交',
+    });
+    if (!confirmed || !planned || nodes.input.value !== planned.source) return;
 
+    const token = generation;
+    const intent = planned;
     submitting = true;
-    nodes.submitBtn.disabled = true;
+    setBusy(true);
     nodes.submitBtn.textContent = '提交中…';
+    requestController = new AbortController();
     try {
-      const result = await post('/job-batches', manifest, {
-        headers: { 'Idempotency-Key': key },
+      const result = await postJsonText('/job-batches', intent.source, {
+        headers: { 'Idempotency-Key': intent.idempotencyKey },
+        signal: requestController.signal,
       });
-      renderResult(result);
-      toastSuccess(`批量 Job 已提交：${result.batch_id || 'batch'}`);
-    } catch (error) {
-      renderError(describeError(error));
-      toastError(describeError(error));
-    } finally {
-      submitting = false;
-      nodes.submitBtn.disabled = false;
-      nodes.submitBtn.textContent = '校验并提交';
-    }
-  }
-
-  function parseInput() {
-    const raw = nodes.input.value.trim();
-    if (!raw) {
-      toastError('请粘贴或上传 JSON manifest。');
-      return null;
-    }
-    try {
-      const parsed = JSON.parse(raw);
-      if (typeof parsed !== 'object' || Array.isArray(parsed)) {
-        toastError('JSON 必须是一个对象（不是数组）。');
-        return null;
+      if (disposed || token !== generation || intent !== planned) return;
+      if (!result || typeof result.job_batch_id !== 'string' || !result.job_batch_id) {
+        throw new Error('服务器回执缺少 job_batch_id；稳定幂等键已保留，可安全重试。');
       }
-      return parsed;
+      receipt = result;
+      renderReceipt(result);
+      toastSuccess(`批次已接收：${result.job_batch_id}`);
+      if (!batchReceiptIsTerminal(result)) startReceiptPolling(result.job_batch_id, token);
     } catch (error) {
-      toastError(`JSON 解析失败：${error.message}`);
-      nodes.input.focus();
-      return null;
+      if (!isAbort(error) && token === generation) {
+        const message = Number(error && error.status) === 409
+          ? '同一 batch_id 已绑定到另一份 manifest；请恢复原内容重试，或更换 batch_id。'
+          : describeError(error);
+        renderError(message, { preservePlan: true });
+        toastError(message);
+      }
+    } finally {
+      if (token === generation && !disposed) {
+        submitting = false;
+        requestController = null;
+        nodes.submitBtn.textContent = receipt ? '批次已提交' : '确认并提交';
+        setBusy(false);
+      }
     }
   }
 
-  function renderPlan(plan) {
-    clear(nodes.output);
-    const items = plan.items || [];
-    const valid = plan.valid;
+  function startReceiptPolling(jobBatchId, token) {
+    stopReceiptPolling();
+    receiptPoller = createPoller({
+      name: `job-batch-${jobBatchId}`,
+      interval: 3000,
+      maxBackoff: 30000,
+      immediate: false,
+      task: async (signal) => {
+        const result = await get(`/job-batches/${encodeURIComponent(jobBatchId)}`, { signal });
+        if (disposed || token !== generation || !receipt || receipt.job_batch_id !== jobBatchId) return;
+        receipt = result;
+        renderReceipt(result);
+        if (batchReceiptIsTerminal(result)) {
+          stopReceiptPolling();
+          toastSuccess(`批次已进入终态：${jobBatchId}`);
+        }
+      },
+    });
+    receiptPoller.start();
+  }
 
-    const summary = el('div', { class: 'card' }, [
+  function renderPlan(result) {
+    clear(nodes.output);
+    const items = Array.isArray(result.items) ? result.items : [];
+    const valid = result.valid === true;
+    const summary = result.summary || {};
+    nodes.output.appendChild(el('section', { class: 'card' }, [
       el('h3', { text: valid ? '✓ 批量计划校验通过' : '✗ 批量计划校验不通过' }),
-      el('p', { class: 'small', text: `batch_id: ${plan.batch_id || '—'} · ${items.length} 个 Job` }),
-    ]);
-
-    if (plan.errors && plan.errors.length) {
-      summary.appendChild(el('div', { class: 'err small' }, [
-        el('strong', { text: '全局错误：' }),
-        ...plan.errors.map((e) => el('div', { text: String(e) })),
-      ]));
-    }
-
-    const table = el('tbody');
-    for (const item of items) {
-      const row = el('tr', {}, [
-        el('td', { class: 'mono', text: item.client_id }),
-        el('td', { text: item.name || '—' }),
-        el('td', {}, [
-          el('span', {
-            class: `badge badge-${item.valid ? 'ok' : 'err'}`,
-            text: item.valid ? '通过' : '失败',
-          }),
-        ]),
-        el('td', { class: 'small' }, [
-          ...(item.warnings || []).map((w) => el('div', { class: 'muted', text: w })),
-          ...(item.errors || []).map((e) => el('div', { class: 'err', text: e })),
-        ]),
-      ]);
-      table.appendChild(row);
-    }
-
-    nodes.output.appendChild(summary);
-    nodes.output.appendChild(el('div', { class: 'table-wrap' }, [
-      el('table', {}, [
-        el('thead', {}, [el('tr', {}, [
-          el('th', { text: 'client_id' }),
-          el('th', { text: '名称' }),
-          el('th', { text: '状态' }),
-          el('th', { text: '详情' }),
-        ])]),
-        table,
-      ]),
+      el('p', { class: 'small mono', text: `batch_id: ${result.batch_id || '—'}` }),
+      el('p', {
+        class: 'small',
+        text: `${summary.job_count ?? items.length} Jobs · ${summary.total_workers ?? '—'} Workers · `
+          + `${formatNumber(summary.total_worker_hours)} Worker-hours · 最大并发 ${summary.max_active_jobs ?? '—'}`,
+      }),
+      renderMessages(result.errors, 'err'),
+      renderMessages(result.warnings, 'muted'),
     ]));
-
-    if (plan.summary) {
-      nodes.output.appendChild(el('details', {}, [
-        el('summary', { text: '计划摘要' }),
-        el('pre', { class: 'code', text: JSON.stringify(plan.summary, null, 2) }),
-      ]));
-    }
+    nodes.output.appendChild(renderPlanTable(items));
+    nodes.submitBtn.disabled = !valid;
   }
 
-  function renderResult(result) {
+  function renderPlanTable(items) {
+    const tbody = el('tbody');
+    for (const item of items) {
+      tbody.appendChild(el('tr', {}, [
+        el('td', { class: 'mono', text: item.client_id || '—' }),
+        el('td', { text: item.name || '—' }),
+        el('td', {}, [el('span', {
+          class: `badge badge-${item.valid ? 'ok' : 'err'}`,
+          text: item.valid ? '通过' : '失败',
+        })]),
+        el('td', { class: 'small' }, [
+          renderMessages(item.warnings, 'muted'),
+          renderMessages(item.errors, 'err'),
+        ]),
+      ]));
+    }
+    return el('div', { class: 'table-wrap' }, [el('table', {}, [
+      el('thead', {}, [el('tr', {}, [
+        el('th', { text: 'client_id' }),
+        el('th', { text: '名称' }),
+        el('th', { text: '状态' }),
+        el('th', { text: '详情' }),
+      ])]),
+      tbody,
+    ])]);
+  }
+
+  function renderReceipt(result) {
     clear(nodes.output);
-    const items = result.items || [];
-    nodes.output.appendChild(el('div', { class: 'card' }, [
-      el('h3', { text: '批量 Job 已提交' }),
-      el('p', { class: 'small mono', text: `batch_id: ${result.batch_id || '—'}` }),
+    const items = Array.isArray(result.items) ? result.items : [];
+    const state = String(result.state || 'queued');
+    const stateClass = receiptStateClass(state, items);
+    nodes.output.appendChild(el('section', { class: 'card' }, [
+      el('div', { class: 'spread' }, [
+        el('div', {}, [
+          el('h3', { text: '批次提交回执' }),
+          el('p', { class: 'small mono', text: `batch_id: ${result.batch_id || '—'}` }),
+          el('p', { class: 'small mono', text: `job_batch_id: ${result.job_batch_id || '—'}` }),
+        ]),
+        el('span', { class: `badge badge-${stateClass}`, text: state }),
+      ]),
       result.idempotent_replay
-        ? el('p', { class: 'small muted', text: '（幂等重放：此批次之前已提交过）' })
+        ? el('p', { class: 'small muted', text: '幂等重放：服务端返回了此前已接受的同一批次。' })
+        : null,
+      !batchReceiptIsTerminal(result)
+        ? el('p', { class: 'small muted', text: '正在自动刷新 queued / accepted / terminal / error 状态。' })
         : null,
     ]));
 
-    if (items.length) {
-      const table = el('tbody');
-      for (const item of items) {
-        const jobId = item.job_id || '—';
-        table.appendChild(el('tr', {}, [
-          el('td', { class: 'mono', text: item.client_id }),
-          el('td', {}, [
-            jobId !== '—'
-              ? el('a', { href: router.href(`/jobs/${encodeURIComponent(jobId)}`), class: 'mono', text: jobId })
-              : el('span', { class: 'mono muted', text: '—' }),
-          ]),
-          el('td', {}, [
-            el('span', {
-              class: `badge badge-${item.state === 'error' ? 'err' : item.state === 'accepted' ? 'ok' : 'idle'}`,
-              text: item.state || '—',
-            }),
-          ]),
-          el('td', { class: 'small err', text: item.error || '' }),
-        ]));
-      }
-      nodes.output.appendChild(el('div', { class: 'table-wrap' }, [
-        el('table', {}, [
-          el('thead', {}, [el('tr', {}, [
-            el('th', { text: 'client_id' }),
-            el('th', { text: 'Job ID' }),
-            el('th', { text: '状态' }),
-            el('th', { text: '错误' }),
-          ])]),
-          table,
-        ]),
+    const tbody = el('tbody');
+    for (const item of items) {
+      const jobState = item.state === 'terminal' && item.job_state ? ` · ${item.job_state}` : '';
+      tbody.appendChild(el('tr', {}, [
+        el('td', { class: 'mono', text: item.client_id || '—' }),
+        el('td', { text: item.name || '—' }),
+        el('td', {}, [item.job_id
+          ? el('a', { href: router.href(`/jobs/${encodeURIComponent(item.job_id)}`), class: 'mono', text: item.job_id })
+          : el('span', { class: 'mono muted', text: '等待接受' })]),
+        el('td', {}, [el('span', {
+          class: `badge badge-${itemStateClass(item)}`,
+          text: `${item.state || 'queued'}${jobState}`,
+        })]),
+        el('td', { class: 'small err', text: item.error || '' }),
       ]));
     }
+    nodes.output.appendChild(el('div', { class: 'table-wrap' }, [el('table', {}, [
+      el('thead', {}, [el('tr', {}, [
+        el('th', { text: 'client_id' }),
+        el('th', { text: '名称' }),
+        el('th', { text: 'Job ID' }),
+        el('th', { text: '状态' }),
+        el('th', { text: '错误' }),
+      ])]),
+      tbody,
+    ])]));
   }
 
-  function renderError(message) {
-    clear(nodes.output);
-    nodes.output.appendChild(el('div', { class: 'card' }, [
-      el('p', { class: 'err', text: message }),
-    ]));
+  function renderMessages(messages, className) {
+    const values = Array.isArray(messages) ? messages : [];
+    return el('div', { class: className }, values.map((message) => el('div', { text: String(message) })));
   }
 
-  function handleFile(event) {
+  function renderError(message, { preservePlan = false } = {}) {
+    if (!preservePlan) clear(nodes.output);
+    nodes.output.prepend(el('div', { class: 'card' }, [el('p', { class: 'err', text: message })]));
+  }
+
+  async function handleFile(event) {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) {
-      toastError('文件不能超过 2 MiB。');
+    const token = ++generation;
+    planned = null;
+    receipt = null;
+    stopReceiptPolling();
+    clear(nodes.output);
+    if (file.size === 0 || file.size > JOB_BATCH_MAX_BYTES) {
+      const message = file.size === 0 ? 'JSON 文件不能为空。' : '文件不能超过 2 MiB。';
+      renderError(message);
+      toastError(message);
+      event.target.value = '';
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      nodes.input.value = reader.result;
-      // Try to pretty-print
-      try {
-        const parsed = JSON.parse(reader.result);
-        nodes.input.value = JSON.stringify(parsed, null, 2);
-      } catch (_) { /* keep as-is */ }
-    };
-    reader.readAsText(file);
+    try {
+      const bytes = await file.arrayBuffer();
+      if (token !== generation || disposed) return;
+      const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      nodes.input.value = source;
+      invalidateSource();
+      nodes.fileMeta.textContent = `${file.name} · ${bytes.byteLength} bytes · 已载入内存，尚未预检`;
+    } catch (_) {
+      if (token !== generation) return;
+      renderError('文件必须是有效 UTF-8 JSON。');
+      toastError('文件必须是有效 UTF-8 JSON。');
+    }
   }
 
   function loadExample() {
@@ -254,6 +348,9 @@ export function createPage({ router, container }) {
         },
       ],
     }, null, 2);
+    nodes.file.value = '';
+    nodes.fileMeta.textContent = '示例已载入内存，尚未预检。';
+    invalidateSource();
   }
 
   function buildLayout() {
@@ -261,7 +358,7 @@ export function createPage({ router, container }) {
     root.appendChild(el('div', { class: 'page-head' }, [
       el('div', {}, [
         el('h1', { text: '批量提交 Job' }),
-        el('p', { class: 'page-sub', text: '粘贴或上传 JSON manifest，一次提交多个 Job。每个 Job 独立校验和接受。' }),
+        el('p', { class: 'page-sub', text: '同一份原始 JSON 先做无副作用预检，确认后进入耐久队列。' }),
       ]),
       el('div', { class: 'page-actions' }, [
         el('a', { class: 'btn', href: router.href('/jobs/new'), text: '单个提交' }),
@@ -269,46 +366,74 @@ export function createPage({ router, container }) {
     ]));
 
     const card = el('section', { class: 'card' });
-
-    // File upload
-    const fileInput = el('input', { type: 'file', accept: '.json,application/json', id: 'batchFile' });
-    fileInput.addEventListener('change', handleFile);
-    const exampleBtn = el('button', { type: 'button', class: 'btn btn-sm', text: '加载示例' });
-    exampleBtn.addEventListener('click', loadExample);
+    nodes.file = el('input', {
+      type: 'file', accept: '.json,application/json', id: 'batchFile', hidden: true,
+    });
+    nodes.file.addEventListener('change', handleFile);
+    nodes.exampleBtn = el('button', { type: 'button', class: 'btn btn-sm', text: '加载示例' });
+    nodes.exampleBtn.addEventListener('click', loadExample);
+    nodes.fileMeta = el('span', { class: 'small muted', text: '文件仅保存在当前页面内存中。' });
     card.appendChild(el('div', { class: 'row', style: { 'margin-bottom': '10px' } }, [
       el('label', { class: 'btn btn-sm', for: 'batchFile', text: '上传 JSON 文件' }),
-      fileInput,
-      exampleBtn,
+      nodes.exampleBtn,
+      nodes.file,
+      nodes.fileMeta,
     ]));
 
-    // JSON editor
     nodes.input = el('textarea', {
       id: 'batchInput',
-      placeholder: '粘贴 JobBatchManifest JSON…\n\n{\n  "schema_version": 1,\n  "batch_id": "my-batch",\n  "jobs": [\n    { "client_id": "task-1", "spec": { ... } }\n  ]\n}',
-      style: { 'min-height': '300px', 'font-family': 'ui-monospace, monospace', 'font-size': '0.82rem' },
+      placeholder: '粘贴 JobBatchManifest JSON…',
+      style: { 'min-height': '360px', 'font-size': '0.82rem' },
       'aria-label': 'JSON manifest',
+      spellcheck: 'false',
+    });
+    nodes.input.addEventListener('input', () => {
+      nodes.file.value = '';
+      nodes.fileMeta.textContent = '内容已修改，必须重新预检。';
+      invalidateSource();
     });
     card.appendChild(el('div', { class: 'field' }, [
       el('label', { for: 'batchInput', text: 'JSON Manifest' }),
       nodes.input,
-      el('span', { class: 'help', text: '最多 100 个 Job，总大小不超过 2 MiB。schema_version 必须为 1。' }),
+      el('span', {
+        class: 'help',
+        text: `请求不超过 2 MiB；schema 硬限 ${JOB_BATCH_SCHEMA_MAX_ITEMS} 个 Job，`
+          + `部署默认 ${JOB_BATCH_DEFAULT_MAX_ITEMS} 个，实际限制以服务端预检为准。`,
+      }),
     ]));
 
-    // Buttons
     nodes.planBtn = el('button', { type: 'button', class: 'btn', text: '校验计划' });
     nodes.planBtn.addEventListener('click', plan);
-    nodes.submitBtn = el('button', { type: 'button', class: 'btn btn-primary', text: '校验并提交' });
+    nodes.submitBtn = el('button', {
+      type: 'button', class: 'btn btn-primary', text: '确认并提交', disabled: true,
+    });
     nodes.submitBtn.addEventListener('click', submit);
     card.appendChild(el('div', { class: 'row' }, [nodes.planBtn, nodes.submitBtn]));
-
     root.appendChild(card);
 
-    // Output area
-    nodes.output = el('div', { role: 'status' });
+    nodes.output = el('div', { role: 'status', 'aria-live': 'polite' });
     root.appendChild(nodes.output);
-
     return root;
   }
 
   return { mount, dispose };
+}
+
+function formatNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—';
+}
+
+function itemStateClass(item) {
+  const state = String(item && item.state || '').toLowerCase();
+  const jobState = String(item && item.job_state || '').toLowerCase();
+  if (state === 'error' || (state === 'terminal' && jobState === 'failed')) return 'err';
+  if (state === 'terminal' && jobState === 'cancelled') return 'warn';
+  if (state === 'terminal' || state === 'accepted') return 'ok';
+  return 'idle';
+}
+
+function receiptStateClass(state, items) {
+  if (state !== 'terminal') return state === 'running' ? 'ok' : 'idle';
+  return items.some((item) => itemStateClass(item) === 'err') ? 'err' : 'ok';
 }

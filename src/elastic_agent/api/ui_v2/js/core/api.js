@@ -50,6 +50,26 @@ async function safeDetail(response) {
           .filter(Boolean)
           .join('；');
       }
+      if (detail && typeof detail === 'object') {
+        // JobBatch preflight failures deliberately return a bounded, secret-free
+        // object.  Project only its documented fields instead of stringifying an
+        // arbitrary response object that might gain sensitive fields later.
+        const messages = [];
+        if (typeof detail.message === 'string') messages.push(detail.message);
+        if (Array.isArray(detail.errors)) {
+          messages.push(...detail.errors.filter((item) => typeof item === 'string'));
+        }
+        if (Array.isArray(detail.items)) {
+          for (const item of detail.items.slice(0, 100)) {
+            if (!item || typeof item !== 'object' || !Array.isArray(item.errors)) continue;
+            const prefix = typeof item.client_id === 'string' ? `${item.client_id}: ` : '';
+            for (const message of item.errors) {
+              if (typeof message === 'string') messages.push(prefix + message);
+            }
+          }
+        }
+        return messages.slice(0, 200).join('；').slice(0, 12000);
+      }
       return '';
     }
     const raw = await response.text();
@@ -64,10 +84,13 @@ async function safeDetail(response) {
  *
  * @param {string} method
  * @param {string} path Path relative to /api
- * @param {object} [options] {body, query, signal, headers}
+ * @param {object} [options] {body, rawBody, query, signal, headers}
  */
 export async function request(method, path, options = {}) {
-  const { body, query, signal, headers = {} } = options;
+  const { body, rawBody, query, signal, headers = {} } = options;
+  if (body !== undefined && rawBody !== undefined) {
+    throw new TypeError('request cannot provide both body and rawBody');
+  }
   const url = buildUrl(path, query);
   const init = {
     method,
@@ -80,6 +103,9 @@ export async function request(method, path, options = {}) {
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
+  } else if (rawBody !== undefined) {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = String(rawBody);
   }
 
   let response;
@@ -117,6 +143,7 @@ export async function request(method, path, options = {}) {
 
 export const get = (path, options) => request('GET', path, options);
 export const post = (path, body, options = {}) => request('POST', path, { ...options, body });
+export const postJsonText = (path, rawBody, options = {}) => request('POST', path, { ...options, rawBody });
 export const put = (path, body, options = {}) => request('PUT', path, { ...options, body });
 export const del = (path, options) => request('DELETE', path, options);
 

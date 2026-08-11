@@ -835,22 +835,33 @@ Job. Prefer declarative JobSpec for untrusted submitters.
 
 **UI v2 (preview)**: a new multi-page console is served at `/ui-v2/` (routes:
 `/ui-v2/overview`, `/ui-v2/accounts`, `/ui-v2/accounts/new`, `/ui-v2/jobs/new`,
-`/ui-v2/jobs`, `/ui-v2/jobs/{id}`, `/ui-v2/results`, `/ui-v2/fleet`). It is a
+`/ui-v2/jobs/batch`, `/ui-v2/jobs`, `/ui-v2/jobs/{id}`, `/ui-v2/results`,
+`/ui-v2/fleet`). It is a
 native ES-module SPA with a persistent navigation shell, page-scoped polling,
-deep links and mobile support; the legacy `/batch` and `/fleet` pages remain
-unchanged as the rollback entry points. The static bundle can also be built for
+deep links and mobile support. The legacy `/`/`/batch` Batch Console and
+`/fleet`/`/dashboard` Fleet Dashboard remain available as rollback surfaces;
+the latest JSON batch page is `/ui-v2/jobs/batch`. The static bundle can also be built for
 CDN canary deployment with `python scripts/build_ui_v2.py --out dist/ui-v2`
 (content-hashed assets + manifest; see `docs/ui-v2-implementation-plan.md`).
 The Manager additionally exposes `GET /api/ui/summary` (Bearer-protected)
 returning aggregate counts only — no identifiers, no S3 scans — for the shell's
 status bar and the overview page.
 
-**Frontend**: the Batch Console at `/batch` uses a light theme by default, with
-an optional session-scoped dark theme. The Job submission form keeps the
-JobSpec wire format unchanged while grouping inputs into eight numbered
-sections: basics, compute, source/setup, account, run, results, rotation, and
-trusted Harness settings. Labels name the user-facing purpose first and show
-the raw JobSpec field second; low-frequency settings use disclosure panels.
+The v2 batch page accepts or uploads one strict schema-v1 JSON manifest. It
+sends the same raw UTF-8 bytes to `POST /api/job-batches/plan` and, after an
+explicit resource confirmation, to `POST /api/job-batches`. A stable
+Idempotency-Key derived from `batch_id` makes an uncertain network retry safe;
+the page then polls `GET /api/job-batches/{job_batch_id}` until every item is
+terminal or errored. The schema permits at most 100 Jobs, while the deployment
+default is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits
+are reported by preflight. API keys are never rendered into the public static
+shell; operators enter one per tab and it is kept only in memory/sessionStorage.
+
+**Frontend**: the v2 console uses a light theme by default, with an optional
+session-scoped dark theme. The Job submission form keeps the JobSpec wire
+format unchanged while grouping inputs into four guided steps covering basics,
+source/setup, account/run, and results/recovery/advanced settings. Labels name
+the user-facing purpose first and show the raw JobSpec field second; low-frequency settings use disclosure panels.
 Conditional account, EIP, repo, and rotation controls are visibly disabled
 with an adjacent reason when they do not apply. Result paths and the in-run
 collection interval remain prominent, and the validation/launch action stays

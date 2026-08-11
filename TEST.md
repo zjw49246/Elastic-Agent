@@ -501,10 +501,15 @@ test networks only.
   source invariants for the v2 JS (no `innerHTML`, no localStorage/Service
   Worker, API Key confined to `auth.js`, EIP decommission-before-delete order,
   Idempotency-Key usage).
-- JavaScript (`node --test tests/ui_v2/`): pure-module tests for
-  `js/core/job-spec.js` — JobSpec builder/validator parity with
+- JavaScript (`node --test tests/ui_v2/*.test.mjs`): pure-module tests for
+  `js/core/job-spec.js` and `js/core/job-batch.js` — JobSpec builder/validator parity with
   `core/job_spec.py` (TTL vs run timeout, EIP account counts, Codex
   config_dir, checkpoint/recovery rules, secret env references, S3 dataset
-  parsing) and the per-intent Idempotency-Key state machine.
+  parsing), strict manifest/duplicate-key/UTF-8 size validation, exact raw JSON
+  transport, structured 422 errors, and stable per-intent Idempotency-Key state.
+- JobBatch backend (`tests/unit/test_job_batches.py`): strict schema and body
+  limits, side-effect-free all-item preflight, durable acceptance/replay,
+  per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
+  restart recovery, and Manager-wide concurrency bounds.
 - Import graph: `python scripts/build_ui_v2.py --check` validates that every
   ES-module import resolves inside `src/elastic_agent/api/ui_v2/`.

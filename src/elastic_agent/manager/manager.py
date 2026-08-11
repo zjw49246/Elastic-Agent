@@ -213,6 +213,9 @@ class ElasticAgentManager:
         self._account_allocator: Any = None
         self._account_login_coordinator: Any = None
         self._batch: Any = None
+        from elastic_agent.core.job_batch import JobBatchQueue
+
+        self.job_batch_queue = JobBatchQueue(self)
 
         # Optional S3 result upload: collected/<job_id>/ → s3://<bucket>/<prefix>/.
         # Enabled by ELASTIC_AGENT_RESULTS_S3_BUCKET.
@@ -347,6 +350,11 @@ class ElasticAgentManager:
 
             await self.reconciler.start_periodic()
 
+            # Load accepted JSON batches only after Job/account recovery is
+            # initialized. The queue may then safely replay each queued item
+            # through the canonical single-Job idempotency boundary.
+            await self.job_batch_queue.start()
+
             self._started = True
             logger.info("ElasticAgentManager started")
 
@@ -412,6 +420,13 @@ class ElasticAgentManager:
             await self.reconciler.stop_periodic()
         except Exception:  # noqa: BLE001
             logger.exception("Reconciler shutdown failed")
+
+        # Fence new batch item submissions before asking the underlying Job
+        # orchestrator to settle its owned launch/cleanup tasks.
+        try:
+            await self.job_batch_queue.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("Job batch queue shutdown failed")
 
         # Batch launch/collect/cleanup tasks may still own a temporary EIP
         # worker.  Settle them before startup recovery is cancelled.

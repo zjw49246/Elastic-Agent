@@ -45,7 +45,10 @@ class TestStaticShell:
     @pytest.mark.asyncio
     async def test_ui_v2_serves_index_without_auth(self, ui_client):
         client, _ = ui_client
-        for path in ("/ui-v2", "/ui-v2/", "/ui-v2/overview", "/ui-v2/jobs/some-job"):
+        for path in (
+            "/ui-v2", "/ui-v2/", "/ui-v2/overview",
+            "/ui-v2/jobs/some-job", "/ui-v2/jobs/batch",
+        ):
             resp = await client.get(path)
             assert resp.status_code == 200, path
             assert "text/html" in resp.headers["content-type"]
@@ -97,7 +100,7 @@ class TestStaticShell:
         assert "text/html" not in resp.headers.get("content-type", "")
 
     @pytest.mark.asyncio
-    async def test_legacy_batch_and_fleet_untouched(self, ui_client):
+    async def test_legacy_batch_and_fleet_remain_rollback_surfaces(self, ui_client):
         client, _ = ui_client
         assert (await client.get("/batch")).status_code == 200
         assert (await client.get("/fleet")).status_code == 200
@@ -160,6 +163,11 @@ class TestFrontendSourceInvariants:
             assert "ea_api_key" not in source, module
             assert "Bearer ${" not in source, module
 
+        auth_source = (UI_V2_ROOT / "js" / "core" / "auth.js").read_text(encoding="utf-8")
+        assert "ea-auth-token" not in auth_source
+        assert "querySelector('meta" not in auth_source
+        assert "ea-auth-token" not in (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
+
     def test_index_has_no_inline_script(self):
         html = (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
         # The only <script> is the module entry with a src attribute.
@@ -194,6 +202,19 @@ class TestFrontendSourceInvariants:
         assert "Idempotency-Key" in (
             UI_V2_ROOT / "js" / "pages" / "job-new.js"
         ).read_text(encoding="utf-8")
+
+    def test_job_batch_uses_raw_stable_intent_and_status_polling(self):
+        page = (UI_V2_ROOT / "js" / "pages" / "job-batch.js").read_text(encoding="utf-8")
+        core = (UI_V2_ROOT / "js" / "core" / "job-batch.js").read_text(encoding="utf-8")
+        assert "postJsonText('/job-batches/plan', source" in page
+        assert "postJsonText('/job-batches', intent.source" in page
+        assert "batchIdempotencyKey(manifest.batch_id)" in page
+        assert "job_batch_id" in page
+        assert "get(`/job-batches/${" in page
+        assert "receiptPoller.stop()" in page
+        assert "assertNoDuplicateJsonKeys(raw)" in core
+        assert "sessionStorage" not in page
+        assert "localStorage" not in page
 
     def test_eip_decommission_flow_order(self):
         source = (UI_V2_ROOT / "js" / "pages" / "accounts.js").read_text(encoding="utf-8")

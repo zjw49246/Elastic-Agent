@@ -5,6 +5,9 @@
 > 范围：Manager 管理前端、为前端提供的只读聚合/分页 API、无中断发布与回滚  
 > 生产安全原则：UI v2 灰度期间不修改、不重启现有 Manager，不中断运行中的 Job 或 Worker WebSocket
 
+> 实现状态更新（2026-08-11）：JSON JobBatch 后端与
+> `/ui-v2/jobs/batch` 已完成集成；旧 Batch/Fleet 入口继续作为立即回滚面。
+
 ## 1. 决策摘要
 
 UI v2 采用“统一应用壳 + 持久导航 + 页面级数据加载”，将当前 Batch Console 中混在一起的账号、Job 表单、Job 历史和结果拆开，同时保留独立 Fleet 页面能力。
@@ -184,6 +187,7 @@ UI v2 必须保证“只加载当前页”，不能把拆页变成多个页面�
 | `/accounts` | `/ui-v2/accounts` | 账号列表、额度、EIP、allocation | accounts/allocations/bindings |
 | `/accounts/new` | `/ui-v2/accounts/new` | 新增 OAuth 或 Agent API 账号 | provider metadata |
 | `/jobs/new` | `/ui-v2/jobs/new` | Job 表单、预检、计划、提交 | provider defaults + accounts |
+| `/jobs/batch` | `/ui-v2/jobs/batch` | 严格 JSON manifest 预检、提交、队列状态 | job-batches plan/submit/status |
 | `/jobs` | `/ui-v2/jobs` | 活跃/历史 Job 分页、搜索和筛选 | paginated jobs |
 | `/jobs/{id}` | `/ui-v2/jobs/{id}` | Job 时间线、Worker、日志和操作 | one job + optional logs/result |
 | `/results` | `/ui-v2/results` | 全部结果摘要、分数、S3、下载 | paginated results |
@@ -193,13 +197,9 @@ UI v2 必须保证“只加载当前页”，不能把拆页变成多个页面�
 
 ### 5.3 旧入口兼容
 
-Canary 期间：
-
-- `/`、`/batch` 继续返回旧 Batch Console。
+- `/`、`/batch` 继续返回旧 Batch Console，作为立即回滚面。
 - `/fleet`、`/dashboard` 继续返回旧 Fleet Dashboard。
-- `/ui-v2/*` 只返回新静态应用。
-
-稳定后可在 Cloudflare 增加“仅精确 `/`”的 Redirect Rule，将其重定向到 `/ui-v2/overview`。旧 `/batch` 必须至少保留一个完整观察期。清洁路由是否替代 `/ui-v2/*` 在后续单独决策，不阻塞 v2 上线。
+- `/ui-v2/*` 只返回新静态应用，API 与 WebSocket 不参与 fallback。
 
 ## 6. 页面规格
 

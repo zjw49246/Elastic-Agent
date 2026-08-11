@@ -98,6 +98,7 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
     )
     from elastic_agent.api.routes.files import router as files_router
     from elastic_agent.api.routes.health import router as health_router
+    from elastic_agent.api.routes.job_batches import router as job_batches_router
     from elastic_agent.api.routes.jobs import router as jobs_router
     from elastic_agent.api.routes.nodes import router as nodes_router
     from elastic_agent.api.routes.ui import router as ui_router
@@ -110,6 +111,7 @@ def create_app(manager: ElasticAgentManager) -> FastAPI:
     app.include_router(agent_api_accounts_router, prefix="/api")
     app.include_router(account_login_router, prefix="/api")
     app.include_router(jobs_router, prefix="/api")
+    app.include_router(job_batches_router, prefix="/api")
     # ui_v2 mounts /api/ui/summary plus the /ui-v2/* static shell; API routes
     # are registered above so the SPA fallback can never shadow /api or /ws.
     app.include_router(ui_v2_router)
