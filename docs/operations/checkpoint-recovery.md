@@ -59,6 +59,24 @@ Checkpoint mode requires `ELASTIC_AGENT_RESULTS_S3_BUCKET`. It always stages a
 Manager-side exact snapshot; Worker-direct mutable uploads are not used as
 recovery proof.
 
+### Troubleshooting snapshot byte budget errors
+
+`checkpoint snapshot byte budget is exhausted` refers to the Manager's
+process-wide in-memory reservation for temporary checkpoint snapshots. It does
+not by itself mean that a Worker ran out of memory, the S3 bucket is full, or
+the Manager filesystem has no free space. Check the Manager filesystem and the
+checkpoint snapshot directory separately before treating it as a capacity
+incident.
+
+An older cleanup bug deleted successfully uploaded snapshot files without
+returning their bytes to `_snapshot_reserved_bytes`. The stale accounting grew
+until it reached the default 20 GiB budget and then rejected every later
+snapshot even though the files were already gone. The fixed cleanup path treats
+snapshot deletion and reservation release as one operation on both successful
+uploads and snapshot-copy failures. Restarting an affected old Manager clears
+the stale process-local count, but deploying the fix is required to prevent it
+from accumulating again.
+
 Every workload path that participates in output, resume, setup, or rotation
 must be stable across replacement instances. Use `{{shard_id}}` or
 `{{shard_index}}`; checkpoint Jobs reject `{{hostname}}`, `$HOSTNAME`, and

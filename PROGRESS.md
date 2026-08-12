@@ -863,3 +863,29 @@ header，导航显示当前管理员并提供退出登录。服务端 Bearer API
 网格紧贴下一卡片、桌面误显汉堡按钮、移动顶栏状态溢出及标题常驻焦点框。静态资源 revision
 升为 `admin-session-v2` 立即换代缓存。管理员/UI 专项 **108 passed**、Node **26 passed**，
 Ruff、UI import、截图复核与 `git diff --check` 通过。
+
+## 2026-08-12 Checkpoint 临时快照预算归还修复（commit `5e56a5a`）
+
+**问题**：生产中的 checkpoint Job 陆续报
+`checkpoint snapshot byte budget is exhausted`。临时快照文件实际已经删除，Manager 磁盘仍有
+约 56 GiB 可用，快照目录也只有 4 KiB，但进程仍持续拒绝后续周期和终态 checkpoint。受影响的
+Job 即使 run 正常退出 0，也会因最终 checkpoint 无法提交而被标记为 failed。
+
+**根因**：这是 Manager 进程内的预算记账泄漏，不是 Worker 内存、S3 容量或 Manager 磁盘
+耗尽。`S3CheckpointStore` 创建快照时会增加进程级 `_snapshot_reserved_bytes`，默认上限为
+20 GiB；旧清理逻辑在调用 `snapshot.unlink()` 前记录 `cleaned = False`，正常删除成功后却没有
+把 `cleaned` 更新为 `True`，因此文件虽已删除，对应的已使用额度没有扣回。额度随每次
+checkpoint 单向累计，最终造成“实际有空间、记账显示已满”。
+
+**解决**：集中新增 `_remove_snapshot_and_release_budget()`，把删除临时快照与归还同一笔内存
+预算作为一个清理动作；成功上传的 `finally` 路径和快照复制异常路径均调用该方法。临时文件
+已经不存在时按幂等清理处理，仍只归还调用方持有的那一笔 reservation，避免两条路径再次产生
+不一致。
+
+**回归覆盖**：新增 4-byte 快照预算下连续提交三代 checkpoint 的测试；旧代码第二代必然误报
+预算耗尽，修复后连续成功。另注入一次 snapshot `fsync` 失败，验证异常清理后下一次提交仍能
+复用完整预算。Checkpoint、Manager fleet、恢复事务和崩溃恢复专项 **129 passed**；完整 Python
+套件 **3088 passed / 12 skipped / 0 failed**，Ruff 与 `git diff --check` 通过。
+
+**生产验证**：修复版 `feat/admin-account-auth-v2@5e56a5a` 于 2026-08-12 07:33 UTC 部署；
+Manager 健康检查通过，重启清除了旧进程内已泄漏的计数，部署后的初次复核未再出现该预算错误。
