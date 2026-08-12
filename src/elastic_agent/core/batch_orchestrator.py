@@ -37,7 +37,6 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Protocol
 
-from elastic_agent.core.ephemeral_stdin import EphemeralStdinLeaseStore
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
 from elastic_agent.harness.base import Harness
 from elastic_agent.harness.generic import build_execute, resolve_harness
@@ -566,12 +565,6 @@ class FleetDriver(Protocol):
         worker to scan output for rate-limit banners (Mode-B rotation)."""
         ...
 
-    async def send_sensitive_input(
-        self, worker_id: str, task_id: str, payload: bytearray,
-    ) -> None:
-        """Send a one-shot secret frame after the exact process is launched."""
-        ...
-
     async def resolve_secret_env(
         self, secret_env: dict[str, str],
     ) -> dict[str, str]:
@@ -707,7 +700,6 @@ class BatchOrchestrator:
         status_reconcile_grace_seconds: float = 60.0,
         disconnect_grace_seconds: float = 60.0,
         exit_archive_grace_seconds: float = 15.0,
-        stdin_lease_store: EphemeralStdinLeaseStore | None = None,
     ) -> None:
         self._driver = driver
         self._scale_in_on_complete = scale_in_on_complete
@@ -727,7 +719,6 @@ class BatchOrchestrator:
             0.01,
             exit_archive_grace_seconds,
         )
-        self._stdin_lease_store = stdin_lease_store
         self._worker_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
@@ -2136,44 +2127,6 @@ class BatchOrchestrator:
                 )
             ),
         )
-        if spec.run.stdin_protocol == "run_benchmark_v1":
-            if self._stdin_lease_store is None:
-                try:
-                    await self._driver.stop_command(
-                        run.worker_id,
-                        run.task_id,
-                    )
-                finally:
-                    raise RuntimeError(
-                        "run-benchmark stdin lease store is unavailable"
-                    )
-            try:
-                payload = self._stdin_lease_store.consume(job.job_id)
-            except BaseException:
-                try:
-                    await self._driver.stop_command(
-                        run.worker_id,
-                        run.task_id,
-                    )
-                finally:
-                    raise
-            try:
-                await self._driver.send_sensitive_input(
-                    run.worker_id,
-                    run.task_id,
-                    payload,
-                )
-            except BaseException:
-                try:
-                    await self._driver.stop_command(
-                        run.worker_id,
-                        run.task_id,
-                    )
-                finally:
-                    raise
-            finally:
-                for index in range(len(payload)):
-                    payload[index] = 0
         # PROCESS_EXIT can race the return of WebSocket send_command.  Never
         # resurrect a terminal run after that event already finalized it.
         if run.phase == WorkerPhase.DISPATCHING:
@@ -3773,9 +3726,6 @@ class BatchOrchestrator:
                     )
                     self._schedule_finish_retry(job)
                     return
-
-                if self._stdin_lease_store is not None:
-                    self._stdin_lease_store.discard(job.job_id)
 
                 if job.interrupt_requested:
                     if self._is_eip_bound(job.spec):

@@ -151,6 +151,9 @@ ENVIRONMENT_PROFILES: dict[str, dict[str, Any]] = {
             "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
         ],
     },
+    # Retained as a read-only compatibility profile for JobSpec journals
+    # written by the upstream schema revision.  It is generic Worker runtime
+    # metadata and does not enable the removed Run-Benchmark bridge.
     "ubuntu-agent-docker-v2": {
         "id": "ubuntu-agent-docker-v2",
         "os_family": "ubuntu",
@@ -511,10 +514,6 @@ class RunSpec(StrictSpecModel):
     # env expansion). When True the rendered command is wrapped as
     # ``bash -lc "<cmd>"``; when False it is shlex-split into a bare argv.
     shell: bool = True
-    # Secret-bearing stdin is not part of JobSpec persistence.  This marker is
-    # accepted only by a dedicated server-side constructor which installs a
-    # process-local, one-shot lease before the Job can reach dispatch.
-    stdin_protocol: Literal["none", "run_benchmark_v1"] = "none"
 
     @field_validator("command")
     @classmethod

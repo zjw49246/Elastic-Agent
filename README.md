@@ -187,10 +187,8 @@ whole-prefix `sync`. Destination parent paths are computed and quoted without
 shell word splitting, including spaces, globs, and single quotes.
 
 The AWS worker instance profile must grant `s3:GetObject` for the exact dataset
-prefix. Recursive prefix inputs also require `s3:ListBucket`, conditioned to
-`jobs/datasets`, `jobs/datasets/`, and `jobs/datasets/*`. The production policy
-does not permit listing result prefixes; result objects remain unreadable and
-undeletable from workers.
+prefix. The production policy limits that read grant to `jobs/datasets/*`;
+result objects remain unreadable and undeletable from workers.
 
 `environment.profile` selects a versioned common platform definition maintained
 by the framework. Jobs add only their repository, setup steps, datasets, run
@@ -231,53 +229,6 @@ reference. The reference is persisted and shown in plans, while the value is
 resolved immediately before dispatch and is never returned by the Job API.
 Cross-host secret delivery requires `ELASTIC_AGENT_MANAGER_URL=wss://...`;
 plaintext WebSocket delivery is rejected before Secrets Manager/SSM is read.
-
-Tokyo A launches new Workers with the AWS KeyPair `panyuexi` and its matching
-mode-`0600` `/home/ubuntu/panyuexi.pem`. The Manager IAM policy pins both that
-active KeyPair and the older `interview-key` rollback ARN; it never permits a
-wildcard KeyPair resource.
-
-### Trusted Run-Benchmark dynamic execution
-
-Run-Benchmark API-key trajectories use a narrower server-owned constructor:
-
-```text
-POST /api/jobs/run-benchmark
-```
-
-The caller supplies an exact Run-Benchmark commit/release identity, sealed S3
-input identity, public harness route, wall-time, and one `RBWORK01` credential
-frame. `Idempotency-Key` is mandatory. The Manager fixes the repository,
-`manager_rsync` delivery, `ubuntu-agent-docker-v2` environment, single Worker,
-setup/run commands, `account.mode=none`, S3 namespace, and final collect path;
-the ordinary `/api/jobs` and `/api/jobs/plan` routes reject the reserved
-`run.stdin_protocol` value.
-
-The wall-time is the instance's exact positive budget in the inclusive
-`1–10,800` second range. The Manager and Worker must preserve it exactly; they
-neither clamp sub-minute smoke/debug tasks to 60 seconds nor reject those tasks
-before credential consumption.
-
-The frame is never stored in JobSpec or its request fingerprint. It is adopted
-by a bounded process-local `bytearray` lease, consumed once only after the exact
-task process starts, sent over the required WSS transport, decoded at the task
-supervisor, written as binary stdin, and immediately closed for EOF. Buffers are
-overwritten after send and on discard, expiry, failure, or Manager shutdown.
-A Manager restart deliberately loses an unconsumed lease; a durable `prepared`
-Job cannot be resumed with an old credential and requires a new attempt.
-
-Manager provisioning orders repository setup before S3 dataset sync. The
-constructor therefore installs the exact package during setup, then runs the
-fixed `elastic_worker prepare && elastic_worker execute` chain after S3 sync.
-The credential frame can wait only in that trusted process's stdin pipe:
-`prepare` never reads stdin, and `execute` is the first reader after the input
-seal, release, instance, image, and wall-time bindings have all passed.
-
-The shared bucket must expose only
-`jobs/datasets/run-benchmark/v1/sha256/<digest>/` to the Worker instance role.
-Workers read sealed inputs with IAM credentials and write only their normal
-per-Job result prefix. Provider keys never enter S3, cloud-init, checkpoint,
-environment variables, command arguments, disk, or logs.
 
 `setup.repo` must be a remote HTTP(S), SSH/Git, or scp-style Git URL and may not
 contain embedded HTTP credentials, query parameters, or fragments. Use

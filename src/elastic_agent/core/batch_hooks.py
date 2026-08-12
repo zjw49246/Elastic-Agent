@@ -2179,7 +2179,6 @@ def wire_batch(
             "_update_batch_interrupt_intent",
             None,
         ),
-        stdin_lease_store=getattr(manager, "ephemeral_stdin_leases", None),
     )
 
     async def _bench_runtime_rejected_api_key(

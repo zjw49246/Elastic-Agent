@@ -39,29 +39,11 @@ uv run pytest -q tests/unit/test_aws_manager_launcher.py
 These tests cover required environment-only configuration, secret-free
 settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
 Manager-role identity, local state/key permissions, systemd readiness/teardown
-bounds, exact active/rollback KeyPair and production IAM resource pins, complete IAM simulator coverage,
-the Worker's write-only result-prefix plus dataset-only list/read policy, S3 plaintext-transport
+bounds, exact production IAM resource pins, complete IAM simulator coverage,
+the Worker's write-only result-prefix policy, S3 plaintext-transport
 denial, the versioned common x86_64 production instance allowlist, and AMI availability,
 architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
 explicit Canonical break-glass path.
-
-Validate the trusted Run-Benchmark lease/dispatch boundary without cloud or
-model calls:
-
-```bash
-uv run pytest -q \
-  tests/unit/test_ephemeral_stdin.py \
-  tests/unit/test_batch_orchestrator.py \
-  tests/unit/test_task_supervisor.py \
-  tests/unit/test_api_batch.py
-```
-
-These tests prove one-shot/TTL/close zeroization, command-before-secret ordering,
-missing-lease process stop, exact binary stdin plus EOF, WSS gating, dedicated
-server-owned Job construction, public JobSpec rejection of the reserved stdin
-protocol, exact `1–10,800` second wall-time propagation including sub-minute
-tasks, post-S3 `prepare && execute` ordering, deterministic idempotency, and absence of the frame, key, or
-secret-derived digest from the durable Job journal.
 
 Validate AWS private management-path selection across bootstrap, login, logs,
 and collection:
@@ -129,7 +111,7 @@ uv run pytest -q \
   tests/unit/test_log_event_parser.py \
   tests/unit/test_request_body_limit.py \
   tests/unit/test_bootstrap_steps.py \
-  tests/unit/test_web_ui.py \
+  tests/unit/test_web_ui.py
   tests/unit/test_ui_v2.py       # UI v2 static shell, /api/ui/summary, frontend source invariants
 ```
 
