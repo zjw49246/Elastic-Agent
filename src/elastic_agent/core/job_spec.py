@@ -147,6 +147,21 @@ ENVIRONMENT_PROFILES: dict[str, dict[str, Any]] = {
             "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
         ],
     },
+    # Retained as a read-only compatibility profile for JobSpec journals
+    # written by the upstream schema revision.  It is generic Worker runtime
+    # metadata and does not enable the removed Run-Benchmark bridge.
+    "ubuntu-agent-docker-v2": {
+        "id": "ubuntu-agent-docker-v2",
+        "os_family": "ubuntu",
+        "runtime": "elastic-agent",
+        "agent_cli": "version-pinned",
+        "browser_login": True,
+        "docker": True,
+        "system_packages": [
+            "python3", "python3-pip", "python3-venv", "git", "curl",
+            "rsync", "nodejs", "npm",
+        ],
+    },
 }
 
 
