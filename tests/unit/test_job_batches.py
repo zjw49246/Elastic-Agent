@@ -31,6 +31,7 @@ from elastic_agent.core.job_batch import (
     JobBatchLimits,
     JobBatchManifest,
     JobBatchQueue,
+    aggregate_manifest,
 )
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
 from elastic_agent.core.providers.base import (
@@ -298,6 +299,30 @@ class TestJobBatchValidationAndPlan:
         ):
             JobBatchLimits()
 
+    def test_account_aggregation_keeps_auth_kinds_in_separate_pools(self):
+        def account_spec(name: str, auth_kind: str) -> dict[str, object]:
+            return {
+                "name": name,
+                "run": {"command": "true"},
+                "fanout": {"workers": 2},
+                "account": {
+                    "agent_type": "codex",
+                    "auth_kind": auth_kind,
+                    "group": "standard",
+                },
+            }
+
+        manifest = JobBatchManifest.model_validate(_manifest(
+            account_spec("oauth", "oauth"),
+            account_spec("api", "agent_api"),
+            account_spec("compatible", "any"),
+        ))
+        pools = aggregate_manifest(manifest)["account_requirements"]["by_pool"]
+
+        assert [(pool["auth_kind"], pool["required_slots"]) for pool in pools] == [
+            ("agent_api", 2), ("any", 2), ("oauth", 2),
+        ]
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("mutate", "location"),
@@ -361,6 +386,31 @@ class TestJobBatchValidationAndPlan:
         assert batch.started == []
         assert manager.provider.create_calls == 0
         assert not (Path(manager.config.registry.path).with_name("specs")).exists()
+
+    @pytest.mark.asyncio
+    async def test_valid_plan_reports_effective_requested_instance_type(
+        self, batch_client, monkeypatch,
+    ):
+        client, manager, batch = batch_client
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_ALLOWED_INSTANCE_TYPES",
+            "t3.medium,r5.2xlarge",
+        )
+        spec = _spec("requested-instance")
+        spec["fanout"] = {"workers": 1, "instance_type": "r5.2xlarge"}
+
+        response = await client.post(
+            "/api/job-batches/plan",
+            json=_manifest(spec),
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["valid"] is True
+        assert result["side_effects"] is False
+        assert result["summary"]["instance_types"] == ["r5.2xlarge"]
+        assert batch.started == []
+        assert manager.provider.create_calls == 0
 
     @pytest.mark.asyncio
     async def test_submit_is_all_or_nothing_when_any_preflight_fails(
@@ -554,6 +604,40 @@ class TestJobBatchValidationAndPlan:
 
 class TestJobBatchSubmissionAndQueue:
     @pytest.mark.asyncio
+    async def test_default_any_replays_legacy_manifest_without_auth_kind(
+        self, batch_client,
+    ):
+        client, manager, _batch = batch_client
+        manifest = _manifest(_spec("legacy-any"))
+        headers = {"Idempotency-Key": "legacy-any-batch"}
+        submitted = await client.post(
+            "/api/job-batches", json=manifest, headers=headers,
+        )
+        assert submitted.status_code == 201
+        job_batch_id = submitted.json()["job_batch_id"]
+        await manager.job_batch_queue.stop()
+
+        legacy = copy.deepcopy(manager.job_batch_queue._journals[job_batch_id])
+        for item in legacy["manifest"]["jobs"]:
+            item["spec"]["account"].pop("auth_kind")
+        canonical = json.dumps(
+            legacy["manifest"], ensure_ascii=True, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        legacy["manifest_fingerprint"] = hashlib.sha256(canonical).hexdigest()
+        manager.job_batch_queue._validate_journal(
+            legacy, expected_id=job_batch_id,
+        )
+        manager.job_batch_queue._journals[job_batch_id] = legacy
+
+        replay = await client.post(
+            "/api/job-batches", json=manifest, headers=headers,
+        )
+
+        assert replay.status_code == 201
+        assert replay.json()["idempotent_replay"] is True
+
+    @pytest.mark.asyncio
     async def test_submit_requires_an_idempotency_key(self, batch_client):
         client, manager, batch = batch_client
 
@@ -600,6 +684,34 @@ class TestJobBatchSubmissionAndQueue:
         assert conflict.status_code == 409
         assert "changed" not in conflict.text
         assert len(set(batch.started)) == len(batch.started)
+
+    @pytest.mark.asyncio
+    async def test_same_batch_and_client_ids_can_start_a_distinct_run(
+        self,
+        batch_client,
+    ):
+        client, _, _ = batch_client
+        manifest = _manifest(_spec("repeatable"), batch_id="repeatable-batch")
+
+        first = await client.post(
+            "/api/job-batches",
+            json=manifest,
+            headers={"Idempotency-Key": "repeatable-run-one"},
+        )
+        second = await client.post(
+            "/api/job-batches",
+            json=manifest,
+            headers={"Idempotency-Key": "repeatable-run-two"},
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["batch_id"] == second.json()["batch_id"]
+        assert first.json()["items"][0]["client_id"] == (
+            second.json()["items"][0]["client_id"]
+        )
+        assert first.json()["job_batch_id"] != second.json()["job_batch_id"]
+        assert second.json().get("idempotent_replay") is not True
 
     @pytest.mark.asyncio
     async def test_detail_and_list_never_echo_job_secrets(self, batch_client):

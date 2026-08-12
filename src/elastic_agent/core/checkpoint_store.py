@@ -518,6 +518,20 @@ class S3CheckpointStore:
             os.close(descriptor)
             raise
 
+    def _remove_snapshot_and_release_budget(
+        self,
+        snapshot: Path,
+        size: int,
+    ) -> None:
+        """Remove one private snapshot and return its in-memory reservation."""
+
+        try:
+            snapshot.unlink()
+        except FileNotFoundError:
+            pass
+        with self._snapshot_budget_lock:
+            self._snapshot_reserved_bytes -= size
+
     def _snapshot_file(
         self,
         *,
@@ -616,14 +630,11 @@ class S3CheckpointStore:
             if descriptor >= 0:
                 os.close(descriptor)
             source.close()
-            cleaned = not snapshot.exists()
-            try:
-                snapshot.unlink()
-            except FileNotFoundError:
-                cleaned = True
-            if reserved and cleaned:
-                with self._snapshot_budget_lock:
-                    self._snapshot_reserved_bytes -= opened_stat.st_size
+            if reserved:
+                self._remove_snapshot_and_release_budget(
+                    snapshot,
+                    opened_stat.st_size,
+                )
             raise
 
     def _head_blob(self, key: str) -> dict[str, Any] | None:
@@ -877,14 +888,10 @@ class S3CheckpointStore:
                                 cancel_event=cancel_event,
                             )
                     finally:
-                        cleaned = not snapshot.exists()
-                        try:
-                            snapshot.unlink()
-                        except FileNotFoundError:
-                            cleaned = True
-                        if cleaned:
-                            with self._snapshot_budget_lock:
-                                self._snapshot_reserved_bytes -= size
+                        self._remove_snapshot_and_release_budget(
+                            snapshot,
+                            size,
+                        )
                     files.append({
                         "path": relative,
                         "size": size,

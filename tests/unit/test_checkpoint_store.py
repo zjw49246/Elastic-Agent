@@ -1132,6 +1132,76 @@ def test_checkpoint_snapshot_preserves_disk_reserve(
         )
 
 
+def test_checkpoint_snapshot_budget_is_released_after_success(tmp_path: Path):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"four")
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        max_snapshot_bytes=4,
+        snapshot_free_reserve_bytes=0,
+    )
+
+    for generation in ("g1", "g2", "g3"):
+        store.commit(
+            job_id="job-reuse-snapshot-budget",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation=generation,
+        )
+
+
+def test_checkpoint_snapshot_budget_is_released_after_copy_error(
+    tmp_path: Path, monkeypatch,
+):
+    source = tmp_path / "source"
+    (source / "results").mkdir(parents=True)
+    (source / "results" / "answer.bin").write_bytes(b"four")
+    client = FakeS3()
+    store = S3CheckpointStore(
+        bucket=client.bucket,
+        client=client,
+        max_total_bytes=100,
+        max_snapshot_bytes=4,
+        snapshot_free_reserve_bytes=0,
+    )
+    real_fsync = os.fsync
+    fail_once = True
+
+    def flaky_fsync(descriptor: int) -> None:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("simulated snapshot fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "elastic_agent.core.checkpoint_store.os.fsync",
+        flaky_fsync,
+    )
+
+    with pytest.raises(OSError, match="simulated snapshot fsync failure"):
+        store.commit(
+            job_id="job-copy-error-releases-budget",
+            worker_namespace="shard-00000",
+            source_root=source,
+            paths=["results"],
+            generation="g1",
+        )
+
+    store.commit(
+        job_id="job-copy-error-releases-budget",
+        worker_namespace="shard-00000",
+        source_root=source,
+        paths=["results"],
+        generation="g2",
+    )
+
+
 def test_checkpoint_snapshot_never_copies_growth_beyond_open_size(
     tmp_path: Path, monkeypatch,
 ):

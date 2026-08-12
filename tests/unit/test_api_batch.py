@@ -12,6 +12,7 @@ import stat
 import tarfile
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1687,6 +1688,165 @@ class TestJobsAPI:
         assert insufficient_distinct_slots.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_preflight_and_submit_enforce_account_auth_kind(
+        self, client, manager, monkeypatch,
+    ):
+        native = await client.post("/api/accounts", json={
+            "id": "oauth-boundary",
+            "email": "oauth-boundary@example.com",
+            "agent_type": "claude",
+            "group": "auth-boundary",
+        })
+        assert native.status_code == 201
+        adapter = manager.agent_api_store.registry.require("cloudrouter")
+        monkeypatch.setattr(
+            adapter, "probe_models",
+            AsyncMock(return_value={"claude": ["claude-opus-4-8"]}),
+        )
+        monkeypatch.setattr(
+            adapter, "fetch_usage",
+            AsyncMock(return_value={
+                "account_id": "cloudrouter-1",
+                "known": True,
+                "available": True,
+                "reason": "active",
+                "windows": [],
+            }),
+        )
+        api = await client.post("/api/agent-api/accounts", json={
+            "provider": "cloudrouter",
+            "name": "Auth boundary API",
+            "group": "auth-boundary",
+            "api_key": "private-auth-boundary-key",
+        })
+        assert api.status_code == 201
+
+        oauth_request = {
+            "name": "oauth-capacity",
+            "run": {"command": "true"},
+            "fanout": {"workers": 2},
+            "account": {
+                "auth_kind": "oauth", "group": "auth-boundary",
+            },
+        }
+        oauth_capacity = await client.post(
+            "/api/jobs/plan", json=oauth_request,
+        )
+        oauth_submit = await client.post("/api/jobs", json=oauth_request)
+        api_capacity = await client.post("/api/jobs/plan", json={
+            "name": "api-capacity",
+            "run": {"command": "true"},
+            "account": {
+                "auth_kind": "agent_api",
+                "group": "auth-boundary",
+                "per_worker": 2,
+                "config_dir": "/home/ubuntu/.claude-api",
+            },
+        })
+        compatible = await client.post("/api/jobs/plan", json={
+            "name": "compatible-capacity",
+            "run": {"command": "true"},
+            "fanout": {"workers": 2},
+            "account": {
+                "auth_kind": "any", "group": "auth-boundary",
+            },
+        })
+        explicit_api_as_oauth = await client.post("/api/jobs/plan", json={
+            "name": "wrong-explicit-api",
+            "run": {"command": "true"},
+            "account": {
+                "auth_kind": "oauth", "ids": ["cloudrouter-1"],
+            },
+        })
+        explicit_oauth_as_api = await client.post("/api/jobs", json={
+            "name": "wrong-explicit-oauth",
+            "run": {"command": "true"},
+            "account": {
+                "auth_kind": "agent_api", "ids": ["oauth-boundary"],
+            },
+        })
+
+        assert oauth_capacity.status_code == oauth_submit.status_code == 422
+        assert "1 eligible OAuth" in oauth_capacity.json()["detail"]
+        assert "0 eligible Agent API" in oauth_capacity.json()["detail"]
+        assert api_capacity.status_code == 422
+        assert "0 eligible OAuth" in api_capacity.json()["detail"]
+        assert "1 eligible Agent API" in api_capacity.json()["detail"]
+        assert compatible.status_code == 200
+        assert compatible.json()["account"]["auth_kind"] == "any"
+        assert explicit_api_as_oauth.status_code == 422
+        assert "auth kind 'agent_api', not requested 'oauth'" in (
+            explicit_api_as_oauth.json()["detail"]
+        )
+        assert explicit_oauth_as_api.status_code == 422
+        assert "auth kind 'oauth', not requested 'agent_api'" in (
+            explicit_oauth_as_api.json()["detail"]
+        )
+        assert manager.batch.started == []
+
+    @pytest.mark.asyncio
+    async def test_oauth_automatic_plan_does_not_enumerate_agent_api_store(
+        self, client, manager, monkeypatch,
+    ):
+        created = await client.post("/api/accounts", json={
+            "id": "oauth-only-plan",
+            "email": "oauth-only-plan@example.com",
+            "agent_type": "claude",
+            "group": "oauth-only-plan",
+        })
+        assert created.status_code == 201
+        list_accounts = AsyncMock(side_effect=AssertionError(
+            "oauth automatic preflight must not enumerate Agent API"
+        ))
+        monkeypatch.setattr(manager.agent_api_store, "list", list_accounts)
+
+        response = await client.post("/api/jobs/plan", json={
+            "name": "oauth-only-plan",
+            "run": {"command": "true"},
+            "account": {
+                "auth_kind": "oauth", "group": "oauth-only-plan",
+            },
+        })
+
+        assert response.status_code == 200
+        assert response.json()["account"]["auth_kind"] == "oauth"
+        list_accounts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preflight_excludes_accounts_from_automatic_capacity(
+        self, client,
+    ):
+        for account_id in ("excluded-plan-a", "excluded-plan-b"):
+            created = await client.post("/api/accounts", json={
+                "id": account_id,
+                "email": f"{account_id}@example.com",
+                "agent_type": "claude",
+                "group": "excluded-plan",
+            })
+            assert created.status_code == 201
+
+        request = {
+            "name": "excluded-account-capacity",
+            "run": {"command": "true"},
+            "fanout": {"workers": 2},
+            "account": {
+                "auth_kind": "oauth",
+                "group": "excluded-plan",
+                "exclude_ids": ["excluded-plan-a"],
+            },
+        }
+        insufficient = await client.post("/api/jobs/plan", json=request)
+        enough = await client.post(
+            "/api/jobs/plan",
+            json={**request, "fanout": {"workers": 1}},
+        )
+
+        assert insufficient.status_code == 422
+        assert "1 eligible OAuth account" in insufficient.json()["detail"]
+        assert enough.status_code == 200, enough.text
+        assert enough.json()["account"]["excluded"] == 1
+
+    @pytest.mark.asyncio
     async def test_non_eip_oauth_account_cannot_be_repeated(
         self, client,
     ):
@@ -2825,6 +2985,29 @@ class TestJobsAPI:
         assert detail["spec"]["name"] == "ai4sci"
 
     @pytest.mark.asyncio
+    async def test_list_orders_jobs_by_created_time_newest_first(
+        self, client, manager,
+    ):
+        first = (await client.post(
+            "/api/jobs", json={**self._SPEC, "name": "submitted-first"},
+        )).json()
+        second = (await client.post(
+            "/api/jobs", json={**self._SPEC, "name": "submitted-second"},
+        )).json()
+        manager.batch.get_job(first["job_id"]).created_at = datetime(
+            2026, 8, 10, 8, 0, tzinfo=timezone.utc,
+        )
+        manager.batch.get_job(second["job_id"]).created_at = datetime(
+            2026, 8, 12, 8, 0, tzinfo=timezone.utc,
+        )
+
+        listed = (await client.get("/api/jobs")).json()["jobs"]
+
+        assert [job["job_id"] for job in listed] == [
+            second["job_id"], first["job_id"],
+        ]
+
+    @pytest.mark.asyncio
     async def test_get_uses_immutable_persisted_submission_config_live_and_after_restart(
         self, client, manager,
     ):
@@ -3065,8 +3248,15 @@ class TestJobsAPI:
         assert "aws-secretsmanager" not in detail.text
 
         resubmit = await client.post(f"/api/jobs/{job_id}/resubmit")
-        assert resubmit.status_code == 500
-        assert "invalid persisted spec" in resubmit.json()["detail"]
+        assert resubmit.status_code == 201
+        resubmitted_spec = resubmit.json()["spec"]
+        assert resubmitted_spec["environment"]["profile"] == (
+            "ubuntu-agent-docker-sandbox-v1"
+        )
+        assert resubmitted_spec["account"]["auth_kind"] == "agent_api"
+        assert resubmitted_spec["account"]["exclude_ids"] == [
+            "retired-account"
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -4023,6 +4213,143 @@ class TestJobsAPI:
             f"{source_id}.json",
         ]
 
+    def test_recovery_changes_account_selection_only_with_exhaustion_proof(self):
+        from elastic_agent.api.routes.jobs import (
+            RecoveryJobRequest,
+            _build_checkpoint_recovery_spec,
+        )
+        from elastic_agent.core.batch_orchestrator import (
+            CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
+        )
+        from elastic_agent.core.job_spec import JobSpec
+
+        source = JobSpec.model_validate({
+            "name": "eip-source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "c" * 40,
+            },
+            "run": {
+                "command": "capture",
+                "resume_command": "capture --resume",
+            },
+            "account": {
+                "binding": "eip",
+                "ids": ["oauth-b"],
+                "exclude_ids": ["oauth-a"],
+            },
+            "fanout": {"workers": 1, "shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+        })
+        request = RecoveryJobRequest(source_job_id="job-eip-source")
+        exhausted_payload = {
+            "spec": source.model_dump(mode="json"),
+            "terminal_summary": {"terminal_workers": [
+                {
+                    "account_id": "oauth-b",
+                    "error": CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
+                },
+                {
+                    "account_id": "oauth-c",
+                    "error": "ordinary application failure",
+                },
+            ]},
+        }
+
+        exhausted = _build_checkpoint_recovery_spec(
+            "job-eip-source", exhausted_payload, request,
+        )
+        ordinary = _build_checkpoint_recovery_spec(
+            "job-eip-source",
+            {
+                **exhausted_payload,
+                "terminal_summary": {"terminal_workers": [{
+                    "account_id": "oauth-b",
+                    "error": "ordinary application failure",
+                }]},
+            },
+            request,
+        )
+
+        assert exhausted["account"]["ids"] == []
+        assert exhausted["account"]["exclude_ids"] == [
+            "oauth-a", "oauth-b",
+        ]
+        assert ordinary["account"]["ids"] == ["oauth-b"]
+        assert ordinary["account"]["exclude_ids"] == ["oauth-a"]
+
+    @pytest.mark.asyncio
+    async def test_recovery_accumulates_exhausted_accounts_from_source_journal(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.batch_orchestrator import (
+            CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
+        )
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-exhausted-source-journal"
+        source = JobSpec.model_validate({
+            "name": "persisted-exhausted-source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "d" * 40,
+            },
+            "run": {
+                "command": "capture",
+                "resume_command": "capture --resume",
+            },
+            "account": {
+                "mode": "none",
+                "exclude_ids": ["oauth-a"],
+            },
+            "fanout": {"workers": 1, "shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+        })
+        persist_job_spec(manager.config.registry.path, source_id, source)
+        update_job_state(
+            manager.config.registry.path,
+            source_id,
+            "failed",
+            summary={
+                "done": True,
+                "cleanup_pending": 0,
+                "terminal_workers": [{
+                    "worker_id": "terminated-worker",
+                    "shard_index": 0,
+                    "account_id": "oauth-b",
+                    "error": CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR,
+                    "worker_released": True,
+                }],
+            },
+        )
+
+        response = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": source_id},
+            headers={"Idempotency-Key": "exclude-source-journal"},
+        )
+
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["spec"]["account"]["exclude_ids"] == [
+            "oauth-a", "oauth-b",
+        ]
+        target_path = (
+            Path(manager.config.registry.path).with_name("specs")
+            / f"{body['job_id']}.json"
+        )
+        persisted = json.loads(target_path.read_text())
+        assert persisted["spec"]["account"]["exclude_ids"] == [
+            "oauth-a", "oauth-b",
+        ]
+
     @pytest.mark.asyncio
     async def test_server_side_recovery_preserves_private_source_spec_and_is_idempotent(
         self, client, manager, monkeypatch,
@@ -4200,6 +4527,48 @@ class TestJobsAPI:
             first_body["job_id"],
             first_body["job_id"],
         ]
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_recovery_defaults_to_declared_resume_command(
+        self, client, manager, monkeypatch,
+    ):
+        from elastic_agent.core.job_spec import JobSpec
+        from elastic_agent.core.job_spec_store import (
+            persist_job_spec,
+            update_job_state,
+        )
+
+        monkeypatch.setenv(
+            "ELASTIC_AGENT_RESULTS_S3_BUCKET", "results-bucket",
+        )
+        source_id = "job-declared-resume-source"
+        source = JobSpec.model_validate({
+            "name": "declared-resume-source",
+            "setup": {
+                "repo": "https://github.com/org/bench.git",
+                "resolved_commit": "b" * 40,
+            },
+            "run": {
+                "command": "capture --initial --seed 7263",
+                "resume_command": "capture --resume --seed 7263",
+            },
+            "account": {"mode": "none"},
+            "fanout": {"shard_by": "shard_index"},
+            "collect": {"paths": ["results"], "checkpoint": True},
+        })
+        persist_job_spec(manager.config.registry.path, source_id, source)
+        update_job_state(manager.config.registry.path, source_id, "failed")
+
+        response = await client.post(
+            "/api/jobs/recover",
+            json={"source_job_id": source_id},
+            headers={"Idempotency-Key": "declared-resume-default"},
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["spec"]["run"]["command"] == (
+            "capture --resume --seed 7263"
+        )
 
     @pytest.mark.asyncio
     async def test_latest_recovery_is_pinned_before_durable_prepare(
@@ -6687,13 +7056,25 @@ class TestJobResults:
 
 class TestBatchConsoleUI:
     @pytest.mark.asyncio
-    async def test_batch_page_served(self, client):
+    async def test_batch_page_served(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    subject="batch-owner@example.test",
+                    must_change_password=False,
+                )
+            ),
+        )
         r = await client.get("/batch")
         assert r.status_code == 200
         assert "Batch Console" in r.text
         assert "Submit Job" in r.text
         assert "Accounts" in r.text
         assert 'id="jProfile"' in r.text
+        assert 'value="ubuntu-agent-docker-sandbox-v1"' in r.text
+        assert 'id="batchSummaryAccounts"' in r.text
+        assert "pool.auth_kind || 'any'" in r.text
         assert 'id="jRepoRef"' in r.text
         assert 'id="jRunTimeout"' in r.text
         assert 'id="jSpot"' in r.text

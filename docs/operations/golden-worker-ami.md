@@ -3,8 +3,10 @@
 Elastic-Agent can use one encrypted, credential-free worker image to avoid
 reinstalling common system, browser, agent, Docker, and Python dependencies for
 every ephemeral EC2. The current provider has one global `ami_id`, so the image
-is a union of `ubuntu-agent-v1` and `ubuntu-agent-docker-v1`; Docker is installed
-but disabled until a Docker Job enables it.
+is a union of `ubuntu-agent-v1`, `ubuntu-agent-docker-v1`, and
+`ubuntu-agent-docker-sandbox-v1`; Docker is installed but disabled until a
+Docker Job enables it. The sandbox profile additionally bakes `python3-venv`,
+Bubblewrap, and util-linux.
 
 ## Build
 
@@ -58,6 +60,12 @@ the VCS commit in claude-pty's `direct_url.json`. A missing verifier, corrupt or
 stale manifest, package drift, failed command/import, or unpinned PTY URL runs
 the complete existing apt/npm/pip fallback.
 
+For the sandbox profile, image verification checks the Bubblewrap package and
+`bwrap` command. The authoritative isolation gate remains a probe run as the
+Job user with bwrap `--unshare-user --unshare-net`; util-linux is retained for
+compatibility and diagnostics, not as an outer `unshare` prerequisite. Do not
+weaken sysctl or AppArmor to make either probe pass.
+
 Do not bake account state, `auth.json`, browser profiles, Job code/data, the
 Manager URL/token, or a running Elastic-Agent service. Current framework source
 and the per-worker runtime unit are still delivered at provision time.
@@ -78,8 +86,9 @@ Apply OS security updates by building and promoting a replacement AMI.
 Before promotion, verify that the AMI is owned by this account, available,
 x86_64/HVM/ENA, IMDSv2-only, has an encrypted EBS snapshot, and carries
 `ManagedBy=elastic-agent` plus `Role=worker-golden`. Then run canaries for the
-standard profile, Docker profile, S3 collection, Claude login, Codex login, and
-one EIP-bound Job. Confirm each EC2/root EBS is destroyed and its EIP retained.
+standard profile, Docker profile, sandbox profile (including the Job-user bwrap
+probe), S3 collection, Claude login, Codex login, and one EIP-bound Job. Confirm
+each EC2/root EBS is destroyed and its EIP retained.
 
 Select a fixed AMI ID through the Manager deployment configuration; never use a
 moving alias. Rollback must update the Manager IAM image ARN pin and deployment
@@ -131,3 +140,7 @@ account binding and completed a real `codex exec` without a manual OTP.
 This 2026-07-22 image predates the immutable-host update policy above. New
 bootstrap code hardens it before starting a runtime, but the next golden build
 must carry and pass the baked-policy verification before it replaces this AMI.
+It also predates `ubuntu-agent-docker-sandbox-v1`; that profile uses the complete
+package-install fallback and must pass its real Job-user bwrap probe. The next
+image should bake these packages so the profile can return to the verified fast
+path.

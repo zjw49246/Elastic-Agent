@@ -33,6 +33,7 @@ function assertNoSecrets(patch, path = '') {
 const initialState = Object.freeze({
   route: null,
   authed: false,
+  principal: null,
   health: null,
   summary: null,
   loginAttempts: [],

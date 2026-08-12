@@ -8,8 +8,9 @@ and small deployments working without an edge dependency.
 
 Security posture:
 
-* The static shell is public (like the legacy ``/batch`` HTML): it contains no
-  data.  Every data/mutation API stays behind ``require_api_key``.
+* JavaScript/CSS assets are public and contain no data. The SPA shell requires
+  an authenticated administrator session and preserves safe deep links through
+  the native login/password-change flow.
 * ``GET /api/ui/summary`` returns aggregate counts only — no account IDs, no
   emails, no job names, no secrets — and never scans S3.
 * Static responses set ``X-Content-Type-Options: nosniff``; ``index.html`` is
@@ -22,15 +23,18 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse
 
-from elastic_agent.api.auth import require_api_key
+from elastic_agent.api.auth import get_session_principal, require_api_key
 
 router = APIRouter(tags=["ui-v2"])
 
 UI_V2_ROOT = Path(__file__).resolve().parent.parent / "ui_v2"
+UI_V2_ASSET_REVISION = "admin-session-v4"
+_REVISIONED_ASSET_PREFIX = f"rev/{UI_V2_ASSET_REVISION}/"
 
 # Only these static types exist in the bundle; anything else 404s.
 _ALLOWED_SUFFIXES = {
@@ -64,6 +68,13 @@ _ASSET_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 
+_REVISIONED_ASSET_HEADERS = {
+    # The revision is changed whenever deployed UI source changes, so every
+    # module in the relative-import graph may be cached under this namespace.
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "X-Content-Type-Options": "nosniff",
+}
+
 
 def _resolve_asset(rel_path: str) -> Path:
     """Resolve a request path inside the UI v2 root, fail closed on escapes."""
@@ -79,7 +90,20 @@ def _resolve_asset(rel_path: str) -> Path:
     return candidate
 
 
-def _serve_index() -> FileResponse:
+async def _serve_index(request: Request) -> FileResponse | RedirectResponse:
+    principal = await get_session_principal(request)
+    if principal is None:
+        return RedirectResponse(
+            "/login?" + urlencode({"next": request.url.path}),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+    if principal.must_change_password:
+        return RedirectResponse(
+            "/change-password?" + urlencode({"next": request.url.path}),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
     index = UI_V2_ROOT / "index.html"
     if not index.is_file():
         raise HTTPException(404, "UI v2 assets are not installed")
@@ -88,24 +112,42 @@ def _serve_index() -> FileResponse:
 
 @router.get("/ui-v2", include_in_schema=False)
 @router.get("/ui-v2/", include_in_schema=False)
-async def ui_v2_root():
-    return _serve_index()
+async def ui_v2_root(request: Request):
+    return await _serve_index(request)
 
 
 @router.get("/ui-v2/{rest:path}", include_in_schema=False)
-async def ui_v2_assets(rest: str):
+async def ui_v2_assets(rest: str, request: Request):
     """Serve static assets; unknown paths fall back to the SPA shell.
 
     The fallback only exists under ``/ui-v2/*`` — ``/api/*`` and ``/ws/*`` are
     mounted before this router and are never claimed by the SPA.
     """
-    # Explicit asset paths (with an allowed suffix) are served as files.
+    # A revisioned namespace changes the URL of the entry point and every
+    # relative ES-module import together.  This bypasses stale browser/CDN
+    # copies even when an edge policy overrides the origin's no-cache header.
+    if rest.startswith("rev/"):
+        if not rest.startswith(_REVISIONED_ASSET_PREFIX):
+            raise HTTPException(404, "Unknown UI asset revision")
+        revisioned_path = rest.removeprefix(_REVISIONED_ASSET_PREFIX)
+        if "." not in revisioned_path.rsplit("/", 1)[-1]:
+            raise HTTPException(404, "Not found")
+        asset = _resolve_asset(revisioned_path)
+        media_type = _ALLOWED_SUFFIXES[asset.suffix]
+        return FileResponse(
+            asset,
+            media_type=media_type,
+            headers=_REVISIONED_ASSET_HEADERS,
+        )
+
+    # Explicit unversioned asset paths remain available for local tooling and
+    # old open tabs, but the current shell no longer references them.
     if "." in rest.rsplit("/", 1)[-1]:
         asset = _resolve_asset(rest)
         media_type = _ALLOWED_SUFFIXES[asset.suffix]
         return FileResponse(asset, media_type=media_type, headers=_ASSET_HEADERS)
     # Everything else is a client-side route (deep link) — serve the shell.
-    return _serve_index()
+    return await _serve_index(request)
 
 
 # --------------------------------------------------------------------------

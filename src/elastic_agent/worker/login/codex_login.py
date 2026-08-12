@@ -28,9 +28,15 @@ import time
 import uuid
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
+
+from elastic_agent.core.rate_limit import (
+    is_auth_failure,
+    is_rate_limited,
+    is_transient_overload,
+)
 
 # Browser automation gets its own budget.  It must remain shorter than the
 # Manager's end-to-end ACCOUNT_LOGIN timeout because CLI startup, auth.json
@@ -117,6 +123,17 @@ CONTINUE_BUTTON_TEXTS = (
 
 class CodexLoginError(RuntimeError):
     """A safe, user-facing Codex login failure."""
+
+
+class CodexSmokeAccountError(CodexLoginError):
+    """The isolated CLI smoke test proved an account-scoped hard failure."""
+
+    def __init__(
+        self,
+        failure_kind: Literal["hard_quota", "auth_failure"],
+    ) -> None:
+        self.failure_kind = failure_kind
+        super().__init__("Codex exec smoke test failed")
 
 
 def _suppress_sensitive_http_client_logs() -> None:
@@ -869,9 +886,30 @@ async def _smoke_test(codex_bin: str, codex_home: str, logs: list[str]) -> bool:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(process.communicate(), timeout=SMOKE_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=SMOKE_TIMEOUT
+            )
         logs.append(f"Smoke test rc={process.returncode}")
-        return process.returncode == 0
+        if process.returncode == 0:
+            return True
+
+        # Never return provider text to the Manager or logs.  Inspect only a
+        # bounded local window and emit one closed enum when the existing
+        # narrow account detectors prove hard quota/auth failure.  A generic
+        # nonzero status, timeout, or transient overload remains retryable.
+        def bounded_text(raw: bytes) -> str:
+            if len(raw) > 65_536:
+                raw = raw[:32_768] + raw[-32_768:]
+            return raw.decode("utf-8", errors="replace")
+
+        output = "\n".join((bounded_text(stdout), bounded_text(stderr)))
+        if is_auth_failure(output):
+            raise CodexSmokeAccountError("auth_failure")
+        if is_rate_limited(output):
+            raise CodexSmokeAccountError("hard_quota")
+        if is_transient_overload(output):
+            return False
+        return False
     except asyncio.TimeoutError:
         if process is not None:
             _kill_process_group(process)
@@ -882,6 +920,8 @@ async def _smoke_test(codex_bin: str, codex_home: str, logs: list[str]) -> bool:
         if process is not None and process.returncode is None:
             _kill_process_group(process)
             await process.wait()
+        raise
+    except CodexSmokeAccountError:
         raise
     except Exception as exc:
         logs.append(f"Smoke test error ({type(exc).__name__})")
@@ -997,6 +1037,8 @@ async def codex_login(
             "error": _redacted_error(exc, (password, token_171)),
             "logs": logs,
         }
+        if isinstance(exc, CodexSmokeAccountError):
+            failure["failure_kind"] = exc.failure_kind
     finally:
         cleanup_succeeded = False
         try:
@@ -1036,6 +1078,7 @@ async def codex_login(
 
 __all__ = [
     "CodexLoginError",
+    "CodexSmokeAccountError",
     "ManualOtpReader",
     "codex_login",
     "detect_mail_provider",

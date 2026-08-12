@@ -347,6 +347,11 @@ class AccountLoginResultMessage(Message):
     slot_index: int
     success: bool
     error: str | None = None
+    # Worker-proven, non-secret account state from the post-login CLI smoke
+    # test.  Absence means the failure is generic or transient and must not
+    # bench the account.  This is deliberately narrower than free-form error
+    # text so the Manager never infers account health from a redacted message.
+    failure_kind: Literal["hard_quota", "auth_failure"] | None = None
     # ``True`` is an explicit proof that a failed attempt restored credentials
     # and stopped its login processes. ``False`` means cleanup is uncertain
     # and an ordinary reusable worker/account must be quarantined. Successful

@@ -76,6 +76,14 @@ TERMINAL_WORKER_PHASES = {
     WorkerPhase.FAILED,
 }
 
+# Stable, persisted proof that a supervised EIP run stopped specifically
+# because its account was exhausted and must continue as a new checkpoint
+# recovery attempt. The recovery constructor must not infer this from an
+# arbitrary non-zero exit or from generic Job failure text.
+CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR = (
+    "account exhausted (checkpoint recovery required)"
+)
+
 
 @dataclass
 class LoginOutcome:
@@ -87,6 +95,10 @@ class LoginOutcome:
     # the exact CLAUDE_CONFIG_DIR/CODEX_HOME that must drive the run.
     config_dir: str = ""
     auth_kind: str = "oauth"
+    # Structured Worker proof from a fresh-login smoke test.  Manager-side
+    # allocation may quarantine only these exact OAuth account failures;
+    # generic/login-transport/transient failures leave the account reusable.
+    failure_kind: str | None = None
     error: str | None = None
 
 
@@ -404,6 +416,10 @@ class BatchJob:
                     "worker_id": r.worker_id,
                     "shard_index": r.ctx.shard_index,
                     "phase": r.phase.value,
+                    # Account IDs are stable selection handles, not secrets.
+                    # Persist the exact terminal identity so a later recovery
+                    # attempt can automatically exclude an exhausted account.
+                    "account_id": r.account_id,
                     "task_id": r.task_id,
                     "error": r.error,
                     "final_collected": r.final_collected,
@@ -2102,7 +2118,14 @@ class BatchOrchestrator:
             run.worker_id, run.task_id,
             command=ex["command"], cwd=ex["cwd"], env=ex["env"], timeout=ex["timeout"],
             job_id=job.job_id,
-            watch_exhaustion=spec.rotation.strategy != "none",
+            watch_exhaustion=(
+                spec.rotation.strategy != "none"
+                or (
+                    spec.account.binding == "eip"
+                    and spec.collect.checkpoint
+                    and bool(spec.run.resume_command)
+                )
+            ),
         )
         # PROCESS_EXIT can race the return of WebSocket send_command.  Never
         # resurrect a terminal run after that event already finalized it.
@@ -2337,7 +2360,14 @@ class BatchOrchestrator:
         decline_error: str | None = None
         spec = job.spec
         if spec.rotation.strategy != "on_exhaust_restart_resume":
-            decline_error = "account exhausted (no rotation policy)"
+            if (
+                spec.account.binding == "eip"
+                and spec.collect.checkpoint
+                and bool(spec.run.resume_command)
+            ):
+                decline_error = CHECKPOINT_ACCOUNT_EXHAUSTED_ERROR
+            else:
+                decline_error = "account exhausted (no rotation policy)"
         elif run.rotations >= spec.rotation.max_rotations:
             decline_error = (
                 "account exhausted "

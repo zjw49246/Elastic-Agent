@@ -18,7 +18,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from elastic_agent.api.app import create_app
-from elastic_agent.api.auth import reset_api_keys
+from elastic_agent.api.auth import (
+    configure_management_user_store,
+    configure_public_origin,
+    reset_api_keys,
+    reset_management_auth,
+)
 from elastic_agent.core.config import (
     AWSProviderConfig,
     ElasticAgentConfig,
@@ -89,6 +94,7 @@ class AWSManagerSettings:
     max_instances: int
     state_dir: Path
     manager_url: str
+    public_origin: str
     framework_src: Path
     server_host: str
     server_port: int
@@ -168,6 +174,31 @@ def _validate_manager_url(value: str) -> None:
         raise LauncherConfigurationError("ELASTIC_AGENT_MANAGER_URL must end with /ws/runtime")
 
 
+def _validate_public_origin(value: str) -> None:
+    parsed = urlsplit(value)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise LauncherConfigurationError(
+            "ELASTIC_AGENT_PUBLIC_ORIGIN must contain a valid port"
+        ) from exc
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise LauncherConfigurationError(
+            "ELASTIC_AGENT_PUBLIC_ORIGIN must be an absolute https:// origin"
+        )
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/")
+        or parsed.netloc.endswith(":")
+    ):
+        raise LauncherConfigurationError(
+            "ELASTIC_AGENT_PUBLIC_ORIGIN must not contain credentials, path, query, or fragment"
+        )
+
+
 def _validate_api_key_presence(environ: Mapping[str, str]) -> None:
     # Deliberately validate presence only.  Secret values never enter the
     # settings dataclass, exceptions, or startup logs.
@@ -227,6 +258,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
 
     manager_url = _required(source, "ELASTIC_AGENT_MANAGER_URL")
     _validate_manager_url(manager_url)
+    public_origin = _required(source, "ELASTIC_AGENT_PUBLIC_ORIGIN")
+    _validate_public_origin(public_origin)
 
     expected_role_name = _required(source, "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME")
     if not _IAM_ROLE_NAME_RE.fullmatch(expected_role_name):
@@ -249,6 +282,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         max_instances=_positive_int(source, "ELASTIC_AGENT_AWS_MAX_INSTANCES", maximum=100),
         state_dir=_absolute_path(source, "ELASTIC_AGENT_STATE_DIR"),
         manager_url=manager_url,
+        public_origin=public_origin,
         framework_src=_absolute_path(source, "ELASTIC_AGENT_FRAMEWORK_SRC"),
         server_host=_required(source, "ELASTIC_AGENT_SERVER_HOST"),
         server_port=_positive_int(source, "ELASTIC_AGENT_SERVER_PORT", maximum=65535),
@@ -447,6 +481,16 @@ def build_application(settings: AWSManagerSettings):
 
     config = build_config(settings)
     reset_api_keys()
+    reset_management_auth()
+    configure_public_origin(settings.public_origin)
+    try:
+        configure_management_user_store(
+            settings.state_dir / "management-users.json"
+        ).require_enabled_admin()
+    except Exception as exc:
+        raise LauncherConfigurationError(
+            "management user store has no valid enabled administrator"
+        ) from exc
     manager = ElasticAgentManager(config, AWSProvider(config.provider.aws))
     return create_app(manager)
 
@@ -469,6 +513,8 @@ def main() -> None:
         port=settings.server_port,
         log_level=settings.log_level.lower(),
         workers=1,
+        proxy_headers=True,
+        forwarded_allow_ips="127.0.0.1,::1",
     )
 
 

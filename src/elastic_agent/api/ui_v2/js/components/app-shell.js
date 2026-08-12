@@ -110,8 +110,15 @@ export class AppShell {
   }
 
   update() {
-    const { health, summary, loginAttempts } = getState();
+    const { health, summary, loginAttempts, principal } = getState();
     clear(this.statusBar);
+
+    if (principal && principal.email) {
+      this.statusBar.appendChild(el('span', {
+        class: 'muted',
+        text: principal.email,
+      }));
+    }
 
     if (health) {
       this.statusBar.appendChild(el('span', {

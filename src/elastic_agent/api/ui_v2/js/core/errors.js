@@ -46,7 +46,7 @@ export function isAbort(error) {
 export function describeError(error) {
   if (!error) return '未知错误';
   if (error instanceof ApiError) {
-    if (error.status === 401) return '认证失败：API Key 无效或已更换。';
+    if (error.status === 401) return '管理员登录已失效，请重新登录。';
     if (error.status === 403) return '该操作已被服务端禁用。';
     if (error.status === 404) return error.message || '资源不存在。';
     if (error.status === 409) return error.message || '状态冲突，操作未执行。';

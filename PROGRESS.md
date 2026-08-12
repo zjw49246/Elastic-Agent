@@ -734,3 +734,65 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 **解决**：接入持久化 JobBatch 队列、plan/submit/status API、进程重启恢复、逐 Job 独立调度与全局 50 个活跃任务上限。UI v2 对同一份原始 UTF-8 字节执行预检和提交，严格拒绝重复键及超过 2 MiB/100 项的输入；以 batch id 派生稳定幂等键，显式确认后提交并轮询到终态。API key 只保留在内存/sessionStorage/Bearer header，不再写入公开 HTML；旧 Batch/Fleet 页面继续作为可用回退面。
 
 **验证**：完整 Python 套件 **2931 passed / 12 skipped / 0 failed**；UI v2 Node 测试 **23 passed**；新增和修改的核心 Python 文件 Ruff、UI 构建/import 检查及 `git diff --check` 全部通过。
+## 2026-08-11 UI v2 管理员账号登录合并（commit `7f1a97f`）
+
+**分支边界**：从 `main` 的 `4a147e7` 新建 `feat/admin-account-auth-v2`，只移植管理员
+账号认证的三个提交并适配当前 UI v2；没有合并或改写 `main`，暂不创建 PR。
+
+**解决**：浏览器控制台改用 Argon2 管理员账号、Secure/HttpOnly/SameSite Session Cookie、
+内存 CSRF token 和同源校验；匿名或首次改密访问 UI v2 深层路由时，服务端 303 到登录或改密
+页面并保留安全的 `next`。UI v2 删除管理 API Key 输入、sessionStorage 持久化和 Authorization
+header，导航显示当前管理员并提供退出登录。服务端 Bearer API Key 继续只服务自动化调用，
+没有删除既有接口兼容性；AWS 启动前会验证管理员用户和 public origin 配置。
+
+**验证**：完整 Python 套件 **3036 passed / 12 skipped / 0 failed**；UI v2 Node 测试
+**26 passed**；管理员认证、UI v2、JobBatch、AWS 启动等定向测试 **448 passed**，相关 Python
+文件 Ruff、UI 构建/import 与 `git diff --check` 均通过。
+
+**登录落点修复（commit `847b8e9`）**：线上发现访问者误带 `/ui-v2/、` 时，安全 `next`
+校验正确拒绝该路径，却回退到了旧 `/` 控制台。登录和首次改密的缺省/非法落点现统一为
+`/ui-v2/overview`，根地址的匿名登录流程也进入当前 UI v2；合法深层路由继续原样恢复，旧
+`/batch`、`/fleet` 回滚入口和所有业务模块不变。管理员/UI 专项 **107 passed**，Node
+**26 passed**，Ruff、UI import 和 `git diff --check` 通过。
+
+**静态资源换代修复（commit `5c8be80`）**：Cloudflare 的 4 小时 Browser Cache TTL 会忽略
+未哈希源文件的 `no-cache`，导致新 Session shell 仍加载旧 API Key `app.js`。Manager shell
+现引用统一 revision namespace，入口及所有相对 ES module import 一次换代；旧打开页仍可读
+旧路径，当前页面不会再命中旧图。CDN 正式构建会先移除源站 revision，再生成原有内容哈希。
+管理员/UI 专项 **107 passed**、Node **26 passed**，并验证 26-module CDN 构建成功。
+
+**规范入口修复（commit `bb39f25`）**：根地址 `/` 现始终 303 到 `/ui-v2/`，不再因已有
+管理员 Session 而渲染旧 Batch Console；旧界面仅保留在显式 `/batch`、`/fleet` 回滚路径。
+管理员/UI 专项 **107 passed**、Node **26 passed**，Ruff 与 `git diff --check` 通过。
+
+**响应式视觉整理（commit `dece80c`）**：以 1440px 总览/Job 表单和 390px 手机实机渲染
+复核布局，统一页面 20px（移动端 16px）纵向节奏、卡片内边距、网格和表单分组间距；修复统计
+网格紧贴下一卡片、桌面误显汉堡按钮、移动顶栏状态溢出及标题常驻焦点框。静态资源 revision
+升为 `admin-session-v2` 立即换代缓存。管理员/UI 专项 **108 passed**、Node **26 passed**，
+Ruff、UI import、截图复核与 `git diff --check` 通过。
+
+## 2026-08-12 Checkpoint 临时快照预算归还修复（commit `5e56a5a`）
+
+**问题**：生产中的 checkpoint Job 陆续报
+`checkpoint snapshot byte budget is exhausted`。临时快照文件实际已经删除，Manager 磁盘仍有
+约 56 GiB 可用，快照目录也只有 4 KiB，但进程仍持续拒绝后续周期和终态 checkpoint。受影响的
+Job 即使 run 正常退出 0，也会因最终 checkpoint 无法提交而被标记为 failed。
+
+**根因**：这是 Manager 进程内的预算记账泄漏，不是 Worker 内存、S3 容量或 Manager 磁盘
+耗尽。`S3CheckpointStore` 创建快照时会增加进程级 `_snapshot_reserved_bytes`，默认上限为
+20 GiB；旧清理逻辑在调用 `snapshot.unlink()` 前记录 `cleaned = False`，正常删除成功后却没有
+把 `cleaned` 更新为 `True`，因此文件虽已删除，对应的已使用额度没有扣回。额度随每次
+checkpoint 单向累计，最终造成“实际有空间、记账显示已满”。
+
+**解决**：集中新增 `_remove_snapshot_and_release_budget()`，把删除临时快照与归还同一笔内存
+预算作为一个清理动作；成功上传的 `finally` 路径和快照复制异常路径均调用该方法。临时文件
+已经不存在时按幂等清理处理，仍只归还调用方持有的那一笔 reservation，避免两条路径再次产生
+不一致。
+
+**回归覆盖**：新增 4-byte 快照预算下连续提交三代 checkpoint 的测试；旧代码第二代必然误报
+预算耗尽，修复后连续成功。另注入一次 snapshot `fsync` 失败，验证异常清理后下一次提交仍能
+复用完整预算。Checkpoint、Manager fleet、恢复事务和崩溃恢复专项 **129 passed**；完整 Python
+套件 **3088 passed / 12 skipped / 0 failed**，Ruff 与 `git diff --check` 通过。
+
+**生产验证**：修复版 `feat/admin-account-auth-v2@5e56a5a` 于 2026-08-12 07:33 UTC 部署；
+Manager 健康检查通过，重启清除了旧进程内已泄漏的计数，部署后的初次复核未再出现该预算错误。

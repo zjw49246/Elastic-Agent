@@ -849,13 +849,17 @@ status bar and the overview page.
 
 The v2 batch page accepts or uploads one strict schema-v1 JSON manifest. It
 sends the same raw UTF-8 bytes to `POST /api/job-batches/plan` and, after an
-explicit resource confirmation, to `POST /api/job-batches`. A stable
-Idempotency-Key derived from `batch_id` makes an uncertain network retry safe;
-the page then polls `GET /api/job-batches/{job_batch_id}` until every item is
-terminal or errored. The schema permits at most 100 Jobs, while the deployment
-default is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits
-are reported by preflight. API keys are never rendered into the public static
-shell; operators enter one per tab and it is kept only in memory/sessionStorage.
+explicit resource confirmation, to `POST /api/job-batches`. Every intentional
+run gets a new random `Idempotency-Key`, so the same `batch_id` and `client_id`
+values may be run again. Until a definitive receipt arrives, the tab retains
+only the source digest and non-secret key in `sessionStorage`; retrying the
+same source after a network failure or reload safely reuses that key. The page
+then polls `GET /api/job-batches/{job_batch_id}` until every item is terminal
+or errored. The schema permits at most 100 Jobs, while the deployment default
+is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits are
+reported by preflight. Browser operators use the management administrator
+login; the opaque session stays in a Secure/HttpOnly cookie and the CSRF token
+is held only in page memory. Service API keys remain available for automation.
 
 **Frontend**: the v2 console uses a light theme by default, with an optional
 session-scoped dark theme. The Job submission form keeps the JobSpec wire
@@ -927,10 +931,12 @@ spec in `sessionStorage`. After refresh or form edits, the console recommends
 replaying that exact pair and does not wait for mutable provider defaults;
 discarding it to create a new Key requires a separate double confirmation.
 The original strict download endpoint remains available to API clients that
-prefer a prebuilt archive and an HTTP error before response headers. API keys
-are accepted only in
-the `Authorization: Bearer` or `X-API-Key` header; the UI keeps a key in
-`sessionStorage` and strips legacy query-string credentials. REST includes
+prefer a prebuilt archive and an HTTP error before response headers. Browser
+users sign in with a management administrator account; the UI uses an opaque
+`HttpOnly`, `Secure`, `SameSite=Strict` session cookie plus CSRF protection and
+never stores an API key. Existing automation may continue to use a service key
+in the `Authorization: Bearer` header; query-string credentials are rejected.
+REST includes
 `/api/accounts`, `/api/agent-api/accounts`,
 `/api/accounts/login-attempts`, `/api/jobs`, `/api/jobs/{job_id}` (including
 the redacted submission snapshot), `/api/jobs/{job_id}/logs`, and
@@ -962,6 +968,7 @@ ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME
 ELASTIC_AGENT_AWS_MAX_INSTANCES
 ELASTIC_AGENT_STATE_DIR
 ELASTIC_AGENT_MANAGER_URL
+ELASTIC_AGENT_PUBLIC_ORIGIN
 ELASTIC_AGENT_FRAMEWORK_SRC
 ELASTIC_AGENT_SERVER_HOST
 ELASTIC_AGENT_SERVER_PORT
@@ -994,7 +1001,25 @@ This makes a healthy process proof that it is using the dedicated EC2 instance
 role rather than same-account static/admin credentials. The configured state
 directory must be created as the service user with mode `0700` before starting;
 the unit asserts that path exists and exposes readiness only after its local
-health check succeeds.
+health check succeeds. Production startup also fails closed until that state
+directory contains at least one enabled management administrator. Bootstrap or
+rotate an administrator without placing its password in argv or shell history:
+
+```bash
+read -rsp 'Initial administrator password: ' EA_INITIAL_ADMIN_PASSWORD
+printf '%s\n' "$EA_INITIAL_ADMIN_PASSWORD" |
+  uv run python -m elastic_agent.management_auth_cli \
+    --state-file /home/ubuntu/.elastic-agent-demo/management-users.json \
+    upsert --email owner@example.com --password-stdin --temporary
+unset EA_INITIAL_ADMIN_PASSWORD
+```
+
+`--temporary` forces a password change on the first browser login. The state
+file stores only an Argon2id hash and is maintained as mode `0600`; do not place
+the initial password in source, EnvironmentFiles, JobSpec, or chat. The browser
+origin is pinned by `ELASTIC_AGENT_PUBLIC_ORIGIN` and must be a clean HTTPS
+origin. Worker `/ws/runtime` tokens and Job agent credentials remain separate
+machine/delegation trust boundaries.
 
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,

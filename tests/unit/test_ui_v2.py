@@ -8,12 +8,17 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from elastic_agent.api.routes.ui_v2 import UI_V2_ROOT, reset_summary_cache
+from elastic_agent.api.routes.ui_v2 import (
+    UI_V2_ASSET_REVISION,
+    UI_V2_ROOT,
+    reset_summary_cache,
+)
 from elastic_agent.testing import create_test_manager
 
 pytestmark = pytest.mark.level0
@@ -26,7 +31,21 @@ async def ui_client():
 
     app = create_app(result.manager)
     reset_summary_cache()
-    with patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}):
+    principal = SimpleNamespace(
+        subject="admin@example.test",
+        must_change_password=False,
+    )
+    with (
+        patch.dict(os.environ, {"ELASTIC_AGENT_EXTERNAL_API_KEYS": "test-key"}),
+        patch(
+            "elastic_agent.api.routes.ui.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ),
+        patch(
+            "elastic_agent.api.routes.ui_v2.get_session_principal",
+            new=AsyncMock(return_value=principal),
+        ),
+    ):
         from elastic_agent.api import auth
 
         auth.reset_api_keys()
@@ -43,7 +62,7 @@ AUTH = {"Authorization": "Bearer test-key"}
 
 class TestStaticShell:
     @pytest.mark.asyncio
-    async def test_ui_v2_serves_index_without_auth(self, ui_client):
+    async def test_ui_v2_serves_index_for_authenticated_admin(self, ui_client):
         client, _ = ui_client
         for path in (
             "/ui-v2", "/ui-v2/", "/ui-v2/overview",
@@ -83,15 +102,24 @@ class TestStaticShell:
         client, _ = ui_client
         shell = await client.get("/ui-v2/jobs/batch")
         assert shell.status_code == 200
-        assert 'href="/ui-v2/assets/app.css"' in shell.text
-        assert 'src="/ui-v2/js/app.js"' in shell.text
+        prefix = f"/ui-v2/rev/{UI_V2_ASSET_REVISION}"
+        assert f'href="{prefix}/assets/app.css"' in shell.text
+        assert f'src="{prefix}/js/app.js"' in shell.text
 
-        css = await client.get("/ui-v2/assets/app.css")
-        js = await client.get("/ui-v2/js/app.js")
+        css = await client.get(f"{prefix}/assets/app.css")
+        js = await client.get(f"{prefix}/js/app.js")
         assert css.status_code == 200
         assert css.headers["content-type"].startswith("text/css")
         assert js.status_code == 200
         assert js.headers["content-type"].startswith("text/javascript")
+        assert "immutable" in js.headers["cache-control"]
+        assert "initAuth, hasSession" in js.text
+        assert "promptForKey" not in js.text
+
+        stale_revision = await client.get(
+            "/ui-v2/rev/older-api-key-ui/js/app.js"
+        )
+        assert stale_revision.status_code == 404
 
     @pytest.mark.asyncio
     async def test_path_traversal_is_rejected(self, ui_client):
@@ -119,7 +147,9 @@ class TestStaticShell:
         client, _ = ui_client
         assert (await client.get("/batch")).status_code == 200
         assert (await client.get("/fleet")).status_code == 200
-        assert "Batch Console" in (await client.get("/")).text
+        root = await client.get("/")
+        assert root.status_code == 303
+        assert root.headers["location"] == "/ui-v2/"
 
 
 class TestUiSummary:
@@ -168,9 +198,9 @@ class TestFrontendSourceInvariants:
             assert re.search(r"serviceWorker\s*[.\[(]", source) is None, module
             assert re.search(r"indexedDB\s*[.\[(]", source) is None, module
 
-    def test_api_key_stays_in_auth_module(self):
-        # Only auth.js touches the sessionStorage slot or builds the Bearer
-        # header value; other modules go through authHeader()/rawFetch().
+    def test_admin_session_uses_cookie_and_in_memory_csrf(self):
+        # Retired browser API keys are only removed. The opaque session stays in
+        # an HttpOnly cookie; only auth.js holds the page-lifetime CSRF token.
         for module in self._all_js():
             source = module.read_text(encoding="utf-8")
             if module.name == "auth.js":
@@ -179,9 +209,19 @@ class TestFrontendSourceInvariants:
             assert "Bearer ${" not in source, module
 
         auth_source = (UI_V2_ROOT / "js" / "core" / "auth.js").read_text(encoding="utf-8")
+        api_source = (UI_V2_ROOT / "js" / "core" / "api.js").read_text(encoding="utf-8")
+        assert "sessionStorage.removeItem('ea_api_key')" in auth_source
+        assert "sessionStorage.getItem('ea_api_key')" not in auth_source
+        assert "sessionStorage.setItem('ea_api_key'" not in auth_source
+        assert "X-CSRF-Token" in auth_source
+        assert "credentials: 'same-origin'" in api_source
+        assert "Authorization" not in api_source
         assert "ea-auth-token" not in auth_source
         assert "querySelector('meta" not in auth_source
-        assert "ea-auth-token" not in (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
+        html = (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
+        assert "ea-auth-token" not in html
+        assert "退出登录" in html
+        assert "换 Key" not in html
 
     def test_index_has_no_inline_script(self):
         html = (UI_V2_ROOT / "index.html").read_text(encoding="utf-8")
@@ -191,6 +231,14 @@ class TestFrontendSourceInvariants:
             assert body.strip() == "", "inline script bodies are forbidden by CSP"
         assert 'type="module"' in html
         assert "onclick=" not in html
+
+    def test_layout_has_page_rhythm_and_responsive_chrome(self):
+        css = (UI_V2_ROOT / "assets" / "app.css").read_text(encoding="utf-8")
+        assert ".page-root > * + * { margin-top: 20px; }" in css
+        assert ".page-root > [role=\"status\"] > * + *" in css
+        assert ".icon-btn.nav-toggle { display: none; }" in css
+        assert ".app-status { display: none; }" in css
+        assert ".card { padding: 17px; }" in css
 
     def test_download_urls_never_carry_key(self):
         source = (UI_V2_ROOT / "js" / "core" / "downloads.js").read_text(encoding="utf-8")
@@ -218,12 +266,14 @@ class TestFrontendSourceInvariants:
             UI_V2_ROOT / "js" / "pages" / "job-new.js"
         ).read_text(encoding="utf-8")
 
-    def test_job_batch_uses_raw_stable_intent_and_status_polling(self):
+    def test_job_batch_uses_per_run_recoverable_intent_and_status_polling(self):
         page = (UI_V2_ROOT / "js" / "pages" / "job-batch.js").read_text(encoding="utf-8")
         core = (UI_V2_ROOT / "js" / "core" / "job-batch.js").read_text(encoding="utf-8")
         assert "postJsonText('/job-batches/plan', source" in page
         assert "postJsonText('/job-batches', intent.source" in page
-        assert "batchIdempotencyKey(manifest.batch_id)" in page
+        assert "claimBatchSubmissionIntent(intent.source)" in page
+        assert "clearBatchSubmissionIntent(intent.submissionIntent)" in page
+        assert "batch-json-v2-" in core
         assert "job_batch_id" in page
         assert "get(`/job-batches/${" in page
         assert "receiptPoller.stop()" in page

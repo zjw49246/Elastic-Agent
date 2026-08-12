@@ -53,7 +53,7 @@ UI v2 采用“统一应用壳 + 持久导航 + 页面级数据加载”，将�
 
 当前 Batch 页面已经有大量值得保留的正确行为，拆页不是从头重写：
 
-- API Key 只放在 `sessionStorage`，通过 Bearer Header 使用。
+- 浏览器使用管理员账号 session；HttpOnly Cookie 保存 opaque token，CSRF 只在页面内存。
 - Job 提交先运行 `/api/jobs/plan`，再使用稳定 `Idempotency-Key` 提交。
 - Job 卡片增量 reconcile，避免轮询时丢失展开状态、焦点、横向滚动和页面位置。
 - 结果请求有 request version，迟到响应不会覆盖新状态。
@@ -110,7 +110,7 @@ UI v2 必须保证“只加载当前页”，不能把拆页变成多个页面�
 
 ### 3.2 非目标
 
-- 不在本项目中实现新的用户体系、RBAC 或多租户隔离；v2 仍使用现有管理员 API Key。
+- 不扩展现有管理员账号为通用 RBAC 或多租户体系；v2 只接受 admin role。
 - 不改变 JobSpec、账号分配、EIP 生命周期或 Worker 执行语义。
 - 不把 Agent API Key、OAuth password、邮箱查询 Token 或 OTP 放入浏览器持久存储。
 - 不把 Harness 上传提升为普通用户流程；它继续是默认关闭的管理员高级功能。
@@ -122,12 +122,13 @@ UI v2 必须保证“只加载当前页”，不能把拆页变成多个页面�
 
 ### 4.1 认证与秘密
 
-- 静态 HTML 可以公开加载；除 `/api/health` 外，数据和操作 API 必须继续由 `require_api_key` 保护。
-- API Key 只允许通过 `Authorization: Bearer`，禁止 query string、Cookie 和下载 URL。
-- API Key 只保存在内存与 `sessionStorage.ea_api_key`；禁止 `localStorage`。
+- JS/CSS 可以公开加载；SPA shell 和除 `/api/health` 外的数据/操作 API 必须要求管理员 session 或自动化 Bearer service token。
+- 浏览器 session token 只存在 Secure/HttpOnly/SameSite=Strict Cookie；JavaScript 不读取 token。
+- CSRF token 只保存在 auth module 内存，非安全方法同时发送 `X-CSRF-Token` 并由服务端校验精确 HTTPS Origin。
+- 旧 API Key 只供自动化 Bearer 客户端；浏览器启动时删除旧 `sessionStorage.ea_api_key`，不得读取或发送它。
 - 页面发现 URL 中存在 `api_key` 时，必须在任何 API 请求前移除它，并且不能把该值当作凭据使用。
 - OAuth password、邮箱查询 Token、Agent API Key、OTP 都是 write-only；不得进入 store、草稿、toast、错误日志或前端遥测。
-- 下载必须继续通过带 Bearer Header 的 `fetch`，不得退化为携带 key 的 `<a href>`。
+- 下载必须继续通过 same-origin cookie-authenticated `fetch`，不得退化为携带凭据的 `<a href>`。
 - Job 详情继续使用服务端脱敏数据；不得回显 env value、secret reference、setup step env 或带凭据的仓库 URL。
 
 ### 4.2 Job 幂等与破坏性操作
@@ -171,7 +172,7 @@ UI v2 必须保证“只加载当前页”，不能把拆页变成多个页面�
 │ 结果           │                                              │
 │ Workers    N   │                                              │
 │                │                                              │
-│ 换 Key / 主题  │                                              │
+│ 账号 / 退出 / 主题 │                                           │
 └────────────────┴──────────────────────────────────────────────┘
 ```
 
@@ -470,7 +471,7 @@ Store 更新必须以不可变 snapshot 或显式 reducer 完成；页面不得�
 - 为 GET 提供 request generation，避免迟到覆盖。
 - 401 只触发一次全局重新认证流程并暂停 poller。
 - 429/5xx/网络错误由 poller 指数退避；普通交互请求不自动重复破坏性操作。
-- 503“服务未配置 API Key/恢复中”和 401 区分展示。
+- 503“管理员认证不可用/恢复中”和 401“会话失效”区分展示。
 
 任何错误消息进入页面时使用 `textContent`。禁止把 API 返回字符串直接拼入 `innerHTML` 或 inline event handler。
 
@@ -656,16 +657,15 @@ GET /api/nodes?limit=100&offset=0&status=running
 
 ```text
 打开深链接
-  → 静态 shell 200
-  → 清理 URL api_key
-  → 读取 sessionStorage key
-  → 无 key：显示登录对话框
-  → 使用 /api/ui/summary 或受保护轻量请求验证
-  → 成功：恢复原深链接
-  → 401：暂停 poller，重新认证
+  → Manager 校验 HttpOnly session
+  → 匿名：303 到 /login?next=<安全深链接>
+  → 原生邮箱/密码 form POST，Set-Cookie 后 303 回深链接
+  → UI v2 调 /api/auth/me，将 principal 与 CSRF 留在内存
+  → 首次密码：303 到 /change-password，完成后恢复深链接
+  → 401：停止 poller/download 并回到登录页
 ```
 
-“忘记 Key”必须清理内存/sessionStorage、abort 所有请求和下载，并返回安全的认证状态。
+“退出登录”必须 abort 请求/下载、撤销服务端 session、清空内存 principal/CSRF 并返回登录页。
 
 ### 9.2 添加账号
 
@@ -753,7 +753,7 @@ elastic-agent.claude-code-manager.com/ui-v2/*
 
 Worker route 不能使用会覆盖全站的宽泛模式。SPA fallback 只在 `/ui-v2/*` 内生效；任何 `/api`、`/ws`、结果下载请求都不得回落到 `index.html`。
 
-同源部署使 UI 继续调用绝对路径 `/api/*`，无需启用 CORS，也不会改变 API Key 的 sessionStorage origin。
+同源部署使 UI 继续调用绝对路径 `/api/*`，无需启用 CORS，并让 Secure Cookie 与精确 Origin/CSRF 校验保持在同一站点。
 
 ### 10.3 静态发布要求
 
@@ -848,7 +848,7 @@ Jobs/Results 分页、summary 和 catalog 需要发布 Manager 代码。发布�
 
 ### 11.2 浏览器存储与缓存
 
-- `sessionStorage` 只保存 API Key 与非敏感 UI 偏好；Key 仍由 auth 模块封装，不暴露给普通组件。
+- `sessionStorage` 只保存非敏感 UI 偏好和幂等提交意图；不得保存 session token、CSRF 或管理 API Key。
 - 禁止 `localStorage`、IndexedDB 和 Service Worker 缓存认证或业务数据。
 - account secret、OTP、env/secret_env 不进入浏览器持久存储。
 - HTML 不缓存；敏感 API 和日志/下载设置 `no-store`。
@@ -877,19 +877,19 @@ Jobs/Results 分页、summary 和 catalog 需要发布 Manager 代码。发布�
 
 - 每个路由可直接访问、刷新、前进和后退。
 - 导航不整页刷新，当前项有 `aria-current="page"`。
-- API Key 输入后恢复原深链接。
+- 管理员登录/首次改密后恢复原深链接。
 - 非法 UI 路由显示 404；不得误请求同名 API。
-- 静态 shell 无 key 返回 200，数据 API 无 key 返回 401。
+- 匿名静态 shell 深链接返回带安全 `next` 的 303；JS/CSS 仍可公开读取，数据 API 返回 401。
 - JS/CSS MIME、缓存、nosniff 和 SPA fallback 正确。
 
 ### 12.3 认证与秘密
 
-- Key 不进入 URL、Cookie、localStorage、DOM、Referer 和下载 URL。
-- `?api_key=` 在 API 请求前被清除且不能认证。
-- 401 暂停 poller；更新 key 后只重试一次。
+- 管理 session token 不进入 JavaScript、URL、storage、DOM、Referer 或下载 URL。
+- `?api_key=` 和旧 storage key 在 API 请求前被清除且不能认证。
+- 401 暂停 poller/download 并跳转登录，不自动重放写请求。
 - password/token/API key/OTP/secret env 不进入草稿、toast、console 或异常。
 - 422 不回显哨兵秘密。
-- 忘记 key 会 abort fetch/download 并清空会话。
+- 退出登录会 abort fetch/download、撤销服务端会话并清空内存 CSRF。
 
 ### 12.4 Job 表单
 
@@ -1054,7 +1054,7 @@ Canary 观察项：
 - [ ] `/ui-v2/*` 发布和回滚均不重启 Manager/Tunnel。
 - [ ] `/api/*`、`/ws/*` 未被静态 fallback 接管。
 - [ ] 旧 `/batch`、`/fleet` 可用。
-- [ ] API Key 不出现在 URL、Cookie、localStorage、DOM 和下载 URL。
+- [ ] 管理 session token 不出现在 JavaScript、URL、storage、DOM 和下载 URL；Cookie 固定 HttpOnly/Secure。
 - [ ] 账号秘密、OTP、env 不持久化、不进日志。
 - [ ] Job plan/submit 语义与旧 UI 一致。
 - [ ] 重复提交测试为 0。

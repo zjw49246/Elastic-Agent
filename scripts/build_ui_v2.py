@@ -139,6 +139,10 @@ def build(out_dir: Path) -> dict:
 
     # index.html entry rewrite.
     index = (UI_ROOT / "index.html").read_text(encoding="utf-8")
+    # The Manager serves source modules below a revisioned namespace so an
+    # intermediary cannot reuse an older un-hashed module graph.  A CDN build
+    # already content-hashes every file, so flatten that source-only prefix.
+    index = re.sub(r"/ui-v2/rev/[A-Za-z0-9._-]+/", "/ui-v2/", index)
     entry = UI_ROOT / "js" / "app.js"
     index = index.replace("js/app.js", hashed[entry].replace("\\", "/"))
     for original, hashed_name in css_map.items():

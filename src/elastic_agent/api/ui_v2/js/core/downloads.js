@@ -2,7 +2,7 @@
  * Authenticated, cancellable result downloads.
  *
  * The Bearer header is mandatory, so a plain ``<a href>`` is not an option —
- * that would put the API Key in a URL. One download per Job is allowed at a
+ * that would put credentials in a URL. One download per Job is allowed at a
  * time; cancelling aborts the fetch and cancels the reader so the Manager stops
  * streaming from S3.
  */

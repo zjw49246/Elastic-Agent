@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   JOB_BATCH_MAX_BYTES,
-  batchIdempotencyKey,
+  claimBatchSubmissionIntent,
+  clearBatchSubmissionIntent,
   parseBatchSource,
   utf8ByteLength,
 } from '../../src/elastic_agent/api/ui_v2/js/core/job-batch.js';
@@ -42,13 +43,33 @@ test('schema hard limit and UTF-8 byte limit are enforced locally', () => {
   assert.throws(() => parseBatchSource(`"${'a'.repeat(JOB_BATCH_MAX_BYTES)}"`), /2 MiB/);
 });
 
-test('batch_id derives a stable intent key and changed identity derives a new key', async () => {
-  const first = await batchIdempotencyKey('batch-contract');
-  const replay = await batchIdempotencyKey('batch-contract');
-  const changed = await batchIdempotencyKey('batch-other');
-  assert.equal(first, replay);
-  assert.notEqual(first, changed);
-  assert.match(first, /^batch-json-v1-[0-9a-f]{64}$/);
+test('one pending run retries safely, then the same JSON gets a new execution key', async () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  let nextByte = 1;
+  const cryptoApi = {
+    subtle: globalThis.crypto.subtle,
+    getRandomValues: (bytes) => {
+      bytes.fill(nextByte);
+      nextByte += 1;
+      return bytes;
+    },
+  };
+  const source = JSON.stringify(manifest());
+  const first = await claimBatchSubmissionIntent(source, { cryptoApi, storage });
+  const retry = await claimBatchSubmissionIntent(source, { cryptoApi, storage });
+  assert.equal(retry.idempotencyKey, first.idempotencyKey);
+  assert.equal(retry.recovered, true);
+  assert.match(first.idempotencyKey, /^batch-json-v2-[0-9a-f]{64}$/);
+
+  clearBatchSubmissionIntent(first, { storage });
+  const rerun = await claimBatchSubmissionIntent(source, { cryptoApi, storage });
+  assert.notEqual(rerun.idempotencyKey, first.idempotencyKey);
+  assert.equal(rerun.recovered, false);
 });
 
 test('raw JSON transport preserves exact source bytes', async () => {

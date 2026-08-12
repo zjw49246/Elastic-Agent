@@ -6,7 +6,7 @@ JSON JobBatch 用于一次上传多份完整 `JobSpec`，由 Manager 按容量�
 
 1. 打开 `/ui-v2/jobs/batch`。
 2. 粘贴 JSON 或选择本地 `.json` 文件，然后点击“校验计划”。
-3. 检查 Job 数、总 Workers、Worker-hours、实例类型、并发量和逐项警告。
+3. 检查 Job 数、总 Workers、Worker-hours、实例类型、账号来源/组/绑定方式、并发量和逐项警告。
 4. 只有全部 Job 都通过服务端 preflight 后，页面才会开放确认按钮。
 5. 最后由管理员确认，才会接受批次并开始创建真实资源。
 
@@ -127,9 +127,14 @@ manifest 只保存在当前页面内存中，不写入 `localStorage` 或 `sessi
 
 ## 幂等与状态
 
-Console 用 `batch_id` 派生稳定的 `Idempotency-Key`。网络超时后，用原文件重试不会重复创建 Job；同一 `batch_id` 改了内容会收到 `409`，要启动新的逻辑批次必须显式更换 `batch_id`。
+Console 为每次管理员明确提交生成新的随机 `Idempotency-Key`，所以相同的
+`batch_id` 和 `client_id` 可以重复运行。一次提交在收到确定回执前会把源文件摘要和
+幂等键保存在当前标签页的 `sessionStorage`；网络超时或页面重载后用原文件重试，
+仍会恢复该键而不会重复创建 Job。收到确定的成功回执后记录会删除，下一次预检并
+提交同一份 JSON 会创建一组新 Job。
 
-直接调用 API 时，调用方必须自行保存并复用同一个 `Idempotency-Key`：
+直接调用 API 时，调用方必须为每次新运行生成新 `Idempotency-Key`，并只在该次
+请求结果不确定时保存、复用原键：
 
 ```bash
 curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches/plan" \
@@ -140,9 +145,12 @@ curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches/plan" \
 curl -fsS -X POST "$ELASTIC_AGENT_URL/api/job-batches" \
   -H "Authorization: Bearer $ELASTIC_AGENT_API_KEY" \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: ai4sci-codex-replay-20260801-a' \
+  -H "Idempotency-Key: $ELASTIC_AGENT_RUN_KEY" \
   --data-binary @job-batch.json
 ```
+
+其中 `ELASTIC_AGENT_RUN_KEY` 应在一次新运行开始时生成（例如 UUID），并持久保存到该次
+请求获得确定回执；不要把稳定的 `batch_id` 直接当作所有运行共用的 Key。
 
 状态含义：
 

@@ -356,6 +356,13 @@ The focused suite covers:
   quoted destination parents, bounded Manager session/cost metadata, and
   historical Job `scandir`/journal-read/response/admission ceilings with
   explicit truncation metadata.
+- management administrator authentication: private atomic `0600` Argon2id user
+  store, stdin-only bootstrap CLI, indistinguishable invalid credentials,
+  bounded login attempts, opaque Secure/HttpOnly/SameSite browser sessions,
+  exact-origin CSRF enforcement, first-login password rotation, logout/replay
+  rejection, local-only UI/UI v2 deep-link redirects, in-memory-only UI v2 CSRF,
+  retired browser API-key cleanup, and legacy Bearer service-token compatibility.
+  Worker `/ws/runtime` token tests remain independent.
 
 ## Management API smoke test
 

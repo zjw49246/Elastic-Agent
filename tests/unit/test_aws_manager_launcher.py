@@ -5,18 +5,22 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from deploy.aws_manager import (
     CANONICAL_OWNER_ID,
     LauncherConfigurationError,
+    build_application,
     build_config,
     load_settings,
     prepare_local_paths,
     validate_image_description,
     validate_worker_ami,
 )
+from elastic_agent.api.auth import configured_public_origin, reset_management_auth
+from elastic_agent.core.management_auth import ManagementUserStore
 
 CALLER_ACCOUNT = "123456789012"
 SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
@@ -54,6 +58,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_AWS_MAX_INSTANCES": "30",
         "ELASTIC_AGENT_STATE_DIR": str(tmp_path / "state"),
         "ELASTIC_AGENT_MANAGER_URL": "wss://manager.example/ws/runtime",
+        "ELASTIC_AGENT_PUBLIC_ORIGIN": "https://manager.example",
         "ELASTIC_AGENT_FRAMEWORK_SRC": str(tmp_path / "release" / "src"),
         "ELASTIC_AGENT_SERVER_HOST": "0.0.0.0",
         "ELASTIC_AGENT_SERVER_PORT": "8080",
@@ -114,8 +119,21 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "UnsetEnvironment=AWS_ACCESS_KEY_ID" in source
 
 
+def test_production_launcher_trusts_forwarded_clients_only_from_loopback_proxy():
+    source = (Path(__file__).resolve().parents[2] / "deploy/aws_manager.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "proxy_headers=True" in source
+    assert 'forwarded_allow_ips="127.0.0.1,::1"' in source
+
+
 def test_production_allowlist_covers_common_x86_worker_families():
     source = AWS_ENV.read_text(encoding="utf-8")
+    assert (
+        "ELASTIC_AGENT_PUBLIC_ORIGIN=https://elastic-agent.claude-code-manager.com"
+        in source
+    )
     configured = next(
         line.partition("=")[2]
         for line in source.splitlines()
@@ -317,6 +335,7 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert config.provider.aws.worker_instance_profile == "elastic-agent-worker"
     assert config.provider.aws.max_instances == 30
     assert settings.expected_role_name == "elastic-agent-manager"
+    assert settings.public_origin == "https://manager.example"
     assert config.worker.ssh_user == "ubuntu"
     assert config.registry.path == str(tmp_path / "state" / "registry.json")
     assert config.task_registry.path == str(tmp_path / "state" / "task_registry.json")
@@ -327,6 +346,39 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert settings.results_s3_bucket == "elastic-agent-results-example"
     assert settings.results_s3_prefix == "jobs"
     assert settings.results_s3_interval == 60
+
+
+def test_build_application_requires_enabled_admin_and_pins_public_origin(
+    tmp_path, monkeypatch
+):
+    settings = load_settings(_environment(tmp_path))
+    state_file = settings.state_dir / "management-users.json"
+    settings.framework_src.mkdir(parents=True)
+    settings.ssh_key_path.write_text("test-only-key", encoding="utf-8")
+    settings.ssh_key_path.chmod(0o600)
+    monkeypatch.setattr(
+        "deploy.aws_manager.validate_worker_ami",
+        lambda _settings: SimpleNamespace(
+            image_id=_settings.ami_id,
+            provenance="unit-test",
+            break_glass_used=False,
+        ),
+    )
+
+    with pytest.raises(LauncherConfigurationError, match="management user store"):
+        build_application(settings)
+
+    ManagementUserStore(state_file).upsert_user(
+        "launcher-owner@example.test",
+        "temporary-launcher-passphrase",
+        must_change_password=True,
+    )
+    try:
+        app = build_application(settings)
+        assert app is not None
+        assert configured_public_origin() == "https://manager.example"
+    finally:
+        reset_management_auth()
 
 
 @pytest.mark.parametrize(
@@ -342,6 +394,7 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
         "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME",
         "ELASTIC_AGENT_STATE_DIR",
         "ELASTIC_AGENT_MANAGER_URL",
+        "ELASTIC_AGENT_PUBLIC_ORIGIN",
         "ELASTIC_AGENT_RESULTS_S3_BUCKET",
         "ELASTIC_AGENT_RESULTS_S3_PREFIX",
         "ELASTIC_AGENT_RESULTS_S3_INTERVAL",
@@ -369,6 +422,26 @@ def test_load_settings_requires_secret_free_wss_runtime_url(tmp_path, url):
     environ["ELASTIC_AGENT_MANAGER_URL"] = url
 
     with pytest.raises(LauncherConfigurationError, match="ELASTIC_AGENT_MANAGER_URL"):
+        load_settings(environ)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://manager.example",
+        "https://user:password@manager.example",
+        "https://manager.example/path",
+        "https://manager.example?query=value",
+        "https://manager.example#fragment",
+        "https://manager.example:",
+        "https://manager.example:invalid",
+    ],
+)
+def test_load_settings_requires_clean_https_public_origin(tmp_path, origin):
+    environ = _environment(tmp_path)
+    environ["ELASTIC_AGENT_PUBLIC_ORIGIN"] = origin
+
+    with pytest.raises(LauncherConfigurationError, match="ELASTIC_AGENT_PUBLIC_ORIGIN"):
         load_settings(environ)
 
 

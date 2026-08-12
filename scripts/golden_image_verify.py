@@ -40,6 +40,7 @@ _SYSTEM_COMMANDS = {
     "xvfb": "Xvfb",
     "xdotool": "xdotool",
     "wget": "wget",
+    "bubblewrap": "bwrap",
 }
 
 _IMPORT_NAMES = {

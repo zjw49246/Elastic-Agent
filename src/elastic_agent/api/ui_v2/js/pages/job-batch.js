@@ -8,7 +8,8 @@ import {
   JOB_BATCH_DEFAULT_MAX_ITEMS,
   JOB_BATCH_MAX_BYTES,
   JOB_BATCH_SCHEMA_MAX_ITEMS,
-  batchIdempotencyKey,
+  claimBatchSubmissionIntent,
+  clearBatchSubmissionIntent,
   batchReceiptIsTerminal,
   parseBatchSource,
 } from '../core/job-batch.js';
@@ -23,7 +24,7 @@ export function createPage({ router, container }) {
   let submitting = false;
   let requestController = null;
   let receiptPoller = null;
-  let planned = null; // exact {source, manifest, plan, idempotencyKey}
+  let planned = null; // exact {source, manifest, plan, submissionIntent}
   let receipt = null;
 
   function mount() {
@@ -79,12 +80,11 @@ export function createPage({ router, container }) {
     nodes.planBtn.textContent = '校验中…';
     requestController = new AbortController();
     try {
-      const idempotencyKey = await batchIdempotencyKey(manifest.batch_id);
       const result = await postJsonText('/job-batches/plan', source, {
         signal: requestController.signal,
       });
       if (disposed || token !== generation || source !== nodes.input.value) return;
-      planned = { source, manifest, plan: result, idempotencyKey };
+      planned = { source, manifest, plan: result, submissionIntent: null };
       receipt = null;
       renderPlan(result);
       if (result.valid === true) {
@@ -115,32 +115,40 @@ export function createPage({ router, container }) {
       return;
     }
 
+    submitting = true;
+    setBusy(true);
     const summary = planned.plan.summary || {};
     const confirmed = await confirmDialog({
       title: '确认启动批量 Jobs',
       message: `将接受 ${summary.job_count ?? planned.manifest.jobs.length} 个 Job、`
         + `${summary.total_workers ?? '—'} 个 Workers，最大并发 `
         + `${summary.max_active_jobs ?? planned.manifest.policy?.max_active_jobs ?? 3} 个 Job。`
-        + '提交后会创建真实资源。',
+        + '本次确认会创建一组新的运行和真实资源；仅网络中断重试会复用本次运行身份。',
       confirmLabel: '确认提交',
     });
-    if (!confirmed || !planned || nodes.input.value !== planned.source) return;
+    if (!confirmed || !planned || nodes.input.value !== planned.source) {
+      submitting = false;
+      setBusy(false);
+      return;
+    }
 
     const token = generation;
     const intent = planned;
-    submitting = true;
-    setBusy(true);
     nodes.submitBtn.textContent = '提交中…';
     requestController = new AbortController();
     try {
+      if (!intent.submissionIntent) {
+        intent.submissionIntent = await claimBatchSubmissionIntent(intent.source);
+      }
       const result = await postJsonText('/job-batches', intent.source, {
-        headers: { 'Idempotency-Key': intent.idempotencyKey },
+        headers: { 'Idempotency-Key': intent.submissionIntent.idempotencyKey },
         signal: requestController.signal,
       });
       if (disposed || token !== generation || intent !== planned) return;
       if (!result || typeof result.job_batch_id !== 'string' || !result.job_batch_id) {
         throw new Error('服务器回执缺少 job_batch_id；稳定幂等键已保留，可安全重试。');
       }
+      clearBatchSubmissionIntent(intent.submissionIntent);
       receipt = result;
       renderReceipt(result);
       toastSuccess(`批次已接收：${result.job_batch_id}`);
@@ -148,7 +156,7 @@ export function createPage({ router, container }) {
     } catch (error) {
       if (!isAbort(error) && token === generation) {
         const message = Number(error && error.status) === 409
-          ? '同一 batch_id 已绑定到另一份 manifest；请恢复原内容重试，或更换 batch_id。'
+          ? '本次待恢复提交的幂等键与另一份 manifest 冲突；请重新预检后再提交。'
           : describeError(error);
         renderError(message, { preservePlan: true });
         toastError(message);
@@ -358,7 +366,10 @@ export function createPage({ router, container }) {
     root.appendChild(el('div', { class: 'page-head' }, [
       el('div', {}, [
         el('h1', { text: '批量提交 Job' }),
-        el('p', { class: 'page-sub', text: '同一份原始 JSON 先做无副作用预检，确认后进入耐久队列。' }),
+        el('p', {
+          class: 'page-sub',
+          text: '同一份 JSON 可重复运行；每次确认创建新运行，网络中断重试不会重复创建。',
+        }),
       ]),
       el('div', { class: 'page-actions' }, [
         el('a', { class: 'btn', href: router.href('/jobs/new'), text: '单个提交' }),

@@ -58,7 +58,17 @@ def test_batch_manifest_is_memory_only_and_plan_precedes_submit():
     )
 
     assert "localStorage" not in batch_script
-    assert "sessionStorage" not in batch_script
+    assert "sessionStorage.getItem(BATCH_PENDING_INTENT_STORAGE_KEY)" in batch_script
+    assert "sessionStorage.setItem(BATCH_PENDING_INTENT_STORAGE_KEY" in batch_script
+    stored_intent = _between(
+        batch_script,
+        "sessionStorage.setItem(BATCH_PENDING_INTENT_STORAGE_KEY, JSON.stringify({",
+        "}));",
+    )
+    assert "file_hash: fileHash" in stored_intent
+    assert "idempotency_key: key" in stored_intent
+    assert "rawSource" not in stored_intent
+    assert "manifest" not in stored_intent
     assert "FileReader" not in batch_script
     assert "await file.arrayBuffer()" in plan_function
     assert "JSON.parse(source)" in plan_function
