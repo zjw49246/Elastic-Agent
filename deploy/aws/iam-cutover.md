@@ -241,7 +241,7 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$MANAGER_POLICY" \
     "arn:aws:ec2:ap-northeast-1::image/$FINAL_AMI_ID" \
     arn:aws:ec2:ap-northeast-1:297645381734:subnet/subnet-0c1db80817d054277 \
     arn:aws:ec2:ap-northeast-1:297645381734:security-group/sg-05c68220f901fb555 \
-    arn:aws:ec2:ap-northeast-1:297645381734:key-pair/panyuexi \
+    arn:aws:ec2:ap-northeast-1:297645381734:key-pair/interview-key \
     arn:aws:ec2:ap-northeast-1:297645381734:network-interface/eni-0123456789abcdef0 \
     arn:aws:ec2:ap-northeast-1:297645381734:volume/vol-0123456789abcdef0 \
     arn:aws:ec2:ap-northeast-1:297645381734:instance/i-0123456789abcdef0 \

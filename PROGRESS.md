@@ -1,24 +1,5 @@
 # PROGRESS — 经验教训沉淀
 
-## 2026-08-11 Run-Benchmark S3 dataset/setup ordering
-
-**问题**：真实无模型 smoke 已通过 IAM、私网 SSH 和四步 host bootstrap，但 Manager 的固定顺序是
-`code → setup → S3 dataset → run`，constructor 却在 setup step 执行 `elastic_worker prepare`，导致
-`_SEAL.json` 尚未下载就按设计失败并回收实例。
-
-**解决**：setup 只创建 venv 并安装 exact package；固定 run command 改为 `prepare && exec execute`。
-Manager 在进程启动后发送的一次性 frame 只在 trusted stdin pipe 等待，prepare 不读取 stdin，execute 在
-seal/release/instance/image/wall-time 全部证明后才首次读取。保留通用 dataset 顺序，避免影响其他 Job。
-
-## 2026-08-11 Tokyo A dynamic Worker KeyPair binding
-
-**问题**：无模型 smoke 的首台 EC2 进入 running 后无法 SSH；Worker SG 的 Manager-SG 私网规则正确，但
-生产 env 使用 `interview-key`，本地 PEM 实际匹配 `panyuexi`。切换 env 后，Manager role 的精确
-RunInstances resource whitelist 又按预期拒绝未列出的 `panyuexi`。
-
-**解决**：新 Worker 统一为 `panyuexi + /home/ubuntu/panyuexi.pem`；IAM policy 精确增加 `panyuexi` ARN，
-同时保留旧 `interview-key` 作为回滚，不使用通配符。测试同时绑定 env、runbook 和两个精确 ARN。
-
 ## 2026-08-11 Run-Benchmark 一次性凭据动态 Job 通道
 
 **问题**：通用 JobSpec 的 `run.secret_env` 会持久化 secret reference，无法满足 Run-Benchmark API Key
@@ -772,21 +753,3 @@ API/checkpoint 212 项、结果/UI/supervisor 等 558 项及最终 IAM/transacti
 **解决**：接入持久化 JobBatch 队列、plan/submit/status API、进程重启恢复、逐 Job 独立调度与全局 50 个活跃任务上限。UI v2 对同一份原始 UTF-8 字节执行预检和提交，严格拒绝重复键及超过 2 MiB/100 项的输入；以 batch id 派生稳定幂等键，显式确认后提交并轮询到终态。API key 只保留在内存/sessionStorage/Bearer header，不再写入公开 HTML；旧 Batch/Fleet 页面继续作为可用回退面。
 
 **验证**：完整 Python 套件 **2931 passed / 12 skipped / 0 failed**；UI v2 Node 测试 **23 passed**；新增和修改的核心 Python 文件 Ruff、UI 构建/import 检查及 `git diff --check` 全部通过。
-## 2026-08-11 UI v2 深层路由刷新资源修复（commit `b5672d1`）
-
-**问题**：SPA shell 用相对路径 `assets/app.css` 和 `js/app.js`。直接打开 `/ui-v2/` 正常，但刷新 `/ui-v2/jobs/batch` 等深层 History-API 路由时，浏览器改为请求 `/ui-v2/jobs/assets/app.css` 与 `/ui-v2/jobs/js/app.js`，两者 404，页面只剩未隐藏的无障碍文本和无样式导航。
-
-**解决**：入口资源固定为 `/ui-v2/assets/app.css` 与 `/ui-v2/js/app.js`；构建器继续在该根路径内替换内容哈希文件名。新增深层路由 shell 回归测试，同时验证根路径 CSS/JS 的状态和 MIME。
-
-**避免复发**：SPA fallback 测试不能只断言深层 URL 返回 HTML，还必须验证该 HTML 引用的静态入口从任意路由都解析到同一应用根。
-
-**验证**：完整 Python 套件 **2940 passed / 12 skipped / 0 failed**；UI v2 Python 专项 **19 passed**、Node 测试 **23 passed**；内容哈希构建、Ruff 与 `git diff --check` 通过。
-## 2026-08-11 JobBatch 终态 journal 跨 JobSpec 版本恢复（commit `ff40a7a`）
-
-**问题**：生产机保留 121 份全部终态的 JobBatch journal，它们由一版超前 JobSpec 写入，包含当前 `main` 不认识的 profile/账号字段。新 Manager 启动时用当前严格 JobSpec 重解析所有历史 manifest，导致应用启动失败，尽管这些批次永远不会再次调度。
-
-**解决**：写入和所有非终态恢复继续严格绑定当前 JobSpec；仅加载“批次终态且每项均为 terminal/error”的历史记录时，允许把 JobSpec 当作不可执行的 opaque payload，同时严格校验 journal/envelope 字段、policy、ID 唯一性、item 映射及原始 canonical SHA-256 指纹。这样保留历史查询而不会运行未知 schema。
-
-**避免复发**：持久 journal 的可执行恢复与只读历史恢复必须分层；前者严格绑定当前 schema，后者应在完整性和终态证明后保持前向可读，不能让旧历史阻断整个控制面启动。
-
-**验证**：完整 Python 套件 **2941 passed / 12 skipped / 0 failed**；JobBatch + UI v2 专项 **48 passed**，Ruff 与 `git diff --check` 通过；生产 121 份 journal 均为 terminal、679 个 terminal item + 57 个 error item，且原始 canonical 指纹 **121/121** 匹配。

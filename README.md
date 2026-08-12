@@ -230,11 +230,6 @@ resolved immediately before dispatch and is never returned by the Job API.
 Cross-host secret delivery requires `ELASTIC_AGENT_MANAGER_URL=wss://...`;
 plaintext WebSocket delivery is rejected before Secrets Manager/SSM is read.
 
-Tokyo A launches new Workers with the AWS KeyPair `panyuexi` and its matching
-mode-`0600` `/home/ubuntu/panyuexi.pem`. The Manager IAM policy pins both that
-active KeyPair and the older `interview-key` rollback ARN; it never permits a
-wildcard KeyPair resource.
-
 ### Trusted Run-Benchmark dynamic execution
 
 Run-Benchmark API-key trajectories use a narrower server-owned constructor:
