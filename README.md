@@ -274,7 +274,7 @@ top-level `balance=0` and `remaining=0` stay visible but are not exhaustion
 signals. Explicit exhausted status, expiry, quota, and rate-limit windows still
 block allocation.
 ApexRouter is Codex-only: it queries
-`https://35-75-22-186.sslip.io/v1/models` with the pinned Codex CLI version and
+`https://api.apexin.ai/v1/models` with the pinned Codex CLI version and
 configures the `apexrouter` Responses API provider. Fresh allocation prefers a
 compatible, available API identity and falls back to OAuth; `account.ids` can
 select a generated ID such as `cloudrouter-1` or `apex-1` explicitly. Set

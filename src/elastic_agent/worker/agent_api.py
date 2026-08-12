@@ -23,7 +23,7 @@ from typing import Any
 
 CLOUDROUTER_CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CLOUDROUTER_CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
-APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = frozenset(
     {
         "ANTHROPIC_AUTH_TOKEN",

@@ -69,7 +69,7 @@ def test_default_registry_enables_apex_after_cloudrouter() -> None:
 def test_apex_endpoints_and_client_version_are_fixed() -> None:
     adapter = ApexRouterAdapter()
 
-    assert APEX_CODEX_BASE_URL == "https://35-75-22-186.sslip.io/v1"
+    assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
     assert APEX_MODELS_URL == f"{APEX_CODEX_BASE_URL}/models"
     assert APEX_USAGE_URL == f"{APEX_CODEX_BASE_URL}/usage"
     assert APEX_CODEX_CLIENT_VERSION == CODEX_CLI_VERSION == "0.144.6"
@@ -78,7 +78,7 @@ def test_apex_endpoints_and_client_version_are_fixed() -> None:
     assert APEX_USAGE_URL in adapter.endpoints.values()
     assert all(
         value is None
-        or value.startswith("https://35-75-22-186.sslip.io/")
+        or value.startswith("https://api.apexin.ai/")
         for value in adapter.endpoints.values()
     )
 

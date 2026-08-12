@@ -107,8 +107,14 @@ class TestApexRouterClassification:
         assert is_apexrouter_auth_failure(
             "ApexRouter API: HTTP 403 Forbidden"
         )
+        assert is_apexrouter_auth_failure(
+            "https://api.apexin.ai/v1/responses: HTTP 403 Forbidden"
+        )
         assert is_apexrouter_transient(
             "Apex gateway: HTTP 429 Too Many Requests"
+        )
+        assert is_apexrouter_transient(
+            "https://api.apexin.ai/v1/responses: HTTP 429 Too Many Requests"
         )
         assert is_apexrouter_hard_limit(
             "ApexRouter API key is out of credits"

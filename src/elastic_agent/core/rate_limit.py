@@ -204,6 +204,9 @@ _APEXROUTER_FALLBACK_PREFIX = (
     r"^\s*[^\n]{0,80}"
     r"(?:ApexRouter(?:\s+(?:API|gateway))?"
     r"|Apex\s+(?:API|gateway)"
+    # Keep the retired hostname here so logs emitted by older Workers still
+    # receive the same safe classification after a rolling deployment.
+    r"|api\.apexin\.ai"
     r"|35-75-22-186\.sslip\.io)"
     r"[^\n]{0,240}"
 )

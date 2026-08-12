@@ -24,7 +24,10 @@ from elastic_agent.core.agent_api import (
 from elastic_agent.core.bootstrap_steps import CODEX_CLI_VERSION
 from elastic_agent.core.cloudrouter import CloudRouterAdapter
 
-APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+# Public ApexRouter gateway.  The former sslip.io address is kept out of the
+# active endpoint set because it can still answer usage requests while its
+# model/Responses route has no ready upstream account.
+APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
 APEX_CODEX_CLIENT_VERSION = CODEX_CLI_VERSION
