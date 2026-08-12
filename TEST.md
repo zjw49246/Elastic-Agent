@@ -40,7 +40,7 @@ These tests cover required environment-only configuration, secret-free
 settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
 Manager-role identity, local state/key permissions, systemd readiness/teardown
 bounds, exact active/rollback KeyPair and production IAM resource pins, complete IAM simulator coverage,
-the Worker's write-only result-prefix plus dataset-only list/read policy, S3 plaintext-transport
+the Worker's write-only result-prefix policy, S3 plaintext-transport
 denial, the versioned common x86_64 production instance allowlist, and AMI availability,
 architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
 explicit Canonical break-glass path.

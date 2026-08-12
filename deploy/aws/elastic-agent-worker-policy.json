@@ -8,21 +8,6 @@
       "Resource": "arn:aws:s3:::elastic-agent-results-297645381734"
     },
     {
-      "Sid": "ListOnlyJobDatasets",
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::elastic-agent-results-297645381734",
-      "Condition": {
-        "StringLike": {
-          "s3:prefix": [
-            "jobs/datasets",
-            "jobs/datasets/",
-            "jobs/datasets/*"
-          ]
-        }
-      }
-    },
-    {
       "Sid": "ReadOnlyJobDatasets",
       "Effect": "Allow",
       "Action": "s3:GetObject",

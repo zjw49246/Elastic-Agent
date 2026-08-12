@@ -49,13 +49,11 @@ terminate; KMS EBS grant/data-key calls; SSM managed-node heartbeats; STS
 identity. Manager-side result upload/read uses S3 data-plane calls, which are
 not present in default CloudTrail event history. The policy also follows the
 actual boto3/AWS CLI calls in this repository. Worker result collection uses
-local-to-S3 `aws s3 cp --recursive`, so result upload does not need
-`ListBucket`. Recursive dataset download uses `aws s3 sync` and therefore gets
-only a condition-scoped `ListBucket` grant for `jobs/datasets/*`; result and
-other bucket prefixes remain unlistable. The separate `GetBucketLocation`
-permission is retained for CLI/region-discovery compatibility without granting
-object reads. Object transfer and failed multipart cleanup map to `PutObject`
-and `AbortMultipartUpload`.
+local-to-S3 `aws s3 cp --recursive`, not `sync`, so it does not need
+`ListBucket`; removing it also hides other Jobs' object names. The separate
+`GetBucketLocation` permission is retained for CLI/region-discovery
+compatibility without granting bucket listing or object reads. Object transfer
+and failed multipart cleanup map to `PutObject` and `AbortMultipartUpload`.
 
 ## 1. Prepare the concrete policy and read-only preflight
 
@@ -151,8 +149,8 @@ MANAGER_POLICY=$(jq -c . "$EA_IAM_TMP/manager-policy.json")
 # policy so future explicit Deny/cross-statement constraints remain effective.
 test "$(printf %s "$MANAGER_POLICY" | wc -c)" -le 131072
 
-# Worker: result upload and dataset-only prefix listing are allowed, while
-# result listing, cross-prefix writes, result reads, and deletes are denied.
+# Worker: result upload is allowed, while listing, cross-prefix writes, object
+# reads, and deletes are denied.
 test "$(aws iam simulate-custom-policy --policy-input-list "$WORKER_POLICY" \
   --action-names s3:PutObject \
   --resource-arns \
@@ -169,12 +167,6 @@ test "$(aws iam simulate-custom-policy --policy-input-list "$WORKER_POLICY" \
     arn:aws:s3:::elastic-agent-results-297645381734/jobs/job-test/result.json \
   --query 'length(EvaluationResults[?EvalDecision!=`implicitDeny`])' \
   --output text)" = 0
-test "$(aws iam simulate-custom-policy --policy-input-list "$WORKER_POLICY" \
-  --action-names s3:ListBucket \
-  --resource-arns arn:aws:s3:::elastic-agent-results-297645381734 \
-  --context-entries \
-    'ContextKeyName=s3:prefix,ContextKeyValues=jobs/datasets/run-test/,ContextKeyType=string' \
-  --query 'EvaluationResults[0].EvalDecision' --output text)" = allowed
 test "$(aws iam simulate-custom-policy --policy-input-list "$WORKER_POLICY" \
   --action-names s3:ListBucket \
   --resource-arns arn:aws:s3:::elastic-agent-results-297645381734 \

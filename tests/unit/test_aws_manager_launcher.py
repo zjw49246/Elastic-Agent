@@ -277,21 +277,6 @@ def test_worker_policy_reads_only_datasets_and_writes_results():
         "Action": "s3:GetBucketLocation",
         "Resource": "arn:aws:s3:::elastic-agent-results-297645381734",
     }
-    assert statements["ListOnlyJobDatasets"] == {
-        "Sid": "ListOnlyJobDatasets",
-        "Effect": "Allow",
-        "Action": "s3:ListBucket",
-        "Resource": "arn:aws:s3:::elastic-agent-results-297645381734",
-        "Condition": {
-            "StringLike": {
-                "s3:prefix": [
-                    "jobs/datasets",
-                    "jobs/datasets/",
-                    "jobs/datasets/*",
-                ],
-            },
-        },
-    }
     assert statements["ReadOnlyJobDatasets"] == {
         "Sid": "ReadOnlyJobDatasets",
         "Effect": "Allow",
