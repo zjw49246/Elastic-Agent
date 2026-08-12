@@ -14,6 +14,7 @@ import struct
 import tarfile
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -3150,6 +3151,29 @@ class TestJobsAPI:
         detail = (await client.get(f"/api/jobs/{jid}")).json()
         assert detail["job_id"] == jid
         assert detail["spec"]["name"] == "ai4sci"
+
+    @pytest.mark.asyncio
+    async def test_list_orders_jobs_by_created_time_newest_first(
+        self, client, manager,
+    ):
+        first = (await client.post(
+            "/api/jobs", json={**self._SPEC, "name": "submitted-first"},
+        )).json()
+        second = (await client.post(
+            "/api/jobs", json={**self._SPEC, "name": "submitted-second"},
+        )).json()
+        manager.batch.get_job(first["job_id"]).created_at = datetime(
+            2026, 8, 10, 8, 0, tzinfo=timezone.utc,
+        )
+        manager.batch.get_job(second["job_id"]).created_at = datetime(
+            2026, 8, 12, 8, 0, tzinfo=timezone.utc,
+        )
+
+        listed = (await client.get("/api/jobs")).json()["jobs"]
+
+        assert [job["job_id"] for job in listed] == [
+            second["job_id"], first["job_id"],
+        ]
 
     @pytest.mark.asyncio
     async def test_get_uses_immutable_persisted_submission_config_live_and_after_restart(

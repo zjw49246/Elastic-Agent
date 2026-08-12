@@ -32,6 +32,7 @@ import time
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
@@ -951,6 +952,29 @@ def _load_historical_job_journals(
         "read_bytes": read_bytes,
         "truncated": truncated,
     }
+
+
+def _job_list_order(item: dict) -> tuple[float, str]:
+    """Order current and historical Job rows newest-first, deterministically."""
+
+    for field in ("created_at", "started_at", "completed_at"):
+        raw = item.get(field)
+        if isinstance(raw, datetime):
+            value = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                value = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        try:
+            return value.timestamp(), str(item.get("job_id") or "")
+        except (OSError, OverflowError, ValueError):
+            continue
+    return float("-inf"), str(item.get("job_id") or "")
 
 
 def _journal_state(payload: dict) -> str:
@@ -3652,6 +3676,7 @@ async def list_jobs() -> dict:
             or response_truncated
             or leases_truncated
         )
+        out.sort(key=_job_list_order, reverse=True)
         return {
             "jobs": out,
             # Preserve the existing UI/API meaning: number of returned rows.
