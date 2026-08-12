@@ -434,7 +434,7 @@ async def _await_owned_task(
     return result
 
 
-def sensitive_transport_error(manager, *, feature: str = "secret input") -> str | None:
+def _secret_env_transport_error(manager) -> str | None:
     """Reject plaintext cross-host delivery of resolved Job secrets.
 
     Secret references are deliberately resolved only at dispatch time, but the
@@ -462,15 +462,11 @@ def sensitive_transport_error(manager, *, feature: str = "secret input") -> str 
         )
         return None
     return (
-        f"{feature} requires a wss:// Manager URL because secrets "
+        "run.secret_env requires a wss:// Manager URL because resolved secrets "
         "cross the worker WebSocket; configure ELASTIC_AGENT_MANAGER_URL=wss://... "
         "(or set ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV=1 only on a trusted "
         "test network)"
     )
-
-
-def _secret_env_transport_error(manager) -> str | None:
-    return sensitive_transport_error(manager, feature="run.secret_env")
 
 ProvisionHook = Callable[[str, Harness, JobSpec], Awaitable[bool]]
 LoginHook = Callable[
@@ -3419,25 +3415,6 @@ raise SystemExit(code)
             timeout=timeout,
             job_id=job_id,
             watch_exhaustion=watch_exhaustion,
-        )
-
-    async def send_sensitive_input(
-        self,
-        worker_id: str,
-        task_id: str,
-        payload: bytearray,
-    ) -> None:
-        """Deliver one lease payload without placing it in command/env state."""
-
-        import base64
-
-        if not isinstance(payload, bytearray) or not payload:
-            raise ValueError("sensitive stdin payload must be a non-empty bytearray")
-        encoded = base64.b64encode(payload).decode("ascii")
-        await self._mgr.connection_manager.send_sensitive_input(
-            worker_id,
-            task_id,
-            encoded,
         )
 
     async def resolve_secret_env(

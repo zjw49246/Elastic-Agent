@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
 import hashlib
 import io
 import json
 import os
 import stat
-import struct
 import tarfile
 import threading
 from contextlib import asynccontextmanager
@@ -1569,142 +1567,6 @@ class TestJobsAPI:
                 summary={"workers": 3, "phases": {state: 3}},
             )
         return job_id
-
-    @staticmethod
-    def _run_benchmark_request(*, secret: bytes = b"secret-key") -> dict:
-        public = {
-            "instance_id": "instance-1",
-            "instance_ref": "inst-1234567890abcdef1234567890abcdef",
-            "instance_digest": "c" * 64,
-            "harness_id": "codex-api",
-            "model": "gpt-5.6-sol",
-            "server_id": "elastic",
-            "tags": ["user-trajectory"],
-            "data_tag": "trajectory-test",
-            "worker_release_digest": "b" * 64,
-            "credential_mode": "ephemeral_per_run",
-            "effort": "ultra",
-            "api_protocol": "openai_responses",
-            "api_base": "https://api.apexin.ai/v1",
-            "accepted_timeout": False,
-        }
-        encoded = json.dumps(
-            public, sort_keys=True, separators=(",", ":")
-        ).encode()
-        frame = struct.pack(">8sII", b"RBWORK01", len(encoded), len(secret))
-        frame += encoded + secret
-        return {
-            "run_id": "run-elastic-1",
-            "resolved_commit": "a" * 40,
-            "worker_release_digest": "b" * 64,
-            "input_digest": "d" * 64,
-            "input_uri": (
-                "s3://results/jobs/datasets/run-benchmark/v1/sha256/"
-                + "d" * 64
-                + "/"
-            ),
-            "instance_digest": "c" * 64,
-            "harness_id": "codex-api",
-            "wall_time_seconds": 3600,
-            "credential_frame": base64.b64encode(frame).decode(),
-        }
-
-    @pytest.mark.asyncio
-    async def test_run_benchmark_bridge_builds_only_manager_owned_job(
-        self, client, manager, monkeypatch,
-    ):
-        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
-        monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
-        manager.config.provider.aws.worker_instance_profile = "worker-profile"
-        request = self._run_benchmark_request()
-
-        response = await client.post(
-            "/api/jobs/run-benchmark",
-            json=request,
-            headers={"Idempotency-Key": "run-benchmark-attempt-1"},
-        )
-
-        assert response.status_code == 201, response.text
-        job = manager.batch.get_job(response.json()["job_id"])
-        assert job.spec.setup.repo == "git@github.com:panjose/Run-Benchmark.git"
-        assert job.spec.setup.resolved_commit == "a" * 40
-        assert job.spec.setup.s3_datasets[0].uri == request["input_uri"]
-        assert job.spec.run.stdin_protocol == "run_benchmark_v1"
-        assert job.spec.run.secret_env == {}
-        assert job.spec.account.mode == "none"
-        assert job.spec.fanout.workers == 1
-        persisted = json.loads(
-            (
-                Path(manager.config.registry.path).with_name("specs")
-                / f"{job.job_id}.json"
-            ).read_text()
-        )
-        serialized = json.dumps(persisted)
-        assert "secret-key" not in serialized
-        assert request["credential_frame"] not in serialized
-        assert hashlib.sha256(
-            base64.b64decode(request["credential_frame"])
-        ).hexdigest() not in serialized
-        assert manager.ephemeral_stdin_leases.contains(job.job_id)
-
-    @pytest.mark.asyncio
-    async def test_run_benchmark_bridge_is_idempotent_without_persisting_secret_digest(
-        self, client, manager, monkeypatch,
-    ):
-        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
-        monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
-        manager.config.provider.aws.worker_instance_profile = "worker-profile"
-        headers = {"Idempotency-Key": "run-benchmark-idempotent"}
-        request = self._run_benchmark_request()
-
-        first = await client.post(
-            "/api/jobs/run-benchmark", json=request, headers=headers,
-        )
-        replay = await client.post(
-            "/api/jobs/run-benchmark", json=request, headers=headers,
-        )
-        changed = await client.post(
-            "/api/jobs/run-benchmark",
-            json=self._run_benchmark_request(secret=b"another-key"),
-            headers=headers,
-        )
-
-        assert first.status_code == 201
-        assert replay.status_code == 201
-        assert replay.json()["idempotent_replay"] is True
-        assert changed.status_code == 201
-        assert changed.json()["idempotent_replay"] is True
-        assert manager.batch.started == [first.json()["job_id"]]
-        retained = manager.ephemeral_stdin_leases.consume(first.json()["job_id"])
-        try:
-            assert b"secret-key" in retained
-            assert b"another-key" not in retained
-        finally:
-            retained[:] = b"\0" * len(retained)
-
-    @pytest.mark.asyncio
-    async def test_public_jobs_cannot_enable_sensitive_stdin(
-        self, client,
-    ):
-        response = await client.post("/api/jobs", json={
-            "name": "untrusted-sensitive-stdin",
-            "run": {
-                "command": "true",
-                "stdin_protocol": "run_benchmark_v1",
-            },
-            "account": {"mode": "none"},
-        })
-        plan = await client.post("/api/jobs/plan", json={
-            "name": "untrusted-sensitive-stdin",
-            "run": {
-                "command": "true",
-                "stdin_protocol": "run_benchmark_v1",
-            },
-            "account": {"mode": "none"},
-        })
-
-        assert response.status_code == 422
-        assert plan.status_code == 422
 
     @pytest.mark.asyncio
     async def test_submit_returns_detail(self, client, manager):

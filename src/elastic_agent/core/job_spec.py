@@ -147,18 +147,6 @@ ENVIRONMENT_PROFILES: dict[str, dict[str, Any]] = {
             "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
         ],
     },
-    "ubuntu-agent-docker-v2": {
-        "id": "ubuntu-agent-docker-v2",
-        "os_family": "ubuntu",
-        "runtime": "elastic-agent",
-        "agent_cli": "version-pinned",
-        "browser_login": True,
-        "docker": True,
-        "system_packages": [
-            "python3", "python3-pip", "python3-venv", "git", "curl",
-            "rsync", "nodejs", "npm",
-        ],
-    },
 }
 
 
@@ -492,10 +480,6 @@ class RunSpec(StrictSpecModel):
     # env expansion). When True the rendered command is wrapped as
     # ``bash -lc "<cmd>"``; when False it is shlex-split into a bare argv.
     shell: bool = True
-    # Secret-bearing stdin is not part of JobSpec persistence.  This marker is
-    # accepted only by a dedicated server-side constructor which installs a
-    # process-local, one-shot lease before the Job can reach dispatch.
-    stdin_protocol: Literal["none", "run_benchmark_v1"] = "none"
 
     @field_validator("command")
     @classmethod

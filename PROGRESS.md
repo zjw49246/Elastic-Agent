@@ -1,24 +1,5 @@
 # PROGRESS — 经验教训沉淀
 
-## 2026-08-11 Run-Benchmark 一次性凭据动态 Job 通道
-
-**问题**：通用 JobSpec 的 `run.secret_env` 会持久化 secret reference，无法满足 Run-Benchmark API Key
-不进入 JobSpec/S3/cloud-init/checkpoint/disk/log 的边界；普通 interactive `SEND_INPUT` 又会把文本加换行且
-不关闭 stdin，无法承载 `RBWORK01` 二进制 frame，子进程会永久等待 EOF。Manager 重启还会丢失内存 Key，
-不能把 prepared Job 静默恢复成无凭据或重放旧调用。
-
-**解决**：增加 Manager-owned `/api/jobs/run-benchmark` constructor，固定 repo/exact commit、环境、命令、
-单 Worker、S3 和 collect，只把严格交叉验证的公开 binding 持久化。frame 由 bounded process-local
-`EphemeralStdinLeaseStore` 无复制接管；command 启动后 consume，一次性经 WSS `SENSITIVE_INPUT` 发送，
-task supervisor 最终 decode、写原始 bytes 并立即 EOF。所有 mutable buffer 在发送、丢弃、过期、失败和
-shutdown 后覆零；普通 `/jobs`/plan 禁止 reserved protocol，缺 lease/发送失败会 stop 已启动 task。
-request fingerprint 不含 frame、Key 或 secret-derived digest；相同 Idempotency-Key 的 replay 只返回原 Job，
-不会替换其 lease。prepared journal 在 Manager restart 后明确 409，要求新 attempt。
-
-**验证**：新增 lease one-shot/TTL/close、dispatch ordering、missing-lease stop、supervisor binary+EOF 和专用
-API 安全/幂等/无秘密 journal 测试；专项 suite 338 passed（既有 asyncio subprocess teardown warning 不影响
-结果）。生产验收只允许无付费 provisioning/result 生命周期 smoke，不能为部署主动调用真实模型 Key。
-
 ## 2026-08-07 ApexRouter 不限额窗口准入（commits `8bbd2df`, `017149e`）
 
 **问题**：ApexRouter 用固定窗口的 `remaining=null`、`limit=null` 表示该共享窗口

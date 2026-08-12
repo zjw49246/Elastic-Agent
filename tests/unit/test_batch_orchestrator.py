@@ -12,7 +12,6 @@ from elastic_agent.core.batch_orchestrator import (
     WorkerAssignment,
     WorkerPhase,
 )
-from elastic_agent.core.ephemeral_stdin import EphemeralStdinLeaseStore
 from elastic_agent.core.job_spec import JobSpec, RunSpec
 
 pytestmark = pytest.mark.asyncio
@@ -57,7 +56,6 @@ class FakeDriver:
         self.resolved_secret_env: dict[str, str] = {}
         self.secret_resolve_calls: list[dict[str, str]] = []
         self.secret_resolve_error: str | None = None
-        self.sensitive_inputs: list[tuple[str, str, bytes]] = []
         self.recovery_prepare_error: str | None = None
         self.recovery_restore_error: str | None = None
         self.recovery_cleanup_error: str | None = None
@@ -189,16 +187,11 @@ class FakeDriver:
 
     async def run_command(self, worker_id, task_id, command, cwd, env, timeout,
                           job_id, watch_exhaustion):
-        self.events.append(("run_command", worker_id, task_id))
         self.dispatched.append({
             "worker_id": worker_id, "task_id": task_id, "command": command,
             "cwd": cwd, "env": env, "timeout": timeout,
             "job_id": job_id, "watch_exhaustion": watch_exhaustion,
         })
-
-    async def send_sensitive_input(self, worker_id, task_id, payload):
-        self.events.append(("sensitive_input", worker_id, task_id))
-        self.sensitive_inputs.append((worker_id, task_id, bytes(payload)))
 
     async def resolve_secret_env(self, secret_env):
         self.secret_resolve_calls.append(dict(secret_env))
@@ -341,63 +334,6 @@ class TestLaunch:
         assert len(job.runs) == 4
         assert all(r.phase == WorkerPhase.RUNNING for r in job.runs.values())
         assert len(d.dispatched) == 4
-
-    async def test_run_benchmark_lease_is_sent_once_after_command_launch(self):
-        driver = FakeDriver()
-        leases = EphemeralStdinLeaseStore()
-        orchestrator = BatchOrchestrator(
-            driver,
-            stdin_lease_store=leases,
-        )
-        spec = _spec(
-            run=RunSpec(
-                command="python -m run_benchmark.elastic_worker execute",
-                stdin_protocol="run_benchmark_v1",
-            ),
-            fanout={"workers": 1},
-            account={"mode": "none"},
-        )
-        job = orchestrator.prepare(spec)
-        payload = bytearray(b"RBWORK01-binary-secret-frame")
-        leases.put(job.job_id, payload, ttl_seconds=60)
-
-        await orchestrator.submit_prepared(job)
-        assert job.launch_task is not None
-        await job.launch_task
-
-        assert driver.sensitive_inputs == [
-            (next(iter(job.runs)), next(iter(job.runs.values())).task_id, b"RBWORK01-binary-secret-frame")
-        ]
-        assert [event[0] for event in driver.events].index(
-            "run_command"
-        ) < [event[0] for event in driver.events].index("sensitive_input")
-        assert not leases.contains(job.job_id)
-        assert payload == bytearray(len(payload))
-
-    async def test_missing_run_benchmark_lease_stops_launched_process(self):
-        driver = FakeDriver()
-        orchestrator = BatchOrchestrator(
-            driver,
-            stdin_lease_store=EphemeralStdinLeaseStore(),
-        )
-        job = orchestrator.prepare(
-            _spec(
-                run=RunSpec(
-                    command="python -m run_benchmark.elastic_worker execute",
-                    stdin_protocol="run_benchmark_v1",
-                ),
-                fanout={"workers": 1},
-                account={"mode": "none"},
-            )
-        )
-
-        await orchestrator.submit_prepared(job)
-        assert job.launch_task is not None
-        await job.launch_task
-
-        run = next(iter(job.runs.values()))
-        assert driver.stopped == [(run.worker_id, run.task_id, "SIGTERM")]
-        assert driver.sensitive_inputs == []
 
     async def test_direct_launch_is_tracked_and_shutdown_waits_for_it(self):
         d = FakeDriver()

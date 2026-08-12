@@ -11,8 +11,6 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import codecs
 import json
 import logging
@@ -64,7 +62,6 @@ from elastic_agent.core.protocols.messages import (
     RegisterSyncMappingMessage,
     RunExhaustedMessage,
     SendInputMessage,
-    SensitiveInputMessage,
     StatusMessage,
     StopMessage,
     UnregisterSyncMappingMessage,
@@ -709,7 +706,6 @@ class WorkerRuntime:
             "HEALTH_CHECK": self._handle_health_check,
             "UPLOAD_FILE": self._handle_upload_file,
             "MESSAGE": self._handle_message,
-            "SENSITIVE_INPUT": self._handle_message,
             "WATCH_FILES": self._handle_watch_files,
             "UNWATCH": self._handle_unwatch,
             "REGISTER_SYNC_MAPPING": self._handle_register_sync_mapping,
@@ -2462,74 +2458,12 @@ class WorkerRuntime:
                 recoverable=True,
             ))
 
-    async def _handle_message(
-        self, msg: SendInputMessage | SensitiveInputMessage,
-    ) -> None:
-        if isinstance(msg, SensitiveInputMessage):
-            if msg.task_id in self._supervised_tasks:
-                try:
-                    await self._task_supervisor.write_stdin_base64_once(
-                        msg.task_id,
-                        msg.payload_base64,
-                    )
-                except Exception:
-                    await self._send_event(ErrorMessage(
-                        error_type="stdin_write_failed",
-                        message=(
-                            "Failed to write sensitive input to independent "
-                            f"task stdin for {msg.task_id}"
-                        ),
-                        recoverable=True,
-                    ))
-                return
-            stdin = self._stdin_pipes.get(msg.task_id)
-            if stdin is None:
-                await self._send_event(ErrorMessage(
-                    error_type="no_process",
-                    message=f"No running process for task {msg.task_id}",
-                    recoverable=True,
-                ))
-                return
-            try:
-                decoded = bytearray(
-                    base64.b64decode(msg.payload_base64, validate=True)
-                )
-            except (binascii.Error, ValueError):
-                await self._send_event(ErrorMessage(
-                    error_type="stdin_write_failed",
-                    message=(
-                        "Sensitive stdin frame was invalid for task "
-                        f"{msg.task_id}"
-                    ),
-                    recoverable=False,
-                ))
-                return
-            try:
-                if not decoded or len(decoded) > 256 * 1024:
-                    raise ValueError("sensitive stdin frame size is invalid")
-                stdin.write(decoded)
-                await stdin.drain()
-                stdin.close()
-                wait_closed = getattr(stdin, "wait_closed", None)
-                if callable(wait_closed):
-                    await wait_closed()
-            except Exception:
-                await self._send_event(ErrorMessage(
-                    error_type="stdin_write_failed",
-                    message=f"Failed to write to stdin for task {msg.task_id}",
-                    recoverable=True,
-                ))
-            finally:
-                for index in range(len(decoded)):
-                    decoded[index] = 0
-            return
-
-        payload = msg.payload
+    async def _handle_message(self, msg: SendInputMessage) -> None:
         if msg.task_id in self._supervised_tasks:
             try:
                 await self._task_supervisor.write_stdin(
                     msg.task_id,
-                    payload,
+                    msg.payload,
                 )
             except Exception:
                 await self._send_event(ErrorMessage(
@@ -2550,7 +2484,7 @@ class WorkerRuntime:
             ))
             return
         try:
-            stdin.write((payload + "\n").encode())
+            stdin.write((msg.payload + "\n").encode())
             await stdin.drain()
         except Exception as exc:
             await self._send_event(ErrorMessage(
