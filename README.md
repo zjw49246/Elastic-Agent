@@ -20,7 +20,6 @@ Elastic-Agent is a Python library that provides:
   receive the high-priority `delivery_manuscript` role
 - **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
-- **Hot fleet policy** — Authenticated `GET/PUT /api/fleet-policy` updates the default instance type, root disk, and global instance ceiling for future workers without interrupting active Jobs
 - **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
 
 ## Usage
@@ -40,23 +39,6 @@ manager = ElasticAgentManager(
 )
 app = manager.create_app()
 ```
-
-The Manager persists hot fleet defaults in its private state directory as
-`fleet-runtime-policy.json` with mode `0600`. The API requires the normal
-Manager bearer and accepts all three fields atomically:
-
-```json
-{
-  "default_instance_type": "t3.large",
-  "default_root_disk_gb": 40,
-  "max_instances": 30
-}
-```
-
-Updates affect only future instance creation. Per-Job instance/disk overrides
-remain available, while the runtime maximum continues to bound the total
-controller-owned and in-flight fleet. Lowering the maximum below current usage
-does not terminate active workers; it blocks new creation until usage falls.
 
 ## PTY mode (claude-pty)
 
@@ -271,11 +253,6 @@ setup/run commands, `account.mode=none`, S3 namespace, and final collect path;
 the ordinary `/api/jobs` and `/api/jobs/plan` routes reject the reserved
 `run.stdin_protocol` value.
 
-The wall-time is the instance's exact positive budget in the inclusive
-`1–10,800` second range. The Manager and Worker must preserve it exactly; they
-neither clamp sub-minute smoke/debug tasks to 60 seconds nor reject those tasks
-before credential consumption.
-
 The frame is never stored in JobSpec or its request fingerprint. It is adopted
 by a bounded process-local `bytearray` lease, consumed once only after the exact
 task process starts, sent over the required WSS transport, decoded at the task
@@ -284,21 +261,11 @@ overwritten after send and on discard, expiry, failure, or Manager shutdown.
 A Manager restart deliberately loses an unconsumed lease; a durable `prepared`
 Job cannot be resumed with an old credential and requires a new attempt.
 
-Manager provisioning orders repository setup before S3 dataset sync. The
-constructor therefore installs the exact package during setup, then runs the
-fixed `elastic_worker prepare && elastic_worker execute` chain after S3 sync.
-The credential frame can wait only in that trusted process's stdin pipe:
-`prepare` never reads stdin, and `execute` is the first reader after the input
-seal, release, instance, image, and wall-time bindings have all passed.
-
-The dedicated Run-Benchmark deployment sets `RUN_BENCHMARK_S3_INPUT_PREFIX` and
-the Manager rejects any input URI outside that exact prefix. Production uses
-`run-benchmark/v1/instances/sha256/<digest>/` in the Run-Benchmark-owned bucket;
-the legacy default `jobs/datasets/run-benchmark/v1/sha256` remains only for
-backward-compatible deployments. Workers read sealed inputs with IAM
-credentials and write only their configured execution/checkpoint prefixes.
-Provider keys never enter S3, cloud-init, checkpoint, environment variables,
-command arguments, disk, or logs.
+The shared bucket must expose only
+`jobs/datasets/run-benchmark/v1/sha256/<digest>/` to the Worker instance role.
+Workers read sealed inputs with IAM credentials and write only their normal
+per-Job result prefix. Provider keys never enter S3, cloud-init, checkpoint,
+environment variables, command arguments, disk, or logs.
 
 `setup.repo` must be a remote HTTP(S), SSH/Git, or scp-style Git URL and may not
 contain embedded HTTP credentials, query parameters, or fragments. Use

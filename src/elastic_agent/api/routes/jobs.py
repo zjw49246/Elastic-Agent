@@ -168,12 +168,6 @@ RUN_BENCHMARK_HARNESSES = frozenset({
 _RUN_BENCHMARK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _RUN_BENCHMARK_DIGEST = re.compile(r"[0-9a-f]{64}")
 _RUN_BENCHMARK_COMMIT = re.compile(r"[0-9a-f]{40,64}")
-_RUN_BENCHMARK_S3_PREFIX_PART = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-)
-_RUN_BENCHMARK_INPUT_PREFIX_DEFAULT = (
-    "jobs/datasets/run-benchmark/v1/sha256"
-)
 
 
 class RunBenchmarkJobRequest(BaseModel):
@@ -188,7 +182,7 @@ class RunBenchmarkJobRequest(BaseModel):
     input_uri: str = Field(min_length=1, max_length=1024)
     instance_digest: str = Field(min_length=64, max_length=64)
     harness_id: str = Field(min_length=1, max_length=128)
-    wall_time_seconds: int = Field(ge=1, le=RUN_BENCHMARK_MAX_WALL_SECONDS)
+    wall_time_seconds: int = Field(ge=60, le=RUN_BENCHMARK_MAX_WALL_SECONDS)
     credential_frame: str = Field(
         repr=False,
         min_length=1,
@@ -1669,24 +1663,6 @@ def _safe_run_benchmark_text(
     return value
 
 
-def _run_benchmark_input_prefix() -> str:
-    value = os.environ.get(
-        "RUN_BENCHMARK_S3_INPUT_PREFIX",
-        _RUN_BENCHMARK_INPUT_PREFIX_DEFAULT,
-    )
-    if (
-        not value
-        or value != value.strip("/")
-        or len(value.encode("utf-8", errors="strict")) > 512
-        or any(
-            _RUN_BENCHMARK_S3_PREFIX_PART.fullmatch(part) is None
-            for part in PurePosixPath(value).parts
-        )
-    ):
-        raise HTTPException(500, "Run-Benchmark input storage prefix is invalid")
-    return value
-
-
 def _validate_run_benchmark_public_request(
     envelope: RunBenchmarkJobRequest,
     public: dict[str, object],
@@ -1790,7 +1766,7 @@ def _run_benchmark_job_spec(
             503, "Run-Benchmark input storage is not configured"
         )
     expected_uri = (
-        f"s3://{bucket}/{_run_benchmark_input_prefix()}/"
+        f"s3://{bucket}/jobs/datasets/run-benchmark/v1/sha256/"
         f"{request.input_digest}/"
     )
     if request.input_uri != expected_uri:
@@ -1839,6 +1815,7 @@ def _run_benchmark_job_spec(
         "python3 -m venv .elastic-runtime-venv",
         ".elastic-runtime-venv/bin/python -m pip install "
         "--disable-pip-version-check .",
+        shlex.join(prepare_args),
     ))
     exact_source = f"{runtime_root}/releases/{request.worker_release_digest}/src"
     execute_args = [
@@ -1848,13 +1825,6 @@ def _run_benchmark_job_spec(
         "--wall-time-seconds", str(request.wall_time_seconds),
     ]
     run_timeout = request.wall_time_seconds + 900
-    # Manager delivery order is code -> setup steps -> S3 datasets -> run.
-    # Keep dependency installation in setup, but perform the sealed input,
-    # release, and image attestation at the start of the trusted run process.
-    # The one-shot stdin frame may already be waiting in that process pipe;
-    # ``prepare`` never reads stdin and ``execute`` becomes the first reader
-    # only after every attestation succeeds.
-    run_command = f"{shlex.join(prepare_args)} && exec {shlex.join(execute_args)}"
     ttl_seconds = min(
         int(MAX_EPHEMERAL_STDIN_TTL_SECONDS),
         max(3600, request.wall_time_seconds + 10_800),
@@ -1880,10 +1850,10 @@ def _run_benchmark_job_spec(
             )}],
         },
         "run": {
-            "command": run_command,
+            "command": shlex.join(execute_args),
             "cwd": ".",
             "timeout": run_timeout,
-            "shell": True,
+            "shell": False,
             "stdin_protocol": "run_benchmark_v1",
             "env": {},
             "secret_env": {},

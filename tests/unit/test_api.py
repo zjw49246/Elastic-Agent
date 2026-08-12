@@ -149,56 +149,6 @@ class TestHealthEndpoint:
         assert data["provider"] == "aliyun"
 
 
-class TestFleetRuntimePolicyEndpoint:
-    @pytest.mark.asyncio
-    async def test_policy_requires_authentication(self, app, manager):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as anonymous:
-            await manager.start()
-            try:
-                response = await anonymous.get("/api/fleet-policy")
-            finally:
-                await manager.stop()
-        assert response.status_code == 401
-
-    @pytest.mark.asyncio
-    async def test_policy_updates_future_instances(self, client, manager, provider):
-        initial = await client.get("/api/fleet-policy")
-        assert initial.status_code == 200
-        assert initial.json()["default_instance_type"] == "ecs.c6.large"
-        assert initial.json()["default_root_disk_gb"] == 40
-
-        updated = await client.put(
-            "/api/fleet-policy",
-            json={
-                "default_instance_type": "c7i.2xlarge",
-                "default_root_disk_gb": 200,
-                "max_instances": 4,
-            },
-        )
-        assert updated.status_code == 200
-        assert updated.json()["applies_to"] == "future_instances"
-        assert updated.json()["max_instances"] == 4
-
-        await manager.scale_out(count=1)
-        assert next(iter(provider._instances.values())).instance_type == "c7i.2xlarge"
-        assert manager.config.provider.aliyun.max_instances == 4
-
-    @pytest.mark.asyncio
-    async def test_policy_rejects_unknown_or_invalid_fields(self, client):
-        invalid = await client.put(
-            "/api/fleet-policy",
-            json={
-                "default_instance_type": "T3.LARGE",
-                "default_root_disk_gb": 7,
-                "max_instances": 0,
-                "surprise": True,
-            },
-        )
-        assert invalid.status_code == 422
-
-
 # ------------------------------------------------------------------
 # Node list
 # ------------------------------------------------------------------

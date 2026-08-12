@@ -1614,18 +1614,9 @@ class TestJobsAPI:
         self, client, manager, monkeypatch,
     ):
         monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
-        monkeypatch.setenv(
-            "RUN_BENCHMARK_S3_INPUT_PREFIX",
-            "run-benchmark/v1/instances/sha256",
-        )
         monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
         manager.config.provider.aws.worker_instance_profile = "worker-profile"
         request = self._run_benchmark_request()
-        request["input_uri"] = (
-            "s3://results/run-benchmark/v1/instances/sha256/"
-            + "d" * 64
-            + "/"
-        )
 
         response = await client.post(
             "/api/jobs/run-benchmark",
@@ -1639,15 +1630,6 @@ class TestJobsAPI:
         assert job.spec.setup.resolved_commit == "a" * 40
         assert job.spec.setup.s3_datasets[0].uri == request["input_uri"]
         assert job.spec.run.stdin_protocol == "run_benchmark_v1"
-        assert job.spec.run.shell is True
-        assert "elastic_worker prepare" not in job.spec.setup.steps[0].command
-        assert "python3 -m venv .elastic-runtime-venv" in (
-            job.spec.setup.steps[0].command
-        )
-        prepare_position = job.spec.run.command.index("elastic_worker prepare")
-        execute_position = job.spec.run.command.index("elastic_worker execute")
-        assert prepare_position < execute_position
-        assert " && exec " in job.spec.run.command
         assert job.spec.run.secret_env == {}
         assert job.spec.account.mode == "none"
         assert job.spec.fanout.workers == 1
@@ -1664,27 +1646,6 @@ class TestJobsAPI:
             base64.b64decode(request["credential_frame"])
         ).hexdigest() not in serialized
         assert manager.ephemeral_stdin_leases.contains(job.job_id)
-
-    @pytest.mark.asyncio
-    async def test_run_benchmark_bridge_preserves_positive_subminute_wall_time(
-        self, client, manager, monkeypatch,
-    ):
-        monkeypatch.setenv("ELASTIC_AGENT_RESULTS_S3_BUCKET", "results")
-        monkeypatch.setenv("ELASTIC_AGENT_ALLOW_INSECURE_SECRET_ENV", "1")
-        manager.config.provider.aws.worker_instance_profile = "worker-profile"
-        request = self._run_benchmark_request()
-        request["wall_time_seconds"] = 30
-
-        response = await client.post(
-            "/api/jobs/run-benchmark",
-            json=request,
-            headers={"Idempotency-Key": "run-benchmark-short-timeout"},
-        )
-
-        assert response.status_code == 201, response.text
-        job = manager.batch.get_job(response.json()["job_id"])
-        assert "--wall-time-seconds 30" in job.spec.run.command
-        assert job.spec.run.timeout == 930
 
     @pytest.mark.asyncio
     async def test_run_benchmark_bridge_is_idempotent_without_persisting_secret_digest(
