@@ -24,6 +24,7 @@ Restart=always
 RestartSec=5
 TimeoutStartSec=300
 TimeoutStopSec=32400
+LimitNOFILE=65536
 UMask=0077
 
 # The Manager needs network access and one state directory, but it does not

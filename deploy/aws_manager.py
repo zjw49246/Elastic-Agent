@@ -26,10 +26,12 @@ from elastic_agent.api.auth import (
 )
 from elastic_agent.core.config import (
     AWSProviderConfig,
+    BatchRuntimeConfig,
     ElasticAgentConfig,
     LoggingConfig,
     ProviderConfig,
     RegistryConfig,
+    ResultsConfig,
     ServerConfig,
     TaskRegistryConfig,
     WebhookConfig,
@@ -50,6 +52,8 @@ _AWS_ID_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
 _IAM_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_+=,.@-]{1,64}$")
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+AWS_MAX_INSTANCES_HARD_LIMIT = 300
+MANAGER_OPERATION_CONCURRENCY_HARD_LIMIT = 64
 _FORBIDDEN_AWS_CREDENTIAL_ENV = (
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -92,6 +96,9 @@ class AWSManagerSettings:
     worker_instance_profile: str
     expected_role_name: str
     max_instances: int
+    worker_concurrency: int
+    collect_concurrency: int
+    collect_jitter_ratio: float
     state_dir: Path
     manager_url: str
     public_origin: str
@@ -103,6 +110,7 @@ class AWSManagerSettings:
     results_s3_bucket: str
     results_s3_prefix: str
     results_s3_interval: float
+    results_s3_periodic_enabled: bool
     allow_canonical_base_ami: bool = False
 
 
@@ -142,6 +150,21 @@ def _positive_float(environ: Mapping[str, str], name: str, *, maximum: float) ->
         raise LauncherConfigurationError(f"{name} must be a number") from exc
     if value <= 0 or value > maximum:
         raise LauncherConfigurationError(f"{name} must be greater than 0 and at most {maximum:g}")
+    return value
+
+
+def _nonnegative_float(
+    environ: Mapping[str, str], name: str, *, maximum: float,
+) -> float:
+    raw = _required(environ, name)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise LauncherConfigurationError(f"{name} must be a number") from exc
+    if value < 0 or value > maximum:
+        raise LauncherConfigurationError(
+            f"{name} must be between 0 and {maximum:g}"
+        )
     return value
 
 
@@ -279,7 +302,26 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         ssh_key_path=_absolute_path(source, "ELASTIC_AGENT_AWS_SSH_KEY_PATH"),
         worker_instance_profile=_required(source, "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE"),
         expected_role_name=expected_role_name,
-        max_instances=_positive_int(source, "ELASTIC_AGENT_AWS_MAX_INSTANCES", maximum=100),
+        max_instances=_positive_int(
+            source,
+            "ELASTIC_AGENT_AWS_MAX_INSTANCES",
+            maximum=AWS_MAX_INSTANCES_HARD_LIMIT,
+        ),
+        worker_concurrency=_positive_int(
+            source,
+            "ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY",
+            maximum=MANAGER_OPERATION_CONCURRENCY_HARD_LIMIT,
+        ),
+        collect_concurrency=_positive_int(
+            source,
+            "ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY",
+            maximum=MANAGER_OPERATION_CONCURRENCY_HARD_LIMIT,
+        ),
+        collect_jitter_ratio=_nonnegative_float(
+            source,
+            "ELASTIC_AGENT_PERIODIC_COLLECT_JITTER_RATIO",
+            maximum=1.0,
+        ),
         state_dir=_absolute_path(source, "ELASTIC_AGENT_STATE_DIR"),
         manager_url=manager_url,
         public_origin=public_origin,
@@ -291,6 +333,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         results_s3_bucket=_required(source, "ELASTIC_AGENT_RESULTS_S3_BUCKET"),
         results_s3_prefix=_required(source, "ELASTIC_AGENT_RESULTS_S3_PREFIX"),
         results_s3_interval=_positive_float(source, "ELASTIC_AGENT_RESULTS_S3_INTERVAL", maximum=86400),
+        results_s3_periodic_enabled=_boolean(
+            source,
+            "ELASTIC_AGENT_RESULTS_S3_PERIODIC_ENABLED",
+            default=True,
+        ),
         allow_canonical_base_ami=_boolean(source, "ELASTIC_AGENT_ALLOW_CANONICAL_BASE_AMI"),
     )
 
@@ -313,6 +360,14 @@ def build_config(settings: AWSManagerSettings) -> ElasticAgentConfig:
         server=ServerConfig(host=settings.server_host, port=settings.server_port),
         provider=ProviderConfig(type="aws", aws=aws),
         worker=WorkerConfig(ssh_user=settings.worker_ssh_user),
+        batch_runtime=BatchRuntimeConfig(
+            worker_concurrency=settings.worker_concurrency,
+            collect_concurrency=settings.collect_concurrency,
+            collect_jitter_ratio=settings.collect_jitter_ratio,
+        ),
+        results=ResultsConfig(
+            s3_periodic_enabled=settings.results_s3_periodic_enabled,
+        ),
         registry=RegistryConfig(path=str(settings.state_dir / "registry.json")),
         task_registry=TaskRegistryConfig(path=str(settings.state_dir / "task_registry.json")),
         logging=LoggingConfig(

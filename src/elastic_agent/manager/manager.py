@@ -339,11 +339,19 @@ class ElasticAgentManager:
             # Do not let the whole-tree periodic uploader acquire its sync lock
             # ahead of startup final collection. Recovery must settle old
             # billable workers before background mirroring starts.
-            if self._s3_uploader is not None:
+            if (
+                self._s3_uploader is not None
+                and self.config.results.s3_periodic_enabled
+            ):
                 self._s3_task = asyncio.create_task(
                     self._s3_uploader.run_periodic(interval)
                 )
                 logger.info("S3 result upload enabled → s3://%s", bucket)
+            elif self._s3_uploader is not None:
+                logger.info(
+                    "Periodic whole-tree S3 result mirroring is disabled; "
+                    "awaited per-Job uploads remain enabled"
+                )
 
             online_workers = set(self.connection_manager.connected_workers)
             await self.task_registry.recover(online_workers)
@@ -2716,6 +2724,11 @@ class ElasticAgentManager:
         self._batch = BatchOrchestrator(
             driver,
             scale_in_on_complete=scale_in_on_complete,
+            worker_concurrency=self.config.batch_runtime.worker_concurrency,
+            collect_concurrency=self.config.batch_runtime.collect_concurrency,
+            collect_jitter_ratio=(
+                self.config.batch_runtime.collect_jitter_ratio
+            ),
             persist_spec_hook=self._persist_batch_job_spec,
             job_state_hook=self._update_batch_job_state,
             interrupt_intent_hook=self._update_batch_interrupt_intent,

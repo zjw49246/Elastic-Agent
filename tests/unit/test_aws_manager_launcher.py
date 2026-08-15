@@ -56,6 +56,9 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE": "elastic-agent-worker",
         "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME": "elastic-agent-manager",
         "ELASTIC_AGENT_AWS_MAX_INSTANCES": "30",
+        "ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY": "8",
+        "ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY": "8",
+        "ELASTIC_AGENT_PERIODIC_COLLECT_JITTER_RATIO": "0.1",
         "ELASTIC_AGENT_STATE_DIR": str(tmp_path / "state"),
         "ELASTIC_AGENT_MANAGER_URL": "wss://manager.example/ws/runtime",
         "ELASTIC_AGENT_PUBLIC_ORIGIN": "https://manager.example",
@@ -67,6 +70,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_RESULTS_S3_BUCKET": "elastic-agent-results-example",
         "ELASTIC_AGENT_RESULTS_S3_PREFIX": "jobs",
         "ELASTIC_AGENT_RESULTS_S3_INTERVAL": "60",
+        "ELASTIC_AGENT_RESULTS_S3_PERIODIC_ENABLED": "true",
         "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
         "AWS_CONFIG_FILE": "/dev/null",
         "BOTO_CONFIG": "/dev/null",
@@ -108,6 +112,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "ReadWritePaths=/home/ubuntu/.elastic-agent-demo" in source
     assert "ExecStartPost=" in source and "/api/health" in source
     assert "TimeoutStopSec=32400" in source
+    assert "LimitNOFILE=65536" in source
     for setting in (
         "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
         "AWS_CONFIG_FILE=/dev/null",
@@ -165,14 +170,18 @@ def test_production_allowlist_covers_common_x86_worker_families():
     assert set(iam_types) == actual
 
 
-def test_production_job_batch_global_limit_is_50():
+def test_production_targets_300_bounded_workers():
     settings = {
         line.partition("=")[0]: line.partition("=")[2]
         for line in AWS_ENV.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#") and "=" in line
     }
 
-    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "50"
+    assert settings["ELASTIC_AGENT_AWS_MAX_INSTANCES"] == "300"
+    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "300"
+    assert settings["ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY"] == "32"
+    assert settings["ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY"] == "32"
+    assert settings["ELASTIC_AGENT_RESULTS_S3_PERIODIC_ENABLED"] == "false"
 
 
 def test_manager_policy_and_cutover_pin_real_key_pair_name():
@@ -334,6 +343,10 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert config.provider.aws.key_pair_name == "elastic-agent-key"
     assert config.provider.aws.worker_instance_profile == "elastic-agent-worker"
     assert config.provider.aws.max_instances == 30
+    assert config.batch_runtime.worker_concurrency == 8
+    assert config.batch_runtime.collect_concurrency == 8
+    assert config.batch_runtime.collect_jitter_ratio == 0.1
+    assert config.results.s3_periodic_enabled is True
     assert settings.expected_role_name == "elastic-agent-manager"
     assert settings.public_origin == "https://manager.example"
     assert config.worker.ssh_user == "ubuntu"
@@ -346,6 +359,36 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert settings.results_s3_bucket == "elastic-agent-results-example"
     assert settings.results_s3_prefix == "jobs"
     assert settings.results_s3_interval == 60
+
+
+def test_load_settings_accepts_300_instances_and_rejects_301(tmp_path):
+    environ = _environment(tmp_path)
+    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "300"
+    assert load_settings(environ).max_instances == 300
+
+    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "301"
+    with pytest.raises(
+        LauncherConfigurationError,
+        match="ELASTIC_AGENT_AWS_MAX_INSTANCES must be between 1 and 300",
+    ):
+        load_settings(environ)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY", "65"),
+        ("ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY", "65"),
+        ("ELASTIC_AGENT_PERIODIC_COLLECT_JITTER_RATIO", "1.01"),
+    ],
+)
+def test_load_settings_rejects_unbounded_manager_concurrency(
+    tmp_path, name, value,
+):
+    environ = _environment(tmp_path)
+    environ[name] = value
+    with pytest.raises(LauncherConfigurationError, match=name):
+        load_settings(environ)
 
 
 def test_build_application_requires_enabled_admin_and_pins_public_origin(
@@ -392,6 +435,9 @@ def test_build_application_requires_enabled_admin_and_pins_public_origin(
         "ELASTIC_AGENT_AWS_SSH_KEY_PATH",
         "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE",
         "ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME",
+        "ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY",
+        "ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY",
+        "ELASTIC_AGENT_PERIODIC_COLLECT_JITTER_RATIO",
         "ELASTIC_AGENT_STATE_DIR",
         "ELASTIC_AGENT_MANAGER_URL",
         "ELASTIC_AGENT_PUBLIC_ORIGIN",

@@ -94,6 +94,25 @@ class MonitorConfig(BaseSettings):
     reconcile_interval: int = 300
 
 
+class BatchRuntimeConfig(BaseSettings):
+    """Bounded Manager-side concurrency for worker lifecycle operations."""
+
+    worker_concurrency: int = 8
+    collect_concurrency: int = 8
+    collect_jitter_ratio: float = 0.0
+
+
+class ResultsConfig(BaseSettings):
+    """Manager-local result mirroring controls.
+
+    Disabling the periodic whole-tree scan does not disable awaited per-Job
+    final uploads.  It is intended for deployments whose Workers upload each
+    collection directly to S3 with an instance profile.
+    """
+
+    s3_periodic_enabled: bool = True
+
+
 class DrainConfig(BaseSettings):
     timeout: int = 3600
 
@@ -121,6 +140,8 @@ class ElasticAgentConfig(BaseSettings):
     external_api: ExternalAPIConfig = Field(default_factory=ExternalAPIConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+    batch_runtime: BatchRuntimeConfig = Field(default_factory=BatchRuntimeConfig)
+    results: ResultsConfig = Field(default_factory=ResultsConfig)
     drain: DrainConfig = Field(default_factory=DrainConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     task_registry: TaskRegistryConfig = Field(default_factory=TaskRegistryConfig)

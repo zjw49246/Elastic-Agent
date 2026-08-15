@@ -39,7 +39,7 @@ manifest 只保存在当前页面内存中，不写入 `localStorage` 或 `sessi
 - `policy` 可省略；默认 `max_active_jobs=3`、`on_job_failure="continue"`。
 - 单个 manifest 的 `max_active_jobs` 始终限制在 1–10；Manager 的
   `ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS` 是跨所有批次的独立全局上限，
-  可配置为 1–50，不会放宽单批 schema。
+  可配置为 1–300，不会放宽单批 schema。
 - v1 只支持 `continue`：一项提交或执行失败会被记录，但不会取消其他项。
 - schema 硬限 100 项；部署默认最多 20 项、100 Workers、1440 Worker-hours、3 个活跃 Job，请以页面 preflight 返回为准。
 - 文件和请求体上限均为 2 MiB。
