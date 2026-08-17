@@ -2,6 +2,10 @@
 
 > **重要：Claude 必须自主维护本文件。** 架构或约定变化时更新，保持简洁。
 
+## 当前生产 Manager（2026-08-16）
+
+- 运维入口固定为 `ssh -i "panyuexi.pem" ubuntu@ec2-43-206-219-152.ap-northeast-1.compute.amazonaws.com`。检查 campaign 时以该远端 Manager 为准，不要把项目宿主机上的旧 `elastic-agent-manager.service`、旧公网 IP 或历史迁移节点误认为当前生产 Manager。
+
 ## 架构要点
 
 - **任务执行两条路径**（worker/runtime.py `_handle_execute`）：
