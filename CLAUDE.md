@@ -5,6 +5,7 @@
 ## 当前生产 Manager（2026-08-16）
 
 - 运维入口固定为 `ssh -i "panyuexi.pem" ubuntu@ec2-43-206-219-152.ap-northeast-1.compute.amazonaws.com`。检查 campaign 时以该远端 Manager 为准，不要把项目宿主机上的旧 `elastic-agent-manager.service`、旧公网 IP 或历史迁移节点误认为当前生产 Manager。
+- **Task 题库唯一边界**：所有 ASIBench task 源码只在 `/home/ubuntu/Projects/ASIBench-Autoscaling-Agent` 定位、更新和集成；不得从 `/home/ubuntu/Projects/Task-Generate` 或其他项目读取/修改 task。题库运行改动应在专用分支/worktree 中合并最新 `main`，不要污染其他长期分支。
 
 ## 架构要点
 
