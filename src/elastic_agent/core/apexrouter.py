@@ -290,6 +290,7 @@ class ApexRouterAdapter(CloudRouterAdapter):
     provider = "apex"
 
     def __init__(self, *, usage_policy: str | None = None) -> None:
+        super().__init__()
         policy = usage_policy or os.environ.get(
             "ELASTIC_AGENT_APEX_USAGE_POLICY",
             "runtime",

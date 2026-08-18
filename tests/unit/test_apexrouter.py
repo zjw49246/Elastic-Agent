@@ -70,6 +70,7 @@ def test_default_registry_enables_apex_after_cloudrouter() -> None:
 def test_apex_endpoints_and_client_version_are_fixed() -> None:
     adapter = ApexRouterAdapter()
 
+    assert adapter._total_timeout_seconds > 0
     assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
     assert APEX_CLAUDE_BASE_URL == "https://api.apexin.ai"
     assert APEX_MODELS_URL == f"{APEX_CODEX_BASE_URL}/models"
