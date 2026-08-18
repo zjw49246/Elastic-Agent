@@ -408,6 +408,12 @@ def is_apexrouter_auth_failure(text: str | None) -> bool:
             or bool(error_types & {"401", "403"})
             or bool(_APEXROUTER_AUTH_MESSAGE_RE.search(message))
         )
+    # Some OpenAI-compatible clients retain only the HTTP status and a short
+    # reason, dropping the provider prefix and the exact "invalid api key"
+    # wording.  Apex treats both 401 and 403 as key rejection, so recognize
+    # those status lines directly while keeping arbitrary prose out.
+    if re.search(r"^\s*(?:HTTP\s*)?(?:401|403)\b", text, re.IGNORECASE):
+        return True
     return bool(_APEXROUTER_AUTH_FALLBACK_RE.search(text))
 
 
@@ -428,7 +434,10 @@ def is_apexrouter_hard_limit(text: str | None) -> bool:
             bool(error_types & _APEXROUTER_HARD_LIMIT_ERROR_TYPES)
             or bool(_APEXROUTER_HARD_LIMIT_MESSAGE_RE.search(message))
         )
-    return bool(_APEXROUTER_HARD_LIMIT_FALLBACK_RE.search(text))
+    return bool(
+        _APEXROUTER_HARD_LIMIT_MESSAGE_RE.search(text)
+        or _APEXROUTER_HARD_LIMIT_FALLBACK_RE.search(text)
+    )
 
 
 def is_apexrouter_transient(text: str | None) -> bool:
@@ -448,7 +457,11 @@ def is_apexrouter_transient(text: str | None) -> bool:
             or bool(error_types & {"429", "500", "502"})
             or bool(_APEXROUTER_TRANSIENT_MESSAGE_RE.search(message))
         )
-    return bool(_APEXROUTER_TRANSIENT_FALLBACK_RE.search(text))
+    return bool(
+        re.search(r"^\s*(?:HTTP\s*)?(?:429|500|502)\b", text, re.IGNORECASE)
+        or _APEXROUTER_TRANSIENT_MESSAGE_RE.search(text)
+        or _APEXROUTER_TRANSIENT_FALLBACK_RE.search(text)
+    )
 
 
 def is_rate_limited(text: str | None) -> bool:

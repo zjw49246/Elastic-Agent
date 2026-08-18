@@ -170,15 +170,15 @@ def test_production_allowlist_covers_common_x86_worker_families():
     assert set(iam_types) == actual
 
 
-def test_production_targets_300_bounded_workers():
+def test_production_targets_800_bounded_workers():
     settings = {
         line.partition("=")[0]: line.partition("=")[2]
         for line in AWS_ENV.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#") and "=" in line
     }
 
-    assert settings["ELASTIC_AGENT_AWS_MAX_INSTANCES"] == "300"
-    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "300"
+    assert settings["ELASTIC_AGENT_AWS_MAX_INSTANCES"] == "800"
+    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "800"
     assert settings["ELASTIC_AGENT_WORKER_BRINGUP_CONCURRENCY"] == "32"
     assert settings["ELASTIC_AGENT_PERIODIC_COLLECT_CONCURRENCY"] == "32"
     assert settings["ELASTIC_AGENT_RESULTS_S3_PERIODIC_ENABLED"] == "false"
@@ -361,15 +361,15 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert settings.results_s3_interval == 60
 
 
-def test_load_settings_accepts_300_instances_and_rejects_301(tmp_path):
+def test_load_settings_accepts_800_instances_and_rejects_801(tmp_path):
     environ = _environment(tmp_path)
-    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "300"
-    assert load_settings(environ).max_instances == 300
+    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "800"
+    assert load_settings(environ).max_instances == 800
 
-    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "301"
+    environ["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "801"
     with pytest.raises(
         LauncherConfigurationError,
-        match="ELASTIC_AGENT_AWS_MAX_INSTANCES must be between 1 and 300",
+        match="ELASTIC_AGENT_AWS_MAX_INSTANCES must be between 1 and 800",
     ):
         load_settings(environ)
 

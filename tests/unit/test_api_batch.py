@@ -625,7 +625,7 @@ class TestAccountsAPI:
         assert await manager.agent_api_store.list() == []
 
     @pytest.mark.asyncio
-    async def test_apex_agent_api_account_is_codex_only_and_write_only(
+    async def test_apex_agent_api_account_supports_advertised_types_and_is_write_only(
         self, client, manager, monkeypatch,
     ):
         adapter = manager.agent_api_store.registry.require("apex")
@@ -634,7 +634,7 @@ class TestAccountsAPI:
             adapter,
             "probe_models",
             AsyncMock(return_value={
-                "claude": [],
+                "claude": ["claude-opus-5"],
                 "codex": ["gpt-5.4"],
             }),
         )
@@ -670,8 +670,11 @@ class TestAccountsAPI:
         assert body["id"] == "apex-1"
         assert body["api_provider"] == "apex"
         assert body["auth_kind"] == "agent_api"
-        assert body["supported_agent_types"] == ["codex"]
-        assert body["models"] == {"claude": [], "codex": ["gpt-5.4"]}
+        assert body["supported_agent_types"] == ["claude", "codex"]
+        assert body["models"] == {
+            "claude": ["claude-opus-5"],
+            "codex": ["gpt-5.4"],
+        }
         assert body["has_api_key"] is True
         assert "api_key" not in body
         assert key not in created.text
@@ -695,8 +698,7 @@ class TestAccountsAPI:
             },
         })
         assert codex_plan.status_code == 200
-        assert claude_plan.status_code == 422
-        assert "supports codex, not claude" in claude_plan.json()["detail"]
+        assert claude_plan.status_code == 200
 
         provider_accounts = await client.get("/api/agent-api/accounts")
         assert provider_accounts.status_code == 200

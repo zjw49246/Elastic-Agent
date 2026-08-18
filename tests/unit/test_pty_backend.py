@@ -144,6 +144,26 @@ class TestEventToLogLine:
         )
         assert error_type == "agent_api_auth_failure"
 
+    def test_apex_gateway_errors_use_runtime_quota_policy(self):
+        error_type, _message = classify_turn_error(
+            "HTTP 401 Unauthorized: invalid token",
+            apexrouter=True,
+        )
+        assert error_type == "agent_api_auth_failure"
+
+        error_type, message = classify_turn_error(
+            "ApexRouter: insufficient credits",
+            apexrouter=True,
+        )
+        assert error_type == "agent_api_rate_limited"
+        assert "ApexRouter" in message
+
+        error_type, _message = classify_turn_error(
+            "HTTP 429 too many requests",
+            apexrouter=True,
+        )
+        assert error_type == "transient_overload"
+
     def test_generic_error_stays_pty_turn_error(self):
         error_type, message = classify_turn_error("the turn failed unexpectedly")
         assert error_type == "pty_turn_error"

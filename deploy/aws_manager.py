@@ -52,7 +52,7 @@ _AWS_ID_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
 _IAM_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_+=,.@-]{1,64}$")
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
-AWS_MAX_INSTANCES_HARD_LIMIT = 300
+AWS_MAX_INSTANCES_HARD_LIMIT = 800
 MANAGER_OPERATION_CONCURRENCY_HARD_LIMIT = 64
 _FORBIDDEN_AWS_CREDENTIAL_ENV = (
     "AWS_ACCESS_KEY_ID",

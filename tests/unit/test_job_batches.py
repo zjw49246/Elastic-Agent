@@ -273,13 +273,13 @@ async def batch_client(
 
 
 class TestJobBatchValidationAndPlan:
-    def test_global_limit_accepts_300_without_expanding_manifest_policy(
+    def test_global_limit_accepts_800_without_expanding_manifest_policy(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "300")
+        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "800")
         limits = JobBatchLimits()
-        assert limits.global_max_active_jobs == 300
+        assert limits.global_max_active_jobs == 800
         JobBatchManifest.model_validate(
             _manifest(_spec("policy-ten"), max_active_jobs=10)
         )
@@ -288,14 +288,14 @@ class TestJobBatchValidationAndPlan:
                 _manifest(_spec("policy-eleven"), max_active_jobs=11)
             )
 
-    def test_global_limit_rejects_values_above_300(
+    def test_global_limit_rejects_values_above_800(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "301")
+        monkeypatch.setenv("ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS", "801")
         with pytest.raises(
             ValueError,
-            match="ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS must be between 1 and 300",
+            match="ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS must be between 1 and 800",
         ):
             JobBatchLimits()
 

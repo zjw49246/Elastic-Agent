@@ -273,15 +273,16 @@ CloudRouter's explicit `mode="unrestricted"` means the key has no spend cap:
 top-level `balance=0` and `remaining=0` stay visible but are not exhaustion
 signals. Explicit exhausted status, expiry, quota, and rate-limit windows still
 block allocation.
-ApexRouter is Codex-only: it queries
-`https://api.apexin.ai/v1/models` with the pinned Codex CLI version and
-configures the `apexrouter` Responses API provider. Fresh allocation prefers a
-compatible, available API identity and falls back to OAuth; `account.ids` can
-select a generated ID such as `cloudrouter-1` or `apex-1` explicitly. Set
-optional `account.model` to require an exact advertised model (Claude stable
-aliases also match their dated variants); without it, admission checks only
-the selected Agent family for backward compatibility. This field validates
-routing but does not rewrite the opaque run command's own model arguments.
+ApExRouter queries `https://api.apexin.ai/v1/models` with the pinned Codex CLI
+version. The gateway may return either native `models[].slug` records or the
+OpenAI-compatible `data[].id` catalog; Elastic projects each advertised
+`claude-*` or Codex-family model to the matching Agent type. Claude uses the
+fixed `https://api.apexin.ai` Anthropic endpoint, while Codex uses the fixed
+`/v1` Responses endpoint. Fresh allocation prefers a compatible, available API
+identity and falls back to OAuth; `account.ids` can select a generated ID such
+as `cloudrouter-1` or `apex-1` explicitly. Set optional `account.model` to
+require an exact advertised model; this validates routing but does not rewrite
+the opaque run command's own model arguments.
 Jobs do not need a separate API mode and API identities support the same
 persistent EIP binding flow.
 
@@ -314,9 +315,9 @@ key once to the selected Worker. Claude and Codex read it through a private
 helper; routing is fixed to the selected provider, inherited official and
 gateway auth/base overrides are removed, and a structured provider failure is
 reported as a failed Job even when the CLI process exits `0`. Managed Claude
-is available only through CloudRouter and loads only its Worker-owned user
-settings; project/local settings, hooks, and MCP configuration are excluded so
-Job files cannot redirect the provider or credential helper.
+loads only its Worker-owned user settings for either configured provider;
+project/local settings, hooks, and MCP configuration are excluded so Job files
+cannot redirect the provider or credential helper.
 
 During Manager startup recovery, Agent API allocation stays closed until every
 previous Worker has a confirmed terminal cloud readback. OAuth allocation can
@@ -364,16 +365,19 @@ the same allocation fence. Storage failure never reports a full success: the
 released-EIP/retained-identity partial state is quarantined and shown explicitly
 in the UI.
 
-ApexRouter `/usage` reports per-key `used` values but shared-group
+ApexRouter `/usage`, when deployed, reports per-key `used` values but shared-group
 `remaining`, `limits`, and `concurrency`; Elastic keeps those scopes separate
 and excludes the key when any shared limit is exhausted. An explicit `null`
 pair for one window's `remaining` and `limit` means that shared window is
 unlimited; limited and unlimited windows may coexist, while missing,
 asymmetric-null, or invalid values fail closed. ApexRouter does not currently
-supply an expiry time. At runtime, Apex authentication failures and explicit
-quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
-failures are treated as transient provider errors rather than proof that the
-individual key is exhausted.
+supply an expiry time, and the public New API gateway may omit `/v1/usage`
+entirely. In that case the default
+`ELASTIC_AGENT_APEX_USAGE_POLICY=runtime` admits the validated model catalog
+without inventing balance numbers; authentication failures and explicit quota
+messages from real requests still quarantine/rotate the key, while ordinary
+HTTP `429` and `500`/`502` failures remain transient same-key retries. Set the
+policy to `strict` when a deployment requires a provider usage endpoint.
 
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent
