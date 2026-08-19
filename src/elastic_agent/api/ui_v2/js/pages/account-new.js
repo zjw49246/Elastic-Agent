@@ -16,7 +16,7 @@ const TYPES = [
   { value: 'claude_oauth', label: 'Claude OAuth' },
   { value: 'codex_oauth', label: 'Codex OAuth' },
   { value: 'cloudrouter', label: 'CloudRouter（Agent API）' },
-  { value: 'apex', label: 'ApexRouter（Agent API，仅 Codex）' },
+  { value: 'apex', label: 'ApexRouter（Agent API，按模型类型分配）' },
 ];
 
 export function createPage({ router, container }) {
@@ -189,7 +189,7 @@ function buildLayout(nodes, submit) {
   // ---- Agent API fields
   nodes.apiName = el('input', { type: 'text', id: 'newApiName', autocomplete: 'off' });
   nodes.apiKey = el('input', { type: 'password', id: 'newApiKey', autocomplete: 'new-password' });
-  nodes.apexHint = el('p', { class: 'help', text: 'ApexRouter 只支持 Codex。' });
+  nodes.apexHint = el('p', { class: 'help', text: 'ApexRouter 的 Claude/Codex 能力以 /models 返回为准。' });
   nodes.apiFields = el('fieldset', {}, [
     el('legend', { text: 'Agent API 账号' }),
     el('div', { class: 'form-grid' }, [

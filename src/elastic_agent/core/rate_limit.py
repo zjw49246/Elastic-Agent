@@ -138,9 +138,9 @@ _CLOUDROUTER_HARD_LIMIT_ERROR_TYPES = frozenset(
 )
 
 # ApexRouter's 429 is a group-shared concurrency/request condition, so changing
-# keys cannot repair it.  Only an explicit per-key quota/credit message is a
-# hard limit.  Its 401 and 403 responses both mean the delegated key was
-# rejected and must take auth precedence over quota/transient handling.
+# keys cannot repair it. Only an explicit per-key quota/credit/balance message
+# is a hard limit. A 403 balance response must be checked before the generic
+# auth status: Apex has used 403 for both rejected keys and depleted balances.
 _APEXROUTER_AUTH_ERROR_TYPES = frozenset(
     {
         "authentication_error",
@@ -165,9 +165,12 @@ _APEXROUTER_TRANSIENT_ERROR_TYPES = frozenset(
 )
 _APEXROUTER_HARD_LIMIT_ERROR_TYPES = frozenset(
     {
+        "balance_exhausted",
+        "balance_insufficient",
         "billing_hard_limit_reached",
         "credits_exhausted",
         "insufficient_credits",
+        "insufficient_balance",
         "insufficient_quota",
         "out_of_credits",
         "quota_exhausted",
@@ -191,11 +194,20 @@ _APEXROUTER_TRANSIENT_MESSAGE_RE = re.compile(
     r"|upstream[ _-]?error",
     re.IGNORECASE,
 )
+_APEXROUTER_BARE_TRANSIENT_STATUS_RE = re.compile(
+    r"^\s*HTTP(?:\s+Error)?\s*[:=-]?\s*(?:429|500|502)\b[^\n]{0,100}"
+    r"(?:too many requests|rate[ _-]?limit|internal[ _-]?server[ _-]?error|"
+    r"bad gateway|upstream[ _-]?error)",
+    re.IGNORECASE,
+)
 _APEXROUTER_HARD_LIMIT_MESSAGE_RE = re.compile(
     r"\binsufficient[ _-]?(?:quota|credits?)\b"
+    r"|\binsufficient[ _-]?(?:balance|funds?)\b"
     r"|\bquota[ _-]?(?:exhausted|exceeded)\b"
     r"|\bout of credits?\b"
     r"|\bcredits?[ _-]?exhausted\b"
+    r"|\bbalance[ _-]?(?:exhausted|depleted)\b"
+    r"|\b(?:account[ _-]?)?balance[ _-]?(?:is[ _-]?)?(?:insufficient|too[ _-]?low)\b"
     r"|\b(?:billing[ _-]?hard|monthly[ _-]?spend|spend)[ _-]?limit"
     r"(?:[ _-]?(?:reached|exceeded))?\b",
     re.IGNORECASE,
@@ -225,9 +237,11 @@ _APEXROUTER_TRANSIENT_FALLBACK_RE = re.compile(
 )
 _APEXROUTER_HARD_LIMIT_FALLBACK_RE = re.compile(
     _APEXROUTER_FALLBACK_PREFIX
-    + r"(?:insufficient[ _-]?(?:quota|credits?)|"
+    + r"(?:insufficient[ _-]?(?:quota|credits?|balance|funds?)|"
     r"quota[ _-]?(?:exhausted|exceeded)|out of credits?|"
     r"credits?[ _-]?exhausted|"
+    r"balance[ _-]?(?:exhausted|depleted)|"
+    r"(?:account[ _-]?)?balance[ _-]?(?:is[ _-]?)?(?:insufficient|too[ _-]?low)|"
     r"(?:billing[ _-]?hard|monthly[ _-]?spend|spend)[ _-]?limit)",
     re.IGNORECASE,
 )
@@ -403,11 +417,27 @@ def is_apexrouter_auth_failure(text: str | None) -> bool:
     structured = _cloudrouter_structured_error(text)
     if structured is not None:
         error_types, message = structured
+        # Apex can report a depleted account balance with HTTP 403. Keep this
+        # out of the sticky invalid-key path even when the status is present.
+        if bool(
+            error_types & _APEXROUTER_HARD_LIMIT_ERROR_TYPES
+        ) or bool(_APEXROUTER_HARD_LIMIT_MESSAGE_RE.search(message)):
+            return False
         return (
             bool(error_types & _APEXROUTER_AUTH_ERROR_TYPES)
             or bool(error_types & {"401", "403"})
             or bool(_APEXROUTER_AUTH_MESSAGE_RE.search(message))
         )
+    # Require an Apex provider marker for unstructured status lines. A generic
+    # "HTTP 403" can be ordinary application output and is not proof of key
+    # rejection.
+    if re.search(
+        r"^\s*HTTP(?:\s+Error)?\s*[:=-]?\s*401\b[^\n]{0,100}"
+        r"(?:unauthori[sz]ed|invalid[ _-]?(?:token|api[ _-]?key))",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
     return bool(_APEXROUTER_AUTH_FALLBACK_RE.search(text))
 
 
@@ -419,7 +449,7 @@ def is_apexrouter_hard_limit(text: str | None) -> bool:
     only amplify load against the same group.
     """
 
-    if not text or is_apexrouter_auth_failure(text):
+    if not text:
         return False
     structured = _cloudrouter_structured_error(text)
     if structured is not None:
@@ -448,7 +478,10 @@ def is_apexrouter_transient(text: str | None) -> bool:
             or bool(error_types & {"429", "500", "502"})
             or bool(_APEXROUTER_TRANSIENT_MESSAGE_RE.search(message))
         )
-    return bool(_APEXROUTER_TRANSIENT_FALLBACK_RE.search(text))
+    return bool(
+        _APEXROUTER_BARE_TRANSIENT_STATUS_RE.search(text)
+        or _APEXROUTER_TRANSIENT_FALLBACK_RE.search(text)
+    )
 
 
 def is_rate_limited(text: str | None) -> bool:

@@ -17,6 +17,7 @@ import pytest
 
 from elastic_agent.worker.agent_api import (
     AGENT_API_CODEX_AUTH_ENV_KEYS,
+    APEX_CLAUDE_BASE_URL,
     APEX_CODEX_BASE_URL,
     CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS,
     CLOUDROUTER_CLAUDE_BASE_URL,
@@ -429,7 +430,7 @@ def test_configure_cloudrouter_codex_writes_responses_provider_without_key(tmp_p
     assert "\nmodel =" not in config
 
 
-def test_configure_apex_codex_is_private_fixed_and_codex_only(tmp_path):
+def test_configure_apex_codex_is_private_and_fixed(tmp_path):
     home = Path(
         configure_agent_api(
             provider="apex",
@@ -455,7 +456,7 @@ def test_configure_apex_codex_is_private_fixed_and_codex_only(tmp_path):
     assert projection.provider == "apex"
     assert projection.agent_type == "codex"
     assert marker["endpoints"] == {
-        "claude_base_url": None,
+        "claude_base_url": APEX_CLAUDE_BASE_URL,
         "codex_base_url": APEX_CODEX_BASE_URL,
     }
     assert 'model_provider = "apexrouter"' in config
@@ -468,15 +469,30 @@ def test_configure_apex_codex_is_private_fixed_and_codex_only(tmp_path):
     assert "lck-apex-private" not in config
     assert "lck-apex-private" not in json.dumps(marker)
 
-    with pytest.raises(AgentAPIConfigurationError, match="does not support"):
+
+
+def test_configure_apex_claude_uses_fixed_endpoint_and_helper(tmp_path):
+    home = Path(
         configure_agent_api(
             provider="apex",
             agent_type="claude",
             config_dir=tmp_path / "claude-slot",
             api_key="lck-apex-private",
             account_id="apex-4",
-            models={"claude": ["claude-opus-4-8"]},
+            models={"claude": ["claude-opus-5"]},
         )
+    )
+    projection = validate_agent_api_home(home)
+    settings = json.loads((home / "settings.json").read_text())
+    wrapper = (projection.root / "claude-wrapper").read_text()
+
+    assert projection.provider == "apex"
+    assert projection.agent_type == "claude"
+    assert projection.models == ("claude-opus-5",)
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == APEX_CLAUDE_BASE_URL
+    assert settings["apiKeyHelper"].endswith("key-helper-launcher")
+    assert f"export ANTHROPIC_BASE_URL={APEX_CLAUDE_BASE_URL}" in wrapper
+    assert "lck-apex-private" not in wrapper
 
 
 @pytest.mark.parametrize(
@@ -841,13 +857,19 @@ def test_auth_env_scrub_removes_cloudrouter_claude_provider_overrides():
     }
 
 
-def test_auth_env_scrub_rejects_apex_claude():
-    with pytest.raises(AgentAPIConfigurationError, match="does not support"):
-        scrub_agent_api_env(
-            {},
-            provider="apex",
-            agent_type="claude",
-        )
+def test_auth_env_scrub_supports_apex_claude():
+    env = {
+        "ANTHROPIC_API_KEY": "attacker",
+        "ANTHROPIC_BASE_URL": "https://attacker.invalid",
+        "SAFE": "keep",
+    }
+
+    scrub_agent_api_env(env, provider="apex", agent_type="claude")
+
+    assert env == {
+        "ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL,
+        "SAFE": "keep",
+    }
 
 
 def test_codex_auth_env_scrub_removes_all_key_and_base_overrides():

@@ -4,7 +4,8 @@ An Agent API key is never placed in a CLI configuration file, environment
 variable, command line, or projection marker.  Instead, each projection owns a
 private key file and an executable credential helper.  The generated Claude
 and Codex homes contain only the selected provider's fixed endpoint plus the
-helper path. CloudRouter supports Claude and Codex; ApexRouter is Codex-only.
+helper path. The admission probe determines which agent types a provider
+account may use.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from typing import Any
 
 CLOUDROUTER_CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CLOUDROUTER_CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
+APEX_CLAUDE_BASE_URL = "https://api.apexin.ai"
 APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = frozenset(
     {
@@ -103,8 +105,8 @@ _PROVIDER_SPECS = {
         codex_provider_name="CloudRouter",
     ),
     "apex": _ProviderSpec(
-        agent_types=frozenset({"codex"}),
-        claude_base_url=None,
+        agent_types=frozenset({"claude", "codex"}),
+        claude_base_url="https://api.apexin.ai",
         codex_base_url=APEX_CODEX_BASE_URL,
         codex_provider_id="apexrouter",
         codex_provider_name="ApexRouter",
@@ -167,14 +169,15 @@ exec /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin "${0%/*}/key-helper"
 
 _CLAUDE_WRAPPER_UNSET_ENV_KEYS = tuple(sorted(CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS | CLOUDROUTER_CLAUDE_PROVIDER_ENV_KEYS))
 
-_CLAUDE_WRAPPER = f"""#!/bin/sh
+def _claude_wrapper(base_url: str) -> str:
+    return f"""#!/bin/sh
 unset {" ".join(_CLAUDE_WRAPPER_UNSET_ENV_KEYS)}
-export ANTHROPIC_BASE_URL={CLOUDROUTER_CLAUDE_BASE_URL}
+export ANTHROPIC_BASE_URL={base_url}
 umask 077
 claude_binary=${{{CLOUDROUTER_CLAUDE_BINARY_ENV}:-}}
 case "$claude_binary" in
   /*) ;;
-  *) echo "CloudRouter Claude binary is not pinned" >&2; exit 126 ;;
+  *) echo "Managed Claude binary is not pinned" >&2; exit 126 ;;
 esac
 for argument do
   case "$argument" in
@@ -189,6 +192,9 @@ done
 # would otherwise execute before or alongside the managed provider request.
 exec "$claude_binary" --setting-sources user "$@"
 """
+
+
+_CLAUDE_WRAPPER = _claude_wrapper(CLOUDROUTER_CLAUDE_BASE_URL)
 
 
 class AgentAPIError(RuntimeError):
@@ -700,20 +706,24 @@ def _validate_runtime(projection: AgentAPIProjection) -> None:
         raise UnsafeAgentAPIPathError("Invalid Agent API key file")
 
     if projection.agent_type == "claude":
+        claude_base_url = _provider_spec(projection.provider).claude_base_url
+        if not claude_base_url:
+            raise UnsafeAgentAPIPathError("Agent API provider has no Claude endpoint")
+        expected_wrapper = _claude_wrapper(claude_base_url).encode("utf-8")
         wrapper = _read_owned_regular(
             projection.root / "claude-wrapper",
             expected_mode=0o700,
-            maximum=len(_CLAUDE_WRAPPER.encode("utf-8")),
+            maximum=len(expected_wrapper),
         )
-        if wrapper != _CLAUDE_WRAPPER.encode("utf-8"):
+        if wrapper != expected_wrapper:
             raise UnsafeAgentAPIPathError("Modified Claude Agent API wrapper")
         _require_private_directory(projection.root / "bin")
         shim = _read_owned_regular(
             projection.root / "bin" / "claude",
             expected_mode=0o700,
-            maximum=len(_CLAUDE_WRAPPER.encode("utf-8")),
+            maximum=len(expected_wrapper),
         )
-        if shim != _CLAUDE_WRAPPER.encode("utf-8"):
+        if shim != expected_wrapper:
             raise UnsafeAgentAPIPathError("Modified Claude Agent API shim")
         try:
             settings = json.loads(
@@ -734,7 +744,7 @@ def _validate_runtime(projection: AgentAPIProjection) -> None:
             ) from exc
         expected_settings = {
             "env": {
-                "ANTHROPIC_BASE_URL": CLOUDROUTER_CLAUDE_BASE_URL,
+                "ANTHROPIC_BASE_URL": claude_base_url,
             },
             "apiKeyHelper": _helper_command(projection.root),
             "skipDangerousModePermissionPrompt": True,
@@ -867,9 +877,15 @@ def configure_agent_api(
                 mode=0o700,
             )
             if agent_type == "claude":
+                claude_base_url = _provider_spec(provider).claude_base_url
+                if not claude_base_url:
+                    raise AgentAPIConfigurationError(
+                        "Agent API provider has no Claude endpoint"
+                    )
+                claude_wrapper = _claude_wrapper(claude_base_url)
                 settings = {
                     "env": {
-                        "ANTHROPIC_BASE_URL": CLOUDROUTER_CLAUDE_BASE_URL,
+                        "ANTHROPIC_BASE_URL": claude_base_url,
                     },
                     "apiKeyHelper": _helper_command(projection_root),
                     "skipDangerousModePermissionPrompt": True,
@@ -881,12 +897,12 @@ def configure_agent_api(
                 )
                 _atomic_private_write(
                     projection_root / "claude-wrapper",
-                    _CLAUDE_WRAPPER.encode("utf-8"),
+                    claude_wrapper.encode("utf-8"),
                     mode=0o700,
                 )
                 _atomic_private_write(
                     projection_root / "bin" / "claude",
-                    _CLAUDE_WRAPPER.encode("utf-8"),
+                    claude_wrapper.encode("utf-8"),
                     mode=0o700,
                 )
             else:
@@ -1018,7 +1034,12 @@ def scrub_agent_api_env(
     if agent_type == "claude":
         # A Job-level override must not redirect a helper-authenticated request
         # and disclose the delegated key to another origin.
-        env["ANTHROPIC_BASE_URL"] = CLOUDROUTER_CLAUDE_BASE_URL
+        claude_base_url = _provider_spec(provider).claude_base_url
+        if not claude_base_url:
+            raise AgentAPIConfigurationError(
+                "Agent API provider has no Claude endpoint"
+            )
+        env["ANTHROPIC_BASE_URL"] = claude_base_url
     else:
         # The selected custom provider owns its fixed base URL in config.toml.
         # Remove generic process-level aliases that can supersede it.
@@ -1117,6 +1138,7 @@ __all__ = [
     "AgentAPIError",
     "AgentAPIProjection",
     "AGENT_API_CODEX_AUTH_ENV_KEYS",
+    "APEX_CLAUDE_BASE_URL",
     "APEX_CODEX_BASE_URL",
     "CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS",
     "CLOUDROUTER_CLAUDE_BASE_URL",
