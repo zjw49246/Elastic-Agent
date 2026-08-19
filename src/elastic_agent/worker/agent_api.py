@@ -247,6 +247,17 @@ def codex_base_url_for_provider(provider: str) -> str:
     return _provider_spec(provider).codex_base_url
 
 
+def claude_base_url_for_provider(provider: str) -> str:
+    """Return the immutable Claude route for an enabled Agent API provider."""
+
+    base_url = _provider_spec(provider).claude_base_url
+    if not base_url:
+        raise AgentAPIConfigurationError(
+            f"Agent API provider {provider!r} has no Claude endpoint",
+        )
+    return base_url
+
+
 def _account_id_matches_provider(provider: Any, account_id: Any) -> bool:
     if not isinstance(account_id, str) or len(account_id) > 128:
         return False
@@ -985,7 +996,6 @@ def claude_wrapper_for_home(path: str | os.PathLike[str]) -> str:
 
     projection = validate_agent_api_home(
         path,
-        provider="cloudrouter",
         agent_type="claude",
     )
     if projection.wrapper is None:  # pragma: no cover - protected by validation
@@ -998,7 +1008,6 @@ def claude_shim_directory_for_home(path: str | os.PathLike[str]) -> str:
 
     projection = validate_agent_api_home(
         path,
-        provider="cloudrouter",
         agent_type="claude",
     )
     return str(projection.root / "bin")
@@ -1150,6 +1159,7 @@ __all__ = [
     "UnsafeAgentAPIPathError",
     "agent_api_marker_for_home",
     "apply_agent_api_runtime_env",
+    "claude_base_url_for_provider",
     "claude_wrapper_for_home",
     "claude_shim_directory_for_home",
     "codex_base_url_for_provider",

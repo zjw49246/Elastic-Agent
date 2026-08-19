@@ -926,9 +926,9 @@ class WorkerRuntime:
             if projection is not None:
                 from elastic_agent.worker.agent_api import (
                     AGENT_API_CODEX_AUTH_ENV_KEYS,
-                    CLOUDROUTER_CLAUDE_BASE_URL,
                     CLOUDROUTER_CLAUDE_BINARY_ENV,
                     apply_agent_api_runtime_env,
+                    claude_base_url_for_provider,
                     claude_shim_directory_for_home,
                     claude_wrapper_for_home,
                     codex_base_url_for_provider,
@@ -988,12 +988,15 @@ class WorkerRuntime:
                             "claude",
                             path=env.get("PATH"),
                         )
-                        if not original_binary:
-                            raise RuntimeError("Claude CLI is unavailable")
-                        env[CLOUDROUTER_CLAUDE_BINARY_ENV] = original_binary
+                        # A trusted container owner can consume the projection
+                        # without a host Claude install. Keep the shim first in
+                        # PATH so accidental host invocation still fails closed
+                        # when no absolute original binary was pinned.
+                        if original_binary:
+                            env[CLOUDROUTER_CLAUDE_BINARY_ENV] = original_binary
                         exports.extend([
                             "export ANTHROPIC_BASE_URL="
-                            f"{shlex.quote(CLOUDROUTER_CLAUDE_BASE_URL)}",
+                            f"{shlex.quote(claude_base_url_for_provider(projection.provider))}",
                             "export PATH="
                             f"{shlex.quote(claude_shim_directory_for_home(projection.home))}:$PATH",
                         ])

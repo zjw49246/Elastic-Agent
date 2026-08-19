@@ -1098,6 +1098,108 @@ class TestProcessExecution:
         )
         assert exit_event["exit_code"] == 0
 
+    @pytest.mark.asyncio
+    async def test_managed_claude_shell_without_host_cli_can_use_projection(
+        self, runtime, tmp_path, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import (
+            APEX_CLAUDE_BASE_URL,
+            ELASTIC_AGENT_API_PROJECTION_ROOT_ENV,
+            configure_agent_api,
+        )
+
+        home = configure_agent_api(
+            provider="apex",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="apex-private",
+            account_id="apex-container-owner",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        monkeypatch.setattr(
+            "elastic_agent.worker.runtime.shutil.which",
+            lambda *_a, **_k: None,
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        script = (
+            "import os;"
+            f"print(os.environ['{ELASTIC_AGENT_API_PROJECTION_ROOT_ENV}'] + "
+            "'|' + os.environ['ANTHROPIC_BASE_URL'])"
+        )
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="apex-claude-container-owner",
+            command=[
+                "bash",
+                "-lc",
+                f"{sys.executable} -c {shlex.quote(script)}",
+            ],
+            cwd=str(tmp_path),
+            env={"CLAUDE_CONFIG_DIR": home},
+        ))
+        await runtime._process_tasks["apex-claude-container-owner"]
+
+        assert any(
+            message["type"] == "LOG"
+            and message["data"].strip()
+            == f"{Path(home).parent}|{APEX_CLAUDE_BASE_URL}"
+            for message in sent
+        )
+        exit_event = next(
+            message for message in sent if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 0
+        assert exit_event["error_type"] is None
+
+    @pytest.mark.asyncio
+    async def test_managed_claude_shell_without_host_cli_keeps_shim_fail_closed(
+        self, runtime, tmp_path, monkeypatch,
+    ):
+        from elastic_agent.core.protocols.messages import ExecuteMessage
+        from elastic_agent.worker.agent_api import configure_agent_api
+
+        home = configure_agent_api(
+            provider="apex",
+            agent_type="claude",
+            config_dir=tmp_path / "slot",
+            api_key="apex-private",
+            account_id="apex-missing-host-cli",
+            models={"claude": ["claude-opus-4-8"]},
+        )
+        monkeypatch.setattr(
+            "elastic_agent.worker.runtime.shutil.which",
+            lambda *_a, **_k: None,
+        )
+        sent: list[dict] = []
+
+        async def capture(message):
+            sent.append(json.loads(message.model_dump_json()))
+
+        runtime._send_event = capture
+        await runtime._handle_execute(ExecuteMessage(
+            task_id="apex-claude-missing-host-cli",
+            command=["bash", "-lc", "claude -p hello"],
+            cwd=str(tmp_path),
+            env={"CLAUDE_CONFIG_DIR": home},
+        ))
+        await runtime._process_tasks["apex-claude-missing-host-cli"]
+
+        assert any(
+            message["type"] == "LOG"
+            and message["stream"] == "stderr"
+            and "Managed Claude binary is not pinned" in message["data"]
+            for message in sent
+        )
+        exit_event = next(
+            message for message in sent if message["type"] == "PROCESS_EXIT"
+        )
+        assert exit_event["exit_code"] == 126
+
     def test_application_error_json_is_not_a_provider_fatal(self):
         assert WorkerRuntime._agent_api_fatal_error(
             '{"type":"error","message":"application-level event"}'
