@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -32,6 +34,64 @@ RECENT_INSTANCE_RETRY_SECONDS = 5
 EIP_ASSOCIATION_CONFIRM_ATTEMPTS = 30
 EIP_ASSOCIATION_CONFIRM_SECONDS = 2.0
 
+# EC2 applies a comparatively low account/region request-rate quota to
+# RunInstances.  A large JobBatch can fan out through more than one
+# AWSProvider object, so this limiter intentionally lives at module scope and
+# uses a threading lock rather than an event-loop-bound asyncio primitive.
+# This gives every provider in this Manager process one shared budget.
+RUN_INSTANCES_RATE_PER_SECOND = 2.0
+RUN_INSTANCES_BURST = 5
+RUN_INSTANCES_MAX_ATTEMPTS = 8
+RUN_INSTANCES_BACKOFF_BASE_SECONDS = 0.5
+RUN_INSTANCES_BACKOFF_MAX_SECONDS = 15.0
+AWS_MAX_POOL_CONNECTIONS = 64
+
+_RUN_INSTANCES_THROTTLE_CODES = frozenset(
+    {
+        "Throttling",
+        "RequestLimitExceeded",
+        "EC2ThrottledException",
+    }
+)
+
+
+class _RunInstancesRateLimiter:
+    """Process-wide, event-loop-independent token bucket for RunInstances."""
+
+    def __init__(self, rate: float, burst: int) -> None:
+        if rate <= 0 or burst < 1:
+            raise ValueError("rate and burst must be positive")
+        self._rate = rate
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        self._updated_at = time.monotonic()
+        self._lock = threading.Lock()
+
+    async def acquire(self) -> None:
+        # Do not reserve future slots: cancelled waiters should not leave holes
+        # that delay the remaining launch queue.  asyncio.sleep makes the wait
+        # immediately responsive to task cancellation.
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._updated_at)
+                self._tokens = min(
+                    self._burst,
+                    self._tokens + elapsed * self._rate,
+                )
+                self._updated_at = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                delay = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(delay)
+
+
+_RUN_INSTANCES_RATE_LIMITER = _RunInstancesRateLimiter(
+    RUN_INSTANCES_RATE_PER_SECOND,
+    RUN_INSTANCES_BURST,
+)
+
 
 def _is_not_found_yet(exc: Exception) -> bool:
     if isinstance(exc, (LookupError, InstanceNotFoundError)):
@@ -47,6 +107,20 @@ def _is_eip_not_found(exc: Exception) -> bool:
     if isinstance(resp, dict):
         return resp.get("Error", {}).get("Code") in _EIP_NOT_FOUND_CODES
     return False
+
+
+def _run_instances_throttle_code(exc: Exception) -> str | None:
+    """Return the retryable EC2 throttle code, if this is one.
+
+    The allowlist is deliberately narrow.  Capacity and account quota errors
+    such as InsufficientInstanceCapacity and InstanceLimitExceeded need a
+    scheduler/operator decision and must fail without replaying RunInstances.
+    """
+    resp = getattr(exc, "response", None)  # botocore ClientError
+    if not isinstance(resp, dict):
+        return None
+    code = resp.get("Error", {}).get("Code")
+    return code if code in _RUN_INSTANCES_THROTTLE_CODES else None
 
 
 _AWS_STATE_MAP: dict[str, InstanceState] = {
@@ -100,8 +174,13 @@ class AWSProvider(CloudProvider):
 
     def _create_client(self):
         import boto3
+        from botocore.config import Config
 
-        return boto3.client("ec2", region_name=self._config.region)
+        return boto3.client(
+            "ec2",
+            region_name=self._config.region,
+            config=Config(max_pool_connections=AWS_MAX_POOL_CONNECTIONS),
+        )
 
     def _native_id(self, instance_id: str) -> str:
         return instance_id.removeprefix("aws:")
@@ -242,10 +321,36 @@ class AWSProvider(CloudProvider):
         ]
         kwargs["BlockDeviceMappings"] = block_devices
 
-        def _call():
-            return self._client.run_instances(**kwargs)
+        resp = None
+        for attempt in range(1, RUN_INSTANCES_MAX_ATTEMPTS + 1):
+            await _RUN_INSTANCES_RATE_LIMITER.acquire()
+            try:
+                # Reuse the exact same kwargs on every retry.  In particular,
+                # ClientToken must remain byte-identical so a lost response
+                # cannot turn a retry into a second instance.
+                resp = await asyncio.to_thread(self._client.run_instances, **kwargs)
+                break
+            except Exception as exc:  # noqa: BLE001
+                throttle_code = _run_instances_throttle_code(exc)
+                if throttle_code is None or attempt >= RUN_INSTANCES_MAX_ATTEMPTS:
+                    raise
+                backoff_ceiling = min(
+                    RUN_INSTANCES_BACKOFF_MAX_SECONDS,
+                    RUN_INSTANCES_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+                )
+                delay = random.uniform(0.0, backoff_ceiling)
+                logger.warning(
+                    "AWS RunInstances throttled with %s; retrying attempt %d/%d in %.2fs",
+                    throttle_code,
+                    attempt + 1,
+                    RUN_INSTANCES_MAX_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
-        resp = await asyncio.to_thread(_call)
+        # The loop returns or raises on every final attempt.  Keep the assert
+        # as a local type narrowing guard rather than accepting Optional below.
+        assert resp is not None
         ec2_inst = resp["Instances"][0]
         native_id = ec2_inst["InstanceId"]
         self._recent_instances[native_id] = time.monotonic()
