@@ -1523,6 +1523,132 @@ class TestRotation:
         assert len(d.collected) >= 1         # collected while still RUNNING
         await orch._stop_periodic_collect(wid)  # cleanup the background loop
 
+    async def test_periodic_collect_has_global_concurrency_limit(self):
+        d = FakeDriver()
+        active = 0
+        peak = 0
+        completed = 0
+        first_wave_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_collect(worker_id, spec, job_id):
+            nonlocal active, completed, peak
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                first_wave_started.set()
+            try:
+                await release.wait()
+            finally:
+                active -= 1
+                completed += 1
+
+        d.collect = gated_collect
+        orch = BatchOrchestrator(d, collect_concurrency=2)
+        spec = _spec(collect={"paths": ["results"]})
+        tasks = [
+            asyncio.create_task(
+                orch._run_periodic_collect(f"w{index}", spec, "job")
+            )
+            for index in range(7)
+        ]
+
+        await asyncio.wait_for(first_wave_started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert peak == 2
+        assert completed == 0
+
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        assert peak == 2
+        assert completed == 7
+
+    async def test_periodic_collect_parameters_are_bounded_and_jitter_stable(
+        self,
+    ):
+        low = BatchOrchestrator(
+            FakeDriver(),
+            collect_concurrency=0,
+            collect_jitter_ratio=-1.0,
+        )
+        high = BatchOrchestrator(
+            FakeDriver(),
+            collect_concurrency=10_000,
+            collect_jitter_ratio=10.0,
+        )
+
+        assert low._collect_semaphore._value == 1
+        assert high._collect_semaphore._value == 256
+        assert low._periodic_collect_delay(60, "worker-a") == 60
+        delay = high._periodic_collect_delay(60, "worker-a")
+        assert 60 <= delay < 120
+        assert high._periodic_collect_delay(60, "worker-a") == delay
+        assert high._periodic_collect_delay(60, "worker-b") != delay
+
+    async def test_final_collect_bypasses_busy_periodic_limit(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d, collect_concurrency=1)
+        job = await orch.launch(_spec(
+            fanout={"workers": 2},
+            collect={"paths": ["results"]},
+        ))
+        first, terminal = sorted(
+            job.runs.values(),
+            key=lambda run: run.worker_id,
+        )
+        holder_started = asyncio.Event()
+        release_holder = asyncio.Event()
+        calls: list[str] = []
+
+        async def controlled_collect(worker_id, spec, job_id):
+            calls.append(worker_id)
+            if worker_id == first.worker_id:
+                holder_started.set()
+                await release_holder.wait()
+
+        d.collect = controlled_collect
+        holder = asyncio.create_task(orch._run_periodic_collect(
+            first.worker_id,
+            job.spec,
+            job.job_id,
+        ))
+        orch._collect_tasks[first.worker_id] = holder
+        await asyncio.wait_for(holder_started.wait(), timeout=1)
+
+        queued = asyncio.create_task(orch._run_periodic_collect(
+            terminal.worker_id,
+            job.spec,
+            job.job_id,
+        ))
+        orch._collect_tasks[terminal.worker_id] = queued
+        await asyncio.sleep(0)
+        assert queued.done() is False
+
+        # Finalization cancels the queued periodic call, then collects directly
+        # even though another periodic call still owns the sole semaphore slot.
+        await asyncio.wait_for(
+            orch.on_worker_exit(
+                job.job_id,
+                terminal.worker_id,
+                0,
+                task_id=terminal.task_id,
+            ),
+            timeout=0.5,
+        )
+        assert queued.cancelled()
+        assert calls == [first.worker_id, terminal.worker_id]
+        assert holder.done() is False
+
+        release_holder.set()
+        await asyncio.wait_for(holder, timeout=1)
+        await orch._stop_periodic_collect(first.worker_id)
+        await orch.on_worker_exit(
+            job.job_id,
+            first.worker_id,
+            0,
+            task_id=first.task_id,
+        )
+
     async def test_checkpoint_periodic_collect_uses_one_job_barrier(self):
         d = FakeDriver()
         calls = []
