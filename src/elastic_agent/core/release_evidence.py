@@ -281,7 +281,11 @@ def validate_task_platform_worker_profile(raw: Any) -> dict[str, Any]:
     if not isinstance(ami_id, str) or not re.fullmatch(r"ami-[0-9a-f]{8,32}", ami_id):
         raise ReleaseEvidenceError("task platform worker profile ami_id is invalid")
     instance_profile_name = raw.get("instance_profile_name")
-    if not isinstance(instance_profile_name, str) or not 1 <= len(instance_profile_name) <= 240:
+    if (
+        not isinstance(instance_profile_name, str)
+        or not instance_profile_name.strip()
+        or len(instance_profile_name) > 240
+    ):
         raise ReleaseEvidenceError("task platform worker profile instance_profile_name is invalid")
     role_arn = raw.get("role_arn")
     if (
@@ -306,7 +310,10 @@ def validate_task_platform_worker_profile(raw: Any) -> dict[str, Any]:
         values = raw.get(key)
         if not isinstance(values, list) or not 1 <= len(values) <= maximum:
             raise ReleaseEvidenceError(f"task platform worker profile {key} is invalid")
-        if any(not isinstance(item, str) for item in values):
+        if any(
+            not isinstance(item, str) or not item.strip() or len(item) > 4096
+            for item in values
+        ):
             raise ReleaseEvidenceError(f"task platform worker profile {key} is invalid")
     if any(re.fullmatch(r"subnet-[0-9a-f]+", item) is None for item in raw["subnet_ids"]):
         raise ReleaseEvidenceError("task platform worker profile subnet_ids is invalid")
