@@ -36,6 +36,20 @@ without making cloud calls:
 uv run pytest -q tests/unit/test_aws_manager_launcher.py
 ```
 
+Validate immutable release evidence and the authenticated health contract
+without making cloud calls:
+
+```bash
+uv run pytest -q tests/unit/test_release_evidence.py tests/unit/test_api.py tests/unit/test_api_auth.py
+```
+
+The release manifest verifier is deterministic and can also be exercised
+without pytest:
+
+```bash
+uv run python -c 'from elastic_agent.core.release_evidence import load_release_manifest; print(load_release_manifest()["release_digest"])'
+```
+
 These tests cover required environment-only configuration, secret-free
 settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
 Manager-role identity, local state/key permissions, systemd readiness/teardown
@@ -68,7 +82,8 @@ uv run pytest -q \
 bash -n scripts/build_golden_ami.sh
 ```
 
-After installing a production release at `/home/ubuntu/elastic-agent`, validate
+After installing a production release at its immutable revision directory,
+such as `/opt/task-platform/elastic-agent-e06ac35dedf4e876ab42ef2cf83161948c09cf87`, validate
 the shipped unit on that host with `systemd-analyze verify
 deploy/aws/elastic-agent-manager.service` before replacing the active unit.
 

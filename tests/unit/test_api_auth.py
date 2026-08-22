@@ -221,8 +221,21 @@ class TestAuthProtectsAllNodeEndpoints:
         assert resp.status_code == 401
 
 
-class TestHealthNoAuth:
+class TestHealthAuth:
     @pytest.mark.asyncio
-    async def test_health_is_public(self, client):
+    async def test_health_requires_auth(self, client):
         resp = await client.get("/api/health")
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_health_returns_release_evidence_with_auth(self, client):
+        resp = await client.get(
+            "/api/health",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
         assert resp.status_code == 200
+        assert {
+            "manager_state_schema",
+            "worker_profile_digest",
+            "release_digest",
+        } <= resp.json().keys()

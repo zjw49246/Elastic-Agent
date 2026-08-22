@@ -26,7 +26,7 @@
       "Effect": "Allow",
       "Action": "ec2:RunInstances",
       "Resource": [
-        "arn:aws:ec2:ap-northeast-1::image/ami-0aec7ffcbe44c6f7a",
+        "arn:aws:ec2:ap-northeast-1::image/ami-0c7d40ac988a900c5",
         "arn:aws:ec2:ap-northeast-1:297645381734:subnet/subnet-0c1db80817d054277",
         "arn:aws:ec2:ap-northeast-1:297645381734:security-group/sg-05c68220f901fb555",
         "arn:aws:ec2:ap-northeast-1:297645381734:key-pair/interview-key",

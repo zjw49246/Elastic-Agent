@@ -115,9 +115,9 @@ grep -F "\$nrconf{restart} = 'l';" \
   /etc/needrestart/conf.d/99-elastic-agent.conf
 ```
 
-## Current production promotion (2026-07-22)
+## Historical production promotion (2026-07-22)
 
-Tokyo production currently pins `ami-0aec7ffcbe44c6f7a`. It is a private,
+Tokyo production previously pinned `ami-0aec7ffcbe44c6f7a`. It is a private,
 self-owned x86_64/HVM/ENA image with IMDSv2 required. Its encrypted 20-GiB
 snapshot is `snap-095e5fef3ae78fce0`, using the account's EBS KMS key. Image
 tags record source commit `378398b`, Claude `2.1.181`, Codex `0.144.6`, and
@@ -144,3 +144,9 @@ It also predates `ubuntu-agent-docker-sandbox-v1`; that profile uses the complet
 package-install fallback and must pass its real Job-user bwrap probe. The next
 image should bake these packages so the profile can return to the verified fast
 path.
+
+The Task Platform release manifest now canonically pins
+`ami-0c7d40ac988a900c5`. Before rollout, independently repeat every provenance,
+encryption, tag, IAM-policy simulation, and canary check above for that exact
+AMI. The Manager launcher rejects the historical AMI because runtime settings,
+IAM image pin, and release manifest must move together.

@@ -26,6 +26,10 @@ from elastic_agent.core.providers.base import (
     InstanceNotFoundError,
     InstanceState,
 )
+from elastic_agent.core.release_evidence import (
+    ReleaseEvidenceError,
+    load_release_manifest,
+)
 from elastic_agent.core.reconciler import CloudReconciler
 from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
 from elastic_agent.core.task_registry import TaskRegistry
@@ -276,10 +280,18 @@ class ElasticAgentManager:
         self.connection_manager.on_disconnect = self._on_worker_disconnect
 
         self._started = False
+        # Populated only after the immutable release manifest passes validation
+        # during start().  Health never invents evidence for a failed startup.
+        self.release_evidence: dict[str, Any] | None = None
 
     async def start(self) -> None:
         if self._started:
             return
+        try:
+            release_evidence = await asyncio.to_thread(load_release_manifest)
+        except ReleaseEvidenceError:
+            logger.exception("Release evidence validation failed; refusing startup")
+            raise
         self._acquire_binding_leader_lock()
         self._shutdown_event.clear()
 
@@ -368,6 +380,10 @@ class ElasticAgentManager:
             # through the canonical single-Job idempotency boundary.
             await self.job_batch_queue.start()
 
+            # Publish health evidence only after every owned startup component
+            # has completed.  A partially initialized process must never look
+            # like a verified release to the platform.
+            self.release_evidence = release_evidence
             self._started = True
             logger.info("ElasticAgentManager started")
 
@@ -382,6 +398,7 @@ class ElasticAgentManager:
                 await self._await_owned_task(quiesce_task)
             finally:
                 self._started = False
+                self.release_evidence = None
                 self._release_binding_leader_lock()
             raise
 
@@ -391,6 +408,7 @@ class ElasticAgentManager:
             await self._await_owned_task(quiesce_task)
         finally:
             self._started = False
+            self.release_evidence = None
             self._release_binding_leader_lock()
         logger.info("ElasticAgentManager stopped")
 

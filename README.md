@@ -962,7 +962,10 @@ Manager instance profile supplies AWS credentials, while a mode-`0600` systemd
 
 ```text
 ELASTIC_AGENT_AWS_REGION
+ELASTIC_AGENT_AWS_ACCOUNT_ID
 ELASTIC_AGENT_AWS_AMI_ID
+ELASTIC_AGENT_RELEASE_REVISION
+ELASTIC_AGENT_RELEASE_MANIFEST
 ELASTIC_AGENT_AWS_INSTANCE_TYPE
 ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS
 ELASTIC_AGENT_AWS_SUBNET_ID
@@ -1025,6 +1028,15 @@ the initial password in source, EnvironmentFiles, JobSpec, or chat. The browser
 origin is pinned by `ELASTIC_AGENT_PUBLIC_ORIGIN` and must be a clean HTTPS
 origin. Worker `/ws/runtime` tokens and Job agent credentials remain separate
 machine/delegation trust boundaries.
+
+The immutable release includes `deploy/release-manifest.json`. Before touching
+state or AWS, the production launcher requires its Worker AMI, AWS account,
+Region, and release revision to match the runtime settings, and Manager startup
+revalidates the manifest before publishing health. Authenticated
+`GET /api/health` exposes the Task Platform evidence contract as three top-level,
+non-secret fields: `manager_state_schema` (`v1`), `worker_profile_digest`, and
+`release_digest` (both `sha256:<64 lowercase hex>`). See
+[`docs/operations/release-evidence.md`](docs/operations/release-evidence.md).
 
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,

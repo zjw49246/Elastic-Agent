@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,8 +22,9 @@ from deploy.aws_manager import (
 )
 from elastic_agent.api.auth import configured_public_origin, reset_management_auth
 from elastic_agent.core.management_auth import ManagementUserStore
+from elastic_agent.core.release_evidence import load_release_manifest
 
-CALLER_ACCOUNT = "123456789012"
+CALLER_ACCOUNT = "297645381734"
 SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
 AWS_ENV = (
     Path(__file__).resolve().parents[2]
@@ -44,10 +46,16 @@ IAM_CUTOVER = Path(__file__).resolve().parents[2] / "deploy/aws/iam-cutover.md"
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
+    manifest = load_release_manifest()
     return {
         "ELASTIC_AGENT_EXTERNAL_API_KEYS": "unit-test-secret",
-        "ELASTIC_AGENT_AWS_REGION": "ap-northeast-1",
-        "ELASTIC_AGENT_AWS_AMI_ID": "ami-0123456789abcdef0",
+        "ELASTIC_AGENT_AWS_REGION": manifest["worker_profile"]["region"],
+        "ELASTIC_AGENT_AWS_ACCOUNT_ID": manifest["worker_profile"]["aws_account_id"],
+        "ELASTIC_AGENT_AWS_AMI_ID": manifest["worker_profile"]["ami_id"],
+        "ELASTIC_AGENT_RELEASE_REVISION": manifest["release_revision"],
+        "ELASTIC_AGENT_RELEASE_MANIFEST": str(
+            Path(__file__).resolve().parents[2] / "deploy/release-manifest.json"
+        ),
         "ELASTIC_AGENT_AWS_INSTANCE_TYPE": "t3.large",
         "ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS": ("sg-0123456789abcdef0,sg-11111111111111111"),
         "ELASTIC_AGENT_AWS_SUBNET_ID": "subnet-0123456789abcdef0",
@@ -77,7 +85,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
 
 def _golden_image() -> dict:
     return {
-        "ImageId": "ami-0123456789abcdef0",
+        "ImageId": load_release_manifest()["worker_profile"]["ami_id"],
         "OwnerId": CALLER_ACCOUNT,
         "State": "available",
         "Architecture": "x86_64",
@@ -107,6 +115,13 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "AssertPathIsDirectory=/home/ubuntu/.elastic-agent-demo" in source
     assert "ReadWritePaths=/home/ubuntu/.elastic-agent-demo" in source
     assert "ExecStartPost=" in source and "/api/health" in source
+    assert "-H @-" in source
+    assert "ELASTIC_AGENT_EXTERNAL_API_KEYS" in source
+    assert (
+        "WorkingDirectory=/opt/task-platform/"
+        "elastic-agent-e06ac35dedf4e876ab42ef2cf83161948c09cf87"
+    ) in source
+    assert "/home/ubuntu/elastic-agent/.venv" not in source
     assert "TimeoutStopSec=32400" in source
     for setting in (
         "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
@@ -325,7 +340,9 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     config = build_config(settings)
 
     assert config.provider.type == "aws"
-    assert config.provider.aws.ami_id == "ami-0123456789abcdef0"
+    assert config.provider.aws.ami_id == "ami-0c7d40ac988a900c5"
+    assert settings.aws_account_id == "297645381734"
+    assert settings.release_revision == "e06ac35dedf4e876ab42ef2cf83161948c09cf87"
     assert config.provider.aws.security_group_ids == [
         "sg-0123456789abcdef0",
         "sg-11111111111111111",
@@ -364,6 +381,7 @@ def test_build_application_requires_enabled_admin_and_pins_public_origin(
             break_glass_used=False,
         ),
     )
+    monkeypatch.setattr("deploy.aws_manager.AWSProvider", lambda _config: object())
 
     with pytest.raises(LauncherConfigurationError, match="management user store"):
         build_application(settings)
@@ -381,11 +399,33 @@ def test_build_application_requires_enabled_admin_and_pins_public_origin(
         reset_management_auth()
 
 
+def test_build_application_rejects_legacy_ami_before_cloud_or_state_access(
+    tmp_path, monkeypatch
+):
+    settings = replace(
+        load_settings(_environment(tmp_path)),
+        ami_id="ami-0aec7ffcbe44c6f7a",
+    )
+    cloud_validation = pytest.fail
+    monkeypatch.setattr("deploy.aws_manager.validate_worker_ami", cloud_validation)
+
+    with pytest.raises(
+        LauncherConfigurationError,
+        match="release manifest does not match deployment settings",
+    ):
+        build_application(settings)
+
+    assert not settings.state_dir.exists()
+
+
 @pytest.mark.parametrize(
     "missing",
     [
         "ELASTIC_AGENT_EXTERNAL_API_KEYS",
+        "ELASTIC_AGENT_AWS_ACCOUNT_ID",
         "ELASTIC_AGENT_AWS_AMI_ID",
+        "ELASTIC_AGENT_RELEASE_REVISION",
+        "ELASTIC_AGENT_RELEASE_MANIFEST",
         "ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS",
         "ELASTIC_AGENT_AWS_SUBNET_ID",
         "ELASTIC_AGENT_AWS_KEY_PAIR_NAME",
@@ -656,6 +696,28 @@ def test_validate_worker_ami_requires_expected_manager_role(tmp_path):
             settings,
             ec2_client=_EC2Client([_golden_image()]),
             sts_client=_WrongRoleSTSClient(),
+        )
+
+
+class _WrongAccountSTSClient:
+    def get_caller_identity(self):
+        return {
+            "Account": "123456789012",
+            "Arn": (
+                "arn:aws:sts::123456789012:assumed-role/"
+                "elastic-agent-manager/i-0123456789abcdef0"
+            ),
+        }
+
+
+def test_validate_worker_ami_requires_manifest_account(tmp_path):
+    settings = load_settings(_environment(tmp_path))
+
+    with pytest.raises(LauncherConfigurationError, match="account does not match"):
+        validate_worker_ami(
+            settings,
+            ec2_client=_EC2Client([_golden_image()]),
+            sts_client=_WrongAccountSTSClient(),
         )
 
 

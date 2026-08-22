@@ -41,6 +41,13 @@ async def health() -> dict:
     from elastic_agent.api.app import get_manager
 
     mgr = get_manager()
+    evidence = getattr(mgr, "release_evidence", None)
+    if not getattr(mgr, "_started", False) or not isinstance(evidence, dict):
+        # A process that has not completed the fail-closed startup gate is not
+        # healthy, even if FastAPI itself is accepting connections.
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=503, detail="release evidence unavailable")
     revision = os.environ.get("ELASTIC_AGENT_RELEASE_REVISION", "")
     account_id = os.environ.get("ELASTIC_AGENT_AWS_ACCOUNT_ID", "")
     region = os.environ.get("ELASTIC_AGENT_AWS_REGION", "")
@@ -50,6 +57,9 @@ async def health() -> dict:
         "uptime_seconds": round(time.monotonic() - _start_time, 1),
         "worker_count": len(mgr.connection_manager.connected_workers),
         "provider": mgr.config.provider.type,
+        "manager_state_schema": evidence["manager_state_schema"],
+        "worker_profile_digest": evidence["worker_profile_digest"],
+        "release_digest": evidence["release_digest"],
         "revision": revision,
         "aws_account_id": account_id,
         "region": region,

@@ -75,7 +75,7 @@ export EA_MANAGER_ROLE=elastic-agent-manager
 export EA_MANAGER_PROFILE=elastic-agent-manager
 export EA_WORKER_ROLE=elastic-agent-worker
 export EA_RESULTS_BUCKET=elastic-agent-results-297645381734
-export FINAL_AMI_ID=ami-0aec7ffcbe44c6f7a
+export FINAL_AMI_ID=ami-0c7d40ac988a900c5
 export FINAL_WORKER_SECURITY_GROUP_ID=sg-05c68220f901fb555
 
 [[ "$FINAL_AMI_ID" =~ ^ami-[0-9a-f]{17}$ ]]

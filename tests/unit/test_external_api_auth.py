@@ -304,6 +304,6 @@ class TestEndpointProtection:
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_health_is_public(self, client):
+    async def test_health_requires_auth(self, client):
         resp = await client.get("/api/health")
-        assert resp.status_code == 200
+        assert resp.status_code == 401

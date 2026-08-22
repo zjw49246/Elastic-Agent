@@ -36,6 +36,11 @@ from elastic_agent.core.config import (
     WorkerConfig,
 )
 from elastic_agent.core.providers.aws import AWSProvider
+from elastic_agent.core.release_evidence import (
+    ReleaseEvidenceError,
+    load_release_manifest,
+    validate_deployment_context,
+)
 from elastic_agent.manager.manager import ElasticAgentManager
 
 logger = logging.getLogger(__name__)
@@ -83,7 +88,10 @@ class AWSManagerSettings:
     """Non-secret production settings loaded from the process environment."""
 
     region: str
+    aws_account_id: str
     ami_id: str
+    release_revision: str
+    release_manifest: Path
     instance_type: str
     worker_security_group_ids: tuple[str, ...]
     subnet_id: str
@@ -241,6 +249,14 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
     if not _REGION_RE.fullmatch(region):
         raise LauncherConfigurationError("ELASTIC_AGENT_AWS_REGION is invalid")
 
+    aws_account_id = _required(source, "ELASTIC_AGENT_AWS_ACCOUNT_ID")
+    if not re.fullmatch(r"\d{12}", aws_account_id):
+        raise LauncherConfigurationError("ELASTIC_AGENT_AWS_ACCOUNT_ID is invalid")
+
+    release_revision = _required(source, "ELASTIC_AGENT_RELEASE_REVISION")
+    if not re.fullmatch(r"[0-9a-f]{40}", release_revision):
+        raise LauncherConfigurationError("ELASTIC_AGENT_RELEASE_REVISION is invalid")
+
     ami_id = _required(source, "ELASTIC_AGENT_AWS_AMI_ID")
     if not _AWS_ID_RE.fullmatch(ami_id) or not ami_id.startswith("ami-"):
         raise LauncherConfigurationError("ELASTIC_AGENT_AWS_AMI_ID is invalid")
@@ -271,7 +287,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
 
     return AWSManagerSettings(
         region=region,
+        aws_account_id=aws_account_id,
         ami_id=ami_id,
+        release_revision=release_revision,
+        release_manifest=_absolute_path(source, "ELASTIC_AGENT_RELEASE_MANIFEST"),
         instance_type=_required(source, "ELASTIC_AGENT_AWS_INSTANCE_TYPE"),
         worker_security_group_ids=groups,
         subnet_id=subnet_id,
@@ -449,6 +468,10 @@ def validate_worker_ami(
     caller_account_id = str(identity.get("Account") or "")
     if not caller_account_id:
         raise LauncherConfigurationError("AWS caller identity has no account ID")
+    if caller_account_id != settings.aws_account_id:
+        raise LauncherConfigurationError(
+            "AWS caller identity account does not match deployment settings"
+        )
     caller_arn = str(identity.get("Arn") or "")
     expected_prefix = (
         f"arn:aws:sts::{caller_account_id}:assumed-role/"
@@ -468,6 +491,21 @@ def validate_worker_ami(
 def build_application(settings: AWSManagerSettings):
     """Validate startup invariants and create the ASGI application."""
 
+    try:
+        release_manifest = load_release_manifest(settings.release_manifest)
+        validate_deployment_context(
+            release_manifest,
+            {
+                "ami_id": settings.ami_id,
+                "region": settings.region,
+                "aws_account_id": settings.aws_account_id,
+                "release_revision": settings.release_revision,
+            },
+        )
+    except ReleaseEvidenceError as exc:
+        raise LauncherConfigurationError(
+            "release manifest does not match deployment settings"
+        ) from exc
     prepare_local_paths(settings)
     result = validate_worker_ami(settings)
     if result.break_glass_used:
