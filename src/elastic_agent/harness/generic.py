@@ -31,7 +31,6 @@ from elastic_agent.core.bootstrap_steps import (
     host_update_hardening_step,
     ipv4_only_egress_step,
     pty_install_step,
-    pty_refresh_step,
     runtime_deploy_step,
     system_init_step,
 )
@@ -231,9 +230,8 @@ def compile_bootstrap_steps(
     """
     if include_login_deps is None:
         include_login_deps = spec.account.mode == "worker_local_login"
-    # claude-pty and its health/refresh hooks host Claude Code only.  `include_pty`
-    # is a Manager-wide provisioning option, so silently narrowing it here keeps
-    # a Codex Job usable without installing or invoking Claude-only machinery.
+    # PTY is an unpublished Claude-only experiment. `include_pty` is narrowed to
+    # Claude jobs, but never installs or refreshes the optional dependency.
     include_claude_pty = include_pty and spec.account.agent_type == "claude"
     profile = spec.environment.manifest()
     common_packages = system_packages or list(profile["system_packages"])
@@ -297,7 +295,6 @@ def compile_bootstrap_steps(
         steps.extend(compile_job_setup_steps(spec, run_as=run_as))
 
     if include_claude_pty and not runtime_from_src:
-        steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
     return steps
 

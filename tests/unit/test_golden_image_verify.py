@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -46,7 +45,6 @@ def _manifest() -> dict:
                     "psutil": "7.2.2",
                 },
             },
-            "pty": {"commit": "d6ff732d633b8b7bdb3ada717ffd1cbc9e701163"},
         },
     }
 
@@ -163,17 +161,3 @@ def test_login_checks_chrome_system_and_python_dependencies(monkeypatch) -> None
     monkeypatch.setattr(golden.importlib, "import_module", lambda _name: None)
 
     golden.verify_login(_manifest(), ["httpx", "playwright"])
-
-
-def test_pty_requires_direct_url_commit_and_import(monkeypatch) -> None:
-    commit = "d6ff732d633b8b7bdb3ada717ffd1cbc9e701163"
-    dist = SimpleNamespace(
-        read_text=lambda name: json.dumps({"vcs_info": {"commit_id": commit}}) if name == "direct_url.json" else None,
-    )
-    monkeypatch.setattr(golden.metadata, "distribution", lambda _name: dist)
-    monkeypatch.setattr(golden.importlib, "import_module", lambda _name: None)
-
-    golden.verify_pty(_manifest(), commit)
-
-    with pytest.raises(golden.VerificationError, match="commit"):
-        golden.verify_pty(_manifest(), "a" * 40)

@@ -25,7 +25,6 @@ from typing import Any
 
 DEFAULT_MANIFEST = Path("/etc/elastic-agent/image-manifest.json")
 SCHEMA_VERSION = 1
-_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 _SYSTEM_COMMANDS = {
@@ -46,7 +45,6 @@ _SYSTEM_COMMANDS = {
 _IMPORT_NAMES = {
     "pydantic-settings": "pydantic_settings",
     "pyyaml": "yaml",
-    "claude-pty": "claude_pty",
 }
 
 
@@ -223,28 +221,6 @@ def verify_docker(manifest: dict[str, Any]) -> None:
     _command_output(["docker", "buildx", "version"])
 
 
-def verify_pty(manifest: dict[str, Any], expected_commit: str) -> None:
-    expected_commit = expected_commit.lower()
-    if not _COMMIT_RE.fullmatch(expected_commit):
-        raise VerificationError("claude-pty expected commit must be a full SHA-1")
-    pty = _component(manifest, "pty")
-    if str(pty.get("commit", "")).lower() != expected_commit:
-        raise VerificationError("manifest claude-pty commit does not match requested commit")
-    try:
-        dist = metadata.distribution("claude-pty")
-        direct_url_text = dist.read_text("direct_url.json")
-        direct_url = json.loads(direct_url_text or "{}")
-    except (metadata.PackageNotFoundError, json.JSONDecodeError, OSError) as exc:
-        raise VerificationError(f"cannot inspect installed claude-pty: {exc}") from exc
-    actual = str(direct_url.get("vcs_info", {}).get("commit_id", "")).lower()
-    if actual != expected_commit:
-        raise VerificationError(f"installed claude-pty commit mismatch: expected {expected_commit}, got {actual}")
-    try:
-        importlib.import_module("claude_pty")
-    except Exception as exc:  # noqa: BLE001
-        raise VerificationError(f"cannot import claude_pty: {exc}") from exc
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
@@ -260,8 +236,6 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("docker")
     python = commands.add_parser("python")
     python.add_argument("requirements", nargs="+")
-    pty = commands.add_parser("pty")
-    pty.add_argument("commit")
     return parser
 
 
@@ -279,8 +253,6 @@ def main(argv: list[str] | None = None) -> int:
             verify_docker(manifest)
         elif args.component == "python":
             verify_python(manifest, args.requirements)
-        elif args.component == "pty":
-            verify_pty(manifest, args.commit)
     except VerificationError as exc:
         print(f"golden image verification failed: {exc}", file=sys.stderr)
         return 1

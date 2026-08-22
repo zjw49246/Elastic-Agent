@@ -41,7 +41,7 @@ class TestBootstrapSteps:
             spec, manager_url="u", auth_token="t", worker_id="w", include_pty=True,
         )]
         # Every framework APT path and host hardening must finish before the
-        # runtime starts; refresh/health still patch the resulting unit.
+        # runtime starts; only the CLI health hook patches the resulting unit.
         assert names.index("credential-login-deps") < names.index(
             "host-update-hardening"
         )
@@ -49,7 +49,8 @@ class TestBootstrapSteps:
             "runtime-deploy"
         )
         assert names.index("harness-code") > names.index("runtime-deploy")
-        assert names.index("pty-refresh-hook") > names.index("harness-code")
+        assert "pty-refresh-hook" not in names
+        assert names.index("claude-cli-health-hook") > names.index("harness-code")
         assert "credential-login-deps" in names  # auto-enabled for worker_local_login
 
     def test_no_framework_apt_install_runs_after_runtime_deploy(self):

@@ -252,6 +252,14 @@ def _exec_msg(**kw):
     return ExecuteMessage(**defaults)
 
 
+@pytest.fixture
+def force_pty_available(monkeypatch):
+    import elastic_agent.worker.pty_backend as pb
+
+    monkeypatch.setattr(pb, "PTY_AVAILABLE", True)
+
+
+@pytest.mark.usefixtures("force_pty_available")
 class TestRuntimePTYDispatch:
     @pytest.mark.asyncio
     async def test_agent_params_routes_to_pty(self, runtime):
@@ -411,6 +419,7 @@ class TestRuntimePTYDispatch:
         runtime._send_event = AsyncMock()
         await runtime._handle_execute(_exec_msg(agent_params={"prompt": "hi"}))
         assert len(spawned) == 1
+        assert spawned[0] == ("claude", "-p", "hi")
 
     @pytest.mark.asyncio
     async def test_duplicate_pty_task_rejected(self, runtime):
@@ -844,7 +853,8 @@ class TestPTYBootstrap:
     def test_pty_install_step(self):
         step = pty_install_step()
         assert step.name == "pty-install"
-        assert "Claude-Code-PTY" in step.command
+        assert "import claude_pty" in step.command
+        assert "pip3 install" not in step.command
 
     def test_default_steps_exclude_pty(self):
         steps = build_default_bootstrap_steps("ws://m", "tok", "w1")
@@ -856,14 +866,11 @@ class TestPTYBootstrap:
         assert "pty-install" in names
         assert names.index("pty-install") < names.index("runtime-deploy")
 
-    def test_include_pty_appends_refresh_hook(self):
-        # resume_node skips bootstrap, so the worker needs a self-refresh hook
+    def test_include_pty_does_not_append_refresh_hook(self):
         steps = build_default_bootstrap_steps("ws://m", "tok", "w1", include_pty=True)
         names = [s.name for s in steps]
-        assert "pty-refresh-hook" in names
+        assert "pty-refresh-hook" not in names
         assert "claude-cli-health-hook" in names
-        # must run after runtime-deploy writes the unit it drops into
-        assert names.index("pty-refresh-hook") > names.index("runtime-deploy")
         assert names.index("claude-cli-health-hook") > names.index("runtime-deploy")
 
     def test_default_steps_exclude_refresh_hook(self):
@@ -874,18 +881,12 @@ class TestPTYBootstrap:
         from elastic_agent.core.bootstrap_steps import pty_refresh_step
 
         step = pty_refresh_step()
-        # script compares installed direct_url commit vs upstream main HEAD
-        assert "direct_url.json" in step.command
-        assert "ls-remote" in step.command
-        assert "refs/heads/main" in step.command
-        assert "--force-reinstall" in step.command
-        # ExecStartPre with `-`: refresh failure must not block runtime start
+        assert "import claude_pty" in step.command
+        assert "ls-remote" not in step.command
+        assert "pip3 install" not in step.command
         assert "ExecStartPre=-/bin/bash /usr/local/bin/claude-pty-refresh.sh" in step.command
         assert "10-pty-refresh.conf" in step.command
         assert "daemon-reload" in step.command
-        # repo URL is templated in, no leftover placeholder
-        assert "{pty_repo_url}" not in step.command
-        assert "Claude-Code-PTY" in step.command
 
     def test_claude_cli_health_step_content(self):
         from elastic_agent.core.bootstrap_steps import claude_cli_health_step
@@ -917,8 +918,8 @@ class TestPTYBootstrap:
     def test_pty_refresh_step_custom_repo(self):
         from elastic_agent.core.bootstrap_steps import pty_refresh_step
 
-        step = pty_refresh_step(pty_repo_url="https://example.com/fork")
-        assert 'URL="https://example.com/fork"' in step.command
+        with pytest.raises(ValueError, match="disabled"):
+            pty_refresh_step(pty_repo_url="https://example.com/fork")
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1141,7 @@ class TestResponseTimeoutPlumbing:
         assert config.response_timeout == 7200.0
 
 
+@pytest.mark.usefixtures("force_pty_available")
 class TestRuntimePassesResponseTimeout:
     @pytest.mark.asyncio
     async def test_msg_timeout_becomes_response_timeout(self, runtime):
@@ -1176,6 +1178,7 @@ class TestRuntimePassesResponseTimeout:
         assert runtime._pty_timeouts == {}
 
 
+@pytest.mark.usefixtures("force_pty_available")
 class TestRootSandboxEnv:
     @pytest.mark.asyncio
     async def test_root_gets_is_sandbox(self, runtime, monkeypatch):

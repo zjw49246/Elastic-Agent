@@ -550,11 +550,6 @@ wheels = [
 ]
 
 [[package]]
-name = "claude-pty"
-version = "0.1.0"
-source = { git = "https://github.com/zjw49246/Claude-Code-PTY#7d5a0e5b2192e248e36fc840a5418b773a4560ec" }
-
-[[package]]
 name = "click"
 version = "8.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -782,7 +777,6 @@ all = [
     { name = "alibabacloud-ecs20140526" },
     { name = "alibabacloud-tea-openapi" },
     { name = "boto3" },
-    { name = "claude-pty" },
     { name = "oss2" },
     { name = "watchdog" },
 ]
@@ -796,9 +790,6 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
-pty = [
-    { name = "claude-pty" },
-]
 worker = [
     { name = "oss2" },
     { name = "watchdog" },
@@ -811,8 +802,7 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1.0" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
     { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.35.0" },
-    { name = "claude-pty", marker = "extra == 'pty'", git = "https://github.com/zjw49246/Claude-Code-PTY" },
-    { name = "elastic-agent", extras = ["aliyun", "aws", "worker", "pty"], marker = "extra == 'all'" },
+    { name = "elastic-agent", extras = ["aliyun", "aws", "worker"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "oss2", marker = "extra == 'worker'", specifier = ">=2.18.0" },
@@ -827,7 +817,7 @@ requires-dist = [
     { name = "watchdog", marker = "extra == 'worker'", specifier = ">=5.0.0" },
     { name = "websockets", specifier = ">=13.0" },
 ]
-provides-extras = ["aliyun", "aws", "worker", "pty", "all", "dev"]
+provides-extras = ["aliyun", "aws", "worker", "all", "dev"]
 
 [[package]]
 name = "fastapi"

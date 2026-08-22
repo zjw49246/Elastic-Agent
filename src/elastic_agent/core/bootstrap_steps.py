@@ -6,7 +6,6 @@ to form a complete bootstrap pipeline.
 
 from __future__ import annotations
 
-import re
 import shlex
 from typing import Literal
 
@@ -545,70 +544,51 @@ def credential_login_deps_step(
 
 
 def pty_install_step(
-    pty_package: str = "git+https://github.com/zjw49246/Claude-Code-PTY.git",
+    pty_package: str | None = None,
     timeout: int = 300,
 ) -> BootstrapStep:
-    """Install claude-pty so the Worker can host agents in PTY sessions."""
-    fallback = (
-        "pip3 install -q --break-system-packages "
-        f"{shlex.quote(pty_package)}"
+    """Detect an externally provisioned experimental PTY capability.
+
+    Production does not install ``claude-pty``: the audited upstream revision
+    has no distributable license. Runtime safely uses the command subprocess
+    fallback when the import is unavailable.
+    """
+    if pty_package:
+        raise ValueError("external claude-pty package installation is disabled")
+    command = (
+        "if python3 -c 'import claude_pty' >/dev/null 2>&1; then "
+        "echo 'experimental claude-pty capability available'; else "
+        "echo 'claude-pty unavailable; Runtime will use subprocess fallback'; fi"
     )
-    # An unpinned branch cannot safely use a baked commit: upstream may have
-    # advanced since image creation.  Only a full commit in the requested VCS
-    # URL is eligible for the offline fast path.
-    match = re.search(r"(?:@|#)([0-9a-fA-F]{40})(?:$|[&#])", pty_package)
-    command = fallback
-    if match:
-        commit = match.group(1).lower()
-        command = _golden_fast_path(
-            "pty", [commit], "golden image claude-pty commit verified", fallback,
-        )
     return BootstrapStep(
         name="pty-install",
         command=command,
         timeout=timeout,
         retry_count=1,
-        description="Install claude-pty for PTY-hosted agent execution",
+        description="Detect separately provisioned experimental PTY capability",
     )
 
 
 PTY_REFRESH_SCRIPT_PATH = "/usr/local/bin/claude-pty-refresh.sh"
 CLAUDE_CLI_HEALTH_SCRIPT_PATH = "/usr/local/bin/claude-cli-healthcheck.sh"
 
-# Worker-side mechanical dep sync (CCM refresh_pty.sh pattern): on every runtime
-# start — including resume of a stopped instance, which skips bootstrap — compare
-# the installed claude-pty commit against the upstream main HEAD and reinstall if
-# behind. Offline / failure keeps the current install (ExecStartPre uses `-`).
+# Compatibility stub for callers that still compose this step. It is strictly
+# local-only and never refreshes optional PTY code from an upstream branch.
 PTY_REFRESH_SCRIPT = """#!/bin/bash
 set -u
-export HOME="${HOME:-/root}"
-export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
-URL="{pty_repo_url}"
-INSTALLED=$(python3 - <<'PYEOF'
-import glob, json
-g = glob.glob('/usr/local/lib/python3*/dist-packages/claude_pty-*.dist-info/direct_url.json')
-print(json.load(open(g[0]))['vcs_info']['commit_id'] if g else '')
-PYEOF
-)
-REMOTE=$(git ls-remote "$URL" refs/heads/main 2>/dev/null | awk '{print $1}')
-[ -z "$REMOTE" ] && exit 0
-if [ "$INSTALLED" != "$REMOTE" ]; then
-  echo "claude-pty: $INSTALLED -> $REMOTE"
-  pip3 install -q --break-system-packages --force-reinstall --no-deps "git+$URL@$REMOTE" || exit 0
-fi
+python3 -c 'import claude_pty' >/dev/null 2>&1 || exit 0
+echo "experimental claude-pty capability available; no automatic refresh performed"
 """
 
 
 def pty_refresh_step(
-    pty_repo_url: str = "https://github.com/zjw49246/Claude-Code-PTY",
+    pty_repo_url: str | None = None,
     timeout: int = 60,
 ) -> BootstrapStep:
-    """Install the claude-pty refresh hook: script + ExecStartPre drop-in.
-
-    Closes the resume_node gap — started-from-stopped instances never
-    re-bootstrap, so without this they run a stale claude-pty forever.
-    """
-    script = PTY_REFRESH_SCRIPT.replace("{pty_repo_url}", pty_repo_url)
+    """Install a local-only PTY capability check; never fetch or reinstall."""
+    if pty_repo_url:
+        raise ValueError("remote claude-pty refresh is disabled")
+    script = PTY_REFRESH_SCRIPT
     cmd = (
         f"cat > {PTY_REFRESH_SCRIPT_PATH} << 'REFRESH'\n"
         f"{script}"
@@ -626,7 +606,7 @@ def pty_refresh_step(
         command=cmd,
         timeout=timeout,
         retry_count=1,
-        description="Install claude-pty auto-refresh on runtime start (mechanical dep sync)",
+        description="Check experimental PTY capability without network access",
     )
 
 
@@ -730,7 +710,5 @@ def build_default_bootstrap_steps(
         harness_code_step(repo_url=repo_url),
     ])
     if include_pty:
-        # refresh hook must land after runtime_deploy_step writes the unit
-        steps.append(pty_refresh_step())
         steps.append(claude_cli_health_step())
     return steps

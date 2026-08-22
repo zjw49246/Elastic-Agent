@@ -44,8 +44,10 @@ def test_builder_installs_verifier_and_writes_manifest_schema() -> None:
     assert "/usr/local/bin/elastic-agent-image-verify" in source
     assert "/etc/elastic-agent/image-manifest.json" in source
     assert '"schema_version": 1' in source
-    for component in ("system", "agents", "login", "docker", "runtime", "pty"):
+    for component in ("system", "agents", "login", "docker", "runtime"):
         assert f'"{component}"' in source
+    assert "Claude-Code-PTY" not in source
+    assert "ClaudePtyCommit" not in source
 
 
 def test_builder_declares_docker_sandbox_profile_dependencies() -> None:

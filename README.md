@@ -20,7 +20,7 @@ Elastic-Agent is a Python library that provides:
   receive the high-priority `delivery_manuscript` role
 - **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
-- **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
+- **PTY-hosted execution** (unpublished experiment) — when an authorized external environment supplies claude-pty, Workers can host persistent sessions; production uses the subprocess path
 
 ## Usage
 
@@ -49,7 +49,7 @@ surface as non-zero exits, so credential rotation keeps working unchanged.
 
 Enable in three places:
 
-1. **Bootstrap** — install claude-pty on Workers:
+1. **Bootstrap** — detect a separately provisioned experimental capability:
    `build_default_bootstrap_steps(..., include_pty=True)`
 2. **Manager** — attach structured launch params to EXECUTE messages:
    `TaskRouter(..., agent_type=ClaudeCodeAgentType(), use_pty=True)`
@@ -63,8 +63,10 @@ session, the prompt is injected into the warm session as a new turn — no
 process respawn, no cold `--resume` (verified: ~3x faster turnaround).
 A STOP tears the session down; the next resume is cold.
 
-The lock currently pins claude-pty commit `7d5a0e5` (cross-host inject
-isolation plus cancellation-safe Session publication and cleanup).
+Production does not declare, download, refresh, or bake claude-pty. The audited
+upstream revision did not provide a distributable license, so PTY support is an
+unpublished experiment only. When the module is absent, `agent_params` does not
+discard the command: Runtime executes the supplied subprocess fallback.
 
 Credential rotation: account swaps are in-place (new tokens written into the
 same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
@@ -1064,7 +1066,7 @@ EC2 instance types require explicit policy allow-list updates.
 ## Development
 
 ```bash
-uv sync --extra dev --extra pty
+uv sync --extra dev
 uv run pytest -q
 ```
 

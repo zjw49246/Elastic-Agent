@@ -33,7 +33,7 @@ Run `--help` for all options. The script:
 2. installs version-pinned dependencies and reboots once;
 3. disables and masks background APT/unattended-upgrade units, makes
    `needrestart` report-only, and validates that policy after reboot;
-4. validates every command, import, CLI version, and claude-pty commit;
+4. validates every declared command, import, and CLI version;
 5. removes account/browser/cloud credentials, runtime tokens, logs, host keys,
    machine identity, and caches;
 6. stops the builder, creates an AMI from its encrypted volume, tags both the
@@ -56,8 +56,8 @@ The build writes `/etc/elastic-agent/image-manifest.json` (schema 1) and install
 when the requested component is present in the manifest and the live machine
 still exactly matches it. Checks include dpkg versions and commands, agent CLI
 versions, Python distribution versions and imports, Chrome, Docker/buildx, and
-the VCS commit in claude-pty's `direct_url.json`. A missing verifier, corrupt or
-stale manifest, package drift, failed command/import, or unpinned PTY URL runs
+the declared package versions. A missing verifier, corrupt or stale manifest,
+package drift, or failed command/import runs
 the complete existing apt/npm/pip fallback.
 
 For the sandbox profile, image verification checks the Bubblewrap package and
@@ -98,7 +98,7 @@ calls are denied. Already-running workers are unaffected. After a second golden
 build exists, retain at least two known-good versions for 7–14 days before
 deregistering an old AMI and deleting its snapshot.
 
-Rebuild whenever the base OS security image, pinned Claude/Codex/claude-pty,
+Rebuild whenever the base OS security image, pinned Claude/Codex,
 Chrome, Docker, Node, or Python dependency set changes. The manifest and image
 tags retain the source AMI, source commit, build timestamp, and build-tree hash.
 
@@ -120,9 +120,10 @@ grep -F "\$nrconf{restart} = 'l';" \
 Tokyo production previously pinned `ami-0aec7ffcbe44c6f7a`. It is a private,
 self-owned x86_64/HVM/ENA image with IMDSv2 required. Its encrypted 20-GiB
 snapshot is `snap-095e5fef3ae78fce0`, using the account's EBS KMS key. Image
-tags record source commit `378398b`, Claude `2.1.181`, Codex `0.144.6`, and
-claude-pty commit `d6ff732`; the disposable builder was terminated after the
-snapshot became available.
+tags record source commit `378398b`, Claude `2.1.181`, and Codex `0.144.6`.
+That historical image also contained an experimental claude-pty commit, but it
+is not a current production artifact and must not be reused or promoted. The
+disposable builder was terminated after the snapshot became available.
 
 This is the first retained golden version. Until its successor is built and
 promoted, the Canonical base image is break glass rather than a second golden:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from elastic_agent.core.bootstrap_steps import (
     agent_install_step,
     build_default_bootstrap_steps,
@@ -326,19 +328,13 @@ class TestDockerInstallStep:
 
 
 class TestPtyInstallStep:
-    def test_pinned_git_commit_can_use_golden_fast_path(self) -> None:
-        commit = "d6ff732d633b8b7bdb3ada717ffd1cbc9e701163"
-        step = pty_install_step(
-            f"git+https://github.com/zjw49246/Claude-Code-PTY@{commit}"
-        )
+    def test_production_step_only_detects_experimental_capability(self) -> None:
+        step = pty_install_step()
 
-        assert f"elastic-agent-image-verify pty {commit}" in step.command
-        assert "pip3 install" in step.command
+        assert "import claude_pty" in step.command
+        assert "pip3 install" not in step.command
+        assert "git" not in step.command
 
-    def test_unpinned_git_source_always_uses_install_fallback(self) -> None:
-        step = pty_install_step(
-            "git+https://github.com/zjw49246/Claude-Code-PTY.git"
-        )
-
-        assert "elastic-agent-image-verify pty" not in step.command
-        assert "pip3 install" in step.command
+    def test_external_package_install_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="disabled"):
+            pty_install_step("git+https://example.com/unlicensed.git")

@@ -35,7 +35,6 @@ IMAGE_WAIT_SECONDS=15
 
 CLAUDE_VERSION="2.1.181"
 CODEX_VERSION="0.144.6"
-PTY_COMMIT="7d5a0e5b2192e248e36fc840a5418b773a4560ec"
 CHROME_VERSION="150.0.7871.181-1"
 CHROME_SHA256="fec50905f7b1235a440977a833476e0162874f5ca79e506cdf40b71af64d92f4"
 CHROME_URL="https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_150.0.7871.181-1_amd64.deb"
@@ -259,7 +258,7 @@ ssh "${SSH_OPTS[@]}" "$SSH_USER@$BUILDER_HOST" \
   sudo bash -s -- \
   "$BASE_AMI" "$SOURCE_COMMIT" "$BUILD_TREE_SHA256" "$BUILD_TIMESTAMP" \
   "$IMAGE_PROFILE" "$RUNTIME_USER" "$CLAUDE_VERSION" "$CODEX_VERSION" \
-  "$PTY_COMMIT" "$CHROME_VERSION" "$CHROME_SHA256" "$CHROME_URL" \
+  "$CHROME_VERSION" "$CHROME_SHA256" "$CHROME_URL" \
   "$UV_VERSION" "$PLAYWRIGHT_VERSION" "$PSUTIL_VERSION" <<'REMOTE_BUILD'
 set -Eeuo pipefail
 BASE_AMI=$1
@@ -270,8 +269,7 @@ IMAGE_PROFILE=$5
 RUNTIME_USER=$6
 CLAUDE_VERSION=$7
 CODEX_VERSION=$8
-PTY_COMMIT=$9
-shift 9
+shift 8
 CHROME_VERSION=$1
 CHROME_SHA256=$2
 CHROME_URL=$3
@@ -343,9 +341,6 @@ pip3 install -q --break-system-packages \
   "websockets==16.0" "httpx==0.28.1" "pyyaml==6.0.3" \
   "psutil==$PSUTIL_VERSION" "playwright==$PLAYWRIGHT_VERSION" \
   "uv==$UV_VERSION"
-pip3 install -q --break-system-packages --force-reinstall --no-deps \
-  "git+https://github.com/zjw49246/Claude-Code-PTY@$PTY_COMMIT"
-
 install -o root -g root -m 0755 /tmp/elastic-agent-image-verify \
   /usr/local/bin/elastic-agent-image-verify
 rm -f /tmp/elastic-agent-image-verify
@@ -353,7 +348,7 @@ usermod -aG docker "$RUNTIME_USER"
 
 python3 - "$BASE_AMI" "$SOURCE_COMMIT" "$BUILD_TREE_SHA256" \
   "$BUILD_TIMESTAMP" "$IMAGE_PROFILE" "$CLAUDE_VERSION" "$CODEX_VERSION" \
-  "$PTY_COMMIT" "$CHROME_VERSION" <<'PY'
+  "$CHROME_VERSION" <<'PY'
 import importlib.metadata as metadata
 import json
 import subprocess
@@ -361,7 +356,7 @@ import sys
 from pathlib import Path
 
 (base_ami, source_commit, tree_hash, built_at, profile, claude_version,
- codex_version, pty_commit, chrome_version) = sys.argv[1:]
+ codex_version, chrome_version) = sys.argv[1:]
 
 def dpkg(name):
     return subprocess.check_output(
@@ -400,7 +395,6 @@ manifest = {
             },
         },
         "runtime": {"python_packages": {name: metadata.version(name) for name in runtime}},
-        "pty": {"commit": pty_commit},
     },
 }
 path = Path("/etc/elastic-agent/image-manifest.json")
@@ -429,12 +423,11 @@ ssh "${SSH_OPTS[@]}" "$SSH_USER@$BUILDER_HOST" true \
 
 log "validating every baked fast-path component"
 ssh "${SSH_OPTS[@]}" "$SSH_USER@$BUILDER_HOST" sudo bash -s -- \
-  "$CLAUDE_VERSION" "$CODEX_VERSION" "$PTY_COMMIT" "$SSH_USER" <<'REMOTE_VERIFY'
+  "$CLAUDE_VERSION" "$CODEX_VERSION" "$SSH_USER" <<'REMOTE_VERIFY'
 set -Eeuo pipefail
 CLAUDE_VERSION=$1
 CODEX_VERSION=$2
-PTY_COMMIT=$3
-SSH_USER=$4
+SSH_USER=$3
 V=/usr/local/bin/elastic-agent-image-verify
 $V system python3 python3-pip git curl rsync nodejs npm python3-venv bubblewrap util-linux
 $V agent claude "$CLAUDE_VERSION"
@@ -442,7 +435,6 @@ $V agent codex "$CODEX_VERSION"
 $V login httpx websockets playwright
 $V docker
 $V python pydantic pydantic-settings websockets httpx psutil
-$V pty "$PTY_COMMIT"
 aws --version
 uv --version
 
@@ -524,10 +516,9 @@ aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$BUILDER_ID"
 
 TAG_SPEC=$(python3 - \
   "$IMAGE_NAME" "$BASE_AMI" "$SOURCE_COMMIT" "$BUILD_TREE_SHA256" \
-  "$BUILD_TIMESTAMP" "$IMAGE_PROFILE" "$CLAUDE_VERSION" "$CODEX_VERSION" \
-  "$PTY_COMMIT" <<'PY'
+  "$BUILD_TIMESTAMP" "$IMAGE_PROFILE" "$CLAUDE_VERSION" "$CODEX_VERSION" <<'PY'
 import json, sys
-(name, base, commit, tree_hash, built_at, profile, claude, codex, pty) = sys.argv[1:]
+(name, base, commit, tree_hash, built_at, profile, claude, codex) = sys.argv[1:]
 tags = [
     {"Key": "Name", "Value": name},
     {"Key": "ManagedBy", "Value": "elastic-agent"},
@@ -540,7 +531,6 @@ tags = [
     {"Key": "BuildTimestamp", "Value": built_at},
     {"Key": "ClaudeVersion", "Value": claude},
     {"Key": "CodexVersion", "Value": codex},
-    {"Key": "ClaudePtyCommit", "Value": pty},
 ]
 print(json.dumps([
     {"ResourceType": "image", "Tags": tags},
