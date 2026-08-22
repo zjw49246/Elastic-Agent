@@ -281,7 +281,13 @@ class TestRuntimePTYDispatch:
         assert "t1:abc" in runtime.active_processes
 
     @pytest.mark.asyncio
-    async def test_config_dir_falls_back_to_env(self, runtime):
+    async def test_config_dir_falls_back_to_env(self, runtime, monkeypatch):
+        # The production worker runs as root and intentionally injects
+        # IS_SANDBOX=1 for unattended Claude launches.  This dispatch test is
+        # about consuming CLAUDE_CONFIG_DIR and filtering that variable, so
+        # pin the simulated worker to a non-root uid rather than inheriting
+        # the uid of the test runner (Linux CI may execute tests as root).
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
         fake = _FakeBackend()
         runtime._pty_backend = fake
         msg = _exec_msg(
