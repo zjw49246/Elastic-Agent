@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+*.egg
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Local dev/demo launchers + worktrees (env-specific, may hold tokens — never commit)
+.claude-manager/

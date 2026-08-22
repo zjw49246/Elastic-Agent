@@ -1,0 +1,254 @@
+"""Tests for AccountStore (frontend-editable account pool)."""
+
+from __future__ import annotations
+
+import json
+import stat
+
+import pytest
+
+from elastic_agent.api.routes.accounts import AccountRequest
+from elastic_agent.core.account_store import AccountStore, AccountStoreCorruptError
+from elastic_agent.core.credential_pool import AccountDefinition, AccountsConfig
+
+pytestmark = pytest.mark.asyncio
+
+
+def _store(tmp_path):
+    return AccountStore(str(tmp_path / "accounts.json"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "bad\nid"),
+        ("id", "x" * 129),
+        ("email", "x" * 321),
+        ("group", "bad\x7fgroup"),
+        ("group", "x" * 101),
+        ("email_token", "x" * (16 * 1024 + 1)),
+        ("password", "x" * (16 * 1024 + 1)),
+    ],
+)
+async def test_account_definition_rejects_oversized_or_unsafe_fields(
+    field, value,
+):
+    payload = {"id": "a", "email": "a@example.com", field: value}
+    with pytest.raises(ValueError):
+        AccountDefinition(**payload)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [AccountRequest, AccountDefinition],
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("email", "user\u0085name@example.com"),
+        ("email", "user\ud800name@example.com"),
+        ("group", "research\u009fgroup"),
+        ("group", "research\u2028group"),
+    ],
+)
+async def test_api_and_persistent_identity_models_reject_nonprintable_unicode(
+    model, field, value,
+):
+    payload = {"id": "safe-id", "email": "safe@example.com", field: value}
+
+    with pytest.raises(ValueError):
+        model(**payload)
+
+
+@pytest.mark.parametrize("model", [AccountRequest, AccountDefinition])
+async def test_api_and_persistent_identity_models_allow_trimmed_internal_spaces(
+    model,
+):
+    account = model(
+        id=" safe-id ",
+        email=" First Last <user@example.com> ",
+        group=" apex research ",
+    )
+
+    assert account.id == "safe-id"
+    assert account.email == "First Last <user@example.com>"
+    assert account.group == "apex research"
+
+
+async def test_empty_initially(tmp_path):
+    assert await _store(tmp_path).list() == []
+
+
+async def test_add_and_list(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(
+        id="a",
+        email="a@x.com",
+        email_token="t",
+        password="secret-password",
+        agent_type="codex",
+        group="prod",
+    ))
+    accts = await s.list()
+    assert len(accts) == 1
+    assert accts[0].id == "a"
+    assert accts[0].agent_type == "codex"
+    assert accts[0].password == "secret-password"
+    assert accts[0].group == "prod"
+
+
+async def test_add_persists_to_disk_compatible_with_pool(tmp_path):
+    path = tmp_path / "accounts.json"
+    s = AccountStore(str(path))
+    await s.add(AccountDefinition(id="a", email="a@x.com"))
+    # File is readable as AccountsConfig (same schema CredentialPool loads).
+    raw = json.loads(path.read_text())
+    cfg = AccountsConfig.model_validate(raw)
+    assert cfg.accounts[0].id == "a"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+async def test_load_tightens_legacy_account_file_permissions(tmp_path):
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({
+        "accounts": [{
+            "id": "a", "email": "a@x.com", "email_token": "secret"
+        }],
+        "groups": {},
+    }), encoding="utf-8")
+    path.chmod(0o644)
+
+    await AccountStore(str(path)).load()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+async def test_upsert_replaces_by_id(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(id="a", email="one@x.com"))
+    await s.add(AccountDefinition(id="a", email="two@x.com"))
+    accts = await s.list()
+    assert len(accts) == 1
+    assert accts[0].email == "two@x.com"
+
+
+async def test_same_email_cannot_be_registered_under_two_ids(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(id="a", email="User@Example.com"))
+    with pytest.raises(ValueError, match="already account"):
+        await s.add(AccountDefinition(id="b", email="user@example.COM"))
+    assert [account.id for account in await s.list()] == ["a"]
+
+
+async def test_same_email_may_identify_one_account_per_agent_type(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(
+        id="claude-a", email="User@Example.com", agent_type="claude"
+    ))
+    await s.add(AccountDefinition(
+        id="codex-a", email="user@example.COM", agent_type="codex",
+        password="openai-password",
+    ))
+
+    accounts = await s.list()
+    assert [(account.id, account.agent_type) for account in accounts] == [
+        ("claude-a", "claude"),
+        ("codex-a", "codex"),
+    ]
+
+
+async def test_codex_account_accepts_email_token_without_password(tmp_path):
+    account = AccountDefinition(
+        id="codex-a",
+        email="user@example.com",
+        agent_type="codex",
+        email_token="mail-query-token",
+    )
+
+    assert account.email_token == "mail-query-token"
+    assert account.password == ""
+
+
+async def test_codex_account_requires_email_token_or_password(tmp_path):
+    with pytest.raises(ValueError, match="email token or OpenAI password"):
+        AccountDefinition(
+            id="codex-a", email="user@example.com", agent_type="codex"
+        )
+
+    with pytest.raises(ValueError, match="email token or OpenAI password"):
+        AccountDefinition(
+            id="codex-a",
+            email="user@example.com",
+            agent_type="codex",
+            email_token="   ",
+        )
+
+
+async def test_duplicate_email_for_same_agent_type_on_disk_fails_closed(tmp_path):
+    path = tmp_path / "accounts.json"
+    source = json.dumps({
+        "accounts": [
+            {"id": "a", "email": "same@example.com", "agent_type": "codex", "password": "p1"},
+            {"id": "b", "email": "SAME@example.com", "agent_type": "codex", "password": "p2"},
+        ],
+        "groups": {},
+    })
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AccountStoreCorruptError, match="account store is corrupt"):
+        await AccountStore(str(path)).load()
+    assert path.read_text(encoding="utf-8") == source
+
+
+async def test_duplicate_email_on_disk_fails_closed(tmp_path):
+    path = tmp_path / "accounts.json"
+    source = json.dumps({
+        "accounts": [
+            {"id": "a", "email": "same@example.com"},
+            {"id": "b", "email": "SAME@example.com"},
+        ],
+        "groups": {},
+    })
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AccountStoreCorruptError, match="account store is corrupt"):
+        await AccountStore(str(path)).load()
+    assert path.read_text(encoding="utf-8") == source
+
+
+async def test_get(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(id="a", email="a@x.com"))
+    assert (await s.get("a")).email == "a@x.com"
+    assert await s.get("missing") is None
+
+
+async def test_remove(tmp_path):
+    s = _store(tmp_path)
+    await s.add(AccountDefinition(id="a", email="a@x.com"))
+    assert await s.remove("a") is True
+    assert await s.list() == []
+    assert await s.remove("a") is False
+
+
+async def test_reload_from_disk(tmp_path):
+    path = tmp_path / "accounts.json"
+    s1 = AccountStore(str(path))
+    await s1.add(AccountDefinition(id="a", email="a@x.com"))
+    s2 = AccountStore(str(path))
+    await s2.load()
+    assert len(await s2.list()) == 1
+
+
+async def test_invalid_legacy_identity_fails_closed_without_overwrite(tmp_path):
+    path = tmp_path / "accounts.json"
+    source = json.dumps({
+        "accounts": [{"id": " ", "email": "x@example.com", "group": "standard"}],
+        "groups": {},
+    })
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AccountStoreCorruptError, match="account store is corrupt"):
+        await AccountStore(str(path)).load()
+
+    assert path.read_text(encoding="utf-8") == source
