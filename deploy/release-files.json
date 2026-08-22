@@ -377,7 +377,7 @@
       "type": "file",
       "mode": "0644",
       "size": 27549,
-      "sha256": "sha256:70852d337e217f31e01cafe0bddb7b11b960a8461d1d10f365cba03c8c4d502b"
+      "sha256": "sha256:45a078163cd88cd3ccfb10eb667c43e2746899fb77a67563911e6b82a59696e2"
     },
     {
       "path": "src/elastic_agent/api/routes/agent_api_accounts.py",
@@ -432,8 +432,8 @@
       "path": "src/elastic_agent/api/routes/ui.py",
       "type": "file",
       "mode": "0644",
-      "size": 259946,
-      "sha256": "sha256:6e4c55751879a8324dbed4e406721232cdb1821b8f0f59c8b7db756c348ff737"
+      "size": 259937,
+      "sha256": "sha256:aa3c81f0ea1604c23aec0c234355a5bc6c0af78042c64c419ae973e01e6cd5c5"
     },
     {
       "path": "src/elastic_agent/api/routes/ui_v2.py",
@@ -1139,8 +1139,8 @@
       "path": "src/elastic_agent/worker/agent_api.py",
       "type": "file",
       "mode": "0644",
-      "size": 40663,
-      "sha256": "sha256:2f054a5c9946d8f55bc529db532c01ac9bbd832e9395761df5780a35953abb22"
+      "size": 40662,
+      "sha256": "sha256:960a78a334c127f39682c9305b25eb2b0230ba29c0d4c31555e931aa9ce3afd0"
     },
     {
       "path": "src/elastic_agent/worker/file_sync.py",
