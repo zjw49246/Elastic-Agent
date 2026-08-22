@@ -14,6 +14,7 @@ from elastic_agent.core.release_evidence import (
     compute_release_digest,
     compute_worker_profile_digest,
     load_release_manifest,
+    verify_release_tree,
     validate_deployment_context,
     validate_release_manifest,
 )
@@ -52,6 +53,29 @@ def test_manifest_path_is_bounded_and_fail_closed(tmp_path: Path) -> None:
     path.write_text("{\"schema_version\": 1}", encoding="utf-8")
     with pytest.raises(ReleaseEvidenceError):
         load_release_manifest(path)
+
+
+def test_checked_in_release_tree_is_bound_by_artifact_index() -> None:
+    manifest = load_release_manifest()
+    verify_release_tree(manifest, release_root=Path(__file__).resolve().parents[2])
+
+
+def test_release_tree_tampering_is_rejected(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    manifest = load_release_manifest()
+    index = json.loads((root / "deploy/release-files.json").read_text())
+    copied = tmp_path / "release"
+    (copied / "deploy").mkdir(parents=True)
+    (copied / "src").mkdir()
+    (copied / "deploy/release-files.json").write_text(
+        json.dumps(index), encoding="utf-8"
+    )
+    first = index["files"][0]
+    target = copied / first["path"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"tampered")
+    with pytest.raises(ReleaseEvidenceError, match="content changed"):
+        verify_release_tree(manifest, release_root=copied)
 
 
 def test_deployment_context_accepts_only_canonical_aws_identity() -> None:

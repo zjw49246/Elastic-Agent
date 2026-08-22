@@ -119,7 +119,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "ELASTIC_AGENT_EXTERNAL_API_KEYS" in source
     assert (
         "WorkingDirectory=/opt/task-platform/"
-        "elastic-agent-e06ac35dedf4e876ab42ef2cf83161948c09cf87"
+        "elastic-agent-current"
     ) in source
     assert "/home/ubuntu/elastic-agent/.venv" not in source
     assert "TimeoutStopSec=32400" in source
@@ -342,7 +342,7 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert config.provider.type == "aws"
     assert config.provider.aws.ami_id == "ami-0c7d40ac988a900c5"
     assert settings.aws_account_id == "297645381734"
-    assert settings.release_revision == "e06ac35dedf4e876ab42ef2cf83161948c09cf87"
+    assert settings.release_revision == load_release_manifest()["release_revision"]
     assert config.provider.aws.security_group_ids == [
         "sg-0123456789abcdef0",
         "sg-11111111111111111",

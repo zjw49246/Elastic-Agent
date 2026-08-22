@@ -254,7 +254,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         raise LauncherConfigurationError("ELASTIC_AGENT_AWS_ACCOUNT_ID is invalid")
 
     release_revision = _required(source, "ELASTIC_AGENT_RELEASE_REVISION")
-    if not re.fullmatch(r"[0-9a-f]{40}", release_revision):
+    if not re.fullmatch(r"artifact-sha256:[0-9a-f]{64}", release_revision):
         raise LauncherConfigurationError("ELASTIC_AGENT_RELEASE_REVISION is invalid")
 
     ami_id = _required(source, "ELASTIC_AGENT_AWS_AMI_ID")

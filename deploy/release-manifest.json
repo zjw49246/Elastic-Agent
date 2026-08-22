@@ -1,11 +1,12 @@
 {
-  "archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
-  "manager_state_schema": "v1",
+  "schema_version": 2,
   "product": "elastic-agent",
-  "release_digest": "sha256:efddb96020c5c96aaf2e5ead5eb59229d14b430eb5337bead7e45afca19dc0a8",
-  "release_revision": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
-  "schema_version": 1,
-  "source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
+  "upstream_source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
+  "upstream_archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
+  "release_revision": "artifact-sha256:800c204da9efbc9dee03b2e7f5e9493804318260aee1b94dcc1e197ba4b6a03a",
+  "release_index": "deploy/release-files.json",
+  "release_artifact_digest": "sha256:800c204da9efbc9dee03b2e7f5e9493804318260aee1b94dcc1e197ba4b6a03a",
+  "manager_state_schema": "v1",
   "worker_profile": {
     "ami_id": "ami-0c7d40ac988a900c5",
     "bootstrap_source": "src/elastic_agent/core/bootstrap_steps.py",
@@ -26,9 +27,10 @@
     ],
     "aws_account_id": "297645381734",
     "region": "ap-northeast-1",
-    "release_revision": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
+    "release_revision": "artifact-sha256:800c204da9efbc9dee03b2e7f5e9493804318260aee1b94dcc1e197ba4b6a03a",
     "runtime_source": "src/elastic_agent/worker/runtime.py",
     "schema_version": 1
   },
-  "worker_profile_digest": "sha256:b7603ada90a8b792774bc9b25d583f9f109e711f076a4d886f2f8a78073f0426"
+  "worker_profile_digest": "sha256:224bf593f97c3ff92d0efeb56467189ee9dc80b706dcb2a61c532c7fe833cfa9",
+  "release_digest": "sha256:e7471ba0a17b389a5ac41f95facca69947fe511f25ddad739ae8ffcb0e773a6c"
 }

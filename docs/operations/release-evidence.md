@@ -1,8 +1,11 @@
 # Release Evidence
 
 `deploy/release-manifest.json` is the canonical, non-secret release manifest.
-It is content addressed with two SHA-256 values:
+`deploy/release-files.json` indexes every tracked release file except those two
+self-referential generated files. Each record binds path, type, executable
+mode, size, and SHA-256. It is content addressed with three SHA-256 values:
 
+- `release_artifact_digest` covers the canonical complete file index.
 - `worker_profile_digest` covers the complete `worker_profile` object.
 - `release_digest` covers the complete manifest after removing only
   `release_digest` itself.
@@ -11,12 +14,13 @@ Both digest strings use the exact `sha256:<64 lowercase hex>` wire format.
 `manager_state_schema` uses the exact `v[1-9][0-9]{0,8}` format and is currently
 `v1`.
 
-The verifier requires the exact manifest schema, the archived source commit,
-the archive SHA-256, and the stable `v1` state schema. It rejects unknown
-fields and field names that could carry tokens,
-passwords, or other credentials. Manager startup validates the manifest before
-loading durable state; a missing, changed, or malformed manifest keeps the
-Manager stopped (fail closed).
+`upstream_source_commit` and `upstream_archive_sha256` truthfully retain the
+original `e06ac...` provenance; they are not claimed as the final release.
+`release_revision` is `artifact-sha256:<64 hex>` derived from the exact final
+file index. The verifier rejects unknown fields and field names that could carry
+tokens, passwords, or other credentials. Manager startup validates the manifest
+and hashes every indexed file before loading durable state; missing, changed,
+mode-shifted, or unexpected files keep the Manager stopped (fail closed).
 
 `GET /api/health` is authenticated with the existing Bearer service token or
 administrator session. In addition to the existing route contract it returns
@@ -46,22 +50,26 @@ or invalid values make deployment verification fail closed. The existing
 replace any of these three evidence fields.
 
 The AWS launcher compares the manifest with runtime settings for Worker AMI,
-AWS account, Region, and release revision before touching state or making cloud
-calls. The canonical production Worker AMI is
+AWS account, Region, and artifact release revision before touching state or
+making cloud calls. The canonical production Worker AMI is
 `ami-0c7d40ac988a900c5`; the historical `ami-0aec7ffcbe44c6f7a` is rejected.
 
 ## Immutable rollout
 
-1. Build the release from the archived source commit recorded in the manifest.
-2. Verify the archive SHA-256 and run the local manifest verifier and focused
-   tests before copying the release to a new immutable directory.
+1. Build the release from the upstream archive recorded in the manifest.
+2. After all tracked changes are committed, run
+   `uv run python scripts/generate_release_evidence.py`, commit only the
+   generated manifest/index, and require its `--check` mode to pass.
 3. Copy the release directory to an immutable path named
-   `/opt/task-platform/elastic-agent-<release_revision>` without modifying it;
-   the manifest and `uv.lock`
+   `/opt/task-platform/elastic-agent-<artifact hex>` without modifying it;
+   the manifest, file index, and `uv.lock`
    remain read-only. Configure state and secret EnvironmentFiles separately.
 4. Start the new Manager and wait for the authenticated local health probe.
    Record all three health evidence fields and compare them byte-for-byte with
    the manifest before allowing traffic.
+   The root-owned deployment EnvironmentFile must set
+   `ELASTIC_AGENT_RELEASE_REVISION` to the manifest's exact
+   `artifact-sha256:<64 hex>` value.
 5. Promote traffic only after the private route contract and idempotency-route
    checks pass. Do not edit a manifest in place; a changed source or worker
    profile is a new release and must receive a new digest.

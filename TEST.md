@@ -47,6 +47,7 @@ The release manifest verifier is deterministic and can also be exercised
 without pytest:
 
 ```bash
+uv run python scripts/generate_release_evidence.py --check
 uv run python -c 'from elastic_agent.core.release_evidence import load_release_manifest; print(load_release_manifest()["release_digest"])'
 ```
 

@@ -1,0 +1,2042 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "path": ".gitignore",
+      "type": "file",
+      "mode": "0644",
+      "size": 219,
+      "sha256": "sha256:11a3d6d056598bda36b9861814c1d49538d07e1fddb18a989c0793511c68ffef"
+    },
+    {
+      "path": "AGENTS.md",
+      "type": "symlink",
+      "mode": "120000",
+      "size": 9,
+      "sha256": "sha256:6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7"
+    },
+    {
+      "path": "CLAUDE.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 62146,
+      "sha256": "sha256:390b1e6dbc170ca512f2ccecb29722fc7101d969c1ba0124a6246d68d7645801"
+    },
+    {
+      "path": "PROGRESS.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 111424,
+      "sha256": "sha256:65661f53a82f7873ac9ba91cdfce871e5e755cbbe323e3532866750aa7814508"
+    },
+    {
+      "path": "README.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 63603,
+      "sha256": "sha256:44edf44dc49c33a4443f47875e92c095b1f33f3024a7ec38778d950a8c6e935f"
+    },
+    {
+      "path": "TEST.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 31221,
+      "sha256": "sha256:02f2c2b5afdae3bf025885e1913e4e936db63d35748cd6cef4b52f745d6c3d8a"
+    },
+    {
+      "path": "deploy/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 58,
+      "sha256": "sha256:3071a1defbba5fa93dfc66e9abc4dc40af2db9b0b26282af8dc9a1f58c4b29b1"
+    },
+    {
+      "path": "deploy/aws/elastic-agent-manager-policy.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 11527,
+      "sha256": "sha256:af9ee6d71d2bd6119cb42703c851e2b064b5e0510ed62de11a7f7e6a69c1e5fd"
+    },
+    {
+      "path": "deploy/aws/elastic-agent-manager.aws.env",
+      "type": "file",
+      "mode": "0644",
+      "size": 2101,
+      "sha256": "sha256:9dfe2841c1cb9bb1287d94e40e43d4c3f1650051d87ab152f09c2f5f87fd1285"
+    },
+    {
+      "path": "deploy/aws/elastic-agent-manager.service",
+      "type": "file",
+      "mode": "0644",
+      "size": 2285,
+      "sha256": "sha256:52bac73c47771234ae524b5760ba0ff7ab876e3eba3f13ed062ab7a275de52f3"
+    },
+    {
+      "path": "deploy/aws/elastic-agent-results-bucket-policy.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 420,
+      "sha256": "sha256:438d81f1a9488d31f54fa49c942ea059bd66fd35440c874db3ee590d1ebe4e5f"
+    },
+    {
+      "path": "deploy/aws/elastic-agent-worker-policy.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 661,
+      "sha256": "sha256:b8ee2a6adb137f72da5e23bd6076e9d9e711d3a1b4a445fd32f82b193f07f584"
+    },
+    {
+      "path": "deploy/aws/iam-cutover.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 30172,
+      "sha256": "sha256:28bc68e99d3fa99c92db942e6a3279edd0649dcfc47818bb3448294fd5e14343"
+    },
+    {
+      "path": "deploy/aws_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 21698,
+      "sha256": "sha256:a214eeeeaf8bdd1fc671d3cf063c975c8ee929c89d2bfffd8e1add002b1f65c2"
+    },
+    {
+      "path": "docs/audiobook-integration/00-overview.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 23015,
+      "sha256": "sha256:892c8e59a90583c2d118a51c753defeb360301fedab46226fbc99ce51641e36c"
+    },
+    {
+      "path": "docs/audiobook-integration/01-elastic-agent-framework-mvp.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 93213,
+      "sha256": "sha256:1353911d1fa43cdf86d478349cf780688a97e87055f2e919362fe9a0d7dc118b"
+    },
+    {
+      "path": "docs/audiobook-integration/02-audiobook-agent-service.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 65131,
+      "sha256": "sha256:244ab50b92fc5f88d84c3653eed975c79e97e50f739f6282b731f7d9b8e2d811"
+    },
+    {
+      "path": "docs/audiobook-integration/03-audiobook-app-adaptation.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 73513,
+      "sha256": "sha256:a2b011f30c9a1894283b38e09ada0b5defdf7bd6ebe20b643ce7b35fa95793cf"
+    },
+    {
+      "path": "docs/audiobook-integration/04-gap-analysis.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 26977,
+      "sha256": "sha256:9edc66b322d3ecbe3fd50c6936742e7c97938271a521da32d8255203412855e4"
+    },
+    {
+      "path": "docs/audiobook-integration/05-interface-contracts.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 28027,
+      "sha256": "sha256:a89afe811a7f7aeb2c4755cc27170c4da78a4e7f29aca5623cd838fa5507748c"
+    },
+    {
+      "path": "docs/audiobook-integration/06-testing-isolation.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 34794,
+      "sha256": "sha256:52231a278ad85ac99acb890aaccee46ee8df8203042e7077fc8920e968768b51"
+    },
+    {
+      "path": "docs/audiobook-integration/TODO.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 36728,
+      "sha256": "sha256:6c7dfc8d18a7dae5591b9ccff2b9592a2f461fc2517eb508885d96bbb6c4681f"
+    },
+    {
+      "path": "docs/audiobook-integration/archive/elastic-agent-analysis.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 99419,
+      "sha256": "sha256:b07beb9adb085d4bac15754a4877ca6c9ae3be93af0e2248c34574515f9f143f"
+    },
+    {
+      "path": "docs/audiobook-integration/archive/harness-example-audiobook-production.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 46864,
+      "sha256": "sha256:0e626eee2c1247f24ec883222f3502adf75e3e4c92a4c5bf2d396ac7948cb696"
+    },
+    {
+      "path": "docs/audiobook-integration/archive/mvp-plan.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 49296,
+      "sha256": "sha256:9a693f0cfad03ae7e9e38f3ac5223eecc87cbefeccf125742a669016c1dfefc4"
+    },
+    {
+      "path": "docs/audiobook-integration/archive/\u8dd1\u4e66\u53cc\u5f15\u64ce\u9009\u62e9\u4e0eElastic-Agent\u63a5\u5165\u65b9\u6848.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 60253,
+      "sha256": "sha256:7f02bfc9e3c13353140ae367f1de54bfc6cbf212e82ad606f9631fc118baca3c"
+    },
+    {
+      "path": "docs/audits/code-audit-2026-07-28.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 55390,
+      "sha256": "sha256:dc2ac174b128bd61923ba68d48f3353f91d8887936c07625cd18fbda7db302bb"
+    },
+    {
+      "path": "docs/harness-example-agent-ml-research.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 39114,
+      "sha256": "sha256:2d663705dc8c54b230224042253d2c7c16f41311f7cc26fd43a872719675686b"
+    },
+    {
+      "path": "docs/harness-example-claude-code-manager.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 48400,
+      "sha256": "sha256:4b5f748df5e2922ee50644725829fbd664b2f0aed41ad8d04fead1ba8e71820c"
+    },
+    {
+      "path": "docs/harness-example-idea-review.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 49266,
+      "sha256": "sha256:d16cbc93c33948782443c8009097b7ca8d20b6e0b154a71e3d410db008eb73f5"
+    },
+    {
+      "path": "docs/operations/checkpoint-recovery.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 16558,
+      "sha256": "sha256:78ecef9fe71931e9b9bea0c8d5d345401035ff7b259f98fce97fce65b2bb860e"
+    },
+    {
+      "path": "docs/operations/golden-worker-ami.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 8174,
+      "sha256": "sha256:8e2f3c3f4bc086570a016e22452db53a36024cd696724d0e56fe4b00f78ab74f"
+    },
+    {
+      "path": "docs/operations/job-batch-json.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 7447,
+      "sha256": "sha256:ffe45210574e5fd3d8a8643d542896fe321d175438d1b54419e28446db6a7a65"
+    },
+    {
+      "path": "docs/operations/mode-b-task-supervisor.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 4055,
+      "sha256": "sha256:33e585bd273dfaa0e832230b4f7121679887f8e9a89ae950c495c5c1490aefe9"
+    },
+    {
+      "path": "docs/operations/release-evidence.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 4536,
+      "sha256": "sha256:863aa9cafc5bd6e9687584b225fef40fcfa9a9ef712d57810223e9e240518ba0"
+    },
+    {
+      "path": "docs/prerequisites/aliyun-setup.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 4937,
+      "sha256": "sha256:ba45ce7d2011fbf329d54c844c216798cc3cc101a63fbce375ac273a85abf81e"
+    },
+    {
+      "path": "docs/prerequisites/aws-setup.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 5502,
+      "sha256": "sha256:475b3ebba5efe3a6dbac2dbfdc01020a0be371b011060f2e757eb908211b24b8"
+    },
+    {
+      "path": "docs/ui-v2-implementation-plan.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 46129,
+      "sha256": "sha256:b4361be62be59ab5fd2bcba1ebee89e13e5c4c3f280aefc1e7988bc3f2939879"
+    },
+    {
+      "path": "pyproject.toml",
+      "type": "file",
+      "mode": "0644",
+      "size": 1825,
+      "sha256": "sha256:f40e672dac7d97745caa5007d0cdac76312b5718be33cfbf5a1a0b56854d0a97"
+    },
+    {
+      "path": "scripts/build_golden_ami.sh",
+      "type": "file",
+      "mode": "0755",
+      "size": 24947,
+      "sha256": "sha256:5d5c806017693b8d13d2e2d303253400b135a0e5f11916ed562d1a6d01e2923b"
+    },
+    {
+      "path": "scripts/build_ui_v2.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6821,
+      "sha256": "sha256:91e8e74347786b56f9f41ed4e2481e9ee052749bf47fbd9fce1245d9292f1e86"
+    },
+    {
+      "path": "scripts/generate_release_evidence.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5316,
+      "sha256": "sha256:1680127d1b776f03222be8312cfdf3e45f7979682fa7495e7045ae4a1751ac0a"
+    },
+    {
+      "path": "scripts/golden_image_verify.py",
+      "type": "file",
+      "mode": "0755",
+      "size": 11800,
+      "sha256": "sha256:dceda02a6fe45ba0d21708c2bd30b04d7030e0b90efa6d6692eda42e7466a792"
+    },
+    {
+      "path": "scripts/refresh_deps.sh",
+      "type": "file",
+      "mode": "0755",
+      "size": 2343,
+      "sha256": "sha256:e78a1f1f3a1d19f41c2eb7dd4a641f1757574b0c4e1d7f7c467541a72fbde780"
+    },
+    {
+      "path": "scripts/validate_aliyun.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8399,
+      "sha256": "sha256:93ee452fc0d101483b6bc6f5a081820f1d59ee8b1027e81323af5b9bfdf14087"
+    },
+    {
+      "path": "scripts/validate_aws.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7320,
+      "sha256": "sha256:eb71dd1027488105b9c0d4f94b15bc63bb543e24b38df637e4cd5cac56ee48a7"
+    },
+    {
+      "path": "src/elastic_agent/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 112,
+      "sha256": "sha256:54864cac502a17bbec3e2e10d2b5e7f21649d21cec8690574e94d5f3209697df"
+    },
+    {
+      "path": "src/elastic_agent/api/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 143,
+      "sha256": "sha256:54c3202cc7b6670c46ea663de71a6174f2bb917973c35d150375597f7c1f18c4"
+    },
+    {
+      "path": "src/elastic_agent/api/app.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5004,
+      "sha256": "sha256:c1b6940024cb28853ca9c61e10e8f283a01fd772f207336484740dfdceaa6cbd"
+    },
+    {
+      "path": "src/elastic_agent/api/auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14392,
+      "sha256": "sha256:13cf1a4cb3740c01c1f6a7d32ebf8d796a4747b64cee9ad824d6a6da3ec56219"
+    },
+    {
+      "path": "src/elastic_agent/api/body_limit.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 16210,
+      "sha256": "sha256:fefa8ce05fa762213ec0517faef5d0b23da5e30293dd35aec9bc815c4e38ffc2"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 51,
+      "sha256": "sha256:363d88b2aa704ad4ecc77f38b43e01286dac85417a287f67b266a51102b4f5d3"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/account_login.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1894,
+      "sha256": "sha256:99dacdc73a5223fc98ef2c688a989b5bb25c50df7ca9268cf7eb67db08611130"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/accounts.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 27549,
+      "sha256": "sha256:70852d337e217f31e01cafe0bddb7b11b960a8461d1d10f365cba03c8c4d502b"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/agent_api_accounts.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10986,
+      "sha256": "sha256:f477f3fe2d4dc2204b7a10daed50a8a147a922d261c24a937958af9cbb917142"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/files.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 22922,
+      "sha256": "sha256:d04e1485445b358857e478befbd79d70b45fb5671b01ffd2e9a207f97ed2b2bb"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/health.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2402,
+      "sha256": "sha256:153cf2211103f3f9853c65f59c3fd453e1c34796dbe01d92c1b8d93a1c59606a"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/job_batches.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10960,
+      "sha256": "sha256:ab2505fdc96a4d358d891abec3627f0bc67a23a800745dee6846cb6a85bf5fea"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/jobs.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 201513,
+      "sha256": "sha256:238eae110f72d2067c3323ebf3e1f1d419a0446eb70d94843069634bd25feefc"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/management_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12740,
+      "sha256": "sha256:896bf6f463a742a41bee31b73b78e9417f730d7cefdddd3e05fa4539d0ab98b0"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/nodes.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6555,
+      "sha256": "sha256:abdd377937e7e747a62ba5bf9b9439de02c98e22cb704588e018a436bba7e94e"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/ui.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 259946,
+      "sha256": "sha256:6e4c55751879a8324dbed4e406721232cdb1821b8f0f59c8b7db756c348ff737"
+    },
+    {
+      "path": "src/elastic_agent/api/routes/ui_v2.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10244,
+      "sha256": "sha256:645ef1b923b1e9a7b523a2bc8afb0380f5c273c822b4013404ce55d166c9867d"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/assets/app.css",
+      "type": "file",
+      "mode": "0644",
+      "size": 15506,
+      "sha256": "sha256:86604e328cbe09bb74c53c83496f017842fe56ee234cc69ef2d4a2443c3c7739"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/index.html",
+      "type": "file",
+      "mode": "0644",
+      "size": 1987,
+      "sha256": "sha256:80976458a7c2d7f11683a94e136cfac3617e0e9bc956e9b1e41524c57d036d06"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/app.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 8117,
+      "sha256": "sha256:c460f8a45c636e239a4b73c76f8c3cc09654e5ce34785752bf5399714cb31bb4"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/components/app-shell.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 5860,
+      "sha256": "sha256:0f9af26c5349e288ba392ebcc54c10f5b13ed684503cd769ff559602e6b7adc8"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/components/dialog.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 4358,
+      "sha256": "sha256:c9d08e9eb56586c1f7c7fad2c9a97d8656f9877aa035ecddcb6deb2cc7d47106"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/components/otp-center.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 4285,
+      "sha256": "sha256:963e27c2e725402d6dc00431a07171becac035b8310160a7f3746fedbe61b747"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/components/status-badge.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 1355,
+      "sha256": "sha256:a4f7f0df137a8aa6e8f1ade679ff19d5caeacb79af32bef6eab7d1ad97a3ec0d"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/components/toast.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 769,
+      "sha256": "sha256:ba63d98a9ef4a9c1d92945a0e4d998c98c2adf61412702d15fd5d2cdf1653caa"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/api.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 6171,
+      "sha256": "sha256:5a25206b1d4e09dcac73a3a0f01ae0418bcea5b366c6493d79bbbf20814ac6cf"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/auth.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 2305,
+      "sha256": "sha256:8cb29011b5ebdc120378565342f3cd02193300f6cf3229b2a8406f7c5e75a7fe"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/dom.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 3721,
+      "sha256": "sha256:c4cd8c298d3f49eed7378f38e5b880475b7ea6822a8e25cc4a5fcc3fead12589"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/downloads.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 4421,
+      "sha256": "sha256:80a5b23cf09d7f6df1c4b796689f4d09f0bc5c5396d885737ef44c670a3bbdbb"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/errors.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 2570,
+      "sha256": "sha256:d5933ff3bbdf6e0f67a800c3efbfdda64b0eeec045bace1533f38950214a54eb"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/job-batch.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 9433,
+      "sha256": "sha256:eeff2d16e035a39c14970e3d8f81c276f533b9d4f8d40155dcae531098308a1f"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/job-spec.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 12982,
+      "sha256": "sha256:957b16fd90919938f7cde1acbdd97e6b4999f50d5173522f9742f5abf9b8788c"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/poller.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 4229,
+      "sha256": "sha256:98ee520795c5001ca86e65a3ae9a49156a89d621efa127300554cda859bf288b"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/router.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 4073,
+      "sha256": "sha256:ee0bf3b5d0590ed6345d89d5e11d286c307ac7dfbe70b00fdfc605ae0286dd1c"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/core/store.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 2339,
+      "sha256": "sha256:b443da44161c53fdd33c51136a9cfbd87208c28aab91ff165c5987195d2d4387"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/account-new.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 9029,
+      "sha256": "sha256:508bdc5b7d1ed9cb848821451a2bc1e26f29a8fed78222a93b67ff28e2bccf65"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/accounts.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 14248,
+      "sha256": "sha256:2bead3680116f5ea079da9e83dc9587a62f11a5241c4b39df138a0ff0269135c"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/fleet.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 9121,
+      "sha256": "sha256:30bb7a264fe412a8c74776c63169760ba6bfbcc8e1e3268a2db36ca5b9576df4"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/job-batch.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 16726,
+      "sha256": "sha256:00e31b9dd984bdbb7f96f433548476112811e117fde9ed925d8ed686057db2ed"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/job-detail.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 17707,
+      "sha256": "sha256:a5e80db61d6500d87da7dcd90c2d6d92f4736f9d80ce1a9053ff07777e8274fc"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/job-new.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 23994,
+      "sha256": "sha256:7e34af35b4a5b5b3b783de9c8f3a6b5fe7c4e576fcf0b7778452cde0f94797f1"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/jobs.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 9674,
+      "sha256": "sha256:ac5889162a657adb71fdd9846b4d28a8c1d1b0b6259b8efa000e94d956a7f041"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/not-found.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 439,
+      "sha256": "sha256:890f7e921ac56aa8b60ba18ca67c3ad71e53db385bdb581d661289758420d613"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/overview.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 5670,
+      "sha256": "sha256:9f8db24e8d242767a4aa3eee1b3774fbb147531a3f4e2c64acf55b02c673e021"
+    },
+    {
+      "path": "src/elastic_agent/api/ui_v2/js/pages/results.js",
+      "type": "file",
+      "mode": "0644",
+      "size": 9476,
+      "sha256": "sha256:3fb457581aad9c960be7373f8d48c3b8df91f680b6054c0e4fd463ef7fafa6a4"
+    },
+    {
+      "path": "src/elastic_agent/core/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 273,
+      "sha256": "sha256:c17c9b1b2af5b97a40028bc9406c71478cbaa76c700a59b644ac6471a451e759"
+    },
+    {
+      "path": "src/elastic_agent/core/account_binding.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 32579,
+      "sha256": "sha256:fee9d69e3c7cbf72077d2af8cdd1f8fce484856c581da33da4e393106c015a00"
+    },
+    {
+      "path": "src/elastic_agent/core/account_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5062,
+      "sha256": "sha256:34eb32b12d60a76e38ee315a5b0aadbba0d6dd01645af53532aab022c0760fd1"
+    },
+    {
+      "path": "src/elastic_agent/core/agent_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 69571,
+      "sha256": "sha256:9e7afe9d7363e16a434e3c4909cc5755e2ae5eb6c504a434b8f6d515c8cac48b"
+    },
+    {
+      "path": "src/elastic_agent/core/agent_type.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5799,
+      "sha256": "sha256:56585947c12babb4e9a00ea415f9360d8a3b46c5171c544701d42accd68647a4"
+    },
+    {
+      "path": "src/elastic_agent/core/apexrouter.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11252,
+      "sha256": "sha256:314615a0066f36f54a4a47d46ee5db7f96292ec5944015ad1172ef7152528603"
+    },
+    {
+      "path": "src/elastic_agent/core/auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1081,
+      "sha256": "sha256:71596fbca752af7ded297ce529b715495f5518446e940695bcac734d02577b06"
+    },
+    {
+      "path": "src/elastic_agent/core/batch_hooks.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 97687,
+      "sha256": "sha256:a4ebcb63e3b0c5a4049ebd2c43c1f086a9a45e0e743cdae571e1e0136ce660b7"
+    },
+    {
+      "path": "src/elastic_agent/core/batch_orchestrator.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 161024,
+      "sha256": "sha256:222068a1376e4bac35d28e363138f792d4570d0c52a8bfe5a81210ec773e2f68"
+    },
+    {
+      "path": "src/elastic_agent/core/binding_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 62202,
+      "sha256": "sha256:05b8ba1a4d6bb8dad3accff4ad997153d0905ac0525ad81be59ae5bc42db08d6"
+    },
+    {
+      "path": "src/elastic_agent/core/bootstrap.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10609,
+      "sha256": "sha256:8d7656b523615f2e63fcc30bd8041f4836161dbd89955105d2433e7b294787e2"
+    },
+    {
+      "path": "src/elastic_agent/core/bootstrap_handler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6648,
+      "sha256": "sha256:6e8d965edf3f9b5abb37abc525d8ac406173d73457ad47102ae5e7bca5be1437"
+    },
+    {
+      "path": "src/elastic_agent/core/bootstrap_steps.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 28491,
+      "sha256": "sha256:227d632c41fe44e9d17fc27285b1d97d9020b077c9adae5346f710bbbf419c06"
+    },
+    {
+      "path": "src/elastic_agent/core/checkpoint_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 99266,
+      "sha256": "sha256:f73ee063b2d8b8e020c97ccdeb9ef2e9bdaf1abdeeb4952ef1a05b29a42504de"
+    },
+    {
+      "path": "src/elastic_agent/core/claude_oauth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 17602,
+      "sha256": "sha256:1cd93a0f2515b219ef31dea2d3a0c854f0a78b06f98e42253b25f96eed852cbe"
+    },
+    {
+      "path": "src/elastic_agent/core/cloudrouter.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 28071,
+      "sha256": "sha256:9a2ab5b750edb8c25da949648ab36b9e7911cbc8a9da744835256e4ce4087137"
+    },
+    {
+      "path": "src/elastic_agent/core/code_sync.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 19181,
+      "sha256": "sha256:6cdb0c2b48d0f339aab7ef9e5cbb6f7eedd14b93d7adc5d30b4854078110975e"
+    },
+    {
+      "path": "src/elastic_agent/core/config.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5200,
+      "sha256": "sha256:5c4d90401de9ce4fdd38819399e4f570df0c2ff0785cb7a0db281e5df2e06aa2"
+    },
+    {
+      "path": "src/elastic_agent/core/credential_binding.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4422,
+      "sha256": "sha256:466047697f90fcfb7051bbc422def8f136556e5ea72210f0b7fbe83bcdae1e96"
+    },
+    {
+      "path": "src/elastic_agent/core/credential_login_service.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 27993,
+      "sha256": "sha256:7931bf6a4526af2de65a700dab72e1eaa923bd900ffc62045f18012839529856"
+    },
+    {
+      "path": "src/elastic_agent/core/credential_login_step.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5554,
+      "sha256": "sha256:cd43cfb4f467bbfdcea799dba5e6ef0417c175860c31053446168fc2f3e1a373"
+    },
+    {
+      "path": "src/elastic_agent/core/credential_pool.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 33184,
+      "sha256": "sha256:b30243adb674c58a9ec405d706763d4fd478f529546b0809faed498f79bae37a"
+    },
+    {
+      "path": "src/elastic_agent/core/credential_rotator.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14453,
+      "sha256": "sha256:75a26d1c7aaa1348f46bfcf153a7a70388b623a50a0965c19452a9f4b5e01346"
+    },
+    {
+      "path": "src/elastic_agent/core/drain_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6210,
+      "sha256": "sha256:db483b003d0e36c39515bf735103174e00c4bb49e13d4198526469105fa33ab1"
+    },
+    {
+      "path": "src/elastic_agent/core/event_bus.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4750,
+      "sha256": "sha256:92d84a6313c305f8cee041fb7cbea0938c10e471c041e0632d0299db05dcf7fe"
+    },
+    {
+      "path": "src/elastic_agent/core/health_checker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7772,
+      "sha256": "sha256:2736f2019356e024ea84cb6b0d31390f13b12a3e7dc19bf211000463d0e5190e"
+    },
+    {
+      "path": "src/elastic_agent/core/job_batch.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 43415,
+      "sha256": "sha256:35d47edce2b9676c7551c28e10af9e23a41cfc0660822411cd99d7d9e990a219"
+    },
+    {
+      "path": "src/elastic_agent/core/job_log_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 22489,
+      "sha256": "sha256:ef690ab1c51bd4490297df29da858ee8a4e8b7d94812d841eca688ed8eb1e745"
+    },
+    {
+      "path": "src/elastic_agent/core/job_spec.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 51520,
+      "sha256": "sha256:a49d553adfb6fda9cf198139514f9f8f3189780e3a8455e38a078606103f3ff3"
+    },
+    {
+      "path": "src/elastic_agent/core/job_spec_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 20711,
+      "sha256": "sha256:6b26a32437cdf6199b0ecad779257eccb0e04fbd030a1d85ddb3237763d9fc3e"
+    },
+    {
+      "path": "src/elastic_agent/core/log_event_parser.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6735,
+      "sha256": "sha256:f636188f08e603631e313354010c47653c5a1261135c104cca19a738c145dd8c"
+    },
+    {
+      "path": "src/elastic_agent/core/log_parser.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5443,
+      "sha256": "sha256:1ada516b0d2710dbc0d607536c543ae732ceff37d16c58635cb395de1c17a033"
+    },
+    {
+      "path": "src/elastic_agent/core/management_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 23067,
+      "sha256": "sha256:a6e36205602b6135b6618f87c715133f9183ae6bbd1d22bd1f3b34ac43eed295"
+    },
+    {
+      "path": "src/elastic_agent/core/manager_fleet_driver.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 180529,
+      "sha256": "sha256:ea937125284ceeb7fdfaa47803a113ad78ccb52221b0b9c2a110aaad1f0b65ed"
+    },
+    {
+      "path": "src/elastic_agent/core/network.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1507,
+      "sha256": "sha256:24ffb48a157362ea764070defc3789f4f3d36900ed57904f733e850bd7903589"
+    },
+    {
+      "path": "src/elastic_agent/core/operations_log.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6289,
+      "sha256": "sha256:cad0c8d976bc6c6f37139abd84d9d42837955788f688bfbc2eb4382ada7d3349"
+    },
+    {
+      "path": "src/elastic_agent/core/operations_logger.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11349,
+      "sha256": "sha256:ad4049585348f09f8383b996fa5f35e43e5bde55a3dc353fb194b4616c399328"
+    },
+    {
+      "path": "src/elastic_agent/core/protocols/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2181,
+      "sha256": "sha256:685eef039a124b03dd8d80b5da6274431111e133f9a8514f7b95e2ac07e98f56"
+    },
+    {
+      "path": "src/elastic_agent/core/protocols/messages.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 16808,
+      "sha256": "sha256:e0bbd28adf09c22275ee99af24181b36e476b803e65c8f7c6a1ebee8716b5730"
+    },
+    {
+      "path": "src/elastic_agent/core/providers/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 782,
+      "sha256": "sha256:8711a3a5ff6f9f97527a8da9cb560c161f1934630585fdb4c76cbf09f937fb87"
+    },
+    {
+      "path": "src/elastic_agent/core/providers/aliyun.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9548,
+      "sha256": "sha256:f61debeafdb34c16792270411bb673e82fcdf60976111034128f8b798acb8a95"
+    },
+    {
+      "path": "src/elastic_agent/core/providers/aws.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 25951,
+      "sha256": "sha256:25656bb1e3950f5a6c098b117b3e90407b758e855691a96c2b84e737895e0161"
+    },
+    {
+      "path": "src/elastic_agent/core/providers/base.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5847,
+      "sha256": "sha256:7bc8741bb3739644f4b2c29115697cd566a8f4ea9b5c9ba7adceafc646054d91"
+    },
+    {
+      "path": "src/elastic_agent/core/quota_monitor.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7745,
+      "sha256": "sha256:7a366f825842e3b83c576dbe4d973680ae4730770432768a3b5dc9528327c910"
+    },
+    {
+      "path": "src/elastic_agent/core/rate_limit.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 19417,
+      "sha256": "sha256:b2af998d5ffbb86fef1c62914676fbf0b686bf306771703da1147c558b2ec15c"
+    },
+    {
+      "path": "src/elastic_agent/core/reconciler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 17826,
+      "sha256": "sha256:a8a27463f6c6e4a61547d091feb5b14ffdd3b804de464c8534b80d2822c9fbb4"
+    },
+    {
+      "path": "src/elastic_agent/core/registry.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5403,
+      "sha256": "sha256:eeab6432663a1c3a0592fae369724df0b170f91b5fba88ae4057a7444a3d0a1f"
+    },
+    {
+      "path": "src/elastic_agent/core/release_evidence.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 18363,
+      "sha256": "sha256:1b08797976910ebe310760601ec0d7e5ed26e25f0ff2a8cef800161b0af12b0a"
+    },
+    {
+      "path": "src/elastic_agent/core/result_uploader.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 27817,
+      "sha256": "sha256:d25a8fe2b2688903391746829bf734118d165e82c1a5d6869902235a7e478613"
+    },
+    {
+      "path": "src/elastic_agent/core/secret_env.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5217,
+      "sha256": "sha256:24ae39f963e6ec0b7f63563360a939f57ac400efa0485817c0d768887c90cbe7"
+    },
+    {
+      "path": "src/elastic_agent/core/secure_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3197,
+      "sha256": "sha256:a0e2c659df7a62fa4da7ee8f5b87ce2d465b5ebcf0fa5f5458e305f038005f7f"
+    },
+    {
+      "path": "src/elastic_agent/core/task_registry.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7772,
+      "sha256": "sha256:6889938f4f4d42f712b6f2ba7e79be48ea3034a68c9272e34e6f49e79178eaf6"
+    },
+    {
+      "path": "src/elastic_agent/core/task_router.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5127,
+      "sha256": "sha256:83e9f7bc546b3c66930b52d78728dfe774ef7bc4fe7197061fd286931679cba1"
+    },
+    {
+      "path": "src/elastic_agent/core/task_scheduler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2985,
+      "sha256": "sha256:ee4990b9950a2cd5916a8b11c90d184b1e3e17af49f0ec817505692cf97a8781"
+    },
+    {
+      "path": "src/elastic_agent/core/webhook.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6039,
+      "sha256": "sha256:77c5def57e5f369d5fb322368a99654ffc8765136f9c2c5a8f0d117bdf2e840b"
+    },
+    {
+      "path": "src/elastic_agent/core/webhook_emitter.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11970,
+      "sha256": "sha256:4aca11fb062954b20fe5ebd50d7e98d6f9838d841b76a205120e48b486114e26"
+    },
+    {
+      "path": "src/elastic_agent/harness/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 70,
+      "sha256": "sha256:324c1203d2d72f11882d35433f9b66bf300e9716e814a240b3b866664ce4033d"
+    },
+    {
+      "path": "src/elastic_agent/harness/base.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2779,
+      "sha256": "sha256:e00ab86bb83c2e0a0781949a0bad8e4481eccae8265dc40f4b98cca3a65f4e08"
+    },
+    {
+      "path": "src/elastic_agent/harness/generic.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14708,
+      "sha256": "sha256:a326fc59821b9d7eb7fa0bb469414bfbda9aa99bd0400e0b7f873382be0dde21"
+    },
+    {
+      "path": "src/elastic_agent/management_auth_cli.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3631,
+      "sha256": "sha256:7a0068b7eb2b1cdbcfdd8dbde93b546f806ae9007f043018af6f05c4b8fcb430"
+    },
+    {
+      "path": "src/elastic_agent/manager/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 305,
+      "sha256": "sha256:ab1609591f0760f5db62f6f909211ff6d4af4702c1e85adca221f2e0a65f0487"
+    },
+    {
+      "path": "src/elastic_agent/manager/connection.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 21287,
+      "sha256": "sha256:f8a7f743b9063303931d9d272e7df6c541a74ebdf53ccc6d576c6103ed79a6ca"
+    },
+    {
+      "path": "src/elastic_agent/manager/manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 181087,
+      "sha256": "sha256:02eb324e6f1fbe8ec847667613e67ed682e61af4aa68c4be12bbfa74a301edf9"
+    },
+    {
+      "path": "src/elastic_agent/testing/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1628,
+      "sha256": "sha256:a884d7863a2b7eb3851bc9372251864935e3c0cbf5bab8274ed1a34f62085b9b"
+    },
+    {
+      "path": "src/elastic_agent/testing/dry_run_provider.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11812,
+      "sha256": "sha256:1a43880a81854eefedd073ea5b87ff53f4dcda3d94fa9183c9fa145030451c99"
+    },
+    {
+      "path": "src/elastic_agent/testing/factory.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4923,
+      "sha256": "sha256:40b6f7c95b57a2a01817ae7a46bc558b53f63fe4b3a9f2f5c96eb2e8c23e3e47"
+    },
+    {
+      "path": "src/elastic_agent/testing/local_worker_process.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6517,
+      "sha256": "sha256:a3f90b76c6c7974f52ab708782ef9b638e7186f9c690155c7642be7d12fd6b21"
+    },
+    {
+      "path": "src/elastic_agent/testing/mock_oauth_server.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8874,
+      "sha256": "sha256:5737b1ba91dafb94d361c9c3078a990d382220074eb1a6ce0188617cf5e03ffd"
+    },
+    {
+      "path": "src/elastic_agent/testing/mock_oss.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5669,
+      "sha256": "sha256:19df9e7f58b07bd7368350740509a4ebc591ee756cd081fe8dad0f65b21a0c2b"
+    },
+    {
+      "path": "src/elastic_agent/testing/mock_worker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11682,
+      "sha256": "sha256:8470db34fa368c0dcfa5258e9911298787730334e43d66f1d45e5544ac44c921"
+    },
+    {
+      "path": "src/elastic_agent/worker/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 222,
+      "sha256": "sha256:4952587f892eaae8edee91e51bc4337de42cabdcf640340407b635305ab75285"
+    },
+    {
+      "path": "src/elastic_agent/worker/agent_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 40663,
+      "sha256": "sha256:2f054a5c9946d8f55bc529db532c01ac9bbd832e9395761df5780a35953abb22"
+    },
+    {
+      "path": "src/elastic_agent/worker/file_sync.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 51175,
+      "sha256": "sha256:d8c9216b9168e6fd8c2842cbc7f86754a5ad67740e4b47118b50f3ac27423dc1"
+    },
+    {
+      "path": "src/elastic_agent/worker/login/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1246,
+      "sha256": "sha256:1fa1edf9b0d7d38cf183725ae9ef8e6d9b2c9a3834124a823d1ec40bdda4f718"
+    },
+    {
+      "path": "src/elastic_agent/worker/login/auto_login.py",
+      "type": "file",
+      "mode": "0755",
+      "size": 44251,
+      "sha256": "sha256:3545433e45243b099ba02257329f22403a576ba20689882090d6a99bcc02d3aa"
+    },
+    {
+      "path": "src/elastic_agent/worker/login/cdp_login.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 35437,
+      "sha256": "sha256:7ab9d700c758622a98c5daac28c6d2db21a777025a95a3764a321e9299d0e9b1"
+    },
+    {
+      "path": "src/elastic_agent/worker/login/codex_login.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 40029,
+      "sha256": "sha256:bf1b27f54d4fc27f18b75a94222cfcd6301aa3871e2ab8af536b89bb8a21846f"
+    },
+    {
+      "path": "src/elastic_agent/worker/process_logger.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3381,
+      "sha256": "sha256:d78d7e971df416ae98b9133cdec74f9024155b0202789cfd34f247e1d6aebfec"
+    },
+    {
+      "path": "src/elastic_agent/worker/pty_backend.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 36841,
+      "sha256": "sha256:a56959d36016b5b63a48a4f94412d86f78c69380dd4e4a89239dbe0214d192bc"
+    },
+    {
+      "path": "src/elastic_agent/worker/quota_checker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12516,
+      "sha256": "sha256:64de6be4fc5d6e800d2e7b596ba8d0cca286f2faf6db9fb22d5021faceba9d75"
+    },
+    {
+      "path": "src/elastic_agent/worker/recovery_transaction.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 30506,
+      "sha256": "sha256:7bf8301e126dddc12101b89fc50234f3ece518fc8641643089fb7b18eb0a435f"
+    },
+    {
+      "path": "src/elastic_agent/worker/runtime.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 151966,
+      "sha256": "sha256:011e1eeeec83afc752be700ac802a08a94a5496c41d87a92af28730c3868dfeb"
+    },
+    {
+      "path": "src/elastic_agent/worker/runtime_main.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1574,
+      "sha256": "sha256:cae803fe4a9fccd79f9ad454f6bf8fe65f16415a58d669b57d07de1018160d4f"
+    },
+    {
+      "path": "src/elastic_agent/worker/task_supervisor.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 60248,
+      "sha256": "sha256:1cd048e2aeea90c14785fd1d89075cea55dfdaec1a2c7993f156879c293e3211"
+    },
+    {
+      "path": "src/elastic_agent/worker/task_sync_mapper.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4550,
+      "sha256": "sha256:d5a34cd784c2038db6642327dec833fec542fe98b73190a707940c7591d3a5bb"
+    },
+    {
+      "path": "tests/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 0,
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/conftest.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7126,
+      "sha256": "sha256:5403f2203dfc87d1bd6584a8d0af989ba3632e4ea3211c422f3074e8aa4206cb"
+    },
+    {
+      "path": "tests/integration/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 0,
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/integration/conftest.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3035,
+      "sha256": "sha256:8083019fa7af1359483250a13bb777755cf66a7f6441351a2133fdbd5d99c9be"
+    },
+    {
+      "path": "tests/integration/test_auto_login_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6977,
+      "sha256": "sha256:6743abeb5fa408025b3046468ce6387502a80149b33c3ff8010fe3f653db4702"
+    },
+    {
+      "path": "tests/integration/test_bootstrap_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7931,
+      "sha256": "sha256:eccc6c7a2f6c6c0ac8a1f15aa823c609e8c27c2483e8e6955c58d280838b84db"
+    },
+    {
+      "path": "tests/integration/test_cloud_lifecycle.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4994,
+      "sha256": "sha256:aa2ecc17b0399354e5ba6d2461568762efdfa0961941468d5cf1bb48ab65f93d"
+    },
+    {
+      "path": "tests/integration/test_cloud_prerequisites.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4127,
+      "sha256": "sha256:2c5ac3765a89acd26e1136154494f676319f9afda95aa78e474e690a96f36e75"
+    },
+    {
+      "path": "tests/integration/test_crash_recovery.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7040,
+      "sha256": "sha256:6e5f4bf2f880d576ec4743b496d8caa45cd84ff832690ad256115902b3008904"
+    },
+    {
+      "path": "tests/integration/test_credential_rotation_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10590,
+      "sha256": "sha256:0b43f4c6d0eae5df8eeb12a698cbfc470a579fbf7735b1e0d06e225e72ab98f8"
+    },
+    {
+      "path": "tests/integration/test_dryrun_provider.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6429,
+      "sha256": "sha256:63541bb07d59c0c9d40622f5302ae6c7fa4cc11097f453bd66d6b9b880c3ead4"
+    },
+    {
+      "path": "tests/integration/test_external_api_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8334,
+      "sha256": "sha256:7d197face2e51094582f5795e074d1108e0db2f92d28666ce575f6500e2dfd5e"
+    },
+    {
+      "path": "tests/integration/test_file_sync_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6621,
+      "sha256": "sha256:5050e87bcaf117eb1a554081d2b16693095d0e2a80b9951f79d761f7f46a913a"
+    },
+    {
+      "path": "tests/integration/test_full_pipeline.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6578,
+      "sha256": "sha256:80effdc663e1ff12c49be84650213fe0aa1b5f5ebc89fda261e29bf8b718e0bf"
+    },
+    {
+      "path": "tests/integration/test_log_sync_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7151,
+      "sha256": "sha256:b339385a7ff578fc5b2483267d3002a38a7e47e482284dc2483e40e256841507"
+    },
+    {
+      "path": "tests/integration/test_multi_worker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8405,
+      "sha256": "sha256:93f9341b51d1ff94e4f3d5eeee79287ba01dc452002403c1d82417de3f413e7b"
+    },
+    {
+      "path": "tests/integration/test_quota_monitor_e2e.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9718,
+      "sha256": "sha256:1eb1c7b2efbf2b3fcdd44c01c2c23058e496fbc3f6a579ded05ad342bc23195b"
+    },
+    {
+      "path": "tests/integration/test_ws_communication.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9352,
+      "sha256": "sha256:6251c5221d4e0999ccba2d54f67eed84f74e2726d7859e28ba1ec59cd001c6b8"
+    },
+    {
+      "path": "tests/ui_v2/auth.test.mjs",
+      "type": "file",
+      "mode": "0644",
+      "size": 2787,
+      "sha256": "sha256:1279ddb6b371a7760c580a25c6816b5142a4c80dcf306f5bf74baab9ae7666c7"
+    },
+    {
+      "path": "tests/ui_v2/job_batch.test.mjs",
+      "type": "file",
+      "mode": "0644",
+      "size": 4489,
+      "sha256": "sha256:a07e8327109921747cbcfaf0aaa1632ff2d4106ba41fc90665d10e9837c0ad7e"
+    },
+    {
+      "path": "tests/ui_v2/job_spec.test.mjs",
+      "type": "file",
+      "mode": "0644",
+      "size": 6375,
+      "sha256": "sha256:cb11a6a73f7624deb6886be33d8abb8297a4715d8495320f1ac68f2d4643066d"
+    },
+    {
+      "path": "tests/unit/__init__.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 0,
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/unit/test_account_binding.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 13924,
+      "sha256": "sha256:e23503abf5169378b52bf38dac977d32917206ec0412dee04c777df1b86142b7"
+    },
+    {
+      "path": "tests/unit/test_account_login_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2987,
+      "sha256": "sha256:db1ff57871fb18e2a223befb5cff7b0d91fab66b0e89dd981228279aa0e80832"
+    },
+    {
+      "path": "tests/unit/test_account_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7844,
+      "sha256": "sha256:40beb2d4cb3595b45d0442ee6f29310d612a29c33ee8a2de5885db1e94da3f4d"
+    },
+    {
+      "path": "tests/unit/test_agent_api_accounts.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 48438,
+      "sha256": "sha256:e6cf5f10896440dc68578d2d81fd29c3b94d94cc0c27812eb335f46b1261a673"
+    },
+    {
+      "path": "tests/unit/test_agent_type.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9796,
+      "sha256": "sha256:2715e3638a04ca8218beef47df8457b8c8609edea484fba158dbc81ec9443f43"
+    },
+    {
+      "path": "tests/unit/test_apexrouter.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 13620,
+      "sha256": "sha256:c44601abadbbc38cde41f14991787e1da58208463adc0b842a53c28e404e68dd"
+    },
+    {
+      "path": "tests/unit/test_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11295,
+      "sha256": "sha256:9e92d837505d0d7405e82de40b0f5ee8a1c491a2dd852727cd1cb27f5178aa61"
+    },
+    {
+      "path": "tests/unit/test_api_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7284,
+      "sha256": "sha256:f4e5369cd745764c385851736c96b77a02ffcd1b536a041da8520ae14e2069bd"
+    },
+    {
+      "path": "tests/unit/test_api_batch.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 255964,
+      "sha256": "sha256:995d8e86f330bbadd98f98c8c7fa001c094bfcc548cb4316b66d28ac5e03f685"
+    },
+    {
+      "path": "tests/unit/test_audit_worker_regressions.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 41261,
+      "sha256": "sha256:efcd6a46cadf6ec11f3938b91ecb28de1a1b692ca26ddac4ffe2c2711aa7415f"
+    },
+    {
+      "path": "tests/unit/test_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2310,
+      "sha256": "sha256:db172bb9853fc0755c094ce09803e78b986cec02d4dd73ff33f640d54ec7856e"
+    },
+    {
+      "path": "tests/unit/test_aws_manager_launcher.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 26012,
+      "sha256": "sha256:270630aea0e86a6409166a5f85891c105d76a3dfa546c4fe72e061a12a817e98"
+    },
+    {
+      "path": "tests/unit/test_aws_provider.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 16625,
+      "sha256": "sha256:d2e68a7ca38a47716297b7fd2a768825a9cfb852841e9ea7c4c641f6516acd59"
+    },
+    {
+      "path": "tests/unit/test_batch_hooks.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 127093,
+      "sha256": "sha256:47238b95c41b01d47feacd63f20b707323819baf473cd1da0b330bd8b1670d49"
+    },
+    {
+      "path": "tests/unit/test_batch_orchestrator.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 120982,
+      "sha256": "sha256:439c13c77a40ab1d60c94946d1479749a2c97672d5e06e5ec19e593fc21c0954"
+    },
+    {
+      "path": "tests/unit/test_binding_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 49752,
+      "sha256": "sha256:b0c3696f7f2263fbb8460629e7b3e19faaa387ee6b1890baa53ec313f8ab6d83"
+    },
+    {
+      "path": "tests/unit/test_bootstrap.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 16924,
+      "sha256": "sha256:e2dc88b61101bad31975f22064e4472174f8d70c79588ee68b3c373233ab2b5d"
+    },
+    {
+      "path": "tests/unit/test_bootstrap_handler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6123,
+      "sha256": "sha256:f4cd2c7d0687fa3173a05d33a66b286f6afd1b6770c264853f3849eec8cb3be2"
+    },
+    {
+      "path": "tests/unit/test_bootstrap_steps.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 13904,
+      "sha256": "sha256:2788c908d1c66f74024dbf708855ae99edbad55704ec57c441842b39a7ff6e4e"
+    },
+    {
+      "path": "tests/unit/test_checkpoint_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 47099,
+      "sha256": "sha256:712cb62bc091c46a5f7bc26fc2ef31f242969282e98b40ef86823dbc4698a043"
+    },
+    {
+      "path": "tests/unit/test_claude_oauth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14632,
+      "sha256": "sha256:3e181d8f895591894f418fbdb50d7bf2e93452ba81b6120fcebbe12a5fd0a109"
+    },
+    {
+      "path": "tests/unit/test_code_sync.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10691,
+      "sha256": "sha256:a77df238aaee11383230dea651e7382fd71d24859fed428d355283cbc273c65e"
+    },
+    {
+      "path": "tests/unit/test_codex_login.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 40461,
+      "sha256": "sha256:c003c7bfc28507a538ec2b02590250e09c52e6ef71798e15b98eb2225d887156"
+    },
+    {
+      "path": "tests/unit/test_config.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11293,
+      "sha256": "sha256:5381fdd1468137c8517b305c6dceeeaea81b9825959f1b2228220f1546b03bdd"
+    },
+    {
+      "path": "tests/unit/test_conftest_levels.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3588,
+      "sha256": "sha256:7ad9de61a65b8f3d55b8539f36f4e3959d5e7f320e32a623902c2451a3a0a748"
+    },
+    {
+      "path": "tests/unit/test_connection_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 26565,
+      "sha256": "sha256:203186c0f20474ca96563f5c7c2ec66ef3dfd69ead5c3e63c77dd242f996229a"
+    },
+    {
+      "path": "tests/unit/test_credential_binding.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11930,
+      "sha256": "sha256:d4ec5c83867c8f5db08884b7f7e8bc0a8048e3e2cac64b17e0eb2475a8dff60b"
+    },
+    {
+      "path": "tests/unit/test_credential_login_step.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7955,
+      "sha256": "sha256:54143bee53f31c053e5b2792f6954dcd031bdedb2da835fe2f1ffa74dd34f1e0"
+    },
+    {
+      "path": "tests/unit/test_credential_messages.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8758,
+      "sha256": "sha256:95e657eae5eb140874935fae77d8601d15072f9323eb4c15b63e4c75f70841ca"
+    },
+    {
+      "path": "tests/unit/test_credential_pool.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 31148,
+      "sha256": "sha256:3466e0792a4e0cf95d1e3b37c8244c69b66edeaff8a265f946db3b63c9cc1c00"
+    },
+    {
+      "path": "tests/unit/test_credential_rotator.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 23184,
+      "sha256": "sha256:bca444c1653455f7cdac20cac80d5f780bcfde6b3809f4f67f27a299ee46512d"
+    },
+    {
+      "path": "tests/unit/test_drain_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6679,
+      "sha256": "sha256:1b834815a6a4b31e455c6a0b6188e3b11f64e95b90855be050d800df8ef5dfca"
+    },
+    {
+      "path": "tests/unit/test_event_bus.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6112,
+      "sha256": "sha256:8ddccc681aea8130126a66ab9f8c27b2bc45f6fafe21a8e74faeadac9a60a7e7"
+    },
+    {
+      "path": "tests/unit/test_external_api_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9890,
+      "sha256": "sha256:bc81aa6d933af65e85031b95dc607f4117d6549254ceb23cc5cfd080ee1b6d19"
+    },
+    {
+      "path": "tests/unit/test_file_sync.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 27594,
+      "sha256": "sha256:42f9d0cb602ed16c8e9cc055afb479447c02e8e4659024acdd2dafbc79a131cd"
+    },
+    {
+      "path": "tests/unit/test_file_sync_debounce.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 18755,
+      "sha256": "sha256:5672b1f16e61d2c31da22f6758636220cf648b5cbd6babd71b121fadd2a1f3e7"
+    },
+    {
+      "path": "tests/unit/test_file_sync_errors.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12580,
+      "sha256": "sha256:2413d3c33da6db68b1040916a905d4a2cde8592af2e98ecfd10108def01fb9f2"
+    },
+    {
+      "path": "tests/unit/test_files_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 32295,
+      "sha256": "sha256:c3b9809f80f24602bd8ede27ca598d1fa0263530111ffa4e48d20d927898be67"
+    },
+    {
+      "path": "tests/unit/test_generic_harness.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 17965,
+      "sha256": "sha256:e40d99547873591907798c28ffd49bfbebb8c7cbf7a8c340fbfe64794c733579"
+    },
+    {
+      "path": "tests/unit/test_golden_ami_script.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5395,
+      "sha256": "sha256:5ddeda7e66f699a96016a232f4be835f08eb95cc58fb7dcaeed5c6a7faf673a4"
+    },
+    {
+      "path": "tests/unit/test_golden_image_verify.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5743,
+      "sha256": "sha256:a444556915f944eb05e18c5ce57e33c8546b581833886f3a4250708e5aadf10d"
+    },
+    {
+      "path": "tests/unit/test_health_checker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7177,
+      "sha256": "sha256:f43d6500dd67707796e020ae86fac66386599de9313f4e9a2f983b838114a4c6"
+    },
+    {
+      "path": "tests/unit/test_job_batch_ui.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 7033,
+      "sha256": "sha256:cf8006ac70216ce490e44ae6430c340663183ba5b1d38af123e2b06b712d6304"
+    },
+    {
+      "path": "tests/unit/test_job_batches.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 40889,
+      "sha256": "sha256:a9c654c46bf60f5713f5599e1804817d4bd973684b5d9313c2a927a0e67b6440"
+    },
+    {
+      "path": "tests/unit/test_job_log_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6871,
+      "sha256": "sha256:6e669ba2cd884d812961d1481aceb2c298e4e9b149b3d04136eb64c1b06494ec"
+    },
+    {
+      "path": "tests/unit/test_job_spec.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 41217,
+      "sha256": "sha256:c997ed2f5404c131fd234c7426eefd4cbabf5cc55f2f4658f112cdd70099c9aa"
+    },
+    {
+      "path": "tests/unit/test_local_worker_process.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2072,
+      "sha256": "sha256:5f4d805eaa177d8aa2190b9f2574f2811221f4a85a9c50017606687ee31c8db0"
+    },
+    {
+      "path": "tests/unit/test_log_event_parser.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14292,
+      "sha256": "sha256:86107dda1160b8a10dea9d39eef3d0b5a35596757b237a304a1f9d589c93e531"
+    },
+    {
+      "path": "tests/unit/test_log_event_parsing.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11871,
+      "sha256": "sha256:6a9d6e96598a49c35209e80785ae0c431c6c250be845493f94a4964fbbdaaf27"
+    },
+    {
+      "path": "tests/unit/test_log_parser.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6460,
+      "sha256": "sha256:52e34b2f1e94945d2065cb1956925c8625ca3cec30a6dac50fd02ca19d68cf58"
+    },
+    {
+      "path": "tests/unit/test_management_api_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 22840,
+      "sha256": "sha256:85f0538d8ab6ee78a69e47054f3d48c1df5a848c3ec6bf98a7b7d6532d9edf65"
+    },
+    {
+      "path": "tests/unit/test_management_auth.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 15081,
+      "sha256": "sha256:92972bb8b7fbd35c97f87f351f837fad917ebd46414a099329f0e6f725f9f804"
+    },
+    {
+      "path": "tests/unit/test_manager.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 151993,
+      "sha256": "sha256:3daedb73b2fb003c06891d6e26c725c4e307f49d7052d813329fb6f75aab737d"
+    },
+    {
+      "path": "tests/unit/test_manager_fleet_driver.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 104078,
+      "sha256": "sha256:4867155e3aef3ac4e6fb89439ce76087466fc264427e9ef46a72bbf6f5fa055e"
+    },
+    {
+      "path": "tests/unit/test_network.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 982,
+      "sha256": "sha256:0dac32cf730170d5be93aad27686fbbca35501bae9c144983d2a2fa9021be9d4"
+    },
+    {
+      "path": "tests/unit/test_oauth_race_and_retry.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9215,
+      "sha256": "sha256:b4f82faac40657068c078e16a05e943157ecc62bc31d82f3455181848399b83a"
+    },
+    {
+      "path": "tests/unit/test_operations_log.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6252,
+      "sha256": "sha256:59d95c4b746512a1c25220cd3907af13555faac636e1adf86880977ea1c29e1a"
+    },
+    {
+      "path": "tests/unit/test_operations_log_extended.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11434,
+      "sha256": "sha256:4eb7f66d0f631d2c55817751e0217bb275d7111b19133176784f5dd5333d47f2"
+    },
+    {
+      "path": "tests/unit/test_operations_logger.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8998,
+      "sha256": "sha256:20064fca69ef7765fddc591dd968b125e559c7a6a245a9cb8cb824d08b1716f0"
+    },
+    {
+      "path": "tests/unit/test_process_logger.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5248,
+      "sha256": "sha256:1df3051e6edcc72c021a4aa3bfb8b9195650107fc679d048a66a212ada51b03e"
+    },
+    {
+      "path": "tests/unit/test_protocol_messages.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 32793,
+      "sha256": "sha256:02c99b06db3665931d73b898fa9983734bbff941b15daf75d38ae2c0319667f9"
+    },
+    {
+      "path": "tests/unit/test_provider_eip.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 10071,
+      "sha256": "sha256:0d01f6a9e7601ce2d8842634172406ff7d45c3ef4d58fc13c6e06860425b9361"
+    },
+    {
+      "path": "tests/unit/test_pty_backend.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 59401,
+      "sha256": "sha256:1233b0d9f6191a0a6747a0f3bae228bd21dc44fccb74612add3d22b4f89a3b29"
+    },
+    {
+      "path": "tests/unit/test_quota_checker.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9778,
+      "sha256": "sha256:0fca1b4681354a73249e87b9403456959c9e2575fc9b18344cc4389a851cac59"
+    },
+    {
+      "path": "tests/unit/test_quota_monitor.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 18362,
+      "sha256": "sha256:869f8af4e8b8e421c8961e5c3e6bab85d828f5f7a085d275c7eb72b733e73429"
+    },
+    {
+      "path": "tests/unit/test_rate_limit.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12914,
+      "sha256": "sha256:5f961240805ec5bd288252c1a61eef402196d4605a76496ee3b28c92ca08aa3a"
+    },
+    {
+      "path": "tests/unit/test_reconciler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 21254,
+      "sha256": "sha256:117d58f7fd1b0728cf728a9a3bd907ce59f505fb592ca6c8d7695c736578916b"
+    },
+    {
+      "path": "tests/unit/test_recovery_transaction.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9788,
+      "sha256": "sha256:aa0bd916c888c1751374866b2777d65dbee2ad4eb5a6d5d6acfc20db725da874"
+    },
+    {
+      "path": "tests/unit/test_registry.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8223,
+      "sha256": "sha256:e5f38556a226b8a59410d80ca025189abde23fbac2a8b95f1fd4178e5716e8cb"
+    },
+    {
+      "path": "tests/unit/test_release_evidence.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 3936,
+      "sha256": "sha256:1f021248003979de328228c1feaff7e411b63f6d0df3dd319188fb9bdcfda66e"
+    },
+    {
+      "path": "tests/unit/test_remove_node.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 5146,
+      "sha256": "sha256:cced3ab3ceb54f02bcfce2d5528dcd09da25b3d439fd37f8c757eaedbfbf77f2"
+    },
+    {
+      "path": "tests/unit/test_request_body_limit.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 16689,
+      "sha256": "sha256:a4b5916e7fcd31d9481469f2fc87fb7a1d9c919c82e38cff2f48ad3a307b482c"
+    },
+    {
+      "path": "tests/unit/test_result_uploader.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 14795,
+      "sha256": "sha256:ca9bdc2671cc0f1b673bef9827af9997edb972c9528a8e8bfdbb72278b0e19a5"
+    },
+    {
+      "path": "tests/unit/test_secret_env.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2768,
+      "sha256": "sha256:74b9f9d2a06a058aab1445dbdabf3b9784f50e644c8e32bd57e7f95a1f366974"
+    },
+    {
+      "path": "tests/unit/test_secure_store.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9270,
+      "sha256": "sha256:78db60202692079b21c63450dff9b70f25e434e0b7385d57565d8f81ff4c0d4b"
+    },
+    {
+      "path": "tests/unit/test_spot_instance.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12082,
+      "sha256": "sha256:e70546f6bcea0332ba04840ada68ebd8afb39cb27f6ffa13cf761bfd6374807d"
+    },
+    {
+      "path": "tests/unit/test_task_registry.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 15075,
+      "sha256": "sha256:d4a25958b7f37eba2d4b29ae21061965d3641081f397c2e79683ac0ebb9ce20a"
+    },
+    {
+      "path": "tests/unit/test_task_router.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11571,
+      "sha256": "sha256:6ced5d1f857e3a03c2a6f9db939c725b06ec43c4e1a26fe4c5dda86df9d0abd8"
+    },
+    {
+      "path": "tests/unit/test_task_scheduler.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 11184,
+      "sha256": "sha256:0d4d7499ff4e5fc41b8b831e3801a07b4b41cf9e6c94e4a1de4d51b4dacb99a4"
+    },
+    {
+      "path": "tests/unit/test_task_supervisor.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 34397,
+      "sha256": "sha256:e7d13266c0b4287469ec22dfdc80e6cff398ef0c12c5d8987273f34edf68d57a"
+    },
+    {
+      "path": "tests/unit/test_task_sync_mapper.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 4675,
+      "sha256": "sha256:6ccd27222842006f89f80af174183e1492ca6ad74128ee083137373d7b53c00b"
+    },
+    {
+      "path": "tests/unit/test_task_sync_mapper_extended.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9412,
+      "sha256": "sha256:c80e12f407bec86ca100a62c50ba2835ece3bc11dae5b9f699db87423928deb2"
+    },
+    {
+      "path": "tests/unit/test_testing_exports.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2649,
+      "sha256": "sha256:827773b9325892ff08befc4302ac2b7c361b82e92a10fca913b1300e3aeb81a1"
+    },
+    {
+      "path": "tests/unit/test_testing_tools.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 13615,
+      "sha256": "sha256:0a0da31ec61d3f1493d3ede8d9aad7cd3e785aeef7233bcdec74e90fcf4b9d74"
+    },
+    {
+      "path": "tests/unit/test_ui_v2.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 12764,
+      "sha256": "sha256:e444d24384bbad9f3cba02fc80f55ceb803a70882e0e27cdcdf10f61abc8e5a8"
+    },
+    {
+      "path": "tests/unit/test_web_ui.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 75250,
+      "sha256": "sha256:7d58445809ddf439576c46360b9bfba36e89230a14d1dc8ea0a03fed5d33887a"
+    },
+    {
+      "path": "tests/unit/test_webhook.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 8176,
+      "sha256": "sha256:6f1427b5ac4b4528959042f6557b790c7f34b89c2c5eecee02eacc6a54988c05"
+    },
+    {
+      "path": "tests/unit/test_webhook_emitter.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 25085,
+      "sha256": "sha256:2ccc23df7f0a24e3f2afc54b33ddd68bc387c9f2f29d40084f569b584eac6808"
+    },
+    {
+      "path": "tests/unit/test_worker_agent_api.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 30538,
+      "sha256": "sha256:ed5d3c217156761b4e5f12ba91ce752cfe3da746f21fb7efaafcda8f5aa4388f"
+    },
+    {
+      "path": "tests/unit/test_worker_log_persistence.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9248,
+      "sha256": "sha256:6b11328323b88e93a82caef8813591a4bdcacd36462c1da7dc411d338927bd2e"
+    },
+    {
+      "path": "tests/unit/test_worker_reconnect.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 9693,
+      "sha256": "sha256:b64919cb803fa030a03ed86141381ddede1c12bba45202a0136e6031d77f75e7"
+    },
+    {
+      "path": "tests/unit/test_worker_runtime.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 91365,
+      "sha256": "sha256:62ce84560e9daaaeba8a7539107f3353eb887c134e6bc76faffa1cd27244bcad"
+    },
+    {
+      "path": "uv.lock",
+      "type": "file",
+      "mode": "0644",
+      "size": 457373,
+      "sha256": "sha256:925487ace40685d261a27c7cbd5f1e6229bd8f42348f8b4dc45e95575448bd90"
+    }
+  ]
+}
