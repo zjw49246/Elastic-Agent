@@ -585,6 +585,10 @@ def test_empty_config_dir_uses_real_users_managed_home(tmp_path, monkeypatch):
 def test_existing_slot_permissions_are_not_rewritten(tmp_path):
     slot = tmp_path / "existing-slot"
     slot.mkdir(mode=0o755)
+    # The process umask also applies to ``mkdir(mode=...)``.  Make the
+    # pre-existing caller-owned mode explicit so this contract remains
+    # deterministic under the restrictive 0700 umask used in production.
+    slot.chmod(0o755)
 
     home = configure_agent_api(
         provider="cloudrouter",
