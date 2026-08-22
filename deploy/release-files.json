@@ -1825,8 +1825,8 @@
       "path": "tests/unit/test_pty_backend.py",
       "type": "file",
       "mode": "0644",
-      "size": 59223,
-      "sha256": "sha256:66df8a925f52f7f8f29e02cc632f5f1ee165668cc5d6eeb6c9dec225c3460fef"
+      "size": 59669,
+      "sha256": "sha256:7d530e7135476c8ee6ed29ddae116936d76c0e60b5101dea5b70dd38d0b2e1c8"
     },
     {
       "path": "tests/unit/test_quota_checker.py",
@@ -2007,8 +2007,8 @@
       "path": "tests/unit/test_worker_agent_api.py",
       "type": "file",
       "mode": "0644",
-      "size": 30538,
-      "sha256": "sha256:ed5d3c217156761b4e5f12ba91ce752cfe3da746f21fb7efaafcda8f5aa4388f"
+      "size": 30775,
+      "sha256": "sha256:6d97230b457fa3db8dd48ee8c21bfe4fd6d88e179cfad17fabdd6d6fce9e6cba"
     },
     {
       "path": "tests/unit/test_worker_log_persistence.py",
