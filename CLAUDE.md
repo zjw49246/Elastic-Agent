@@ -4,6 +4,8 @@
 
 ## 架构要点
 
+- **Release evidence digest 域**：schema v3 将 EA 的 `worker_runtime_provenance_digest` 与 Task Platform 严格 11 字段 `WorkerProfileInput` 的 `worker_profile_digest` 分开。generator 必须显式读取权威外部 JSON，缺失、多字段、少字段、AMI 与 provenance 不一致均 fail closed；测试 fixture 绝不进入生产 manifest。
+
 - **任务执行两条路径**（worker/runtime.py `_handle_execute`）：
   - subprocess（默认）：Manager 经 AgentType 构造 `claude -p ... --output-format stream-json` 命令行，worker spawn 后逐行转发 stdout
   - **PTY 模式**（可选）：`ExecuteMessage.agent_params` 非空且 worker 装了 [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) 时，worker 用 `ElasticPTYBackend`（worker/pty_backend.py，继承 claude_pty 的 BasePTYBackend）把 Claude Code 宿主在持久 PTY 会话里；`command` 始终随消息下发作为 fallback
