@@ -806,3 +806,10 @@ checkpoint 单向累计，最终造成“实际有空间、记账显示已满”
 
 **生产验证**：修复版 `feat/admin-account-auth-v2@5e56a5a` 于 2026-08-12 07:33 UTC 部署；
 Manager 健康检查通过，重启清除了旧进程内已泄漏的计数，部署后的初次复核未再出现该预算错误。
+## 2026-08-22 Task Platform immutable release evidence
+
+**问题**：Task Platform 需要用 Manager 自身发布的权威证据验证 Executor，不能从相近的 Git/AMI digest 猜测；线上旧 Worker AMI 与目标 AMI 也不一致。
+
+**解决**：提交 `de8de15` 增加 canonical release manifest、启动期 fail-closed 校验和受认证 health 顶层证据。wire contract 固定为 `manager_state_schema=v1` 以及两个 `sha256:<64 lowercase hex>` digest；AWS launcher 在读 state 或访问云前逐字比较 AMI/account/Region/revision，并把 STS account 纳入同一边界。生产配置、IAM image pin 与 immutable `/opt/task-platform/elastic-agent-<revision>` 路径同步切到 `ami-0c7d40ac988a900c5`，旧 `ami-0aec7ffcbe44c6f7a` 被测试证明拒绝。
+
+**以后避免**：跨服务证据字段必须先按消费者的 exact schema 固定名称、顶层位置和 digest 前缀，再生成/签名；AMI、IAM resource pin、runtime env 和 manifest 必须作为同一个发布事务推进，任何一项漂移都 fail closed。
