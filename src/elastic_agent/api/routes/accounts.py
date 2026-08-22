@@ -230,42 +230,6 @@ async def list_accounts() -> AccountListResponse:
     )
 
 
-@router.get("/accounts/{account_id}")
-async def get_account_availability(account_id: str) -> dict:
-    """Return the bounded, non-secret capability projection used by the platform."""
-    account = await _get_account_identity(account_id)
-    if account is None:
-        raise HTTPException(404, f"Account {account_id} not found")
-    manager = _mgr()
-    usage = {}
-    api_store = getattr(manager, "agent_api_store", None)
-    if getattr(account, "auth_kind", "oauth") == "agent_api" and api_store is not None:
-        usage = api_store.usage_snapshot(account_id)
-    agent_types = list(getattr(account, "supported_agent_types", []) or [])
-    models = getattr(account, "models", {}) or {}
-    model_ids = sorted({str(item) for values in models.values() for item in values})
-    active_jobs = 0
-    try:
-        for job in manager.batch.list_jobs():
-            for run in getattr(job, "runs", {}).values():
-                phase = getattr(getattr(run, "phase", None), "value", str(getattr(run, "phase", "")))
-                if account_id in (getattr(run, "account_ids", []) or []) and phase not in _TERMINAL_ALLOCATION_PHASES:
-                    active_jobs += 1
-    except Exception:
-        active_jobs = 0
-    global_concurrency = int(os.environ.get("ELASTIC_AGENT_GLOBAL_CONCURRENCY", "10"))
-    status = str(usage.get("status") or ("enabled" if getattr(account, "enabled", False) else "disabled"))
-    available = bool(usage.get("available", getattr(account, "enabled", False)))
-    return {
-        "external_account_id": account.id,
-        "status": status,
-        "available": available,
-        "global_concurrency": global_concurrency,
-        "active_jobs": active_jobs,
-        "capabilities": {"agent_types": agent_types, "model_ids": model_ids},
-    }
-
-
 @router.get("/accounts/allocations")
 async def account_allocations() -> dict:
     """Which accounts are currently bound to which worker/job.
@@ -362,6 +326,42 @@ async def list_account_bindings() -> AccountBindingListResponse:
     """List durable account→EIP mappings, including their availability state."""
     bindings = await _binding_manager().list_bindings()
     return AccountBindingListResponse(bindings=bindings, total=len(bindings))
+
+
+@router.get("/accounts/{account_id}")
+async def get_account_availability(account_id: str) -> dict:
+    """Return the bounded, non-secret capability projection used by the platform."""
+    account = await _get_account_identity(account_id)
+    if account is None:
+        raise HTTPException(404, f"Account {account_id} not found")
+    manager = _mgr()
+    usage = {}
+    api_store = getattr(manager, "agent_api_store", None)
+    if getattr(account, "auth_kind", "oauth") == "agent_api" and api_store is not None:
+        usage = api_store.usage_snapshot(account_id)
+    agent_types = list(getattr(account, "supported_agent_types", []) or [])
+    models = getattr(account, "models", {}) or {}
+    model_ids = sorted({str(item) for values in models.values() for item in values})
+    active_jobs = 0
+    try:
+        for job in manager.batch.list_jobs():
+            for run in getattr(job, "runs", {}).values():
+                phase = getattr(getattr(run, "phase", None), "value", str(getattr(run, "phase", "")))
+                if account_id in (getattr(run, "account_ids", []) or []) and phase not in _TERMINAL_ALLOCATION_PHASES:
+                    active_jobs += 1
+    except Exception:
+        active_jobs = 0
+    global_concurrency = int(os.environ.get("ELASTIC_AGENT_GLOBAL_CONCURRENCY", "10"))
+    status = str(usage.get("status") or ("enabled" if getattr(account, "enabled", False) else "disabled"))
+    available = bool(usage.get("available", getattr(account, "enabled", False)))
+    return {
+        "external_account_id": account.id,
+        "status": status,
+        "available": available,
+        "global_concurrency": global_concurrency,
+        "active_jobs": active_jobs,
+        "capabilities": {"agent_types": agent_types, "model_ids": model_ids},
+    }
 
 
 @router.get("/accounts/{account_id}/binding", response_model=AccountBinding)

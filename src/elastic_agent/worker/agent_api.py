@@ -390,18 +390,16 @@ def _prepare_slot_directory(path: Path) -> None:
 
     _reject_symlink_ancestors(path)
     try:
-        existed = path.exists()
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
         metadata = path.lstat()
     except OSError as exc:
         raise UnsafeAgentAPIPathError("Agent API storage is unavailable") from exc
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
         raise UnsafeAgentAPIPathError("Unsafe Agent API slot directory")
-    if not existed and stat.S_IMODE(metadata.st_mode) != 0o700:
-        try:
-            os.chmod(path, 0o700, follow_symlinks=False)
-        except OSError as exc:
-            raise UnsafeAgentAPIPathError("Unsafe Agent API slot directory") from exc
+    # The caller-selected slot may be an existing CLI home with deliberately
+    # broader permissions.  Never rewrite it.  Newly-created paths are still
+    # requested as 0700; a concurrent umask may make them stricter, which is
+    # safe and must not be widened after creation.
 
 
 def _require_private_directory(path: Path) -> None:
