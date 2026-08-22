@@ -24,9 +24,7 @@ _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _ARTIFACT_REVISION = re.compile(r"^artifact-sha256:[0-9a-f]{64}$")
 _SCHEMA_NAME = re.compile(r"^v[1-9][0-9]{0,8}$")
-_SECRET_NAME = re.compile(
-    r"(?:secret|token|password|credential|api[_-]?key)", re.IGNORECASE
-)
+_SECRET_NAME = re.compile(r"(?:secret|token|password|credential|api[_-]?key)", re.IGNORECASE)
 
 _MANIFEST_KEYS = frozenset(
     {
@@ -44,12 +42,8 @@ _MANIFEST_KEYS = frozenset(
     }
 )
 _RELEASE_INDEX_PATH = "deploy/release-files.json"
-_GENERATED_RELEASE_PATHS = frozenset(
-    {"deploy/release-manifest.json", _RELEASE_INDEX_PATH}
-)
-_ALLOWED_UNTRACKED_PARTS = frozenset(
-    {".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__"}
-)
+_GENERATED_RELEASE_PATHS = frozenset({"deploy/release-manifest.json", _RELEASE_INDEX_PATH})
+_ALLOWED_UNTRACKED_PARTS = frozenset({".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__"})
 _MAX_INDEX_BYTES = 4 * 1024 * 1024
 _MAX_RELEASE_FILES = 10_000
 _MAX_RELEASE_BYTES = 512 * 1024 * 1024
@@ -64,6 +58,12 @@ _WORKER_PROFILE_KEYS = frozenset(
         "region",
         "aws_account_id",
         "release_revision",
+        "ami_manifest_digest",
+        "ami_constraints_digest",
+        "ami_runner_image",
+        "ami_platform_revision",
+        "ami_upstream_revision",
+        "ami_generator_version",
     }
 )
 
@@ -170,6 +170,31 @@ def _validate_worker_profile(raw: Any) -> dict[str, Any]:
     result["profiles"] = normalized_profiles
     for key in ("runtime_source", "bootstrap_source", "dependency_lock"):
         _require_string(result, key)
+    for key in (
+        "ami_manifest_digest",
+        "ami_constraints_digest",
+        "ami_runner_image",
+        "ami_platform_revision",
+        "ami_upstream_revision",
+        "ami_generator_version",
+    ):
+        _require_string(result, key)
+    if _SHA256_DIGEST.fullmatch(result["ami_manifest_digest"]) is None:
+        raise ReleaseEvidenceError("worker profile ami_manifest_digest is invalid")
+    if _SHA256_DIGEST.fullmatch(result["ami_constraints_digest"]) is None:
+        raise ReleaseEvidenceError("worker profile ami_constraints_digest is invalid")
+    if not re.fullmatch(
+        r"[0-9]{12}\.dkr\.ecr\.[a-z]{2}(?:-gov)?-[a-z]+-\d\.amazonaws\.com/"
+        r"[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}",
+        result["ami_runner_image"],
+    ):
+        raise ReleaseEvidenceError("worker profile ami_runner_image is invalid")
+    if _COMMIT.fullmatch(result["ami_platform_revision"]) is None:
+        raise ReleaseEvidenceError("worker profile ami_platform_revision is invalid")
+    if _COMMIT.fullmatch(result["ami_upstream_revision"]) is None:
+        raise ReleaseEvidenceError("worker profile ami_upstream_revision is invalid")
+    if result["ami_generator_version"] != "build-only-v1":
+        raise ReleaseEvidenceError("worker profile ami_generator_version is invalid")
     ami_id = _require_string(result, "ami_id")
     if not re.fullmatch(r"ami-[0-9a-f]{17}", ami_id):
         raise ReleaseEvidenceError("worker profile ami_id is invalid")
@@ -244,9 +269,7 @@ def _validate_release_index(raw: Any) -> dict[str, Any]:
     total_bytes = 0
     normalized: list[dict[str, Any]] = []
     for record in files:
-        if not isinstance(record, dict) or set(record) != {
-            "path", "type", "mode", "size", "sha256"
-        }:
+        if not isinstance(record, dict) or set(record) != {"path", "type", "mode", "size", "sha256"}:
             raise ReleaseEvidenceError("release file index record is invalid")
         path = record.get("path")
         kind = record.get("type")

@@ -12,6 +12,7 @@ import pytest
 
 from deploy.aws_manager import (
     CANONICAL_OWNER_ID,
+    TASK_PLATFORM_AMI_EVIDENCE_TAG_KEYS,
     LauncherConfigurationError,
     build_application,
     build_config,
@@ -26,22 +27,10 @@ from elastic_agent.core.release_evidence import load_release_manifest
 
 CALLER_ACCOUNT = "297645381734"
 SERVICE_UNIT = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.service"
-AWS_ENV = (
-    Path(__file__).resolve().parents[2]
-    / "deploy/aws/elastic-agent-manager.aws.env"
-)
-MANAGER_POLICY = (
-    Path(__file__).resolve().parents[2]
-    / "deploy/aws/elastic-agent-manager-policy.json"
-)
-WORKER_POLICY = (
-    Path(__file__).resolve().parents[2]
-    / "deploy/aws/elastic-agent-worker-policy.json"
-)
-RESULTS_BUCKET_POLICY = (
-    Path(__file__).resolve().parents[2]
-    / "deploy/aws/elastic-agent-results-bucket-policy.json"
-)
+AWS_ENV = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager.aws.env"
+MANAGER_POLICY = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-manager-policy.json"
+WORKER_POLICY = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-worker-policy.json"
+RESULTS_BUCKET_POLICY = Path(__file__).resolve().parents[2] / "deploy/aws/elastic-agent-results-bucket-policy.json"
 IAM_CUTOVER = Path(__file__).resolve().parents[2] / "deploy/aws/iam-cutover.md"
 
 
@@ -53,9 +42,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "ELASTIC_AGENT_AWS_ACCOUNT_ID": manifest["worker_profile"]["aws_account_id"],
         "ELASTIC_AGENT_AWS_AMI_ID": manifest["worker_profile"]["ami_id"],
         "ELASTIC_AGENT_RELEASE_REVISION": manifest["release_revision"],
-        "ELASTIC_AGENT_RELEASE_MANIFEST": str(
-            Path(__file__).resolve().parents[2] / "deploy/release-manifest.json"
-        ),
+        "ELASTIC_AGENT_RELEASE_MANIFEST": str(Path(__file__).resolve().parents[2] / "deploy/release-manifest.json"),
         "ELASTIC_AGENT_AWS_INSTANCE_TYPE": "t3.large",
         "ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS": ("sg-0123456789abcdef0,sg-11111111111111111"),
         "ELASTIC_AGENT_AWS_SUBNET_ID": "subnet-0123456789abcdef0",
@@ -103,9 +90,41 @@ def _golden_image() -> dict:
             }
         ],
         "Tags": [
-            {"Key": "ManagedBy", "Value": "elastic-agent"},
-            {"Key": "Role", "Value": "worker-golden"},
+            {"Key": "ManagedBy", "Value": "task-platform-packer"},
+            {"Key": "TaskPlatform", "Value": "worker"},
+            {"Key": "Service", "Value": "task-platform"},
+            {
+                "Key": "ManifestDigest",
+                "Value": "sha256:2b0c6aa51fd2c93441346817e1a1ee5e79d8c32b27b57b92e39fe2befafa8e37",
+            },
+            {
+                "Key": "ConstraintsDigest",
+                "Value": "sha256:bc81f22a46eee61748cc6d114f7f0d33e0a46e15182726a516e909b82176dce0",
+            },
+            {
+                "Key": "RunnerImage",
+                "Value": (
+                    "297645381734.dkr.ecr.ap-northeast-1.amazonaws.com/"
+                    "task-platform-pilot-runner@sha256:"
+                    "3b8f0b625ccbcc80558daed736c7a0932a31c7bcedb66e971418e0eabe356ab3"
+                ),
+            },
+            {"Key": "PlatformRevision", "Value": "6eff9ab33f9094c3dccb04cd5f5ef9449ce65fb8"},
+            {"Key": "UpstreamRevision", "Value": "115320154e929bc28800a3273ebb3f56eef10070"},
+            {"Key": "GeneratorVersion", "Value": "build-only-v1"},
         ],
+    }
+
+
+def _expected_ami_tags() -> dict[str, str]:
+    profile = load_release_manifest()["worker_profile"]
+    return {
+        "ManifestDigest": profile["ami_manifest_digest"],
+        "ConstraintsDigest": profile["ami_constraints_digest"],
+        "RunnerImage": profile["ami_runner_image"],
+        "PlatformRevision": profile["ami_platform_revision"],
+        "UpstreamRevision": profile["ami_upstream_revision"],
+        "GeneratorVersion": profile["ami_generator_version"],
     }
 
 
@@ -117,10 +136,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "ExecStartPost=" in source and "/api/health" in source
     assert "-H @-" in source
     assert "ELASTIC_AGENT_EXTERNAL_API_KEYS" in source
-    assert (
-        "WorkingDirectory=/opt/task-platform/"
-        "elastic-agent-current"
-    ) in source
+    assert ("WorkingDirectory=/opt/task-platform/elastic-agent-current") in source
     assert "/home/ubuntu/elastic-agent/.venv" not in source
     assert "TimeoutStopSec=32400" in source
     for setting in (
@@ -135,9 +151,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
 
 
 def test_production_launcher_trusts_forwarded_clients_only_from_loopback_proxy():
-    source = (Path(__file__).resolve().parents[2] / "deploy/aws_manager.py").read_text(
-        encoding="utf-8"
-    )
+    source = (Path(__file__).resolve().parents[2] / "deploy/aws_manager.py").read_text(encoding="utf-8")
 
     assert "proxy_headers=True" in source
     assert 'forwarded_allow_ips="127.0.0.1,::1"' in source
@@ -145,10 +159,7 @@ def test_production_launcher_trusts_forwarded_clients_only_from_loopback_proxy()
 
 def test_production_allowlist_covers_common_x86_worker_families():
     source = AWS_ENV.read_text(encoding="utf-8")
-    assert (
-        "ELASTIC_AGENT_PUBLIC_ORIGIN=https://elastic-agent.claude-code-manager.com"
-        in source
-    )
+    assert "ELASTIC_AGENT_PUBLIC_ORIGIN=https://elastic-agent.claude-code-manager.com" in source
     configured = next(
         line.partition("=")[2]
         for line in source.splitlines()
@@ -159,9 +170,15 @@ def test_production_allowlist_covers_common_x86_worker_families():
         f"{family}.{size}"
         for family in (
             "t3",
-            "m5", "m6i", "m7i",
-            "c5", "c6i", "c7i",
-            "r5", "r6i", "r7i",
+            "m5",
+            "m6i",
+            "m7i",
+            "c5",
+            "c6i",
+            "c7i",
+            "r5",
+            "r6i",
+            "r7i",
         )
         for size in ("large", "xlarge", "2xlarge", "4xlarge")
     }
@@ -169,11 +186,7 @@ def test_production_allowlist_covers_common_x86_worker_families():
 
     assert actual == expected
     policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
-    launch = next(
-        statement
-        for statement in policy["Statement"]
-        if statement["Sid"] == "LaunchOnlyManagedWorkers"
-    )
+    launch = next(statement for statement in policy["Statement"] if statement["Sid"] == "LaunchOnlyManagedWorkers")
     iam_types = launch["Condition"]["StringEquals"]["ec2:InstanceType"]
     if isinstance(iam_types, str):
         iam_types = [iam_types]
@@ -193,14 +206,9 @@ def test_production_job_batch_global_limit_is_50():
 def test_manager_policy_and_cutover_pin_real_key_pair_name():
     policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
     launch = next(
-        statement
-        for statement in policy["Statement"]
-        if statement["Sid"] == "LaunchWithPinnedInfrastructure"
+        statement for statement in policy["Statement"] if statement["Sid"] == "LaunchWithPinnedInfrastructure"
     )
-    expected = (
-        "arn:aws:ec2:ap-northeast-1:297645381734:"
-        "key-pair/interview-key"
-    )
+    expected = "arn:aws:ec2:ap-northeast-1:297645381734:key-pair/interview-key"
 
     assert expected in launch["Resource"]
     assert expected in IAM_CUTOVER.read_text(encoding="utf-8")
@@ -214,7 +222,7 @@ def test_iam_cutover_simulates_complete_manager_policy():
 
     assert len(compact) < 131_072
     assert "MANAGER_POLICY=$(jq -c ." in cutover
-    assert 'MANAGER_RUN_POLICY=' not in cutover
+    assert "MANAGER_RUN_POLICY=" not in cutover
     assert '--policy-input-list "$MANAGER_POLICY"' in cutover
     assert "EvaluationResults[?EvalDecision!=`allowed`]" in cutover
 
@@ -235,10 +243,7 @@ def test_manager_policy_tags_and_detaches_only_managed_network_interfaces():
     statements = {statement["Sid"]: statement for statement in policy["Statement"]}
 
     create_tags = statements["TagManagedResourcesAtCreation"]
-    assert (
-        "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*"
-        in create_tags["Resource"]
-    )
+    assert "arn:aws:ec2:ap-northeast-1:297645381734:network-interface/*" in create_tags["Resource"]
     disassociate = statements["DisassociateManagedEips"]
     assert disassociate["Action"] == "ec2:DisassociateAddress"
     assert set(disassociate["Resource"]) == {
@@ -256,39 +261,22 @@ def test_manager_policy_tags_and_detaches_only_managed_network_interfaces():
 
 def test_manager_policy_allows_shard_tag_and_only_internal_checkpoint_deletes():
     policy = json.loads(MANAGER_POLICY.read_text(encoding="utf-8"))
-    statements = {
-        statement["Sid"]: statement
-        for statement in policy["Statement"]
-    }
+    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
 
     for sid in ("LaunchOnlyManagedWorkers", "TagManagedResourcesAtCreation"):
-        assert (
-            "ElasticAgentShardIndex"
-            in statements[sid]["Condition"]["ForAllValues:StringEquals"][
-                "aws:TagKeys"
-            ]
-        )
+        assert "ElasticAgentShardIndex" in statements[sid]["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"]
     delete = statements["DeleteInternalCheckpointHistory"]
     assert delete == {
         "Sid": "DeleteInternalCheckpointHistory",
         "Effect": "Allow",
         "Action": "s3:DeleteObject",
-        "Resource": (
-            "arn:aws:s3:::elastic-agent-results-297645381734/"
-            "jobs/.elastic-agent-checkpoints/*"
-        ),
+        "Resource": ("arn:aws:s3:::elastic-agent-results-297645381734/jobs/.elastic-agent-checkpoints/*"),
     }
     assert "s3:DeleteObject" not in statements["ReadAndWriteResults"]["Action"]
 
     cutover = IAM_CUTOVER.read_text(encoding="utf-8")
-    assert (
-        "ManagedBy,Name,ElasticAgentJob,ElasticAgentShardIndex,"
-        "ElasticAgentController"
-    ) in cutover
-    assert (
-        "jobs/.elastic-agent-checkpoints/job-test/"
-        "checkpoint-blobs/deadbeef"
-    ) in cutover
+    assert ("ManagedBy,Name,ElasticAgentJob,ElasticAgentShardIndex,ElasticAgentController") in cutover
+    assert ("jobs/.elastic-agent-checkpoints/job-test/checkpoint-blobs/deadbeef") in cutover
     assert "jobs/job-test/result.json" in cutover
 
 
@@ -306,9 +294,7 @@ def test_worker_policy_reads_only_datasets_and_writes_results():
         "Sid": "ReadOnlyJobDatasets",
         "Effect": "Allow",
         "Action": "s3:GetObject",
-        "Resource": (
-            "arn:aws:s3:::elastic-agent-results-297645381734/jobs/datasets/*"
-        ),
+        "Resource": ("arn:aws:s3:::elastic-agent-results-297645381734/jobs/datasets/*"),
     }
     assert set(statements["WriteOnlyResultsObjects"]["Action"]) == {
         "s3:PutObject",
@@ -322,17 +308,19 @@ def test_worker_policy_reads_only_datasets_and_writes_results():
 def test_results_bucket_policy_denies_plaintext_transport():
     policy = json.loads(RESULTS_BUCKET_POLICY.read_text(encoding="utf-8"))
 
-    assert policy["Statement"] == [{
-        "Sid": "DenyInsecureTransport",
-        "Effect": "Deny",
-        "Principal": "*",
-        "Action": "s3:*",
-        "Resource": [
-            "arn:aws:s3:::elastic-agent-results-297645381734",
-            "arn:aws:s3:::elastic-agent-results-297645381734/*",
-        ],
-        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
-    }]
+    assert policy["Statement"] == [
+        {
+            "Sid": "DenyInsecureTransport",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [
+                "arn:aws:s3:::elastic-agent-results-297645381734",
+                "arn:aws:s3:::elastic-agent-results-297645381734/*",
+            ],
+            "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+        }
+    ]
 
 
 def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
@@ -357,17 +345,13 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert config.registry.path == str(tmp_path / "state" / "registry.json")
     assert config.task_registry.path == str(tmp_path / "state" / "task_registry.json")
     assert config.logging.operations_log == str(tmp_path / "state" / "operations.log")
-    assert config.webhook.dead_letter_path == str(
-        tmp_path / "state" / "webhook_dead_letters.json"
-    )
+    assert config.webhook.dead_letter_path == str(tmp_path / "state" / "webhook_dead_letters.json")
     assert settings.results_s3_bucket == "elastic-agent-results-example"
     assert settings.results_s3_prefix == "jobs"
     assert settings.results_s3_interval == 60
 
 
-def test_build_application_requires_enabled_admin_and_pins_public_origin(
-    tmp_path, monkeypatch
-):
+def test_build_application_requires_enabled_admin_and_pins_public_origin(tmp_path, monkeypatch):
     settings = load_settings(_environment(tmp_path))
     state_file = settings.state_dir / "management-users.json"
     settings.framework_src.mkdir(parents=True)
@@ -399,9 +383,7 @@ def test_build_application_requires_enabled_admin_and_pins_public_origin(
         reset_management_auth()
 
 
-def test_build_application_rejects_legacy_ami_before_cloud_or_state_access(
-    tmp_path, monkeypatch
-):
+def test_build_application_rejects_legacy_ami_before_cloud_or_state_access(tmp_path, monkeypatch):
     settings = replace(
         load_settings(_environment(tmp_path)),
         ami_id="ami-0aec7ffcbe44c6f7a",
@@ -506,7 +488,8 @@ def test_settings_repr_does_not_contain_external_api_key(tmp_path):
     ],
 )
 def test_load_settings_rejects_alternate_aws_credential_sources(
-    tmp_path, name,
+    tmp_path,
+    name,
 ):
     environ = _environment(tmp_path)
     environ[name] = "must-not-be-used"
@@ -526,7 +509,9 @@ def test_load_settings_rejects_alternate_aws_credential_sources(
     ],
 )
 def test_load_settings_requires_imdsv2_only_credential_chain(
-    tmp_path, name, value,
+    tmp_path,
+    name,
+    value,
 ):
     environ = _environment(tmp_path)
     environ[name] = value
@@ -571,10 +556,12 @@ def test_prepare_local_paths_rejects_unreadable_ssh_key(tmp_path, monkeypatch):
         prepare_local_paths(load_settings(environ))
 
 
-def test_self_owned_encrypted_tagged_golden_image_is_accepted():
-    result = validate_image_description(_golden_image(), caller_account_id=CALLER_ACCOUNT)
+def test_self_owned_encrypted_task_platform_image_is_accepted():
+    expected = _expected_ami_tags()
+    assert set(expected) == TASK_PLATFORM_AMI_EVIDENCE_TAG_KEYS
+    result = validate_image_description(_golden_image(), caller_account_id=CALLER_ACCOUNT, expected_ami_tags=expected)
 
-    assert result.provenance == "self-owned-golden"
+    assert result.provenance == "task-platform-packer"
     assert result.break_glass_used is False
 
 
@@ -596,12 +583,27 @@ def test_runtime_invariants_are_mandatory(field, bad_value, message):
         validate_image_description(image, caller_account_id=CALLER_ACCOUNT)
 
 
-def test_self_owned_image_requires_golden_tags():
+def test_self_owned_image_requires_task_platform_provenance_tags():
     image = _golden_image()
     image["Tags"] = [{"Key": "ManagedBy", "Value": "someone-else"}]
 
-    with pytest.raises(LauncherConfigurationError, match="golden tags"):
-        validate_image_description(image, caller_account_id=CALLER_ACCOUNT)
+    with pytest.raises(LauncherConfigurationError, match="Task Platform Packer"):
+        validate_image_description(
+            image,
+            caller_account_id=CALLER_ACCOUNT,
+            expected_ami_tags=_expected_ami_tags(),
+        )
+
+
+def test_self_owned_image_requires_manifest_bound_evidence_tags():
+    image = _golden_image()
+    image["Tags"] = [tag for tag in image["Tags"] if tag["Key"] != "ManifestDigest"]
+    with pytest.raises(LauncherConfigurationError, match="Task Platform Packer"):
+        validate_image_description(
+            image,
+            caller_account_id=CALLER_ACCOUNT,
+            expected_ami_tags=_expected_ami_tags(),
+        )
 
 
 def test_self_owned_image_requires_encrypted_root_snapshot():
@@ -609,7 +611,11 @@ def test_self_owned_image_requires_encrypted_root_snapshot():
     image["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] = False
 
     with pytest.raises(LauncherConfigurationError, match="root snapshot must be encrypted"):
-        validate_image_description(image, caller_account_id=CALLER_ACCOUNT)
+        validate_image_description(
+            image,
+            caller_account_id=CALLER_ACCOUNT,
+            expected_ami_tags=_expected_ami_tags(),
+        )
 
 
 def test_canonical_base_image_requires_explicit_break_glass():
@@ -656,10 +662,7 @@ class _STSClient:
     def get_caller_identity(self):
         return {
             "Account": CALLER_ACCOUNT,
-            "Arn": (
-                f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/"
-                "elastic-agent-manager/i-0123456789abcdef0"
-            ),
+            "Arn": (f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/elastic-agent-manager/i-0123456789abcdef0"),
         }
 
 
@@ -681,10 +684,7 @@ class _WrongRoleSTSClient:
     def get_caller_identity(self):
         return {
             "Account": CALLER_ACCOUNT,
-            "Arn": (
-                f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/"
-                "shared-administrator/i-0123456789abcdef0"
-            ),
+            "Arn": (f"arn:aws:sts::{CALLER_ACCOUNT}:assumed-role/shared-administrator/i-0123456789abcdef0"),
         }
 
 
@@ -703,10 +703,7 @@ class _WrongAccountSTSClient:
     def get_caller_identity(self):
         return {
             "Account": "123456789012",
-            "Arn": (
-                "arn:aws:sts::123456789012:assumed-role/"
-                "elastic-agent-manager/i-0123456789abcdef0"
-            ),
+            "Arn": ("arn:aws:sts::123456789012:assumed-role/elastic-agent-manager/i-0123456789abcdef0"),
         }
 
 

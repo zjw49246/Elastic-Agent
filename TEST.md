@@ -60,6 +60,13 @@ denial, the versioned common x86_64 production instance allowlist, and AMI avail
 architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
 explicit Canonical break-glass path.
 
+The normal self-owned path is intentionally narrower than an owner/tag OR: it
+requires the exact Task Platform Packer identity tags and the immutable
+ManifestDigest, ConstraintsDigest, RunnerImage, PlatformRevision,
+UpstreamRevision, and GeneratorVersion values bound into the release worker
+profile. Any missing or changed evidence tag must fail before Manager lifecycle
+startup.
+
 Validate AWS private management-path selection across bootstrap, login, logs,
 and collection:
 

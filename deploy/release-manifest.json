@@ -3,9 +3,9 @@
   "product": "elastic-agent",
   "upstream_source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
   "upstream_archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
-  "release_revision": "artifact-sha256:c1b1ccf58df2c3683269f7f4e9adfd3c8309168b497b90cdc47f30745ddb9498",
+  "release_revision": "artifact-sha256:1cf6469f5ba25e3f986855ac7189ea6e2403c94fb9e76ae6023992e62684e9f6",
   "release_index": "deploy/release-files.json",
-  "release_artifact_digest": "sha256:c1b1ccf58df2c3683269f7f4e9adfd3c8309168b497b90cdc47f30745ddb9498",
+  "release_artifact_digest": "sha256:1cf6469f5ba25e3f986855ac7189ea6e2403c94fb9e76ae6023992e62684e9f6",
   "manager_state_schema": "v1",
   "worker_profile": {
     "ami_id": "ami-0c7d40ac988a900c5",
@@ -27,10 +27,16 @@
     ],
     "aws_account_id": "297645381734",
     "region": "ap-northeast-1",
-    "release_revision": "artifact-sha256:c1b1ccf58df2c3683269f7f4e9adfd3c8309168b497b90cdc47f30745ddb9498",
+    "ami_manifest_digest": "sha256:2b0c6aa51fd2c93441346817e1a1ee5e79d8c32b27b57b92e39fe2befafa8e37",
+    "ami_constraints_digest": "sha256:bc81f22a46eee61748cc6d114f7f0d33e0a46e15182726a516e909b82176dce0",
+    "ami_runner_image": "297645381734.dkr.ecr.ap-northeast-1.amazonaws.com/task-platform-pilot-runner@sha256:3b8f0b625ccbcc80558daed736c7a0932a31c7bcedb66e971418e0eabe356ab3",
+    "ami_platform_revision": "6eff9ab33f9094c3dccb04cd5f5ef9449ce65fb8",
+    "ami_upstream_revision": "115320154e929bc28800a3273ebb3f56eef10070",
+    "ami_generator_version": "build-only-v1",
+    "release_revision": "artifact-sha256:1cf6469f5ba25e3f986855ac7189ea6e2403c94fb9e76ae6023992e62684e9f6",
     "runtime_source": "src/elastic_agent/worker/runtime.py",
     "schema_version": 1
   },
-  "worker_profile_digest": "sha256:4b245c2a6a9de52be3c5c086240b097b342ce24ad1446b251ee432b5f5d09895",
-  "release_digest": "sha256:1c1c5735cf015f14f7119571b7b2c2745af18bcba02bd2520674f2abea4e990b"
+  "worker_profile_digest": "sha256:7f225fd13ca57a0708ea8dea301454ceeea01a22c5288026ed0b166a499567a8",
+  "release_digest": "sha256:51901b096485cb9528a5a2aaba614767ab8671a3a50cf7aa47e26e0e6bf083c4"
 }

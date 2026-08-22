@@ -19,8 +19,8 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 61529,
-      "sha256": "sha256:25055dc1505d932f98a7fc0e8e917d0428d0b669c14c450b3660c3a1a5c6881c"
+      "size": 61818,
+      "sha256": "sha256:067de1ddde24c3ce8e74d609445d944224dcc9ca961f01f680e79bea02747023"
     },
     {
       "path": "PROGRESS.md",
@@ -40,8 +40,8 @@
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31221,
-      "sha256": "sha256:02f2c2b5afdae3bf025885e1913e4e936db63d35748cd6cef4b52f745d6c3d8a"
+      "size": 31603,
+      "sha256": "sha256:00a5fce902e3592d5fb18a6eb71c0dc108a0757acf3dbfc937ac6c9b38f5866e"
     },
     {
       "path": "deploy/__init__.py",
@@ -96,8 +96,8 @@
       "path": "deploy/aws_manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 21698,
-      "sha256": "sha256:a214eeeeaf8bdd1fc671d3cf063c975c8ee929c89d2bfffd8e1add002b1f65c2"
+      "size": 22811,
+      "sha256": "sha256:e5dc2e9040e3420809a5bb3df9446a027eed08b97745b2ad6123f5777ac267c1"
     },
     {
       "path": "docs/audiobook-integration/00-overview.md",
@@ -222,8 +222,8 @@
       "path": "docs/operations/golden-worker-ami.md",
       "type": "file",
       "mode": "0644",
-      "size": 8239,
-      "sha256": "sha256:6345d6cda0cf417b8ccb118e9409329e452a9c0c5bce4526f0f5592093011bae"
+      "size": 8650,
+      "sha256": "sha256:ae65c9a880be7613c9f74e81fada443d071373da48680be474fdc226d7d99bd3"
     },
     {
       "path": "docs/operations/job-batch-json.md",
@@ -971,8 +971,8 @@
       "path": "src/elastic_agent/core/release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 18363,
-      "sha256": "sha256:1b08797976910ebe310760601ec0d7e5ed26e25f0ff2a8cef800161b0af12b0a"
+      "size": 19817,
+      "sha256": "sha256:b6d7252b3ee0c856cf834004b615b994463a6a9680c2943e0bd10ed465357597"
     },
     {
       "path": "src/elastic_agent/core/result_uploader.py",
@@ -1468,8 +1468,8 @@
       "path": "tests/unit/test_aws_manager_launcher.py",
       "type": "file",
       "mode": "0644",
-      "size": 26012,
-      "sha256": "sha256:270630aea0e86a6409166a5f85891c105d76a3dfa546c4fe72e061a12a817e98"
+      "size": 27825,
+      "sha256": "sha256:97342bd495f39e7dbed5f2f39e2a157b5c70dc9da49a6b244f6a295237e97da5"
     },
     {
       "path": "tests/unit/test_aws_provider.py",
@@ -1874,8 +1874,8 @@
       "path": "tests/unit/test_release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 3936,
-      "sha256": "sha256:1f021248003979de328228c1feaff7e411b63f6d0df3dd319188fb9bdcfda66e"
+      "size": 4157,
+      "sha256": "sha256:d1b346eec5c66bf92065f16ad97f3af3590081ed29a6429d0c02cefdd8b96e1f"
     },
     {
       "path": "tests/unit/test_remove_node.py",

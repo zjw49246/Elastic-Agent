@@ -46,10 +46,21 @@ from elastic_agent.manager.manager import ElasticAgentManager
 logger = logging.getLogger(__name__)
 
 CANONICAL_OWNER_ID = "099720109477"
-GOLDEN_IMAGE_TAGS = {
-    "ManagedBy": "elastic-agent",
-    "Role": "worker-golden",
+TASK_PLATFORM_AMI_TAGS = {
+    "ManagedBy": "task-platform-packer",
+    "TaskPlatform": "worker",
+    "Service": "task-platform",
 }
+TASK_PLATFORM_AMI_EVIDENCE_TAG_KEYS = frozenset(
+    {
+        "ManifestDigest",
+        "ConstraintsDigest",
+        "RunnerImage",
+        "PlatformRevision",
+        "UpstreamRevision",
+        "GeneratorVersion",
+    }
+)
 
 _AWS_ID_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
@@ -187,13 +198,9 @@ def _validate_public_origin(value: str) -> None:
     try:
         parsed.port
     except ValueError as exc:
-        raise LauncherConfigurationError(
-            "ELASTIC_AGENT_PUBLIC_ORIGIN must contain a valid port"
-        ) from exc
+        raise LauncherConfigurationError("ELASTIC_AGENT_PUBLIC_ORIGIN must contain a valid port") from exc
     if parsed.scheme != "https" or not parsed.hostname:
-        raise LauncherConfigurationError(
-            "ELASTIC_AGENT_PUBLIC_ORIGIN must be an absolute https:// origin"
-        )
+        raise LauncherConfigurationError("ELASTIC_AGENT_PUBLIC_ORIGIN must be an absolute https:// origin")
     if (
         parsed.username
         or parsed.password
@@ -216,14 +223,10 @@ def _validate_api_key_presence(environ: Mapping[str, str]) -> None:
 
 
 def _validate_instance_profile_only(environ: Mapping[str, str]) -> None:
-    forbidden = [
-        name for name in _FORBIDDEN_AWS_CREDENTIAL_ENV
-        if environ.get(name, "").strip()
-    ]
+    forbidden = [name for name in _FORBIDDEN_AWS_CREDENTIAL_ENV if environ.get(name, "").strip()]
     if forbidden:
         raise LauncherConfigurationError(
-            "alternate AWS credential/endpoint environment is forbidden: "
-            + ", ".join(forbidden)
+            "alternate AWS credential/endpoint environment is forbidden: " + ", ".join(forbidden)
         )
     for name in (
         "AWS_SHARED_CREDENTIALS_FILE",
@@ -385,12 +388,14 @@ def validate_image_description(
     image: Mapping[str, Any],
     *,
     caller_account_id: str,
+    expected_ami_tags: Mapping[str, str] | None = None,
     allow_canonical_base_ami: bool = False,
 ) -> ImageValidationResult:
     """Enforce the worker AMI's runtime, encryption, and provenance policy.
 
     Normal production images must be encrypted, owned by the current AWS
-    account, and carry both golden-image tags.  Canonical's official publisher
+    account, and carry the Task Platform Packer provenance tags recorded in
+    the immutable release manifest.  Canonical's official publisher
     image is an emergency-only exception selected with an explicit environment
     opt-in.  That exception also permits Canonical's unencrypted public source
     snapshot; ``AWSProvider`` still requests an encrypted worker root volume.
@@ -410,18 +415,25 @@ def validate_image_description(
 
     owner_id = str(image.get("OwnerId") or "")
     if owner_id == caller_account_id:
+        if expected_ami_tags is None or set(expected_ami_tags) != TASK_PLATFORM_AMI_EVIDENCE_TAG_KEYS:
+            raise LauncherConfigurationError(
+                f"worker AMI {image_id}: immutable Task Platform Packer evidence tags are unavailable"
+            )
         tags = _image_tags(image)
-        missing = [f"{key}={value}" for key, value in GOLDEN_IMAGE_TAGS.items() if tags.get(key) != value]
+        required_tags = dict(TASK_PLATFORM_AMI_TAGS)
+        required_tags.update(expected_ami_tags)
+        missing = [f"{key}={value}" for key, value in required_tags.items() if tags.get(key) != value]
         if missing:
             raise LauncherConfigurationError(
-                f"worker AMI {image_id}: self-owned image is missing required golden tags: " + ", ".join(missing)
+                f"worker AMI {image_id}: self-owned image is missing required Task Platform Packer tags: "
+                + ", ".join(missing)
             )
         if not _root_snapshot_encrypted(image):
             raise LauncherConfigurationError(f"worker AMI {image_id}: root snapshot must be encrypted")
         return ImageValidationResult(
             image_id=image_id,
             owner_id=owner_id,
-            provenance="self-owned-golden",
+            provenance="task-platform-packer",
             break_glass_used=False,
         )
 
@@ -469,21 +481,25 @@ def validate_worker_ami(
     if not caller_account_id:
         raise LauncherConfigurationError("AWS caller identity has no account ID")
     if caller_account_id != settings.aws_account_id:
-        raise LauncherConfigurationError(
-            "AWS caller identity account does not match deployment settings"
-        )
+        raise LauncherConfigurationError("AWS caller identity account does not match deployment settings")
     caller_arn = str(identity.get("Arn") or "")
-    expected_prefix = (
-        f"arn:aws:sts::{caller_account_id}:assumed-role/"
-        f"{settings.expected_role_name}/"
-    )
+    expected_prefix = f"arn:aws:sts::{caller_account_id}:assumed-role/{settings.expected_role_name}/"
     if not caller_arn.startswith(expected_prefix):
-        raise LauncherConfigurationError(
-            "AWS caller identity is not the expected Manager instance role"
-        )
+        raise LauncherConfigurationError("AWS caller identity is not the expected Manager instance role")
+    manifest = load_release_manifest(settings.release_manifest)
+    profile = manifest["worker_profile"]
+    expected_ami_tags = {
+        "ManifestDigest": profile["ami_manifest_digest"],
+        "ConstraintsDigest": profile["ami_constraints_digest"],
+        "RunnerImage": profile["ami_runner_image"],
+        "PlatformRevision": profile["ami_platform_revision"],
+        "UpstreamRevision": profile["ami_upstream_revision"],
+        "GeneratorVersion": profile["ami_generator_version"],
+    }
     return validate_image_description(
         images[0],
         caller_account_id=caller_account_id,
+        expected_ami_tags=expected_ami_tags,
         allow_canonical_base_ami=settings.allow_canonical_base_ami,
     )
 
@@ -503,9 +519,7 @@ def build_application(settings: AWSManagerSettings):
             },
         )
     except ReleaseEvidenceError as exc:
-        raise LauncherConfigurationError(
-            "release manifest does not match deployment settings"
-        ) from exc
+        raise LauncherConfigurationError("release manifest does not match deployment settings") from exc
     prepare_local_paths(settings)
     result = validate_worker_ami(settings)
     if result.break_glass_used:
@@ -522,13 +536,9 @@ def build_application(settings: AWSManagerSettings):
     reset_management_auth()
     configure_public_origin(settings.public_origin)
     try:
-        configure_management_user_store(
-            settings.state_dir / "management-users.json"
-        ).require_enabled_admin()
+        configure_management_user_store(settings.state_dir / "management-users.json").require_enabled_admin()
     except Exception as exc:
-        raise LauncherConfigurationError(
-            "management user store has no valid enabled administrator"
-        ) from exc
+        raise LauncherConfigurationError("management user store has no valid enabled administrator") from exc
     manager = ElasticAgentManager(config, AWSProvider(config.provider.aws))
     return create_app(manager)
 

@@ -84,8 +84,13 @@ Apply OS security updates by building and promoting a replacement AMI.
 ## Promotion and rollback
 
 Before promotion, verify that the AMI is owned by this account, available,
-x86_64/HVM/ENA, IMDSv2-only, has an encrypted EBS snapshot, and carries
-`ManagedBy=elastic-agent` plus `Role=worker-golden`. Then run canaries for the
+x86_64/HVM/ENA, IMDSv2-only, has an encrypted EBS snapshot, and carries the
+exact immutable Task Platform Packer provenance bound into the Elastic-Agent
+worker profile: `ManagedBy=task-platform-packer`, `TaskPlatform=worker`,
+`Service=task-platform`, `GeneratorVersion=build-only-v1`, plus exact
+`ManifestDigest`, `ConstraintsDigest`, `RunnerImage`, `PlatformRevision`, and
+`UpstreamRevision` tags. The launcher rejects a merely self-owned/tagged image
+or a mismatched Packer evidence set. Then run canaries for the
 standard profile, Docker profile, sandbox profile (including the Job-user bwrap
 probe), S3 collection, Claude login, Codex login, and one EIP-bound Job. Confirm
 each EC2/root EBS is destroyed and its EIP retained.
@@ -147,7 +152,8 @@ image should bake these packages so the profile can return to the verified fast
 path.
 
 The Task Platform release manifest now canonically pins
-`ami-0c7d40ac988a900c5`. Before rollout, independently repeat every provenance,
-encryption, tag, IAM-policy simulation, and canary check above for that exact
-AMI. The Manager launcher rejects the historical AMI because runtime settings,
-IAM image pin, and release manifest must move together.
+`ami-0c7d40ac988a900c5` and its Packer evidence tags. Before rollout,
+independently repeat every provenance, encryption, tag, IAM-policy simulation,
+and canary check above for that exact AMI. The Manager launcher rejects the
+historical AMI because runtime settings, IAM image pin, Packer evidence, and
+release manifest must move together.

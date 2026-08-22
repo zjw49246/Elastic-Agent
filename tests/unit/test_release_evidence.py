@@ -14,9 +14,9 @@ from elastic_agent.core.release_evidence import (
     compute_release_digest,
     compute_worker_profile_digest,
     load_release_manifest,
-    verify_release_tree,
     validate_deployment_context,
     validate_release_manifest,
+    verify_release_tree,
 )
 
 
@@ -24,12 +24,13 @@ def test_checked_in_manifest_is_canonical_and_stable() -> None:
     manifest = load_release_manifest()
     assert manifest["manager_state_schema"] == MANAGER_STATE_SCHEMA
     assert manifest["manager_state_schema"] == "v1"
-    assert manifest["worker_profile_digest"] == compute_worker_profile_digest(
-        manifest["worker_profile"]
-    )
+    assert manifest["worker_profile_digest"] == compute_worker_profile_digest(manifest["worker_profile"])
     assert manifest["release_digest"] == compute_release_digest(manifest)
     assert manifest["worker_profile_digest"].startswith("sha256:")
     assert manifest["release_digest"].startswith("sha256:")
+    assert manifest["worker_profile"]["ami_manifest_digest"].startswith("sha256:")
+    assert manifest["worker_profile"]["ami_constraints_digest"].startswith("sha256:")
+    assert manifest["worker_profile"]["ami_generator_version"] == "build-only-v1"
     assert canonical_json(manifest) == canonical_json(json.loads(canonical_json(manifest)))
 
 
@@ -50,7 +51,7 @@ def test_manifest_rejects_secret_named_fields() -> None:
 
 def test_manifest_path_is_bounded_and_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "release.json"
-    path.write_text("{\"schema_version\": 1}", encoding="utf-8")
+    path.write_text('{"schema_version": 1}', encoding="utf-8")
     with pytest.raises(ReleaseEvidenceError):
         load_release_manifest(path)
 
@@ -67,9 +68,7 @@ def test_release_tree_tampering_is_rejected(tmp_path: Path) -> None:
     copied = tmp_path / "release"
     (copied / "deploy").mkdir(parents=True)
     (copied / "src").mkdir()
-    (copied / "deploy/release-files.json").write_text(
-        json.dumps(index), encoding="utf-8"
-    )
+    (copied / "deploy/release-files.json").write_text(json.dumps(index), encoding="utf-8")
     first = index["files"][0]
     target = copied / first["path"]
     target.parent.mkdir(parents=True, exist_ok=True)
