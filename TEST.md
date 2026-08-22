@@ -36,6 +36,21 @@ without making cloud calls:
 uv run pytest -q tests/unit/test_aws_manager_launcher.py
 ```
 
+Validate immutable release evidence and the authenticated health contract
+without making cloud calls:
+
+```bash
+uv run pytest -q tests/unit/test_release_evidence.py tests/unit/test_api.py tests/unit/test_api_auth.py
+```
+
+The release manifest verifier is deterministic and can also be exercised
+without pytest:
+
+```bash
+uv run python scripts/generate_release_evidence.py --worker-profile-input /path/to/authoritative-worker-profile-input.json --check
+uv run python -c 'from elastic_agent.core.release_evidence import load_release_manifest; print(load_release_manifest()["release_digest"])'
+```
+
 These tests cover required environment-only configuration, secret-free
 settings/errors, WSS enforcement, an IMDSv2-only credential chain with exact
 Manager-role identity, local state/key permissions, systemd readiness/teardown
@@ -44,6 +59,13 @@ the Worker's write-only result-prefix policy, S3 plaintext-transport
 denial, the versioned common x86_64 production instance allowlist, and AMI availability,
 architecture, HVM, ENA, IMDSv2, encryption, and provenance checks including the
 explicit Canonical break-glass path.
+
+The normal self-owned path is intentionally narrower than an owner/tag OR: it
+requires the exact Task Platform Packer identity tags and the immutable
+ManifestDigest, ConstraintsDigest, RunnerImage, PlatformRevision,
+UpstreamRevision, and GeneratorVersion values bound into the release worker
+profile. Any missing or changed evidence tag must fail before Manager lifecycle
+startup.
 
 Validate AWS private management-path selection across bootstrap, login, logs,
 and collection:
@@ -68,7 +90,8 @@ uv run pytest -q \
 bash -n scripts/build_golden_ami.sh
 ```
 
-After installing a production release at `/home/ubuntu/elastic-agent`, validate
+After installing a production release at its immutable revision directory,
+such as `/opt/task-platform/elastic-agent-e06ac35dedf4e876ab42ef2cf83161948c09cf87`, validate
 the shipped unit on that host with `systemd-analyze verify
 deploy/aws/elastic-agent-manager.service` before replacing the active unit.
 
@@ -234,9 +257,10 @@ The focused suite covers:
   the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
-- CloudRouter and Codex-only ApexRouter Agent API provider registration,
+- CloudRouter and Claude/Codex ApexRouter Agent API provider registration,
   fixed-endpoint 15-second wall-clock-bounded no-redirect Bearer model/usage
-  requests, Apex's pinned-Codex-version native model catalog and distinct
+  requests, Apex's native/OpenAI-compatible model catalogs, runtime/strict
+  usage policy, provider-specific Claude/Codex projection, and distinct
   per-key usage/shared-group quota normalization, including explicit-null
   unlimited windows, mixed limited/unlimited windows, and asymmetric-null
   fail-closed behavior,
@@ -277,8 +301,8 @@ The focused suite covers:
   HTTP(S)/ALL proxy variables from both plain and secret env so managed traffic
   cannot bypass the account's stable public egress;
 - Agent API REST/UI write-only behavior, CloudRouter/ApexRouter
-  add/refresh/usage controls, provider-aware Agent support (ApexRouter is
-  Codex-only), quota/model display, no browser-persisted Key, and sanitized
+  add/refresh/usage controls, provider-aware Agent/model support, quota/model
+  display, no browser-persisted Key, and sanitized
   validation/upstream errors, reference-aware deletion, and refcount sharing
   only for unbound API identities while OAuth and any durable EIP binding stay
   exclusive.
@@ -293,6 +317,14 @@ The focused suite covers:
   section is opened and focused. The AI4Sci Bench preset and README example use
   `archive/youchengsong-managed-agent-api-20260728`; other repositories must
   set their own `setup.ref`.
+- Apex runtime classification keeps explicit insufficient-balance/quota errors
+  out of the sticky invalid-key path, requires provider/auth evidence for 403,
+  and treats ordinary 429/500/502 gateway failures as same-key transient errors.
+- AWS launch coverage verifies the process-wide `RunInstances` token bucket,
+  stable-client-token throttle retries, cancellation, bounded connection pool,
+  and non-retry behavior for quota/capacity failures. Batch coverage verifies
+  periodic-collect concurrency, stable jitter, final-collect bypass, and exact
+  de-duplication of provider-visible inflight instance capacity.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   suppress live actions after teardown, keep read-only system logs until release,
