@@ -237,5 +237,6 @@ class TestHealthAuth:
         assert {
             "manager_state_schema",
             "worker_profile_digest",
+            "worker_runtime_provenance_digest",
             "release_digest",
         } <= resp.json().keys()

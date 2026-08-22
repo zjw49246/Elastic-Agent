@@ -1035,7 +1035,11 @@ The immutable release includes `deploy/release-manifest.json` and the complete
 tracked-file index `deploy/release-files.json`. Before touching state or AWS,
 the production launcher requires its Worker AMI, AWS account, Region, and
 artifact-derived release revision to match runtime settings. Manager startup
-then hashes the exact indexed source tree before publishing health. Authenticated
+then hashes the exact indexed source tree before publishing health. Schema v3
+keeps the EA runtime/AMI provenance digest separate from the exact canonical
+digest of the Task Platform 11-field WorkerProfileInput. Evidence generation
+requires that authoritative non-secret JSON explicitly and fails closed if it
+is missing or incomplete. Authenticated
 `GET /api/health` exposes the Task Platform evidence contract as three top-level,
 non-secret fields: `manager_state_schema` (`v1`), `worker_profile_digest`, and
 `release_digest` (both `sha256:<64 lowercase hex>`). See

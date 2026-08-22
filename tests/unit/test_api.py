@@ -150,6 +150,8 @@ class TestHealthEndpoint:
         assert data["manager_state_schema"] == "v1"
         assert data["worker_profile_digest"].startswith("sha256:")
         assert len(data["worker_profile_digest"]) == 71
+        assert data["worker_runtime_provenance_digest"].startswith("sha256:")
+        assert len(data["worker_runtime_provenance_digest"]) == 71
         assert data["release_digest"].startswith("sha256:")
         assert len(data["release_digest"]) == 71
 

@@ -15,7 +15,8 @@ import stat
 from pathlib import Path
 from typing import Any, Mapping
 
-RELEASE_MANIFEST_SCHEMA = 2
+RELEASE_MANIFEST_SCHEMA = 3
+LEGACY_RELEASE_MANIFEST_SCHEMA = 2
 RELEASE_INDEX_SCHEMA = 1
 MANAGER_STATE_SCHEMA = "v1"
 WORKER_PROFILE_SCHEMA = 1
@@ -36,6 +37,23 @@ _MANIFEST_KEYS = frozenset(
         "release_index",
         "release_artifact_digest",
         "manager_state_schema",
+        "worker_profile",
+        "worker_profile_digest",
+        "release_digest",
+    }
+)
+_V3_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "product",
+        "release_revision",
+        "upstream_source_commit",
+        "upstream_archive_sha256",
+        "release_index",
+        "release_artifact_digest",
+        "manager_state_schema",
+        "worker_runtime_provenance",
+        "worker_runtime_provenance_digest",
         "worker_profile",
         "worker_profile_digest",
         "release_digest",
@@ -64,6 +82,21 @@ _WORKER_PROFILE_KEYS = frozenset(
         "ami_platform_revision",
         "ami_upstream_revision",
         "ami_generator_version",
+    }
+)
+_TASK_PLATFORM_WORKER_PROFILE_KEYS = frozenset(
+    {
+        "profile_id",
+        "ami_id",
+        "instance_profile_name",
+        "role_arn",
+        "subnet_ids",
+        "security_group_ids",
+        "allowed_instance_types",
+        "environment_profiles",
+        "input_prefixes",
+        "output_prefixes",
+        "secret_reference_prefixes",
     }
 )
 
@@ -97,6 +130,29 @@ def compute_worker_profile_digest(worker_profile: Mapping[str, Any]) -> str:
     return f"sha256:{sha256_hex(worker_profile)}"
 
 
+def compute_task_platform_worker_profile_digest(profile: Mapping[str, Any]) -> str:
+    """Digest the exact Task Platform WorkerProfileInput JSON domain."""
+
+    validate_task_platform_worker_profile(profile)
+    try:
+        encoded = json.dumps(
+            profile,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ReleaseEvidenceError("task platform worker profile is not canonical JSON") from exc
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def compute_worker_runtime_provenance_digest(provenance: Mapping[str, Any]) -> str:
+    """Digest immutable EA runtime/AMI provenance in its separate domain."""
+
+    return compute_worker_profile_digest(provenance)
+
+
 def compute_release_digest(manifest: Mapping[str, Any]) -> str:
     """Return the stable digest for a manifest without its self-digest."""
 
@@ -125,7 +181,10 @@ def artifact_revision(artifact_digest: str) -> str:
 def _reject_secret_names(value: Any, path: str = "manifest") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if not isinstance(key, str) or _SECRET_NAME.search(key):
+            # This is a non-secret resource scope, but its normative API field
+            # name contains ``secret`` and must remain part of the contract.
+            allowed_scope_key = path == "manifest.worker_profile" and key == "secret_reference_prefixes"
+            if not isinstance(key, str) or (_SECRET_NAME.search(key) and not allowed_scope_key):
                 raise ReleaseEvidenceError(f"release manifest contains a forbidden field at {path}")
             _reject_secret_names(child, f"{path}.{key}")
     elif isinstance(value, list):
@@ -210,13 +269,68 @@ def _validate_worker_profile(raw: Any) -> dict[str, Any]:
     return result
 
 
+def validate_task_platform_worker_profile(raw: Any) -> dict[str, Any]:
+    """Validate the strict 11-field Task Platform WorkerProfileInput domain."""
+
+    if not isinstance(raw, dict) or set(raw) != _TASK_PLATFORM_WORKER_PROFILE_KEYS:
+        raise ReleaseEvidenceError("task platform worker profile fields are invalid")
+    profile_id = raw.get("profile_id")
+    if not isinstance(profile_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", profile_id):
+        raise ReleaseEvidenceError("task platform worker profile profile_id is invalid")
+    ami_id = raw.get("ami_id")
+    if not isinstance(ami_id, str) or not re.fullmatch(r"ami-[0-9a-f]{8,32}", ami_id):
+        raise ReleaseEvidenceError("task platform worker profile ami_id is invalid")
+    instance_profile_name = raw.get("instance_profile_name")
+    if not isinstance(instance_profile_name, str) or not 1 <= len(instance_profile_name) <= 240:
+        raise ReleaseEvidenceError("task platform worker profile instance_profile_name is invalid")
+    role_arn = raw.get("role_arn")
+    if (
+        not isinstance(role_arn, str)
+        or re.fullmatch(
+            r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}",
+            role_arn,
+        )
+        is None
+    ):
+        raise ReleaseEvidenceError("task platform worker profile role_arn is invalid")
+    limits = {
+        "subnet_ids": 32,
+        "security_group_ids": 32,
+        "allowed_instance_types": 32,
+        "environment_profiles": 32,
+        "input_prefixes": 64,
+        "output_prefixes": 64,
+        "secret_reference_prefixes": 64,
+    }
+    for key, maximum in limits.items():
+        values = raw.get(key)
+        if not isinstance(values, list) or not 1 <= len(values) <= maximum:
+            raise ReleaseEvidenceError(f"task platform worker profile {key} is invalid")
+        if any(not isinstance(item, str) for item in values):
+            raise ReleaseEvidenceError(f"task platform worker profile {key} is invalid")
+    if any(re.fullmatch(r"subnet-[0-9a-f]+", item) is None for item in raw["subnet_ids"]):
+        raise ReleaseEvidenceError("task platform worker profile subnet_ids is invalid")
+    if any(re.fullmatch(r"sg-[0-9a-f]+", item) is None for item in raw["security_group_ids"]):
+        raise ReleaseEvidenceError("task platform worker profile security_group_ids is invalid")
+    return dict(raw)
+
+
 def validate_release_manifest(raw: Any) -> dict[str, Any]:
     """Validate and return a normalized, immutable release evidence object."""
 
-    if not isinstance(raw, dict) or set(raw) != _MANIFEST_KEYS:
+    if not isinstance(raw, dict):
+        raise ReleaseEvidenceError("release manifest fields are invalid")
+    schema_version = raw.get("schema_version")
+    if schema_version == LEGACY_RELEASE_MANIFEST_SCHEMA:
+        expected_keys = _MANIFEST_KEYS
+    elif schema_version == RELEASE_MANIFEST_SCHEMA:
+        expected_keys = _V3_MANIFEST_KEYS
+    else:
+        raise ReleaseEvidenceError("unsupported release manifest schema")
+    if set(raw) != expected_keys:
         raise ReleaseEvidenceError("release manifest fields are invalid")
     _reject_secret_names(raw)
-    if raw.get("schema_version") != RELEASE_MANIFEST_SCHEMA:
+    if schema_version not in {LEGACY_RELEASE_MANIFEST_SCHEMA, RELEASE_MANIFEST_SCHEMA}:
         raise ReleaseEvidenceError("unsupported release manifest schema")
     if _require_string(raw, "product") != "elastic-agent":
         raise ReleaseEvidenceError("release manifest product is invalid")
@@ -241,13 +355,29 @@ def validate_release_manifest(raw: Any) -> dict[str, Any]:
         raise ReleaseEvidenceError("release manifest manager_state_schema is invalid")
     if manager_state_schema != MANAGER_STATE_SCHEMA:
         raise ReleaseEvidenceError("manager state schema does not match this runtime")
-    worker_profile = _validate_worker_profile(raw["worker_profile"])
-    if worker_profile["release_revision"] != release_revision:
-        raise ReleaseEvidenceError("worker profile release revision does not match release")
+    if schema_version == LEGACY_RELEASE_MANIFEST_SCHEMA:
+        worker_profile = _validate_worker_profile(raw["worker_profile"])
+        if worker_profile["release_revision"] != release_revision:
+            raise ReleaseEvidenceError("worker profile release revision does not match release")
+    else:
+        worker_profile = validate_task_platform_worker_profile(raw["worker_profile"])
+        provenance = _validate_worker_profile(raw["worker_runtime_provenance"])
+        if provenance["release_revision"] != release_revision:
+            raise ReleaseEvidenceError("worker runtime provenance release revision does not match release")
+        provenance_digest = _require_string(raw, "worker_runtime_provenance_digest")
+        if _SHA256_DIGEST.fullmatch(provenance_digest) is None:
+            raise ReleaseEvidenceError("worker runtime provenance digest is invalid")
+        if provenance_digest != compute_worker_profile_digest(provenance):
+            raise ReleaseEvidenceError("worker runtime provenance digest does not match provenance")
     worker_profile_digest = _require_string(raw, "worker_profile_digest")
     if _SHA256_DIGEST.fullmatch(worker_profile_digest) is None:
         raise ReleaseEvidenceError("worker_profile_digest is invalid")
-    if worker_profile_digest != compute_worker_profile_digest(worker_profile):
+    expected_profile_digest = (
+        compute_worker_profile_digest(worker_profile)
+        if schema_version == LEGACY_RELEASE_MANIFEST_SCHEMA
+        else compute_task_platform_worker_profile_digest(worker_profile)
+    )
+    if worker_profile_digest != expected_profile_digest:
         raise ReleaseEvidenceError("worker_profile_digest does not match worker_profile")
     release_digest = _require_string(raw, "release_digest")
     if _SHA256_DIGEST.fullmatch(release_digest) is None:
@@ -399,7 +529,7 @@ def validate_deployment_context(
 ) -> None:
     """Require deployment settings to match the immutable worker profile."""
 
-    profile = manifest.get("worker_profile")
+    profile = manifest.get("worker_runtime_provenance", manifest.get("worker_profile"))
     if not isinstance(profile, Mapping):
         raise ReleaseEvidenceError("release manifest worker profile is unavailable")
     expected = {

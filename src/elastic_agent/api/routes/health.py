@@ -59,6 +59,10 @@ async def health() -> dict:
         "provider": mgr.config.provider.type,
         "manager_state_schema": evidence["manager_state_schema"],
         "worker_profile_digest": evidence["worker_profile_digest"],
+        "worker_runtime_provenance_digest": evidence.get(
+            "worker_runtime_provenance_digest",
+            evidence["worker_profile_digest"],
+        ),
         "release_digest": evidence["release_digest"],
         "revision": revision,
         "aws_account_id": account_id,

@@ -1,6 +1,13 @@
 # Release Evidence
 
 `deploy/release-manifest.json` is the canonical, non-secret release manifest.
+Schema v3 separates two digest domains: `worker_runtime_provenance` and its
+`worker_runtime_provenance_digest` identify EA/AMI provenance, while
+`worker_profile` is the exact 11-field Task Platform `WorkerProfileInput` and
+`worker_profile_digest` hashes that object. The v3 generator requires an
+external, complete profile JSON and fails closed when it is absent or has
+unknown/missing fields. Test-only fixtures must never be copied into a
+production manifest.
 `deploy/release-files.json` indexes every tracked release file except those two
 self-referential generated files. Each record binds path, type, executable
 mode, size, and SHA-256. It is content addressed with three SHA-256 values:
@@ -57,8 +64,9 @@ making cloud calls. The canonical production Worker AMI is
 ## Immutable rollout
 
 1. Build the release from the upstream archive recorded in the manifest.
-2. After all tracked changes are committed, run
-   `uv run python scripts/generate_release_evidence.py`, commit only the
+2. After all tracked changes are committed and the authoritative Task Platform
+   11-field WorkerProfileInput JSON is available, run
+   `uv run python scripts/generate_release_evidence.py --worker-profile-input /absolute/path/profile.json`, commit only the
    generated manifest/index, and require its `--check` mode to pass.
 3. Copy the release directory to an immutable path named
    `/opt/task-platform/elastic-agent-<artifact hex>` without modifying it;

@@ -23,7 +23,9 @@ from elastic_agent.core.release_evidence import (  # noqa: E402
     canonical_json,
     compute_release_artifact_digest,
     compute_release_digest,
-    compute_worker_profile_digest,
+    compute_task_platform_worker_profile_digest,
+    compute_worker_runtime_provenance_digest,
+    validate_task_platform_worker_profile,
 )
 
 MANIFEST_PATH = ROOT / "deploy/release-manifest.json"
@@ -79,7 +81,20 @@ def _record(path: str, git_mode: str) -> dict[str, Any]:
     }
 
 
-def generate() -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_worker_profile(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > 1_048_576:
+            raise SystemExit("worker profile input exceeds size limit")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("worker profile input cannot be read") from exc
+    try:
+        return validate_task_platform_worker_profile(raw)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def generate(worker_profile_input: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     previous = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     index = {
         "schema_version": RELEASE_INDEX_SCHEMA,
@@ -87,8 +102,16 @@ def generate() -> tuple[dict[str, Any], dict[str, Any]]:
     }
     artifact_digest = compute_release_artifact_digest(index)
     revision = artifact_revision(artifact_digest)
-    worker_profile = dict(previous["worker_profile"])
-    worker_profile["release_revision"] = revision
+    provenance_key = (
+        "worker_runtime_provenance"
+        if previous.get("schema_version") == RELEASE_MANIFEST_SCHEMA
+        else "worker_profile"
+    )
+    worker_runtime_provenance = dict(previous[provenance_key])
+    worker_runtime_provenance["release_revision"] = revision
+    worker_profile = _load_worker_profile(worker_profile_input)
+    if worker_profile["ami_id"] != worker_runtime_provenance["ami_id"]:
+        raise SystemExit("worker profile AMI does not match runtime provenance")
     manifest = {
         "schema_version": RELEASE_MANIFEST_SCHEMA,
         "product": "elastic-agent",
@@ -102,8 +125,14 @@ def generate() -> tuple[dict[str, Any], dict[str, Any]]:
         "release_index": "deploy/release-files.json",
         "release_artifact_digest": artifact_digest,
         "manager_state_schema": previous["manager_state_schema"],
+        "worker_runtime_provenance": worker_runtime_provenance,
+        "worker_runtime_provenance_digest": compute_worker_runtime_provenance_digest(
+            worker_runtime_provenance
+        ),
         "worker_profile": worker_profile,
-        "worker_profile_digest": compute_worker_profile_digest(worker_profile),
+        "worker_profile_digest": compute_task_platform_worker_profile_digest(
+            worker_profile
+        ),
         "release_digest": "",
     }
     manifest["release_digest"] = compute_release_digest(manifest)
@@ -136,8 +165,14 @@ def main() -> int:
         action="store_true",
         help="fail if checked-in evidence differs from the tracked release tree",
     )
+    parser.add_argument(
+        "--worker-profile-input",
+        type=Path,
+        required=True,
+        help="path to the authoritative Task Platform WorkerProfileInput JSON",
+    )
     args = parser.parse_args()
-    index, manifest = generate()
+    index, manifest = generate(args.worker_profile_input)
     expected = {
         INDEX_PATH: _render(index),
         MANIFEST_PATH: _render(manifest),

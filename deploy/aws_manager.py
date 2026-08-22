@@ -487,7 +487,7 @@ def validate_worker_ami(
     if not caller_arn.startswith(expected_prefix):
         raise LauncherConfigurationError("AWS caller identity is not the expected Manager instance role")
     manifest = load_release_manifest(settings.release_manifest)
-    profile = manifest["worker_profile"]
+    profile = manifest.get("worker_runtime_provenance", manifest["worker_profile"])
     expected_ami_tags = {
         "ManifestDigest": profile["ami_manifest_digest"],
         "ConstraintsDigest": profile["ami_constraints_digest"],
