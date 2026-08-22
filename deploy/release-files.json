@@ -272,7 +272,14 @@
       "type": "file",
       "mode": "0644",
       "size": 1557,
-      "sha256": "sha256:cb292dc4d0f034d869af17f684e8f676cc5922e13a7cebaaa4b3d47edcbf7d88"
+      "sha256": "sha256:0def70a5dd1ee336967ac59b59ff611714a96e5843b7a2f242ed537f18ecf40c"
+    },
+    {
+      "path": "requirements.txt",
+      "type": "file",
+      "mode": "0644",
+      "size": 43626,
+      "sha256": "sha256:b516d65e2ee30610a5625e56dd2aeb44bab35e4ebff56c6e0e251827f7994a12"
     },
     {
       "path": "scripts/build_golden_ami.sh",
@@ -1899,6 +1906,13 @@
       "sha256": "sha256:ca9bdc2671cc0f1b673bef9827af9997edb972c9528a8e8bfdbb72278b0e19a5"
     },
     {
+      "path": "tests/unit/test_runtime_dependencies.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2176,
+      "sha256": "sha256:9b4944803162d920eb4a7460d145f53fb6f9f5f0a58c3d49b7ce83ac9dda172b"
+    },
+    {
       "path": "tests/unit/test_secret_env.py",
       "type": "file",
       "mode": "0644",
@@ -2035,8 +2049,8 @@
       "path": "uv.lock",
       "type": "file",
       "mode": "0644",
-      "size": 457025,
-      "sha256": "sha256:f6294d01f78520349f0b61ca12d90d4dd16d33cb9b9a208605fdd497b481d2bd"
+      "size": 456998,
+      "sha256": "sha256:09291250883b42b5c67e2900eaa63f28ac785003d3554e5b21fb8b2c8b94852c"
     }
   ]
 }

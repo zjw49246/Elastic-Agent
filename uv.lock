@@ -759,6 +759,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "argon2-cffi" },
+    { name = "boto3" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -784,7 +785,6 @@ aws = [
     { name = "boto3" },
 ]
 dev = [
-    { name = "boto3" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -800,8 +800,8 @@ requires-dist = [
     { name = "alibabacloud-ecs20140526", marker = "extra == 'aliyun'", specifier = ">=4.1.0" },
     { name = "alibabacloud-tea-openapi", marker = "extra == 'aliyun'", specifier = ">=0.3.14" },
     { name = "argon2-cffi", specifier = ">=23.1.0" },
+    { name = "boto3", specifier = ">=1.35.0" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
-    { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.35.0" },
     { name = "elastic-agent", extras = ["aliyun", "aws", "worker"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
