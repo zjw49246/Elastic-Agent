@@ -1,14 +1,14 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "product": "elastic-agent",
   "upstream_source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
   "upstream_archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
-  "release_revision": "artifact-sha256:30896cc87d2d8da3ccef5808a592262a44dce856bdc41a51145fd259c52982a9",
+  "release_revision": "artifact-sha256:7af38eb02c281b16f06533217f242e0257279f5386336fae62cb6db2ea46cba7",
   "release_index": "deploy/release-files.json",
-  "release_artifact_digest": "sha256:30896cc87d2d8da3ccef5808a592262a44dce856bdc41a51145fd259c52982a9",
+  "release_artifact_digest": "sha256:7af38eb02c281b16f06533217f242e0257279f5386336fae62cb6db2ea46cba7",
   "manager_state_schema": "v1",
-  "worker_profile": {
-    "ami_id": "ami-0c7d40ac988a900c5",
+  "worker_runtime_provenance": {
+    "ami_id": "ami-03c4e1dca88d39005",
     "bootstrap_source": "src/elastic_agent/core/bootstrap_steps.py",
     "dependency_lock": "uv.lock",
     "profiles": [
@@ -21,22 +21,54 @@
         "name": "ubuntu-agent-docker-v1"
       },
       {
+        "kind": "docker",
+        "name": "ubuntu-agent-docker-v2"
+      },
+      {
         "kind": "docker-sandbox",
         "name": "ubuntu-agent-docker-sandbox-v1"
       }
     ],
     "aws_account_id": "297645381734",
     "region": "ap-northeast-1",
-    "ami_manifest_digest": "sha256:2b0c6aa51fd2c93441346817e1a1ee5e79d8c32b27b57b92e39fe2befafa8e37",
+    "ami_manifest_digest": "sha256:75823a64acc2d38651b857f9ea22e61aff59c3bec8a02929ebda73fa68406df2",
     "ami_constraints_digest": "sha256:bc81f22a46eee61748cc6d114f7f0d33e0a46e15182726a516e909b82176dce0",
-    "ami_runner_image": "297645381734.dkr.ecr.ap-northeast-1.amazonaws.com/task-platform-pilot-runner@sha256:3b8f0b625ccbcc80558daed736c7a0932a31c7bcedb66e971418e0eabe356ab3",
-    "ami_platform_revision": "6eff9ab33f9094c3dccb04cd5f5ef9449ce65fb8",
+    "ami_runner_image": "297645381734.dkr.ecr.ap-northeast-1.amazonaws.com/task-platform-pilot-runner@sha256:e0b39edf49d637a86161a397b831610167b2a7d9f6f4203dbae2c232ce45dd19",
+    "ami_platform_revision": "7275b31b0a313e7b1d2ee3de89237a029333bde6",
     "ami_upstream_revision": "115320154e929bc28800a3273ebb3f56eef10070",
     "ami_generator_version": "build-only-v1",
-    "release_revision": "artifact-sha256:30896cc87d2d8da3ccef5808a592262a44dce856bdc41a51145fd259c52982a9",
+    "release_revision": "artifact-sha256:7af38eb02c281b16f06533217f242e0257279f5386336fae62cb6db2ea46cba7",
     "runtime_source": "src/elastic_agent/worker/runtime.py",
     "schema_version": 1
   },
-  "worker_profile_digest": "sha256:84d7282fd0b4281f0283a9cb81916ef62e50d93cbabbacf267028bb02cfc0eb4",
-  "release_digest": "sha256:49719265e70d2dc0e9475ffbcc100e6561d4ec9eb90da7feb94fecc15c89bfc4"
+  "worker_runtime_provenance_digest": "sha256:c3bec598211e199be4e1075f57c66210eafda0a2607a65b49c34d8fb76a82220",
+  "worker_profile": {
+    "profile_id": "pilot-build-only-v1",
+    "ami_id": "ami-03c4e1dca88d39005",
+    "instance_profile_name": "TaskPlatformBuildOnlyWorker-pilot",
+    "role_arn": "arn:aws:iam::297645381734:role/task-platform/build-only-workers/TaskPlatformBuildOnlyWorker-pilot",
+    "subnet_ids": [
+      "subnet-0c1db80817d054277"
+    ],
+    "security_group_ids": [
+      "sg-0a72ebfc1a59587c5"
+    ],
+    "allowed_instance_types": [
+      "m6id.32xlarge"
+    ],
+    "environment_profiles": [
+      "ubuntu-agent-docker-v2"
+    ],
+    "input_prefixes": [
+      "s3://task-platform-artifacts-297645381734-apne1/workspaces/7fe226a7-4d0e-486d-8916-372034a8e111/runs/"
+    ],
+    "output_prefixes": [
+      "s3://task-platform-artifacts-297645381734-apne1/workspaces/7fe226a7-4d0e-486d-8916-372034a8e111/runs/"
+    ],
+    "secret_reference_prefixes": [
+      "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:task-platform/7fe226a7-4d0e-486d-8916-372034a8e111/aecbb891-39eb-5d5d-ba3b-7ff2166d2f99/apex/"
+    ]
+  },
+  "worker_profile_digest": "sha256:f052b8f776f575445583ff97cc60d71716d46fc7ca7acc98baa8bec28a324d5a",
+  "release_digest": "sha256:d264a21549ec2c9bd06a360286af272a4eefddb088bf5e90b777de4ea9220b9b"
 }

@@ -19,8 +19,8 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 61818,
-      "sha256": "sha256:067de1ddde24c3ce8e74d609445d944224dcc9ca961f01f680e79bea02747023"
+      "size": 62177,
+      "sha256": "sha256:3e3294ca920685ccef107d8463d3c8af02c1f8caa53156f5c04dd60cc59d74eb"
     },
     {
       "path": "PROGRESS.md",
@@ -33,15 +33,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 63785,
-      "sha256": "sha256:dd2d6a98b684fa29b15cbe0621cf2e648df30a5220942783dfff2c9909467c55"
+      "size": 64053,
+      "sha256": "sha256:ca73313ba2ac14a04867ad6b1e3b461d1556eaf38cbae66516e97970e9761296"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31603,
-      "sha256": "sha256:00a5fce902e3592d5fb18a6eb71c0dc108a0757acf3dbfc937ac6c9b38f5866e"
+      "size": 31675,
+      "sha256": "sha256:ff1027762df8b0b9ef22ba8b8bc15279fe310e496cfbf9c74b20220ac8bf2360"
     },
     {
       "path": "deploy/__init__.py",
@@ -96,8 +96,8 @@
       "path": "deploy/aws_manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 22811,
-      "sha256": "sha256:e5dc2e9040e3420809a5bb3df9446a027eed08b97745b2ad6123f5777ac267c1"
+      "size": 22854,
+      "sha256": "sha256:20edcbc6b731c7cbfe21915e3fac7ee1af4af7b74ba1d2a9d7f3e3f8a52d3334"
     },
     {
       "path": "docs/audiobook-integration/00-overview.md",
@@ -243,8 +243,8 @@
       "path": "docs/operations/release-evidence.md",
       "type": "file",
       "mode": "0644",
-      "size": 4536,
-      "sha256": "sha256:863aa9cafc5bd6e9687584b225fef40fcfa9a9ef712d57810223e9e240518ba0"
+      "size": 5134,
+      "sha256": "sha256:4b0b037cafed6bd11842c8a2ea8b9bbf1c86efa4b5889f0fe0a624e117868d6b"
     },
     {
       "path": "docs/prerequisites/aliyun-setup.md",
@@ -299,8 +299,8 @@
       "path": "scripts/generate_release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 5316,
-      "sha256": "sha256:1680127d1b776f03222be8312cfdf3e45f7979682fa7495e7045ae4a1751ac0a"
+      "size": 6814,
+      "sha256": "sha256:73b2674bc08d2e9b01b786fc6023b561175fcf4710c2128e4141e9bb3790fd0c"
     },
     {
       "path": "scripts/golden_image_verify.py",
@@ -404,8 +404,8 @@
       "path": "src/elastic_agent/api/routes/health.py",
       "type": "file",
       "mode": "0644",
-      "size": 2402,
-      "sha256": "sha256:153cf2211103f3f9853c65f59c3fd453e1c34796dbe01d92c1b8d93a1c59606a"
+      "size": 2566,
+      "sha256": "sha256:9ff69699f5852cf55c3743aa1cecf564f87e896fa95b5bb40e0b2038dc9f2d17"
     },
     {
       "path": "src/elastic_agent/api/routes/job_batches.py",
@@ -978,8 +978,8 @@
       "path": "src/elastic_agent/core/release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 19817,
-      "sha256": "sha256:b6d7252b3ee0c856cf834004b615b994463a6a9680c2943e0bd10ed465357597"
+      "size": 25811,
+      "sha256": "sha256:3f2bbafa7b43ee4c0487081fcf2bdba01f9383ce0fb52439747b40a9198bb5f7"
     },
     {
       "path": "src/elastic_agent/core/result_uploader.py",
@@ -1255,6 +1255,13 @@
       "sha256": "sha256:5403f2203dfc87d1bd6584a8d0af989ba3632e4ea3211c422f3074e8aa4206cb"
     },
     {
+      "path": "tests/fixtures/task-platform-worker-profile-test-only.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 589,
+      "sha256": "sha256:eb3dee4a11af2cf160686676a1b35ab5a406a8716e5e85e35f733026b04bc479"
+    },
+    {
       "path": "tests/integration/__init__.py",
       "type": "file",
       "mode": "0644",
@@ -1440,15 +1447,15 @@
       "path": "tests/unit/test_api.py",
       "type": "file",
       "mode": "0644",
-      "size": 11295,
-      "sha256": "sha256:9e92d837505d0d7405e82de40b0f5ee8a1c491a2dd852727cd1cb27f5178aa61"
+      "size": 11440,
+      "sha256": "sha256:fe562869362e416d5135f95809e2b840e7310e75a79008a201172dd4e8d76609"
     },
     {
       "path": "tests/unit/test_api_auth.py",
       "type": "file",
       "mode": "0644",
-      "size": 7284,
-      "sha256": "sha256:f4e5369cd745764c385851736c96b77a02ffcd1b536a041da8520ae14e2069bd"
+      "size": 7332,
+      "sha256": "sha256:8325c720d8130b93831c5d0193a6e40ab10038a853dd2c0e54c19d895a695214"
     },
     {
       "path": "tests/unit/test_api_batch.py",
@@ -1881,8 +1888,8 @@
       "path": "tests/unit/test_release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 4157,
-      "sha256": "sha256:d1b346eec5c66bf92065f16ad97f3af3590081ed29a6429d0c02cefdd8b96e1f"
+      "size": 9042,
+      "sha256": "sha256:5d09641e8c81aadde3513bac1113390a61495e9399587b7f708b0e196bea4182"
     },
     {
       "path": "tests/unit/test_remove_node.py",
