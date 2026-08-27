@@ -1373,6 +1373,16 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
             run["secret_env"] = {
                 str(key): "[SECRET_REFERENCE]" for key in secret_env
             }
+        trajectory_prompt = run.get("trajectory_prompt")
+        if isinstance(trajectory_prompt, dict):
+            for component in ("system", "developer", "user"):
+                if trajectory_prompt.get(component):
+                    trajectory_prompt[component] = "[REDACTED]"
+            sources = trajectory_prompt.get("sources")
+            if isinstance(sources, list):
+                for source in sources:
+                    if isinstance(source, dict) and source.get("content"):
+                        source["content"] = "[REDACTED]"
     setup = data.get("setup") if isinstance(data, dict) else None
     if isinstance(setup, dict):
         repo = setup.get("repo")

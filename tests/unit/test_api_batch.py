@@ -3024,6 +3024,15 @@ class TestJobsAPI:
                 "secret_env": {
                     "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
                 },
+                "trajectory_prompt": {
+                    "system": "private-system-prompt",
+                    "developer": "private-developer-prompt",
+                    "user": "private-user-prompt",
+                    "sources": [{
+                        "name": "AGENTS.md",
+                        "content": "private-repository-instructions",
+                    }],
+                },
             },
         }
         submitted = (await client.post("/api/jobs", json=spec)).json()
@@ -3049,11 +3058,19 @@ class TestJobsAPI:
         assert live.json()["spec"]["run"]["secret_env"] == {
             "SECRET_TOKEN": "[SECRET_REFERENCE]",
         }
+        assert live.json()["spec"]["run"]["trajectory_prompt"] == {
+            "system": "[REDACTED]",
+            "developer": "[REDACTED]",
+            "user": "[REDACTED]",
+            "sources": [{"name": "AGENTS.md", "content": "[REDACTED]"}],
+        }
         assert live.json()["spec"]["setup"]["steps"][0]["env"] == {
             "SETUP_TOKEN": "[REDACTED]",
         }
         assert "plaintext" not in live.text
         assert "aws-secretsmanager" not in live.text
+        assert "private-system-prompt" not in live.text
+        assert "private-repository-instructions" not in live.text
 
         # Simulate the in-memory batch registry being lost on Manager restart.
         manager.batch._jobs.clear()
@@ -3064,6 +3081,8 @@ class TestJobsAPI:
         assert historical.json()["spec"] == submitted_config
         assert "plaintext" not in historical.text
         assert "aws-secretsmanager" not in historical.text
+        assert "private-system-prompt" not in historical.text
+        assert "private-repository-instructions" not in historical.text
 
     @pytest.mark.asyncio
     async def test_get_config_snapshot_read_fails_fast_when_capacity_is_full(

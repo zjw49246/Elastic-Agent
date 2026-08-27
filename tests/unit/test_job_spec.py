@@ -471,17 +471,11 @@ class TestRunSafetyAndSecretEnv:
         assert run.trajectory_prompt.system == "system {{shard_index}}"
         assert run.trajectory_prompt.sources[0].name == "AGENTS.md"
 
-        with pytest.raises(ValidationError, match="4194304-byte"):
+        with pytest.raises(ValidationError, match="524288-byte"):
             RunSpec(
                 command="bench",
                 trajectory_prompt={
-                    "system": "x" * 1_048_576,
-                    "developer": "y" * 1_048_576,
-                    "user": "z" * 1_048_576,
-                    "sources": [{
-                        "name": "AGENTS.md",
-                        "content": "é" * 1_048_576,
-                    }],
+                    "system": "x" * 524_288,
                 },
             )
 
@@ -489,6 +483,23 @@ class TestRunSafetyAndSecretEnv:
             RunSpec(
                 command="bench",
                 trajectory_prompt={"system_prompt": "wrong field"},
+            )
+
+        with pytest.raises(ValidationError, match="deterministic shard"):
+            RunSpec(
+                command="bench",
+                trajectory_prompt={"system": "account={{account_email}}"},
+            )
+
+    def test_trajectory_prompt_is_bounded_across_initial_fanout(self):
+        with pytest.raises(ValidationError, match="initial trajectory prompt budget"):
+            JobSpec(
+                name="large-fanout",
+                run={
+                    "command": "bench",
+                    "trajectory_prompt": {"system": "x" * 450_000},
+                },
+                fanout={"workers": 100},
             )
 
     def test_secret_env_accepts_references_and_rejects_plaintext(self):
