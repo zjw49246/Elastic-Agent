@@ -1,8 +1,8 @@
 {
   "profile_id": "pilot-build-only-v1",
   "ami_id": "ami-023251121ceb0d6f3",
-  "instance_profile_name": "TaskPlatformBuildOnlyWorker-pilot",
-  "role_arn": "arn:aws:iam::297645381734:role/task-platform/build-only-workers/TaskPlatformBuildOnlyWorker-pilot",
+  "instance_profile_name": "task-platform-pilot-executor-worker",
+  "role_arn": "arn:aws:iam::297645381734:role/task-platform-pilot-executor-worker",
   "subnet_ids": [
     "subnet-000a8edefd5306091"
   ],

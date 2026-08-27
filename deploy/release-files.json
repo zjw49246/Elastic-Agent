@@ -117,8 +117,8 @@
       "path": "deploy/compatibility/task-platform-worker-profile-ami023.json",
       "type": "file",
       "mode": "0644",
-      "size": 954,
-      "sha256": "sha256:e6673149eb241508473e1c8a90b1c04fb0f85e8fe7e5fb17779bb80d35f91b9e"
+      "size": 925,
+      "sha256": "sha256:585a12c3f00192f8e9c06fc51d3444a2c6eb08e69b3a118a3fb9aa5cb6dd879a"
     },
     {
       "path": "docs/audiobook-integration/00-overview.md",
