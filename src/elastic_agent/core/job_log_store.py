@@ -20,11 +20,16 @@ from elastic_agent.core.secure_store import (
     secure_state_directory,
     tighten_state_file,
 )
+from elastic_agent.core.trajectory_prompt import (
+    normalize_trajectory_prompt_metadata,
+    summarize_trajectory_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_SNAPSHOT_VERSION = 1
+_SNAPSHOT_VERSION = 2
+_READABLE_SNAPSHOT_VERSIONS = frozenset({1, _SNAPSHOT_VERSION})
 _TAIL_RESPONSE_BYTES = 8 * 1024 * 1024
 _PRUNED_MARKER = ".pruned"
 _PERSISTED_EXIT_FIELDS = frozenset(
@@ -166,6 +171,7 @@ class JobLogStore:
         entries: Iterable[dict[str, Any]],
         exit_info: dict[str, Any],
         source_truncated: bool = False,
+        prompt_metadata: dict[str, Any] | None = None,
     ) -> Path:
         """Atomically replace the deterministic snapshot for ``task_id``."""
 
@@ -182,6 +188,35 @@ class JobLogStore:
                 entries=entries,
                 exit_info=exit_info,
                 source_truncated=source_truncated,
+                prompt_metadata=prompt_metadata,
+                complete=True,
+            )
+
+    def save_prompt_metadata(
+        self,
+        *,
+        job_id: str,
+        task_id: str,
+        worker_id: str,
+        prompt_metadata: dict[str, Any],
+    ) -> Path:
+        """Durably stage prompt evidence before the remote command starts."""
+
+        job_id = _validate_job_id(job_id)
+        if not task_id.startswith(f"{job_id}:"):
+            raise ValueError("task_id does not belong to the batch Job")
+        if not worker_id or len(task_id) > 1_024 or len(worker_id) > 512:
+            raise ValueError("invalid task or worker identity")
+        with self._write_lock:
+            return self._save_snapshot_locked(
+                job_id=job_id,
+                task_id=task_id,
+                worker_id=worker_id,
+                entries=[],
+                exit_info={},
+                source_truncated=False,
+                prompt_metadata=prompt_metadata,
+                complete=False,
             )
 
     def _save_snapshot_locked(
@@ -193,6 +228,8 @@ class JobLogStore:
         entries: Iterable[dict[str, Any]],
         exit_info: dict[str, Any],
         source_truncated: bool,
+        prompt_metadata: dict[str, Any] | None,
+        complete: bool,
     ) -> Path:
         destination = self._job_directory(job_id, create=True) / f"{_task_key(task_id)}.json"
         normalized: list[dict[str, str]] = []
@@ -205,13 +242,26 @@ class JobLogStore:
             )
             normalized.append(item)
             line_truncated = line_truncated or was_truncated
-        if not normalized and destination.exists():
-            existing = self._read_snapshot(destination, job_id)
-            if existing is not None:
-                # Reliable PROCESS_EXIT may replay after the first archive
-                # released the in-memory parser buffer.  Never replace useful
-                # output with that replay's empty snapshot.
-                return destination
+        existing = (
+            self._read_snapshot(destination, job_id)
+            if destination.exists()
+            else None
+        )
+        if prompt_metadata is None and existing is not None:
+            existing_prompt = existing.get("prompt")
+            if isinstance(existing_prompt, dict):
+                prompt_metadata = existing_prompt
+        if prompt_metadata is not None:
+            prompt_metadata = normalize_trajectory_prompt_metadata(prompt_metadata)
+        if (
+            not normalized
+            and existing is not None
+            and existing.get("complete") is True
+        ):
+            # Reliable PROCESS_EXIT may replay after the first archive released
+            # the in-memory parser buffer. Never replace useful output with that
+            # replay's empty snapshot.
+            return destination
 
         count_truncated = len(normalized) > self.max_entries
         normalized = normalized[-self.max_entries :]
@@ -237,11 +287,13 @@ class JobLogStore:
                 "task_id": task_id,
                 "worker_id": worker_id,
                 "saved_at": saved_at,
-                "complete": True,
+                "complete": complete,
                 "truncated": truncated,
                 "exit": safe_exit,
                 "entries": normalized,
             }
+            if prompt_metadata is not None:
+                payload["prompt"] = prompt_metadata
             encoded = json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -291,7 +343,7 @@ class JobLogStore:
                 raise ValueError("snapshot must be a JSON object")
             task_id = payload.get("task_id")
             if (
-                payload.get("version") != _SNAPSHOT_VERSION
+                payload.get("version") not in _READABLE_SNAPSHOT_VERSIONS
                 or payload.get("job_id") != expected_job_id
                 or not isinstance(task_id, str)
                 or path.name != f"{_task_key(task_id)}.json"
@@ -301,6 +353,9 @@ class JobLogStore:
                 or not isinstance(payload.get("exit"), dict)
             ):
                 raise ValueError("snapshot identity/schema mismatch")
+            prompt = payload.get("prompt")
+            if prompt is not None:
+                payload["prompt"] = normalize_trajectory_prompt_metadata(prompt)
             valid_entries = []
             for entry in payload["entries"]:
                 if (
@@ -381,6 +436,8 @@ class JobLogStore:
             if payload is None or (worker_id is not None and payload["worker_id"] != worker_id):
                 continue
             entries = payload.pop("entries")
+            if task_id is None and isinstance(payload.get("prompt"), dict):
+                payload["prompt"] = summarize_trajectory_prompt(payload["prompt"])
             tasks.append(payload)
             history_truncated = history_truncated or bool(payload.get("truncated"))
             candidate_task = str(payload["task_id"])
@@ -426,7 +483,7 @@ class JobLogStore:
             payload = json.loads(marker.read_text(encoding="utf-8"))
             if (
                 not isinstance(payload, dict)
-                or payload.get("version") != _SNAPSHOT_VERSION
+                or payload.get("version") not in _READABLE_SNAPSHOT_VERSIONS
                 or int(payload.get("pruned_snapshots") or 0) < 1
             ):
                 raise ValueError("invalid Job log prune marker")

@@ -460,6 +460,37 @@ class TestEnvironmentAndSetup:
 
 
 class TestRunSafetyAndSecretEnv:
+    def test_trajectory_prompt_is_strict_and_bounded(self):
+        run = RunSpec(
+            command="bench",
+            trajectory_prompt={
+                "system": "system {{shard_index}}",
+                "sources": [{"name": "AGENTS.md", "content": "rules"}],
+            },
+        )
+        assert run.trajectory_prompt.system == "system {{shard_index}}"
+        assert run.trajectory_prompt.sources[0].name == "AGENTS.md"
+
+        with pytest.raises(ValidationError, match="4194304-byte"):
+            RunSpec(
+                command="bench",
+                trajectory_prompt={
+                    "system": "x" * 1_048_576,
+                    "developer": "y" * 1_048_576,
+                    "user": "z" * 1_048_576,
+                    "sources": [{
+                        "name": "AGENTS.md",
+                        "content": "é" * 1_048_576,
+                    }],
+                },
+            )
+
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            RunSpec(
+                command="bench",
+                trajectory_prompt={"system_prompt": "wrong field"},
+            )
+
     def test_secret_env_accepts_references_and_rejects_plaintext(self):
         run = RunSpec(command="bench", secret_env={
             "TOKEN": "aws-secretsmanager://prod/service#token",

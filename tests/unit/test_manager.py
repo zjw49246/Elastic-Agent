@@ -2666,6 +2666,23 @@ class TestEventRouting:
     @pytest.mark.asyncio
     async def test_archive_job_task_log_fsyncs_then_releases_buffer(self, manager):
         task_id = "job-log-test:w-1:abcdef"
+        prompt = {
+            "schema": 1,
+            "agent_type": "claude",
+            "capture_mode": "declared",
+            "complete": False,
+            "components": {
+                "system": {
+                    "text": "system rules",
+                    "sha256": "97e2b5a8fd07a75081a1205a6f5154b39730b01846a2a399eaf5ae41b00b22a1",
+                    "bytes": 12,
+                },
+            },
+            "sources": [],
+            "unavailable_components": ["provider_builtin_system_prompt"],
+            "invocation": {"argv_sha256": "a" * 64, "resumed": False},
+        }
+        manager.log_event_parser.register_task_prompt(task_id, prompt)
         manager.log_event_parser.process_log_event("w-1", {
             "task_id": task_id,
             "stream": "stderr",
@@ -2685,6 +2702,7 @@ class TestEventRouting:
         snapshots = manager.job_log_store.read_job("job-log-test")
         assert snapshots[0]["entries"][0]["data"] == "actionable error"
         assert snapshots[0]["exit"]["exit_code"] == 1
+        assert snapshots[0]["prompt"] == prompt
 
     @pytest.mark.asyncio
     async def test_archive_failure_releases_bounded_buffer_without_blocking_cleanup(

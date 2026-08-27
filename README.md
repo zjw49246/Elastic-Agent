@@ -110,6 +110,30 @@ The worker keeps a stdin pipe open so interactive callers can send
 argument is present, redirect stdin explicitly in `run.command`; for example,
 use `codex exec ... </dev/null`.
 
+Mode-B harnesses that need reproducible trajectories should declare the prompt
+material they submit under `run.trajectory_prompt`. The Manager renders worker
+templates, hashes each component, and durably stages this metadata before remote
+execution, separately from the bounded stdout/stderr tail:
+
+```json
+{
+  "run": {
+    "command": "codex exec ... </dev/null",
+    "trajectory_prompt": {
+      "system": "Evaluation rules for shard {{shard_index}}",
+      "developer": "Use the repository tools",
+      "user": "Solve the assigned task",
+      "sources": [{"name": "AGENTS.md", "content": "Repository instructions"}]
+    }
+  }
+}
+```
+
+CC/Codex provider built-ins and compiled resume context are not exposed by the
+CLIs. Stored metadata therefore lists those components as unavailable instead
+of claiming byte-exact completeness. Job-wide log reads return prompt hashes;
+select one `task_id` to retrieve its captured plaintext.
+
 On POSIX, each Mode-B command runs in its own process session. STOP, timeout,
 exhaustion, and a parent that exits while leaving children behind terminate the
 whole process group before the Worker publishes its terminal event. A

@@ -3810,6 +3810,7 @@ class ElasticAgentManager:
                 entries=entries,
                 exit_info=data,
                 source_truncated=source_truncated,
+                prompt_metadata=self.log_event_parser.get_task_prompt(task_id),
             )
         except Exception:  # noqa: BLE001
             logger.exception(

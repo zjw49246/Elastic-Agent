@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from elastic_agent.core.checkpoint_store import IncompleteCheckpointSetError
+from elastic_agent.core.job_log_store import JobLogStore
 from elastic_agent.core.job_spec import JobSpec
 from elastic_agent.core.job_spec_store import (
     persist_job_spec,
@@ -21,6 +22,7 @@ from elastic_agent.core.job_spec_store import (
     update_job_interrupt_intent,
     update_job_state,
 )
+from elastic_agent.core.log_event_parser import LogEventParser
 from elastic_agent.core.manager_fleet_driver import (
     ManagerFleetDriver,
     _terminate_subprocess,
@@ -3327,3 +3329,53 @@ async def test_resolve_secret_env_allows_wss_transport(tmp_path, monkeypatch):
     )
 
     assert result == {"TOKEN": "plaintext"}
+
+
+async def test_run_command_persists_prompt_before_remote_dispatch(tmp_path):
+    manager = FakeManager(tmp_path)
+    manager.job_log_store = JobLogStore(tmp_path / "job-logs")
+    manager.log_event_parser = LogEventParser()
+    task_id = "job-prompt:worker-a:abcdef"
+    prompt = {
+        "schema": 1,
+        "agent_type": "codex",
+        "capture_mode": "declared",
+        "complete": False,
+        "components": {
+            "system": {
+                "text": "system rules",
+                "sha256": "97e2b5a8fd07a75081a1205a6f5154b39730b01846a2a399eaf5ae41b00b22a1",
+                "bytes": 12,
+            },
+        },
+        "sources": [],
+        "unavailable_components": ["provider_builtin_system_prompt"],
+        "invocation": {"argv_sha256": "a" * 64, "resumed": False},
+    }
+
+    async def execute(**_kwargs):
+        snapshot = manager.job_log_store.read_job("job-prompt")[0]
+        assert snapshot["complete"] is False
+        assert snapshot["prompt"]["components"]["system"]["text"] == "system rules"
+
+    manager.connection_manager.execute = execute
+
+    driver = ManagerFleetDriver(manager)
+    await driver.stage_prompt_metadata(
+        "worker-a",
+        task_id,
+        "job-prompt",
+        prompt,
+    )
+    await driver.run_command(
+        "worker-a",
+        task_id,
+        ["codex", "exec", "task"],
+        ".",
+        {},
+        60,
+        "job-prompt",
+        False,
+    )
+
+    assert manager.log_event_parser.get_task_prompt(task_id) == prompt
