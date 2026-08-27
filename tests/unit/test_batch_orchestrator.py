@@ -60,6 +60,7 @@ class FakeDriver:
         self.recovery_prepare_error: str | None = None
         self.recovery_restore_error: str | None = None
         self.recovery_cleanup_error: str | None = None
+        self.prompt_metadata: dict[str, dict] = {}
 
     async def acquire_capacity(self, count):
         self.events.append(("capacity_acquire", count))
@@ -186,12 +187,18 @@ class FakeDriver:
         return LoginOutcome(success=True, account_id=f"acc-{self._account_seq}",
                             account_email=f"a{self._account_seq}@x.com")
 
+    async def stage_prompt_metadata(
+        self, worker_id, task_id, job_id, prompt_metadata,
+    ):
+        self.prompt_metadata[task_id] = prompt_metadata
+
     async def run_command(self, worker_id, task_id, command, cwd, env, timeout,
                           job_id, watch_exhaustion):
         self.dispatched.append({
             "worker_id": worker_id, "task_id": task_id, "command": command,
             "cwd": cwd, "env": env, "timeout": timeout,
             "job_id": job_id, "watch_exhaustion": watch_exhaustion,
+            "prompt_metadata": self.prompt_metadata.get(task_id),
         })
 
     async def resolve_secret_env(self, secret_env):
@@ -328,6 +335,34 @@ class TestSubmit:
 
 
 class TestLaunch:
+    async def test_dispatch_captures_rendered_prompt_metadata(self):
+        d = FakeDriver(workers=1)
+        orch = BatchOrchestrator(d)
+        spec = _spec(
+            fanout={"workers": 1},
+            account={"agent_type": "codex", "mode": "none"},
+            run=RunSpec(
+                command="codex exec task-{{shard_index}}",
+                trajectory_prompt={
+                    "system": "system-{{shard_index}}",
+                    "sources": [{
+                        "name": "AGENTS.md",
+                        "content": "worker {{shard_index}}",
+                    }],
+                },
+            ),
+        )
+
+        await orch.launch(spec)
+
+        prompt = d.dispatched[0]["prompt_metadata"]
+        assert prompt["agent_type"] == "codex"
+        assert prompt["capture_mode"] == "declared"
+        assert prompt["complete"] is False
+        assert prompt["components"]["system"]["text"] == "system-0"
+        assert prompt["sources"][0]["text"] == "worker 0"
+        assert "provider_builtin_system_prompt" in prompt["unavailable_components"]
+
     async def test_fans_out_to_all_workers(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)

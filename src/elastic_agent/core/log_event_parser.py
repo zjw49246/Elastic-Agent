@@ -61,6 +61,7 @@ class LogEventParser:
             lambda: deque(maxlen=self._buffer_size)
         )
         self._task_sessions: dict[str, TaskSession] = {}
+        self._task_prompts: dict[str, dict[str, Any]] = {}
         self._worker_costs: dict[str, float] = defaultdict(float)
 
     def process_log_event(
@@ -176,6 +177,18 @@ class LogEventParser:
         """Get extracted session metadata for a task."""
         return self._task_sessions.get(task_id)
 
+    def register_task_prompt(
+        self,
+        task_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Retain prompt metadata outside the bounded event deque."""
+
+        self._task_prompts[task_id] = metadata
+
+    def get_task_prompt(self, task_id: str) -> dict[str, Any] | None:
+        return self._task_prompts.get(task_id)
+
     def get_task_cost(self, task_id: str) -> float:
         """Get aggregated cost for a task."""
         session = self._task_sessions.get(task_id)
@@ -189,6 +202,7 @@ class LogEventParser:
         """Release buffer and session data for a completed task."""
         self._task_buffers.pop(task_id, None)
         self._task_sessions.pop(task_id, None)
+        self._task_prompts.pop(task_id, None)
 
     def buffer_size(self, task_id: str) -> int:
         """Return current buffer size for a task."""

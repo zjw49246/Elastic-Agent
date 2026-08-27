@@ -38,6 +38,7 @@ from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Protocol
 
 from elastic_agent.core.job_spec import JobSpec, WorkerContext
+from elastic_agent.core.trajectory_prompt import build_trajectory_prompt_metadata
 from elastic_agent.harness.base import Harness
 from elastic_agent.harness.generic import build_execute, resolve_harness
 
@@ -2114,6 +2115,20 @@ class BatchOrchestrator:
         run.exit_archive_pending = False
         run.dispatched_at = time.monotonic()
         run.phase = WorkerPhase.DISPATCHING
+        prompt_metadata = build_trajectory_prompt_metadata(
+            spec,
+            run.ctx,
+            command=ex["command"],
+            resumed=resume,
+        )
+        stage_prompt = getattr(self._driver, "stage_prompt_metadata", None)
+        if callable(stage_prompt):
+            await stage_prompt(
+                run.worker_id,
+                run.task_id,
+                job.job_id,
+                prompt_metadata,
+            )
         await self._driver.run_command(
             run.worker_id, run.task_id,
             command=ex["command"], cwd=ex["cwd"], env=ex["env"], timeout=ex["timeout"],
