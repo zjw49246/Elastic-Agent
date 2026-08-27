@@ -1,5 +1,15 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-08-19 通用化 Apex 与大规模 AWS 护栏（commits `fa5b8ea`, `5e94670`, `9411794`）
+
+**问题**：生产验证暴露了三类可复用问题：Apex 同时提供 Claude/Codex 模型但旧投影只支持 Codex；Apex 可能用 HTTP 403 表示余额不足，宽泛的 403 认证判断会写入 sticky invalid-key tombstone；大批 AWS 启动和周期收集会放大 `RunInstances` throttle、连接池和 SSH/S3 并发压力，且新实例在 provider 可见与 inflight reservation 释放之间可能被容量统计双算。
+
+**解决**：Apex model catalog 同时接受 `models[].slug` 与 `data[].id`，按模型族构建固定 Claude/Codex 投影；runtime usage policy 只在 usage endpoint 404 时使用已验证 catalog，真实请求再精确区分 invalid key、余额/额度耗尽和瞬时网关错误。AWS 启动增加进程级 token bucket、窄 throttle 重试、稳定 `ClientToken` 与更大的连接池；周期收集使用独立 semaphore 和稳定 jitter，final collect 直接绕过；容量 admission 以精确 instance ID 扣除 visible/inflight 重叠。
+
+**避免复发**：HTTP 状态码不能脱离 provider 语义直接生成持久账号 tombstone；硬额度错误必须先于通用认证状态判断。云实例 admission 必须把 provider 可见性与本地 reservation 的交叠作为显式状态。面向大规模 fanout 的所有外部调用都应有进程级速率、并发和取消边界。
+
+**验证**：Apex、Worker projection、PTY、AWS provider、BatchOrchestrator 与 Manager 联合定向测试 `440 passed`；相关核心 Python 模块与测试通过 Ruff，`git diff --check` 通过。
+
 ## 2026-08-07 ApexRouter 不限额窗口准入（commits `8bbd2df`, `017149e`）
 
 **问题**：ApexRouter 用固定窗口的 `remaining=null`、`limit=null` 表示该共享窗口

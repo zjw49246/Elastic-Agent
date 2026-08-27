@@ -209,6 +209,11 @@ class ElasticAgentManager:
         self._current_unbound_instance_ids: set[str] = set()
         self._job_state_lock = asyncio.Lock()
         self._inflight_instance_creates = 0
+        # A RunInstances result can become visible to the provider/registry
+        # scan before the scale_out call releases its process-local inflight
+        # reservation.  Track that overlap explicitly so admission counts the
+        # instance once, not once as owned and again as inflight.
+        self._inflight_visible_instance_ids: set[str] = set()
         self._instance_capacity_holds: dict[str, int] = {}
         self._account_allocator: Any = None
         self._account_login_coordinator: Any = None
@@ -339,11 +344,19 @@ class ElasticAgentManager:
             # Do not let the whole-tree periodic uploader acquire its sync lock
             # ahead of startup final collection. Recovery must settle old
             # billable workers before background mirroring starts.
-            if self._s3_uploader is not None:
+            if (
+                self._s3_uploader is not None
+                and self.config.results.s3_periodic_enabled
+            ):
                 self._s3_task = asyncio.create_task(
                     self._s3_uploader.run_periodic(interval)
                 )
                 logger.info("S3 result upload enabled → s3://%s", bucket)
+            elif self._s3_uploader is not None:
+                logger.info(
+                    "Periodic whole-tree S3 result mirroring is disabled; "
+                    "awaited per-Job uploads remain enabled"
+                )
 
             online_workers = set(self.connection_manager.connected_workers)
             await self.task_registry.recover(online_workers)
@@ -2716,6 +2729,11 @@ class ElasticAgentManager:
         self._batch = BatchOrchestrator(
             driver,
             scale_in_on_complete=scale_in_on_complete,
+            worker_concurrency=self.config.batch_runtime.worker_concurrency,
+            collect_concurrency=self.config.batch_runtime.collect_concurrency,
+            collect_jitter_ratio=(
+                self.config.batch_runtime.collect_jitter_ratio
+            ),
             persist_spec_hook=self._persist_batch_job_spec,
             job_state_hook=self._update_batch_job_state,
             interrupt_intent_hook=self._update_batch_interrupt_intent,
@@ -2801,7 +2819,10 @@ class ElasticAgentManager:
                 owned_ids.add(lease.instance_id)
             else:
                 placeholders += 1
-        return len(owned_ids) + placeholders
+        visible_inflight_overlap = len(
+            owned_ids.intersection(self._inflight_visible_instance_ids)
+        )
+        return len(owned_ids) + placeholders - visible_inflight_overlap
 
     async def _reserve_instance_capacity(
         self, count: int, tags: dict[str, str] | None
@@ -2847,6 +2868,7 @@ class ElasticAgentManager:
         tags: dict[str, str] | None = None,
     ) -> list[NodeRecord]:
         reserved_capacity = await self._reserve_instance_capacity(count, tags)
+        capacity_visible_ids: set[str] = set()
         try:
             async with self._instance_lifecycle_lock:
                 return await self._scale_out_unchecked(
@@ -2857,9 +2879,15 @@ class ElasticAgentManager:
                     disk_gb=disk_gb,
                     spot=spot,
                     tags=tags,
+                    capacity_visible_ids=(
+                        capacity_visible_ids if reserved_capacity else None
+                    ),
                 )
         finally:
             async with self._instance_capacity_lock:
+                self._inflight_visible_instance_ids.difference_update(
+                    capacity_visible_ids
+                )
                 self._inflight_instance_creates = max(
                     0,
                     self._inflight_instance_creates - reserved_capacity,
@@ -2874,6 +2902,7 @@ class ElasticAgentManager:
         disk_gb: int | None = None,
         spot: bool = False,
         tags: dict[str, str] | None = None,
+        capacity_visible_ids: set[str] | None = None,
     ) -> list[NodeRecord]:
         from elastic_agent.core.auth import generate_worker_token
         from elastic_agent.core.providers.base import InstanceConfig
@@ -2962,7 +2991,19 @@ class ElasticAgentManager:
                     instance_cfg.client_token = f"ea-u-{uuid.uuid4().hex}"
                     await self._begin_unbound_launch_intent(job_id)
                     unbound_intent_started = True
-                instance = await self.provider.create_instance(instance_cfg)
+                if capacity_visible_ids is None:
+                    instance = await self.provider.create_instance(instance_cfg)
+                else:
+                    # Keep the capacity scan fenced across the exact boundary
+                    # where AWS may expose the new instance but this process
+                    # still owns its inflight reservation.  Once the id is
+                    # recorded, scans can proceed and deduct that overlap.
+                    async with self._instance_capacity_lock:
+                        instance = await self.provider.create_instance(instance_cfg)
+                        capacity_visible_ids.add(instance.instance_id)
+                        self._inflight_visible_instance_ids.add(
+                            instance.instance_id
+                        )
                 if (
                     not lease_id
                     and instance_cfg.tags.get("ElasticAgentJob")

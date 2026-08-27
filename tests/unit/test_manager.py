@@ -2349,11 +2349,46 @@ class TestScaleOut:
         first = asyncio.create_task(manager.scale_out())
         await entered.wait()
 
-        with pytest.raises(RuntimeError, match="configured maximum is 1"):
-            await manager.scale_out()
-
+        second = asyncio.create_task(manager.scale_out())
+        await asyncio.sleep(0.05)
+        assert second.done() is False
         release.set()
         assert len(await first) == 1
+        with pytest.raises(RuntimeError, match="configured maximum is 1"):
+            await second
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_instance_limit_deduplicates_visible_inflight_create(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 2
+        await manager.start()
+        publication_entered = asyncio.Event()
+        release_publication = asyncio.Event()
+        real_emit = manager.event_bus.emit
+
+        async def block_first_publication(event_type, source, data=None):
+            if event_type == "NODE_CREATING" and not publication_entered.is_set():
+                publication_entered.set()
+                await release_publication.wait()
+            return await real_emit(event_type, source, data)
+
+        manager.event_bus.emit = block_first_publication
+        first = asyncio.create_task(manager.scale_out())
+        await publication_entered.wait()
+
+        second = asyncio.create_task(manager.scale_out())
+        await asyncio.sleep(0.05)
+        assert second.done() is False
+        assert manager._inflight_instance_creates == 2
+
+        release_publication.set()
+        first_records, second_records = await asyncio.gather(first, second)
+        assert len(first_records) == len(second_records) == 1
+        assert manager._inflight_instance_creates == 0
+        assert manager._inflight_visible_instance_ids == set()
         await manager.stop()
 
     @pytest.mark.asyncio

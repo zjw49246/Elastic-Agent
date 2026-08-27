@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import Any
 
 from elastic_agent.core.rate_limit import (
+    is_apexrouter_auth_failure,
+    is_apexrouter_hard_limit,
+    is_apexrouter_transient,
     is_cloudrouter_auth_failure,
     is_cloudrouter_hard_limit,
     is_cloudrouter_transient,
@@ -121,6 +124,7 @@ def classify_turn_error(
     content: Any | None,
     *,
     cloudrouter: bool = False,
+    apexrouter: bool = False,
 ) -> tuple[str, str]:
     if isinstance(content, str):
         message = content
@@ -152,6 +156,23 @@ def classify_turn_error(
         return (
             "transient_overload",
             "CloudRouter is temporarily rate limiting gateway requests. "
+            "The worker will back off and retry the same account.",
+        )
+    if apexrouter and is_apexrouter_auth_failure(message):
+        return (
+            "agent_api_auth_failure",
+            "ApexRouter rejected the delegated API key",
+        )
+    if apexrouter and is_apexrouter_hard_limit(message):
+        return (
+            "agent_api_rate_limited",
+            "ApexRouter key quota or credit limit was reached; "
+            "the current PTY task cannot continue.",
+        )
+    if apexrouter and is_apexrouter_transient(message):
+        return (
+            "transient_overload",
+            "ApexRouter is temporarily rate limiting gateway requests. "
             "The worker will back off and retry the same account.",
         )
     # Server-side transient 429/overload (Anthropic infra, NOT an account usage
@@ -568,6 +589,10 @@ if PTY_AVAILABLE:
                     projection is not None
                     and projection.provider == "cloudrouter"
                 )
+                apexrouter = bool(
+                    projection is not None
+                    and projection.provider == "apex"
+                )
                 # Claude's real result frame carries api_error_status only in
                 # raw_json; claude-pty's normalized content may contain just a
                 # short result string. Classify both and let priority retain
@@ -582,6 +607,7 @@ if PTY_AVAILABLE:
                     error_type, error_message = classify_turn_error(
                         value,
                         cloudrouter=cloudrouter,
+                        apexrouter=apexrouter,
                     )
                     self._record_turn_error(
                         task_id,

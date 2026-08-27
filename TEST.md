@@ -234,9 +234,10 @@ The focused suite covers:
   the Manager's repository token;
 - compensation after allocation, create, attach, bootstrap, login, or run
   failures, plus REST API write-only token behavior and active claim/lease guards.
-- CloudRouter and Codex-only ApexRouter Agent API provider registration,
+- CloudRouter and Claude/Codex ApexRouter Agent API provider registration,
   fixed-endpoint 15-second wall-clock-bounded no-redirect Bearer model/usage
-  requests, Apex's pinned-Codex-version native model catalog and distinct
+  requests, Apex's native/OpenAI-compatible model catalogs, runtime/strict
+  usage policy, provider-specific Claude/Codex projection, and distinct
   per-key usage/shared-group quota normalization, including explicit-null
   unlimited windows, mixed limited/unlimited windows, and asymmetric-null
   fail-closed behavior,
@@ -277,8 +278,8 @@ The focused suite covers:
   HTTP(S)/ALL proxy variables from both plain and secret env so managed traffic
   cannot bypass the account's stable public egress;
 - Agent API REST/UI write-only behavior, CloudRouter/ApexRouter
-  add/refresh/usage controls, provider-aware Agent support (ApexRouter is
-  Codex-only), quota/model display, no browser-persisted Key, and sanitized
+  add/refresh/usage controls, provider-aware Agent/model support, quota/model
+  display, no browser-persisted Key, and sanitized
   validation/upstream errors, reference-aware deletion, and refcount sharing
   only for unbound API identities while OAuth and any durable EIP binding stay
   exclusive.
@@ -293,6 +294,14 @@ The focused suite covers:
   section is opened and focused. The AI4Sci Bench preset and README example use
   `archive/youchengsong-managed-agent-api-20260728`; other repositories must
   set their own `setup.ref`.
+- Apex runtime classification keeps explicit insufficient-balance/quota errors
+  out of the sticky invalid-key path, requires provider/auth evidence for 403,
+  and treats ordinary 429/500/502 gateway failures as same-key transient errors.
+- AWS launch coverage verifies the process-wide `RunInstances` token bucket,
+  stable-client-token throttle retries, cancellation, bounded connection pool,
+  and non-retry behavior for quota/capacity failures. Batch coverage verifies
+  periodic-collect concurrency, stable jitter, final-collect bypass, and exact
+  de-duplication of provider-visible inflight instance capacity.
 - Batch Console Worker history/resource separation: completed execution rows
   report their release proof explicitly, display destroyed resources as history,
   suppress live actions after teardown, keep read-only system logs until release,

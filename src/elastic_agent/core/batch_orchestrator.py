@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import functools
+import hashlib
 import hmac
 import logging
 import time
@@ -43,6 +44,11 @@ from elastic_agent.harness.base import Harness
 from elastic_agent.harness.generic import build_execute, resolve_harness
 
 logger = logging.getLogger(__name__)
+
+# Periodic collection is best-effort streaming, so it must not be able to
+# create an unbounded SSH/S3 fan-out when a large fleet reaches the same
+# interval at once. Final collection deliberately bypasses this limit.
+_MAX_PERIODIC_COLLECT_CONCURRENCY = 256
 
 PersistSpecHook = Callable[
     [str, JobSpec, str | None],
@@ -693,6 +699,8 @@ class BatchOrchestrator:
         final_collect_timeout: float = 7_200.0,
         cleanup_retry_seconds: float = 5.0,
         worker_concurrency: int = 8,
+        collect_concurrency: int = 8,
+        collect_jitter_ratio: float = 0.0,
         persist_spec_hook: PersistSpecHook | None = None,
         job_state_hook: JobStateHook | None = None,
         interrupt_intent_hook: InterruptIntentHook | None = None,
@@ -721,6 +729,17 @@ class BatchOrchestrator:
             exit_archive_grace_seconds,
         )
         self._worker_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
+        bounded_collect_concurrency = min(
+            max(1, int(collect_concurrency)),
+            _MAX_PERIODIC_COLLECT_CONCURRENCY,
+        )
+        self._collect_semaphore = asyncio.Semaphore(
+            bounded_collect_concurrency
+        )
+        self._collect_jitter_ratio = min(
+            1.0,
+            max(0.0, float(collect_jitter_ratio)),
+        )
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id
         self._collect_tasks: dict[str, asyncio.Task] = {}  # worker_id -> periodic collect
@@ -2199,11 +2218,14 @@ class BatchOrchestrator:
         if existing and not existing.done():
             return
 
+        def next_delay() -> float:
+            return self._periodic_collect_delay(interval, task_key)
+
         if spec.collect.checkpoint:
             async def _checkpoint_loop() -> None:
                 try:
                     while True:
-                        await asyncio.sleep(interval)
+                        await asyncio.sleep(next_delay())
                         runs = list(job.runs.values())
                         if len(runs) != spec.fanout.workers:
                             continue
@@ -2253,7 +2275,7 @@ class BatchOrchestrator:
                             )
                         results = await asyncio.gather(
                             *(
-                                self._driver.collect(
+                                self._run_periodic_collect(
                                     run.worker_id,
                                     spec,
                                     job.job_id,
@@ -2284,18 +2306,58 @@ class BatchOrchestrator:
         async def _loop() -> None:
             try:
                 while True:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(next_delay())
                     run = job.runs.get(worker_id)
                     if run is None or run.phase in TERMINAL_WORKER_PHASES:
                         return
                     try:
-                        await self._driver.collect(worker_id, spec, job.job_id)
+                        await self._run_periodic_collect(
+                            worker_id,
+                            spec,
+                            job.job_id,
+                        )
                     except Exception:
                         logger.exception("periodic collect failed for %s", worker_id)
             except asyncio.CancelledError:
                 return
 
         self._collect_tasks[task_key] = asyncio.create_task(_loop())
+
+    def _periodic_collect_delay(
+        self,
+        interval: float,
+        task_key: str,
+    ) -> float:
+        """Return a stable, non-negative stagger for one periodic collector.
+
+        The additive form preserves the contract that the first collection is
+        never earlier than one complete configured interval. A stable hash,
+        instead of process-randomized ``hash()``, keeps the schedule
+        deterministic across Manager restarts.
+        """
+        if self._collect_jitter_ratio <= 0.0:
+            return float(interval)
+        digest = hashlib.sha256(task_key.encode("utf-8")).digest()
+        unit_interval = int.from_bytes(digest[:8], "big") / float(1 << 64)
+        return float(interval) * (
+            1.0 + self._collect_jitter_ratio * unit_interval
+        )
+
+    async def _run_periodic_collect(
+        self,
+        worker_id: str,
+        spec: JobSpec,
+        job_id: str,
+    ) -> None:
+        """Run one best-effort collection under the fleet-wide limit.
+
+        Cancellation while queued or active propagates through the semaphore
+        context, which releases a held slot before the periodic task settles.
+        Terminal/final collectors intentionally call the driver directly and
+        therefore cannot queue behind a large periodic wave.
+        """
+        async with self._collect_semaphore:
+            await self._driver.collect(worker_id, spec, job_id)
 
     async def _stop_periodic_collect(self, worker_id: str) -> None:
         """Cancel and fully quiesce a periodic collect before final teardown."""

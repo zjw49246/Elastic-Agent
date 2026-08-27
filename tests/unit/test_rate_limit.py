@@ -75,6 +75,14 @@ class TestApexRouterClassification:
             '{"type":"turn.failed","error":{"message":'
             '"monthly spend limit reached"}}'
         ),
+        (
+            '{"type":"turn.failed","error":{"status":403,'
+            '"message":"insufficient balance"}}'
+        ),
+        (
+            '{"type":"turn.failed","error":{"status":403,'
+            '"message":"account balance is too low"}}'
+        ),
     ])
     def test_explicit_key_quota_is_hard(self, text):
         assert is_apexrouter_hard_limit(text)
@@ -110,6 +118,9 @@ class TestApexRouterClassification:
         assert is_apexrouter_auth_failure(
             "https://api.apexin.ai/v1/responses: HTTP 403 Forbidden"
         )
+        assert not is_apexrouter_auth_failure(
+            "HTTP 403 from unrelated dataset endpoint"
+        )
         assert is_apexrouter_transient(
             "Apex gateway: HTTP 429 Too Many Requests"
         )
@@ -119,6 +130,7 @@ class TestApexRouterClassification:
         assert is_apexrouter_hard_limit(
             "ApexRouter API key is out of credits"
         )
+        assert is_apexrouter_hard_limit("ApexRouter: insufficient balance")
 
 
 class TestCloudRouterClassification:

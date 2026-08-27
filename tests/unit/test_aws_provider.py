@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from elastic_agent.core.config import AWSProviderConfig
+from elastic_agent.core.providers import aws as aws_module
 from elastic_agent.core.providers.aws import AWSProvider
 from elastic_agent.core.providers.base import InstanceConfig, InstanceState
 
@@ -50,6 +52,21 @@ def _provider_with_client(client) -> AWSProvider:
     prov._root_dev_cache = {}
     prov._recent_instances = {}
     return prov
+
+
+@pytest.fixture(autouse=True)
+def _instant_run_instances_limiter(monkeypatch):
+    """Keep ordinary provider tests independent of the production rate."""
+
+    class _ImmediateLimiter:
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(
+        aws_module,
+        "_RUN_INSTANCES_RATE_LIMITER",
+        _ImmediateLimiter(),
+    )
 
 
 @pytest.fixture
@@ -127,6 +144,244 @@ async def test_create_instance_falls_back_when_ami_lookup_fails():
 
     bdm = client.run_instances.call_args.kwargs["BlockDeviceMappings"]
     assert bdm[0]["DeviceName"] == "/dev/sda1"  # safe Ubuntu default
+
+
+def test_aws_client_connection_pool_supports_large_fanout(monkeypatch):
+    captured: dict = {}
+
+    def _client(service_name, **kwargs):
+        captured["service_name"] = service_name
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr("boto3.client", _client)
+
+    AWSProvider(AWSProviderConfig(region="us-east-1"))
+
+    assert captured["service_name"] == "ec2"
+    assert captured["region_name"] == "us-east-1"
+    assert captured["config"].max_pool_connections >= 64
+
+
+@pytest.mark.asyncio
+async def test_run_instances_rate_limit_is_shared_across_provider_instances(
+    monkeypatch,
+):
+    """Separate AWSProvider objects consume one process-wide 2 rps bucket."""
+    now = 100.0
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(aws_module.time, "monotonic", lambda: now)
+
+    async def _advance(delay):
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+
+    monkeypatch.setattr(aws_module.asyncio, "sleep", _advance)
+    monkeypatch.setattr(
+        aws_module,
+        "_RUN_INSTANCES_RATE_LIMITER",
+        aws_module._RunInstancesRateLimiter(rate=2.0, burst=5),
+    )
+
+    providers = []
+    instance_number = 0
+    for _ in range(2):
+        client = MagicMock()
+        client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+
+        def _run_instances(**_kwargs):
+            nonlocal instance_number
+            instance_number += 1
+            return {
+                "Instances": [
+                    {
+                        "InstanceId": f"i-{instance_number}",
+                        "State": {"Name": "pending"},
+                    }
+                ]
+            }
+
+        client.run_instances.side_effect = _run_instances
+        providers.append(_provider_with_client(client))
+
+    config = InstanceConfig(
+        instance_type="t3.large",
+        image_id="ami-x",
+        key_pair_name="k",
+    )
+    for index in range(7):
+        await providers[index % 2].create_instance(config)
+
+    assert sleeps == pytest.approx([0.5, 0.5])
+    assert sum(p._client.run_instances.call_count for p in providers) == 7
+
+
+@pytest.mark.asyncio
+async def test_run_instances_rate_limit_wait_is_cancellable():
+    limiter = aws_module._RunInstancesRateLimiter(rate=0.01, burst=1)
+    await limiter.acquire()
+
+    waiting = asyncio.create_task(limiter.acquire())
+    await asyncio.sleep(0)
+    waiting.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+
+def _run_instances_error(code: str) -> ClientError:
+    return ClientError(
+        {"Error": {"Code": code, "Message": "launch failed"}},
+        "RunInstances",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_retries_only_throttles_with_exponential_jitter_and_same_token(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    client.run_instances.side_effect = [
+        _run_instances_error("Throttling"),
+        _run_instances_error("RequestLimitExceeded"),
+        _run_instances_error("EC2ThrottledException"),
+        {"Instances": [{"InstanceId": "i-ok", "State": {"Name": "pending"}}]},
+    ]
+    provider = _provider_with_client(client)
+    backoff_ceilings: list[float] = []
+    sleeps: list[float] = []
+
+    class _TrackingLimiter:
+        calls = 0
+
+        async def acquire(self):
+            self.calls += 1
+
+    limiter = _TrackingLimiter()
+
+    def _full_jitter_at_ceiling(low, high):
+        assert low == 0.0
+        backoff_ceilings.append(high)
+        return high
+
+    async def _record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(aws_module.random, "uniform", _full_jitter_at_ceiling)
+    monkeypatch.setattr(aws_module.asyncio, "sleep", _record_sleep)
+    monkeypatch.setattr(aws_module, "_RUN_INSTANCES_RATE_LIMITER", limiter)
+
+    instance = await provider.create_instance(
+        InstanceConfig(
+            instance_type="t3.large",
+            image_id="ami-x",
+            key_pair_name="k",
+            client_token="stable-client-token",
+        )
+    )
+
+    assert instance.native_id == "i-ok"
+    assert client.run_instances.call_count == 4
+    assert limiter.calls == 4
+    assert backoff_ceilings == [0.5, 1.0, 2.0]
+    assert sleeps == backoff_ceilings
+    assert {item.kwargs["ClientToken"] for item in client.run_instances.call_args_list} == {"stable-client-token"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    ["InstanceLimitExceeded", "InsufficientInstanceCapacity"],
+)
+async def test_create_does_not_retry_quota_or_capacity_errors(code, monkeypatch):
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    error = _run_instances_error(code)
+    client.run_instances.side_effect = error
+    provider = _provider_with_client(client)
+    sleeps: list[float] = []
+
+    async def _record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(aws_module.asyncio, "sleep", _record_sleep)
+
+    with pytest.raises(ClientError) as raised:
+        await provider.create_instance(
+            InstanceConfig(
+                instance_type="t3.large",
+                image_id="ami-x",
+                key_pair_name="k",
+                client_token="stable-client-token",
+            )
+        )
+
+    assert raised.value is error
+    assert client.run_instances.call_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_create_throttle_retries_are_bounded(monkeypatch):
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    client.run_instances.side_effect = _run_instances_error("Throttling")
+    provider = _provider_with_client(client)
+    monkeypatch.setattr(aws_module, "RUN_INSTANCES_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(aws_module.random, "uniform", lambda _low, _high: 0.0)
+
+    async def _instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(aws_module.asyncio, "sleep", _instant_sleep)
+
+    with pytest.raises(ClientError):
+        await provider.create_instance(
+            InstanceConfig(
+                instance_type="t3.large",
+                image_id="ami-x",
+                key_pair_name="k",
+                client_token="stable-client-token",
+            )
+        )
+
+    assert client.run_instances.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_create_cancellation_interrupts_throttle_backoff(monkeypatch):
+    client = MagicMock()
+    client.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    client.run_instances.side_effect = _run_instances_error("Throttling")
+    provider = _provider_with_client(client)
+    sleeping = asyncio.Event()
+
+    async def _blocked_sleep(_delay):
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(aws_module.random, "uniform", lambda _low, _high: 1.0)
+    monkeypatch.setattr(aws_module.asyncio, "sleep", _blocked_sleep)
+
+    task = asyncio.create_task(
+        provider.create_instance(
+            InstanceConfig(
+                instance_type="t3.large",
+                image_id="ami-x",
+                key_pair_name="k",
+                client_token="stable-client-token",
+            )
+        )
+    )
+    await sleeping.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.run_instances.call_count == 1
 
 
 @pytest.mark.asyncio

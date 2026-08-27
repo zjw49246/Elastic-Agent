@@ -1,14 +1,15 @@
 """ApexRouter adapter for provider-neutral Agent API accounts.
 
-ApexRouter exposes the native Codex model catalog rather than an
-OpenAI-compatible ``data[].id`` list.  It is intentionally Codex-only and its
+ApexRouter exposes both Claude and Codex model catalogs, accepting its native
+``models[].slug`` shape and the OpenAI-compatible ``data[].id`` shape. Its
 quota response combines per-key usage with shared group limits; those values
-must remain separate when deciding availability.  An explicit null/null
+must remain separate when deciding availability. An explicit null/null
 remaining-limit pair marks one shared window as unlimited.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
@@ -27,13 +28,14 @@ from elastic_agent.core.cloudrouter import CloudRouterAdapter
 # Public ApexRouter gateway.  The former sslip.io address is kept out of the
 # active endpoint set because it can still answer usage requests while its
 # model/Responses route has no ready upstream account.
-APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
+APEX_CLAUDE_BASE_URL = "https://api.apexin.ai"
+APEX_CODEX_BASE_URL = f"{APEX_CLAUDE_BASE_URL}/v1"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
 APEX_CODEX_CLIENT_VERSION = CODEX_CLI_VERSION
 APEX_ENDPOINTS: Mapping[str, str | None] = MappingProxyType(
     {
-        "anthropic_base_url": None,
+        "anthropic_base_url": APEX_CLAUDE_BASE_URL,
         "openai_base_url": APEX_CODEX_BASE_URL,
         "models_url": APEX_MODELS_URL,
         "usage_url": APEX_USAGE_URL,
@@ -84,22 +86,29 @@ def _json_number(value: Decimal) -> int | float:
     return float(value)
 
 
-def _is_codex_model(model: str) -> bool:
+def _model_family(model: str) -> str | None:
     value = model.lower()
-    return value.startswith(("gpt-", "o1", "o3", "o4", "codex-"))
+    if value.startswith("claude-"):
+        return "claude"
+    if value.startswith(("gpt-", "o1", "o3", "o4", "codex-")):
+        return "codex"
+    return None
 
 
 def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("models"),
-        list,
-    ):
+    if not isinstance(payload, dict):
         raise AgentApiUpstreamError("invalid_models_response")
-    items = payload["models"]
+    # New API exposes an OpenAI-compatible ``data[].id`` catalog. Keep the
+    # native Apex ``models[].slug`` shape for older deployments as well.
+    items = payload.get("models")
+    if items is None:
+        items = payload.get("data")
+    if not isinstance(items, list):
+        raise AgentApiUpstreamError("invalid_models_response")
     if len(items) > MAX_AGENT_API_MODELS:
         raise AgentApiUpstreamError("invalid_models_response")
 
-    selected: set[str] = set()
+    selected: dict[str, set[str]] = {"claude": set(), "codex": set()}
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -108,7 +117,7 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
             or item.get("visibility") == "hide"
         ):
             continue
-        model = item.get("slug")
+        model = item.get("slug") or item.get("id")
         if not isinstance(model, str):
             continue
         try:
@@ -126,11 +135,31 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
             or any(not character.isprintable() for character in model)
         ):
             raise AgentApiUpstreamError("invalid_models_response")
-        if _is_codex_model(model):
-            selected.add(model)
-    if not selected:
+        family = _model_family(model)
+        if family is not None:
+            selected[family].add(model)
+    if not any(selected.values()):
         raise AgentApiUpstreamError("no_supported_models")
-    return {"claude": [], "codex": sorted(selected)}
+    return {family: sorted(values) for family, values in selected.items()}
+
+
+def _runtime_guarded_usage(account_id: str) -> dict[str, Any]:
+    """Represent a valid key when Apex exposes no public usage endpoint."""
+
+    return {
+        "account_id": account_id,
+        "fetched_at": time.time(),
+        "stale": False,
+        "state": "active",
+        "status": "active",
+        "mode": "runtime_guarded",
+        "quota": None,
+        "windows": [],
+        "usage": {},
+        "available": True,
+        "known": True,
+        "reason": "provider_usage_endpoint_unavailable",
+    }
 
 
 def _normalise_apex_usage(
@@ -256,9 +285,21 @@ def _normalise_apex_usage(
 
 
 class ApexRouterAdapter(CloudRouterAdapter):
-    """Bounded HTTP adapter for ApexRouter's fixed Codex API."""
+    """Bounded HTTP adapter for the Apex/New API gateway."""
 
     provider = "apex"
+
+    def __init__(self, *, usage_policy: str | None = None) -> None:
+        super().__init__()
+        policy = usage_policy or os.environ.get(
+            "ELASTIC_AGENT_APEX_USAGE_POLICY",
+            "runtime",
+        )
+        if policy not in {"runtime", "strict"}:
+            raise ValueError(
+                "ELASTIC_AGENT_APEX_USAGE_POLICY must be runtime or strict"
+            )
+        self.usage_policy = policy
 
     @property
     def endpoints(self) -> Mapping[str, str | None]:
@@ -280,13 +321,21 @@ class ApexRouterAdapter(CloudRouterAdapter):
         account_id: str,
         api_key: str,
     ) -> dict[str, Any]:
-        return _normalise_apex_usage(
-            account_id,
-            await self._request_json(APEX_USAGE_URL, api_key),
-        )
+        try:
+            payload = await self._request_json(APEX_USAGE_URL, api_key)
+        except AgentApiUpstreamError as exc:
+            if (
+                self.usage_policy == "runtime"
+                and exc.status_code == 404
+                and exc.code == "upstream_rejected"
+            ):
+                return _runtime_guarded_usage(account_id)
+            raise
+        return _normalise_apex_usage(account_id, payload)
 
 
 __all__ = [
+    "APEX_CLAUDE_BASE_URL",
     "APEX_CODEX_BASE_URL",
     "APEX_CODEX_CLIENT_VERSION",
     "APEX_ENDPOINTS",

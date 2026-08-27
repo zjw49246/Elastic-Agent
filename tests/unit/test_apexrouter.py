@@ -18,6 +18,7 @@ from elastic_agent.core.agent_api import (
     AgentApiUpstreamError,
 )
 from elastic_agent.core.apexrouter import (
+    APEX_CLAUDE_BASE_URL,
     APEX_CODEX_BASE_URL,
     APEX_CODEX_CLIENT_VERSION,
     APEX_MODELS_URL,
@@ -69,7 +70,9 @@ def test_default_registry_enables_apex_after_cloudrouter() -> None:
 def test_apex_endpoints_and_client_version_are_fixed() -> None:
     adapter = ApexRouterAdapter()
 
+    assert adapter._total_timeout_seconds > 0
     assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
+    assert APEX_CLAUDE_BASE_URL == "https://api.apexin.ai"
     assert APEX_MODELS_URL == f"{APEX_CODEX_BASE_URL}/models"
     assert APEX_USAGE_URL == f"{APEX_CODEX_BASE_URL}/usage"
     assert APEX_CODEX_CLIENT_VERSION == CODEX_CLI_VERSION == "0.144.6"
@@ -78,13 +81,14 @@ def test_apex_endpoints_and_client_version_are_fixed() -> None:
     assert APEX_USAGE_URL in adapter.endpoints.values()
     assert all(
         value is None
+        or value == APEX_CLAUDE_BASE_URL
         or value.startswith("https://api.apexin.ai/")
         for value in adapter.endpoints.values()
     )
 
 
 @pytest.mark.asyncio
-async def test_apex_native_model_probe_is_versioned_filtered_and_codex_only(
+async def test_apex_native_model_probe_is_versioned_and_family_filtered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = ApexRouterAdapter()
@@ -128,7 +132,7 @@ async def test_apex_native_model_probe_is_versioned_filtered_and_codex_only(
     models = await adapter.probe_models("lck-private")
 
     assert models == {
-        "claude": [],
+        "claude": ["claude-opus-4-8"],
         "codex": ["gpt-5.4", "o3"],
     }
     request.assert_awaited_once_with(
@@ -138,6 +142,64 @@ async def test_apex_native_model_probe_is_versioned_filtered_and_codex_only(
         ),
         "lck-private",
     )
+
+
+@pytest.mark.asyncio
+async def test_apex_openai_model_catalog_supports_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter()
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(return_value={
+            "data": [
+                {"id": "claude-opus-5"},
+                {"id": "gpt-5.6-sol"},
+                {"id": "embedding-model"},
+            ],
+        }),
+    )
+
+    assert await adapter.probe_models("private-key") == {
+        "claude": ["claude-opus-5"],
+        "codex": ["gpt-5.6-sol"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_apex_missing_usage_route_uses_runtime_guard_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter(usage_policy="runtime")
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(side_effect=AgentApiUpstreamError("upstream_rejected", 404)),
+    )
+
+    snapshot = await adapter.fetch_usage("apex-1", "private-key")
+
+    assert snapshot["known"] is True
+    assert snapshot["available"] is True
+    assert snapshot["mode"] == "runtime_guarded"
+    assert snapshot["quota"] is None
+    assert snapshot["windows"] == []
+
+
+@pytest.mark.asyncio
+async def test_apex_strict_usage_policy_rejects_missing_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter(usage_policy="strict")
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(side_effect=AgentApiUpstreamError("upstream_rejected", 404)),
+    )
+
+    with pytest.raises(AgentApiUpstreamError, match="upstream_rejected"):
+        await adapter.fetch_usage("apex-1", "private-key")
 
 
 @pytest.mark.asyncio
@@ -356,7 +418,7 @@ async def test_same_key_can_exist_once_per_provider_with_cloudrouter_first(
         apex,
         "probe_models",
         AsyncMock(return_value={
-            "claude": [],
+            "claude": ["claude-opus-5"],
             "codex": ["gpt-5.4"],
         }),
     )
@@ -378,8 +440,8 @@ async def test_same_key_can_exist_once_per_provider_with_cloudrouter_first(
 
     assert cloudrouter_account.id == "cloudrouter-1"
     assert apex_account.id == "apex-1"
-    assert apex_account.supported_agent_types == ["codex"]
-    assert not apex_account.supports_agent_type("claude")
+    assert apex_account.supported_agent_types == ["claude", "codex"]
+    assert apex_account.supports_agent_type("claude")
     assert [account.id for account in await store.list()] == [
         "cloudrouter-1",
         "apex-1",
