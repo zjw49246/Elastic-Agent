@@ -20,7 +20,7 @@ Elastic-Agent is a Python library that provides:
   receive the high-priority `delivery_manuscript` role
 - **Credential management** — Claude/Codex account pools with worker-local auto-login, interactive OTP, quota monitoring, and rotation
 - **AWS account/EIP affinity** — Keep one public IP per stable account ID while creating and destroying EC2 workers per Job
-- **PTY-hosted execution** (optional) — Workers host Claude Code in persistent PTY sessions via [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) instead of spawning `claude -p` per task
+- **PTY-hosted execution** (unpublished experiment) — when an authorized external environment supplies claude-pty, Workers can host persistent sessions; production uses the subprocess path
 
 ## Usage
 
@@ -49,7 +49,7 @@ surface as non-zero exits, so credential rotation keeps working unchanged.
 
 Enable in three places:
 
-1. **Bootstrap** — install claude-pty on Workers:
+1. **Bootstrap** — detect a separately provisioned experimental capability:
    `build_default_bootstrap_steps(..., include_pty=True)`
 2. **Manager** — attach structured launch params to EXECUTE messages:
    `TaskRouter(..., agent_type=ClaudeCodeAgentType(), use_pty=True)`
@@ -63,8 +63,10 @@ session, the prompt is injected into the warm session as a new turn — no
 process respawn, no cold `--resume` (verified: ~3x faster turnaround).
 A STOP tears the session down; the next resume is cold.
 
-The lock currently pins claude-pty commit `7d5a0e5` (cross-host inject
-isolation plus cancellation-safe Session publication and cleanup).
+Production does not declare, download, refresh, or bake claude-pty. The audited
+upstream revision did not provide a distributable license, so PTY support is an
+unpublished experiment only. When the module is absent, `agent_params` does not
+discard the command: Runtime executes the supplied subprocess fallback.
 
 Credential rotation: account swaps are in-place (new tokens written into the
 same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
@@ -310,15 +312,16 @@ CloudRouter's explicit `mode="unrestricted"` means the key has no spend cap:
 top-level `balance=0` and `remaining=0` stay visible but are not exhaustion
 signals. Explicit exhausted status, expiry, quota, and rate-limit windows still
 block allocation.
-ApexRouter is Codex-only: it queries
-`https://api.apexin.ai/v1/models` with the pinned Codex CLI version and
-configures the `apexrouter` Responses API provider. Fresh allocation prefers a
-compatible, available API identity and falls back to OAuth; `account.ids` can
-select a generated ID such as `cloudrouter-1` or `apex-1` explicitly. Set
-optional `account.model` to require an exact advertised model (Claude stable
-aliases also match their dated variants); without it, admission checks only
-the selected Agent family for backward compatibility. This field validates
-routing but does not rewrite the opaque run command's own model arguments.
+ApexRouter queries `https://api.apexin.ai/v1/models` with the pinned Codex CLI
+version. The gateway may return either native `models[].slug` records or the
+OpenAI-compatible `data[].id` catalog; Elastic projects each advertised
+`claude-*` or Codex-family model to the matching Agent type. Claude uses the
+fixed `https://api.apexin.ai` Anthropic endpoint, while Codex uses the fixed
+`/v1` Responses endpoint. Fresh allocation prefers a compatible, available API
+identity and falls back to OAuth; `account.ids` can select a generated ID such
+as `cloudrouter-1` or `apex-1` explicitly. Set optional `account.model` to
+require an exact advertised model; this validates routing but does not rewrite
+the opaque run command's own model arguments.
 Jobs do not need a separate API mode and API identities support the same
 persistent EIP binding flow.
 
@@ -351,9 +354,9 @@ key once to the selected Worker. Claude and Codex read it through a private
 helper; routing is fixed to the selected provider, inherited official and
 gateway auth/base overrides are removed, and a structured provider failure is
 reported as a failed Job even when the CLI process exits `0`. Managed Claude
-is available only through CloudRouter and loads only its Worker-owned user
-settings; project/local settings, hooks, and MCP configuration are excluded so
-Job files cannot redirect the provider or credential helper.
+loads only its Worker-owned user settings for either configured provider;
+project/local settings, hooks, and MCP configuration are excluded so Job files
+cannot redirect the provider or credential helper.
 
 During Manager startup recovery, Agent API allocation stays closed until every
 previous Worker has a confirmed terminal cloud readback. OAuth allocation can
@@ -401,16 +404,20 @@ the same allocation fence. Storage failure never reports a full success: the
 released-EIP/retained-identity partial state is quarantined and shown explicitly
 in the UI.
 
-ApexRouter `/usage` reports per-key `used` values but shared-group
+ApexRouter `/usage`, when deployed, reports per-key `used` values but shared-group
 `remaining`, `limits`, and `concurrency`; Elastic keeps those scopes separate
 and excludes the key when any shared limit is exhausted. An explicit `null`
 pair for one window's `remaining` and `limit` means that shared window is
 unlimited; limited and unlimited windows may coexist, while missing,
 asymmetric-null, or invalid values fail closed. ApexRouter does not currently
-supply an expiry time. At runtime, Apex authentication failures and explicit
-quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
-failures are treated as transient provider errors rather than proof that the
-individual key is exhausted.
+supply an expiry time, and the public New API gateway may omit `/v1/usage`
+entirely. In that case the default
+`ELASTIC_AGENT_APEX_USAGE_POLICY=runtime` admits the validated model catalog
+without inventing balance numbers; explicit invalid-key failures quarantine the
+key, while quota, credit, and insufficient-balance messages remain hard limits
+without becoming sticky invalid-key tombstones. Ordinary
+HTTP `429` and `500`/`502` failures remain transient same-key retries. Set the
+policy to `strict` when a deployment requires a provider usage endpoint.
 
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent
@@ -994,7 +1001,10 @@ Manager instance profile supplies AWS credentials, while a mode-`0600` systemd
 
 ```text
 ELASTIC_AGENT_AWS_REGION
+ELASTIC_AGENT_AWS_ACCOUNT_ID
 ELASTIC_AGENT_AWS_AMI_ID
+ELASTIC_AGENT_RELEASE_REVISION
+ELASTIC_AGENT_RELEASE_MANIFEST
 ELASTIC_AGENT_AWS_INSTANCE_TYPE
 ELASTIC_AGENT_AWS_WORKER_SECURITY_GROUP_IDS
 ELASTIC_AGENT_AWS_SUBNET_ID
@@ -1058,6 +1068,20 @@ origin is pinned by `ELASTIC_AGENT_PUBLIC_ORIGIN` and must be a clean HTTPS
 origin. Worker `/ws/runtime` tokens and Job agent credentials remain separate
 machine/delegation trust boundaries.
 
+The immutable release includes `deploy/release-manifest.json` and the complete
+tracked-file index `deploy/release-files.json`. Before touching state or AWS,
+the production launcher requires its Worker AMI, AWS account, Region, and
+artifact-derived release revision to match runtime settings. Manager startup
+then hashes the exact indexed source tree before publishing health. Schema v3
+keeps the EA runtime/AMI provenance digest separate from the exact canonical
+digest of the Task Platform 11-field WorkerProfileInput. Evidence generation
+requires that authoritative non-secret JSON explicitly and fails closed if it
+is missing or incomplete. Authenticated
+`GET /api/health` exposes the Task Platform evidence contract as three top-level,
+non-secret fields: `manager_state_schema` (`v1`), `worker_profile_digest`, and
+`release_digest` (both `sha256:<64 lowercase hex>`). See
+[`docs/operations/release-evidence.md`](docs/operations/release-evidence.md).
+
 Startup verifies that the worker AMI is available, x86_64/HVM, ENA- and
 IMDSv2-capable, has an encrypted root snapshot, is owned by the Manager account,
 and has `ManagedBy=elastic-agent` plus `Role=worker-golden` tags. Emergency
@@ -1083,7 +1107,7 @@ EC2 instance types require explicit policy allow-list updates.
 ## Development
 
 ```bash
-uv sync --extra dev --extra pty
+uv sync --extra dev
 uv run pytest -q
 ```
 
