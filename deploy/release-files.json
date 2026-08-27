@@ -33,8 +33,8 @@
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 64053,
-      "sha256": "sha256:ca73313ba2ac14a04867ad6b1e3b461d1556eaf38cbae66516e97970e9761296"
+      "size": 65859,
+      "sha256": "sha256:f3b9af6a65b2f417ce2e75938fd68e1c24991dafd81db8ba67016a8dd1a1ea53"
     },
     {
       "path": "TEST.md",
@@ -418,8 +418,8 @@
       "path": "src/elastic_agent/api/routes/jobs.py",
       "type": "file",
       "mode": "0644",
-      "size": 201513,
-      "sha256": "sha256:238eae110f72d2067c3323ebf3e1f1d419a0446eb70d94843069634bd25feefc"
+      "size": 202588,
+      "sha256": "sha256:62516058190be2a376be21adcf19e8e11f7dca38cc3242baeec6725776bc75bb"
     },
     {
       "path": "src/elastic_agent/api/routes/management_auth.py",
@@ -439,8 +439,8 @@
       "path": "src/elastic_agent/api/routes/ui.py",
       "type": "file",
       "mode": "0644",
-      "size": 259937,
-      "sha256": "sha256:aa3c81f0ea1604c23aec0c234355a5bc6c0af78042c64c419ae973e01e6cd5c5"
+      "size": 259946,
+      "sha256": "sha256:6e4c55751879a8324dbed4e406721232cdb1821b8f0f59c8b7db756c348ff737"
     },
     {
       "path": "src/elastic_agent/api/routes/ui_v2.py",
@@ -705,8 +705,8 @@
       "path": "src/elastic_agent/core/batch_orchestrator.py",
       "type": "file",
       "mode": "0644",
-      "size": 161024,
-      "sha256": "sha256:222068a1376e4bac35d28e363138f792d4570d0c52a8bfe5a81210ec773e2f68"
+      "size": 161556,
+      "sha256": "sha256:ffeb3bcabd6914920dd50c3ecc1594c8e80eabe347f0447cb82883e58d8d4f3e"
     },
     {
       "path": "src/elastic_agent/core/binding_manager.py",
@@ -838,15 +838,15 @@
       "path": "src/elastic_agent/core/job_log_store.py",
       "type": "file",
       "mode": "0644",
-      "size": 22489,
-      "sha256": "sha256:ef690ab1c51bd4490297df29da858ee8a4e8b7d94812d841eca688ed8eb1e745"
+      "size": 24713,
+      "sha256": "sha256:9d20333f9ffd585dfc7928882d5945870c43c3f05f804c949f44e2c6e3073c91"
     },
     {
       "path": "src/elastic_agent/core/job_spec.py",
       "type": "file",
       "mode": "0644",
-      "size": 51520,
-      "sha256": "sha256:a49d553adfb6fda9cf198139514f9f8f3189780e3a8455e38a078606103f3ff3"
+      "size": 55434,
+      "sha256": "sha256:33d3d66f9f5be6c6d80bae9cecac496e52091dac2cb191be5c8f3cf6c89654c5"
     },
     {
       "path": "src/elastic_agent/core/job_spec_store.py",
@@ -880,8 +880,8 @@
       "path": "src/elastic_agent/core/manager_fleet_driver.py",
       "type": "file",
       "mode": "0644",
-      "size": 180529,
-      "sha256": "sha256:ea937125284ceeb7fdfaa47803a113ad78ccb52221b0b9c2a110aaad1f0b65ed"
+      "size": 180944,
+      "sha256": "sha256:653d8cab0735deb81e1155418ee7021a66fe51652e73ccb0c86f81f76f7cbda5"
     },
     {
       "path": "src/elastic_agent/core/network.py",
@@ -1024,6 +1024,13 @@
       "sha256": "sha256:ee4990b9950a2cd5916a8b11c90d184b1e3e17af49f0ec817505692cf97a8781"
     },
     {
+      "path": "src/elastic_agent/core/trajectory_prompt.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 6593,
+      "sha256": "sha256:98f0ddf7ef250ff842ff0ce3f7341d553b9ac058236f6c7f02629f1dc365ed59"
+    },
+    {
       "path": "src/elastic_agent/core/webhook.py",
       "type": "file",
       "mode": "0644",
@@ -1084,7 +1091,7 @@
       "type": "file",
       "mode": "0644",
       "size": 181087,
-      "sha256": "sha256:02eb324e6f1fbe8ec847667613e67ed682e61af4aa68c4be12bbfa74a301edf9"
+      "sha256": "sha256:af759fc4ca72b38b55875fef48e58eb6f783556388bf2043cac8c6945b35a2c0"
     },
     {
       "path": "src/elastic_agent/testing/__init__.py",
@@ -1461,8 +1468,8 @@
       "path": "tests/unit/test_api_batch.py",
       "type": "file",
       "mode": "0644",
-      "size": 255964,
-      "sha256": "sha256:995d8e86f330bbadd98f98c8c7fa001c094bfcc548cb4316b66d28ac5e03f685"
+      "size": 259376,
+      "sha256": "sha256:a78d95f8c9ef2004fa5de5236510670ae409f57d0bbcece550eddbc05d50c3ef"
     },
     {
       "path": "tests/unit/test_audit_worker_regressions.py",
@@ -1503,8 +1510,8 @@
       "path": "tests/unit/test_batch_orchestrator.py",
       "type": "file",
       "mode": "0644",
-      "size": 120982,
-      "sha256": "sha256:439c13c77a40ab1d60c94946d1479749a2c97672d5e06e5ec19e593fc21c0954"
+      "size": 122339,
+      "sha256": "sha256:ddd58c71e38966a8962db5939d661e8cea228753d91908cc959302e42d9f1ddb"
     },
     {
       "path": "tests/unit/test_binding_manager.py",
@@ -1713,15 +1720,15 @@
       "path": "tests/unit/test_job_log_store.py",
       "type": "file",
       "mode": "0644",
-      "size": 6871,
-      "sha256": "sha256:6e669ba2cd884d812961d1481aceb2c298e4e9b149b3d04136eb64c1b06494ec"
+      "size": 9686,
+      "sha256": "sha256:8106a3f18cdc819333423c795ca9720ef1d8418a4d337d55cac5f09f84f7c6a1"
     },
     {
       "path": "tests/unit/test_job_spec.py",
       "type": "file",
       "mode": "0644",
-      "size": 41217,
-      "sha256": "sha256:c997ed2f5404c131fd234c7426eefd4cbabf5cc55f2f4658f112cdd70099c9aa"
+      "size": 42732,
+      "sha256": "sha256:4634d9887c5a1ac663d8bf781e91e0fe2ca9ca677e0f157361a78b22638823d1"
     },
     {
       "path": "tests/unit/test_local_worker_process.py",
@@ -1734,8 +1741,8 @@
       "path": "tests/unit/test_log_event_parser.py",
       "type": "file",
       "mode": "0644",
-      "size": 14292,
-      "sha256": "sha256:86107dda1160b8a10dea9d39eef3d0b5a35596757b237a304a1f9d589c93e531"
+      "size": 14477,
+      "sha256": "sha256:20e1ba9a7a0a996e814cbf2df6567e76ed05e063f22a8d3a290a30fbe190a07d"
     },
     {
       "path": "tests/unit/test_log_event_parsing.py",
@@ -1769,15 +1776,15 @@
       "path": "tests/unit/test_manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 151993,
-      "sha256": "sha256:3daedb73b2fb003c06891d6e26c725c4e307f49d7052d813329fb6f75aab737d"
+      "size": 152830,
+      "sha256": "sha256:22c963ee1f11589699d0494b1d72d588bde4572e5b71474019f17a0c116d11b8"
     },
     {
       "path": "tests/unit/test_manager_fleet_driver.py",
       "type": "file",
       "mode": "0644",
-      "size": 104078,
-      "sha256": "sha256:4867155e3aef3ac4e6fb89439ce76087466fc264427e9ef46a72bbf6f5fa055e"
+      "size": 105595,
+      "sha256": "sha256:8083d6297cb58c222fb042171eeb5000e9076e8b2a4e800eb7c3ea4d0581e055"
     },
     {
       "path": "tests/unit/test_network.py",
@@ -1995,6 +2002,13 @@
       "mode": "0644",
       "size": 13615,
       "sha256": "sha256:0a0da31ec61d3f1493d3ede8d9aad7cd3e785aeef7233bcdec74e90fcf4b9d74"
+    },
+    {
+      "path": "tests/unit/test_trajectory_prompt.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 1581,
+      "sha256": "sha256:1fe36b1b4ac7a11233afd16634ce086b8fdef67e2bd91ec98d3dcf18e30dd620"
     },
     {
       "path": "tests/unit/test_ui_v2.py",
