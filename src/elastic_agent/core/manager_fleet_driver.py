@@ -29,7 +29,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from elastic_agent.core.batch_orchestrator import LoginOutcome, WorkerAssignment
@@ -3443,6 +3443,21 @@ raise SystemExit(code)
         # Preserve compatibility with deployment-specific legacy hooks that
         # accept only the original three arguments.
         return await self._login(worker_id, spec, config_dir)
+
+    async def stage_prompt_metadata(
+        self,
+        worker_id: str,
+        task_id: str,
+        job_id: str,
+        prompt_metadata: dict[str, Any],
+    ) -> None:
+        await asyncio.to_thread(
+            self._mgr.job_log_store.save_prompt_metadata,
+            job_id=job_id,
+            task_id=task_id,
+            worker_id=worker_id,
+            prompt_metadata=prompt_metadata,
+        )
 
     async def run_command(
         self, worker_id: str, task_id: str, command: list[str], cwd: str,

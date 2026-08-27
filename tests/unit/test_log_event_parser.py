@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from elastic_agent.core.log_event_parser import LogEventParser, TaskSession
+from elastic_agent.core.log_event_parser import LogEventParser
 
 
 @pytest.fixture
@@ -136,7 +136,12 @@ class TestFilterByType:
                 "task_id": "task-1",
                 "stream": "stdout",
                 "data": f"type={typ}",
-                "parsed": {"type": typ, "subtype": None, "cost_usd": 0.01 if typ == "result" else None, "session_id": sess},
+                "parsed": {
+                    "type": typ,
+                    "subtype": None,
+                    "cost_usd": 0.01 if typ == "result" else None,
+                    "session_id": sess,
+                },
             })
 
         logs = parser.get_task_logs("task-1", types=["assistant"])
@@ -149,7 +154,12 @@ class TestFilterByType:
                 "task_id": "task-1",
                 "stream": "stdout",
                 "data": f"type={typ}",
-                "parsed": {"type": typ, "subtype": None, "cost_usd": 0.01 if typ == "result" else None, "session_id": None},
+                "parsed": {
+                    "type": typ,
+                    "subtype": None,
+                    "cost_usd": 0.01 if typ == "result" else None,
+                    "session_id": None,
+                },
             })
 
         logs = parser.get_task_logs("task-1", types=["assistant", "result"])

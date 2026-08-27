@@ -3024,6 +3024,15 @@ class TestJobsAPI:
                 "secret_env": {
                     "SECRET_TOKEN": "aws-secretsmanager://prod/token#value",
                 },
+                "trajectory_prompt": {
+                    "system": "private-system-prompt",
+                    "developer": "private-developer-prompt",
+                    "user": "private-user-prompt",
+                    "sources": [{
+                        "name": "AGENTS.md",
+                        "content": "private-repository-instructions",
+                    }],
+                },
             },
         }
         submitted = (await client.post("/api/jobs", json=spec)).json()
@@ -3049,11 +3058,19 @@ class TestJobsAPI:
         assert live.json()["spec"]["run"]["secret_env"] == {
             "SECRET_TOKEN": "[SECRET_REFERENCE]",
         }
+        assert live.json()["spec"]["run"]["trajectory_prompt"] == {
+            "system": "[REDACTED]",
+            "developer": "[REDACTED]",
+            "user": "[REDACTED]",
+            "sources": [{"name": "AGENTS.md", "content": "[REDACTED]"}],
+        }
         assert live.json()["spec"]["setup"]["steps"][0]["env"] == {
             "SETUP_TOKEN": "[REDACTED]",
         }
         assert "plaintext" not in live.text
         assert "aws-secretsmanager" not in live.text
+        assert "private-system-prompt" not in live.text
+        assert "private-repository-instructions" not in live.text
 
         # Simulate the in-memory batch registry being lost on Manager restart.
         manager.batch._jobs.clear()
@@ -3064,6 +3081,8 @@ class TestJobsAPI:
         assert historical.json()["spec"] == submitted_config
         assert "plaintext" not in historical.text
         assert "aws-secretsmanager" not in historical.text
+        assert "private-system-prompt" not in historical.text
+        assert "private-repository-instructions" not in historical.text
 
     @pytest.mark.asyncio
     async def test_get_config_snapshot_read_fails_fast_when_capacity_is_full(
@@ -3737,6 +3756,78 @@ class TestJobsAPI:
         assert payload["entries"][0]["data"] == "old attempt"
         assert payload["status"] == "live"
         assert payload["complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_job_logs_summarize_prompts_unless_task_is_selected(
+        self, client, manager,
+    ):
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job_id = submitted["job_id"]
+        task_id = f"{job_id}:w0:prompt"
+        prompt = {
+            "schema": 1,
+            "agent_type": "claude",
+            "capture_mode": "declared",
+            "complete": False,
+            "components": {
+                "system": {
+                    "text": "system rules",
+                    "sha256": "97e2b5a8fd07a75081a1205a6f5154b39730b01846a2a399eaf5ae41b00b22a1",
+                    "bytes": 12,
+                },
+            },
+            "sources": [],
+            "unavailable_components": ["provider_builtin_system_prompt"],
+            "invocation": {"argv_sha256": "a" * 64, "resumed": False},
+        }
+        manager.job_log_store.save_prompt_metadata(
+            job_id=job_id,
+            task_id=task_id,
+            worker_id="w0",
+            prompt_metadata=prompt,
+        )
+        job = manager.batch.get_job(job_id)
+        job.runs["w0"].task_id = task_id
+        manager.log_event_parser.process_log_event("w0", {
+            "task_id": task_id,
+            "worker_id": "w0",
+            "stream": "stdout",
+            "data": "running",
+            "parsed": None,
+        })
+
+        live = (await client.get(f"/api/jobs/{job_id}/logs")).json()
+        assert live["source"] == "live"
+        assert len(live["tasks"]) == 1
+        assert live["tasks"][0]["archived"] is False
+        assert "text" not in live["tasks"][0]["prompt"]["components"]["system"]
+
+        manager.job_log_store.save_snapshot(
+            job_id=job_id,
+            task_id=task_id,
+            worker_id="w0",
+            entries=[{
+                "task_id": task_id,
+                "worker_id": "w0",
+                "stream": "stdout",
+                "data": "done",
+            }],
+            exit_info={"exit_code": 0},
+            prompt_metadata=prompt,
+        )
+
+        summary = (await client.get(f"/api/jobs/{job_id}/logs")).json()
+        assert "text" not in summary["tasks"][0]["prompt"]["components"]["system"]
+
+        detail = (
+            await client.get(
+                f"/api/jobs/{job_id}/logs",
+                params={"task_id": task_id},
+            )
+        ).json()
+        assert detail["tasks"][0]["prompt"]["components"]["system"]["text"] == (
+            "system rules"
+        )
 
     @pytest.mark.asyncio
     async def test_job_logs_use_dedicated_executor_and_fail_fast_when_full(

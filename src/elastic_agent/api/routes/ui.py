@@ -2568,7 +2568,7 @@ function agentApiProviderMeta(provider) {
       label: 'ApexRouter',
       accountLabel: 'ApexRouter · API',
       pickerLabel: 'ApexRouter API',
-      hint: 'ApexRouter 目前仅支持 Codex；可用模型以固定 /models 返回为准。'
+      hint: 'ApexRouter API Key 可投影 Claude/Codex；可用类型以固定 /models 返回为准。'
         + ' 不需要浏览器登录，也不会触发验证码。Key 只写入 Manager 私有账号文件，提交后不回显。',
     };
   }

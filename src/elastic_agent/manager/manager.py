@@ -26,12 +26,12 @@ from elastic_agent.core.providers.base import (
     InstanceNotFoundError,
     InstanceState,
 )
+from elastic_agent.core.reconciler import CloudReconciler
+from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
 from elastic_agent.core.release_evidence import (
     ReleaseEvidenceError,
     load_release_manifest,
 )
-from elastic_agent.core.reconciler import CloudReconciler
-from elastic_agent.core.registry import NodeRecord, NodeRegistry, NodeStatus
 from elastic_agent.core.task_registry import TaskRegistry
 from elastic_agent.core.task_router import TaskRouter
 from elastic_agent.core.task_scheduler import TaskScheduler
