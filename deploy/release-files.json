@@ -118,7 +118,7 @@
       "type": "file",
       "mode": "0644",
       "size": 954,
-      "sha256": "sha256:110bae28c359c00e4bc271743374992fda1e09883650b681e1dde811344a8abc"
+      "sha256": "sha256:e6673149eb241508473e1c8a90b1c04fb0f85e8fe7e5fb17779bb80d35f91b9e"
     },
     {
       "path": "docs/audiobook-integration/00-overview.md",

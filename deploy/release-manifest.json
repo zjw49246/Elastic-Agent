@@ -3,9 +3,9 @@
   "product": "elastic-agent",
   "upstream_source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
   "upstream_archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
-  "release_revision": "artifact-sha256:4efd7a8a3a018317f1f9bfa74d9c5abbd8a6dc62586b304293a1819112bd88a1",
+  "release_revision": "artifact-sha256:c866687975dfc3cc4250ccf0d068a7721255369e4ae1a91e8e2966e47b997f72",
   "release_index": "deploy/release-files.json",
-  "release_artifact_digest": "sha256:4efd7a8a3a018317f1f9bfa74d9c5abbd8a6dc62586b304293a1819112bd88a1",
+  "release_artifact_digest": "sha256:c866687975dfc3cc4250ccf0d068a7721255369e4ae1a91e8e2966e47b997f72",
   "manager_state_schema": "v1",
   "worker_runtime_provenance": {
     "ami_id": "ami-023251121ceb0d6f3",
@@ -37,18 +37,18 @@
     "ami_platform_revision": "7275b31b0a313e7b1d2ee3de89237a029333bde6",
     "ami_upstream_revision": "115320154e929bc28800a3273ebb3f56eef10070",
     "ami_generator_version": "build-only-v1",
-    "release_revision": "artifact-sha256:4efd7a8a3a018317f1f9bfa74d9c5abbd8a6dc62586b304293a1819112bd88a1",
+    "release_revision": "artifact-sha256:c866687975dfc3cc4250ccf0d068a7721255369e4ae1a91e8e2966e47b997f72",
     "runtime_source": "src/elastic_agent/worker/runtime.py",
     "schema_version": 1
   },
-  "worker_runtime_provenance_digest": "sha256:44d1a9ea1d2f4ac50397cbbd0d9a69b67e84bcbf8252ac9bb4e73451a7b34edd",
+  "worker_runtime_provenance_digest": "sha256:2ed4363fadb5ccce174a83237e99a9872250142c07f2e3dfb6ee52415a6f22c4",
   "worker_profile": {
     "profile_id": "pilot-build-only-v1",
     "ami_id": "ami-023251121ceb0d6f3",
     "instance_profile_name": "TaskPlatformBuildOnlyWorker-pilot",
     "role_arn": "arn:aws:iam::297645381734:role/task-platform/build-only-workers/TaskPlatformBuildOnlyWorker-pilot",
     "subnet_ids": [
-      "subnet-0c1db80817d054277"
+      "subnet-000a8edefd5306091"
     ],
     "security_group_ids": [
       "sg-0a72ebfc1a59587c5"
@@ -69,6 +69,6 @@
       "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:task-platform/7fe226a7-4d0e-486d-8916-372034a8e111/aecbb891-39eb-5d5d-ba3b-7ff2166d2f99/apex/"
     ]
   },
-  "worker_profile_digest": "sha256:e9c74e63e6d6f4fd724231aae699c783a63540efc27eba306a7bfa2ce74a4137",
-  "release_digest": "sha256:5fb02e99764b39d319d6ce8b68a94451ffbcc546f81598ad4b6493702964a775"
+  "worker_profile_digest": "sha256:3f999bf46826f70ba8a9fa9e86609b78577accbf5f8b19a253e4a3be7b5ac278",
+  "release_digest": "sha256:ad43cf167abb8eb0b385dd361ce35c7e08c41e7e2a1ccfd67f6d1b30dbd12307"
 }

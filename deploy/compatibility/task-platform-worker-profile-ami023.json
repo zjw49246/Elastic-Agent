@@ -4,7 +4,7 @@
   "instance_profile_name": "TaskPlatformBuildOnlyWorker-pilot",
   "role_arn": "arn:aws:iam::297645381734:role/task-platform/build-only-workers/TaskPlatformBuildOnlyWorker-pilot",
   "subnet_ids": [
-    "subnet-0c1db80817d054277"
+    "subnet-000a8edefd5306091"
   ],
   "security_group_ids": [
     "sg-0a72ebfc1a59587c5"
