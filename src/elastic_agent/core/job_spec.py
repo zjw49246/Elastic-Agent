@@ -48,8 +48,9 @@ MAX_JOB_RUNTIME_SECONDS = 2_592_000
 DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
 MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
 MAX_ACCOUNT_EXCLUDE_IDS = 100
-MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS = 1_048_576
-MAX_TRAJECTORY_PROMPT_BYTES = 4_194_304
+MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS = 524_288
+MAX_TRAJECTORY_PROMPT_BYTES = 524_288
+MAX_TRAJECTORY_PROMPT_INITIAL_FANOUT_BYTES = 40 * 1024 * 1024
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ACCOUNT_REFERENCE_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}"
@@ -76,6 +77,12 @@ _SAFE_JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_CHECKPOINT_GENERATION_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+_TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+_TRAJECTORY_PROMPT_TEMPLATE_VARIABLES = frozenset({
+    "shard_id",
+    "shard_index",
+    "num_shards",
+})
 
 
 def _validate_env_map(env: dict[str, str], *, label: str) -> dict[str, str]:
@@ -242,18 +249,43 @@ class TrajectoryPromptSpec(StrictSpecModel):
         max_length=64,
     )
 
-    @model_validator(mode="after")
-    def bounded_total_content(self) -> TrajectoryPromptSpec:
-        total = len(
+    def serialized_bytes(self) -> int:
+        return len(
             json.dumps(
                 self.model_dump(),
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
         )
+
+    @model_validator(mode="after")
+    def bounded_total_content(self) -> TrajectoryPromptSpec:
+        total = self.serialized_bytes()
         if total > MAX_TRAJECTORY_PROMPT_BYTES:
             raise ValueError(
-                "run.trajectory_prompt content exceeds the 4194304-byte limit"
+                "run.trajectory_prompt content exceeds the 524288-byte limit"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def deterministic_template_variables(self) -> TrajectoryPromptSpec:
+        values = [
+            self.system,
+            self.developer,
+            self.user,
+            *(value for source in self.sources for value in (source.name, source.content)),
+        ]
+        unsupported = {
+            match.group(1)
+            for value in values
+            for match in _TEMPLATE_RE.finditer(value)
+            if match.group(1) not in _TRAJECTORY_PROMPT_TEMPLATE_VARIABLES
+        }
+        if unsupported:
+            raise ValueError(
+                "run.trajectory_prompt supports only deterministic shard "
+                "template variables; unsupported: "
+                + ", ".join(sorted(unsupported))
             )
         return self
 
@@ -261,9 +293,6 @@ class TrajectoryPromptSpec(StrictSpecModel):
 # Template rendering — Manager renders {{var}} before dispatch; shell-native
 # constructs like $(hostname -s) are left untouched for the worker's shell.
 # ---------------------------------------------------------------------------
-
-_TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-
 
 def render_template(text: str, ctx: dict[str, object]) -> str:
     """Substitute ``{{name}}`` placeholders from ``ctx``.
@@ -1030,6 +1059,19 @@ class JobSpec(StrictSpecModel):
         if self.ttl_seconds < self.run.timeout:
             raise ValueError(
                 "ttl_seconds must be greater than or equal to run.timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def trajectory_prompt_fits_initial_fanout(self) -> JobSpec:
+        staged_bytes = (
+            self.run.trajectory_prompt.serialized_bytes()
+            * self.fanout.workers
+        )
+        if staged_bytes > MAX_TRAJECTORY_PROMPT_INITIAL_FANOUT_BYTES:
+            raise ValueError(
+                "run.trajectory_prompt and fanout.workers exceed the "
+                "41943040-byte initial trajectory prompt budget"
             )
         return self
 

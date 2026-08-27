@@ -9,7 +9,7 @@ from typing import Any
 from elastic_agent.core.job_spec import JobSpec, WorkerContext, render_template
 
 PROMPT_METADATA_SCHEMA = 1
-MAX_PROMPT_METADATA_BYTES = 6 * 1024 * 1024
+MAX_PROMPT_METADATA_BYTES = 768 * 1024
 
 
 def _captured_text(text: str) -> dict[str, Any]:

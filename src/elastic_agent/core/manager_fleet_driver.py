@@ -3458,10 +3458,6 @@ raise SystemExit(code)
             worker_id=worker_id,
             prompt_metadata=prompt_metadata,
         )
-        self._mgr.log_event_parser.register_task_prompt(
-            task_id,
-            prompt_metadata,
-        )
 
     async def run_command(
         self, worker_id: str, task_id: str, command: list[str], cwd: str,

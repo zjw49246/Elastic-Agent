@@ -2682,7 +2682,12 @@ class TestEventRouting:
             "unavailable_components": ["provider_builtin_system_prompt"],
             "invocation": {"argv_sha256": "a" * 64, "resumed": False},
         }
-        manager.log_event_parser.register_task_prompt(task_id, prompt)
+        manager.job_log_store.save_prompt_metadata(
+            job_id="job-log-test",
+            task_id=task_id,
+            worker_id="w-1",
+            prompt_metadata=prompt,
+        )
         manager.log_event_parser.process_log_event("w-1", {
             "task_id": task_id,
             "stream": "stderr",

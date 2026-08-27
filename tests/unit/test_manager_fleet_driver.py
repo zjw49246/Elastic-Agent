@@ -22,7 +22,6 @@ from elastic_agent.core.job_spec_store import (
     update_job_interrupt_intent,
     update_job_state,
 )
-from elastic_agent.core.log_event_parser import LogEventParser
 from elastic_agent.core.manager_fleet_driver import (
     ManagerFleetDriver,
     _terminate_subprocess,
@@ -3334,7 +3333,6 @@ async def test_resolve_secret_env_allows_wss_transport(tmp_path, monkeypatch):
 async def test_run_command_persists_prompt_before_remote_dispatch(tmp_path):
     manager = FakeManager(tmp_path)
     manager.job_log_store = JobLogStore(tmp_path / "job-logs")
-    manager.log_event_parser = LogEventParser()
     task_id = "job-prompt:worker-a:abcdef"
     prompt = {
         "schema": 1,
@@ -3378,4 +3376,4 @@ async def test_run_command_persists_prompt_before_remote_dispatch(tmp_path):
         False,
     )
 
-    assert manager.log_event_parser.get_task_prompt(task_id) == prompt
+    assert manager.job_log_store.read_job("job-prompt")[0]["prompt"] == prompt

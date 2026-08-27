@@ -367,23 +367,6 @@ class TestCostAggregation:
 
 
 class TestReleaseTask:
-    def test_prompt_metadata_is_not_part_of_bounded_event_buffer(self, parser):
-        metadata = {"schema": 1, "components": {"system": {"text": "rules"}}}
-        parser.register_task_prompt("task-1", metadata)
-        for index in range(200):
-            parser.process_log_event("worker-1", {
-                "task_id": "task-1",
-                "stream": "stdout",
-                "data": str(index),
-                "parsed": None,
-            })
-
-        assert parser.buffer_size("task-1") == 100
-        assert parser.get_task_prompt("task-1") is metadata
-
-        parser.release_task("task-1")
-        assert parser.get_task_prompt("task-1") is None
-
     def test_release_clears_buffer(self, parser):
         parser.process_log_event("worker-1", {
             "task_id": "task-1",

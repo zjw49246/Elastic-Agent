@@ -132,7 +132,20 @@ execution, separately from the bounded stdout/stderr tail:
 CC/Codex provider built-ins and compiled resume context are not exposed by the
 CLIs. Stored metadata therefore lists those components as unavailable instead
 of claiming byte-exact completeness. Job-wide log reads return prompt hashes;
-select one `task_id` to retrieve its captured plaintext.
+select one `task_id` to retrieve its captured plaintext. Job detail responses
+redact the declaration, so they cannot bypass that task-scoped plaintext read.
+The declaration is limited to 512 KiB, and its initial fanout must fit a 40 MiB
+staging budget before any worker is provisioned.
+
+Task Platform execution campaigns can generate this metadata from a reviewed
+`job_spec_template`: place the framework-visible system/developer/user text and
+named instruction sources in `run.trajectory_prompt`, then render and freeze the
+ordinary JobSpec with the rest of the campaign inputs. After the campaign Job is
+accepted, read `GET /api/jobs/{job_id}/logs` for task ids and select each task
+with `?task_id=...&lines=1` when assembling the restricted trajectory artifact.
+Pin this Elastic-Agent revision in Task Platform before publishing templates
+that use the new field; no Task Platform runtime or production mutation is
+performed here.
 
 On POSIX, each Mode-B command runs in its own process session. STOP, timeout,
 exhaustion, and a parent that exits while leaving children behind terminate the
