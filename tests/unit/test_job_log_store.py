@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from elastic_agent.core.job_log_store import JobLogStore
+from elastic_agent.core.job_spec import JobSpec, RunSpec, WorkerContext
+from elastic_agent.core.trajectory_prompt import build_trajectory_prompt_metadata
 
 
 def _entry(task_id: str, index: int, *, worker_id: str = "aws:i-123") -> dict:
@@ -212,3 +214,87 @@ def test_job_log_store_rejects_symlink_job_directory(tmp_path: Path) -> None:
             exit_info={"exit_code": 0},
         )
     assert list(outside.iterdir()) == []
+
+
+def test_prompt_metadata_survives_tail_truncation_and_v1_remains_readable(
+    tmp_path: Path,
+) -> None:
+    store = JobLogStore(
+        tmp_path / "job-logs",
+        max_entries=2,
+        max_bytes=64_000,
+    )
+    task_id = "job-prompt:worker:abcdef"
+    spec = JobSpec(
+        name="prompt",
+        account={"agent_type": "claude", "mode": "none"},
+        run=RunSpec(
+            command="claude -p task",
+            trajectory_prompt={
+                "system": "important system prompt",
+                "sources": [{"name": "CLAUDE.md", "content": "project rules"}],
+            },
+        ),
+    )
+    prompt = build_trajectory_prompt_metadata(
+        spec,
+        WorkerContext(),
+        command=["bash", "-lc", "claude -p task"],
+        resumed=False,
+    )
+    staged = store.save_prompt_metadata(
+        job_id="job-prompt",
+        task_id=task_id,
+        worker_id="worker",
+        prompt_metadata=prompt,
+    )
+    assert json.loads(staged.read_text())["complete"] is False
+
+    store.save_snapshot(
+        job_id="job-prompt",
+        task_id=task_id,
+        worker_id="worker",
+        entries=[_entry(task_id, index, worker_id="worker") for index in range(10)],
+        exit_info={"exit_code": 0},
+        source_truncated=True,
+    )
+
+    full = store.read_job_tail("job-prompt", lines=10, task_id=task_id)
+    assert len(full["entries"]) == 2
+    assert full["tasks"][0]["truncated"] is True
+    assert full["tasks"][0]["prompt"]["components"]["system"]["text"] == (
+        "important system prompt"
+    )
+    summary = store.read_job_tail("job-prompt", lines=10)
+    assert "text" not in summary["tasks"][0]["prompt"]["components"]["system"]
+    assert summary["tasks"][0]["prompt"]["components"]["system"]["sha256"]
+
+    empty_task = "job-prompt:worker:empty"
+    store.save_prompt_metadata(
+        job_id="job-prompt",
+        task_id=empty_task,
+        worker_id="worker",
+        prompt_metadata=prompt,
+    )
+    store.save_snapshot(
+        job_id="job-prompt",
+        task_id=empty_task,
+        worker_id="worker",
+        entries=[],
+        exit_info={"exit_code": 0},
+    )
+    empty = store.read_job_tail(
+        "job-prompt",
+        lines=10,
+        task_id=empty_task,
+    )["tasks"][0]
+    assert empty["complete"] is True
+    assert empty["prompt"]["components"]["system"]["text"] == (
+        "important system prompt"
+    )
+
+    legacy_payload = json.loads(staged.read_text())
+    legacy_payload["version"] = 1
+    legacy_payload.pop("prompt")
+    staged.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    assert 1 in {snapshot["version"] for snapshot in store.read_job("job-prompt")}

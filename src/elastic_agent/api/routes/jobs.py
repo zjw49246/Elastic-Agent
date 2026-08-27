@@ -1373,6 +1373,16 @@ def _redacted_spec(spec: JobSpec | dict) -> dict:
             run["secret_env"] = {
                 str(key): "[SECRET_REFERENCE]" for key in secret_env
             }
+        trajectory_prompt = run.get("trajectory_prompt")
+        if isinstance(trajectory_prompt, dict):
+            for component in ("system", "developer", "user"):
+                if trajectory_prompt.get(component):
+                    trajectory_prompt[component] = "[REDACTED]"
+            sources = trajectory_prompt.get("sources")
+            if isinstance(sources, list):
+                for source in sources:
+                    if isinstance(source, dict) and source.get("content"):
+                        source["content"] = "[REDACTED]"
     setup = data.get("setup") if isinstance(data, dict) else None
     if isinstance(setup, dict):
         repo = setup.get("repo")
@@ -3374,7 +3384,10 @@ async def job_logs(
             continue
         # A completed task snapshot is authoritative; reliable LOG ordering
         # makes a same-id live buffer a duplicate replay rather than a new run.
-        if candidate in archived_by_task:
+        if (
+            candidate in archived_by_task
+            and archived_by_task[candidate].get("complete") is True
+        ):
             continue
         entries = mgr.log_event_parser.get_task_logs(candidate, limit=lines)
         if worker_id is not None and not any(
@@ -3428,32 +3441,41 @@ async def job_logs(
     for ordinal, entry in enumerate(archived["entries"]):
         retain(entry, str(entry.get("task_id") or ""), ordinal)
 
-    tasks: list[dict] = []
+    task_views: dict[str, dict] = {}
     sources: set[str] = set()
-    if archived_by_task:
+    if archived["entries"] or any(
+        snapshot.get("complete") is True
+        for snapshot in archived_by_task.values()
+    ):
         sources.add("archive")
     for candidate, snapshot in archived_by_task.items():
         exit_info = snapshot.get("exit", {})
-        tasks.append({
+        view = {
             "task_id": candidate,
             "worker_id": str(snapshot.get("worker_id") or ""),
-            "archived": True,
+            "archived": bool(snapshot.get("complete")),
             "complete": bool(snapshot.get("complete")),
             "exit_code": exit_info.get("exit_code"),
             "error_type": exit_info.get("error_type"),
             "error_message": exit_info.get("error_message"),
-        })
+        }
+        if isinstance(snapshot.get("prompt"), dict):
+            view["prompt"] = snapshot["prompt"]
+        task_views[candidate] = view
     for candidate, entries in live_by_task.items():
         sources.add("live")
         selected_worker = str(entries[0].get("worker_id") or "") if entries else ""
-        tasks.append({
+        view = task_views.setdefault(candidate, {
             "task_id": candidate,
             "worker_id": selected_worker,
-            "archived": False,
-            "complete": False,
             "exit_code": None,
             "error_type": None,
             "error_message": None,
+        })
+        view.update({
+            "worker_id": selected_worker or view.get("worker_id", ""),
+            "archived": False,
+            "complete": False,
         })
         for ordinal, entry in enumerate(entries):
             retain(entry, candidate, ordinal)
@@ -3462,7 +3484,7 @@ async def job_logs(
         item for _key, _size, item in sorted(newest)
     ]
     total = int(archived["total"]) + sum(live_totals.values())
-    tasks.sort(key=lambda item: item["task_id"])
+    tasks = sorted(task_views.values(), key=lambda item: item["task_id"])
 
     scope_active = False
     if job is not None:

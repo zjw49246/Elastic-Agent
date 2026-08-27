@@ -26,6 +26,7 @@ uploaded Harness subclass instead — see the harness registry.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from dataclasses import asdict, dataclass
@@ -47,6 +48,9 @@ MAX_JOB_RUNTIME_SECONDS = 2_592_000
 DEFAULT_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 900
 MAX_ACCOUNT_LOGIN_TIMEOUT_SECONDS = 1_200
 MAX_ACCOUNT_EXCLUDE_IDS = 100
+MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS = 524_288
+MAX_TRAJECTORY_PROMPT_BYTES = 524_288
+MAX_TRAJECTORY_PROMPT_INITIAL_FANOUT_BYTES = 40 * 1024 * 1024
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ACCOUNT_REFERENCE_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}"
@@ -73,6 +77,12 @@ _SAFE_JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_CHECKPOINT_GENERATION_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+_TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+_TRAJECTORY_PROMPT_TEMPLATE_VARIABLES = frozenset({
+    "shard_id",
+    "shard_index",
+    "num_shards",
+})
 
 
 def _validate_env_map(env: dict[str, str], *, label: str) -> dict[str, str]:
@@ -194,13 +204,95 @@ class StrictSpecModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+
+class TrajectoryPromptSourceSpec(StrictSpecModel):
+    """One framework-visible instruction source included in a model request."""
+
+    name: str = Field(min_length=1, max_length=4_096)
+    content: str = Field(
+        default="",
+        max_length=MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS,
+    )
+
+    @field_validator("name")
+    @classmethod
+    def safe_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or "\x00" in normalized:
+            raise ValueError("trajectory prompt source name is invalid")
+        return normalized
+
+
+class TrajectoryPromptSpec(StrictSpecModel):
+    """Prompt material declared by an opaque harness for trajectory capture.
+
+    Mode-B commands assemble their own provider requests, so Elastic-Agent
+    cannot infer this material from stdout. Callers that need reproducible
+    trajectories declare the exact framework-visible inputs here. Provider
+    built-ins and compiled session context remain explicitly unavailable.
+    """
+
+    system: str = Field(
+        default="",
+        max_length=MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS,
+    )
+    developer: str = Field(
+        default="",
+        max_length=MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS,
+    )
+    user: str = Field(
+        default="",
+        max_length=MAX_TRAJECTORY_PROMPT_COMPONENT_CHARS,
+    )
+    sources: list[TrajectoryPromptSourceSpec] = Field(
+        default_factory=list,
+        max_length=64,
+    )
+
+    def serialized_bytes(self) -> int:
+        return len(
+            json.dumps(
+                self.model_dump(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    @model_validator(mode="after")
+    def bounded_total_content(self) -> TrajectoryPromptSpec:
+        total = self.serialized_bytes()
+        if total > MAX_TRAJECTORY_PROMPT_BYTES:
+            raise ValueError(
+                "run.trajectory_prompt content exceeds the 524288-byte limit"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def deterministic_template_variables(self) -> TrajectoryPromptSpec:
+        values = [
+            self.system,
+            self.developer,
+            self.user,
+            *(value for source in self.sources for value in (source.name, source.content)),
+        ]
+        unsupported = {
+            match.group(1)
+            for value in values
+            for match in _TEMPLATE_RE.finditer(value)
+            if match.group(1) not in _TRAJECTORY_PROMPT_TEMPLATE_VARIABLES
+        }
+        if unsupported:
+            raise ValueError(
+                "run.trajectory_prompt supports only deterministic shard "
+                "template variables; unsupported: "
+                + ", ".join(sorted(unsupported))
+            )
+        return self
+
 # ---------------------------------------------------------------------------
 # Template rendering — Manager renders {{var}} before dispatch; shell-native
 # constructs like $(hostname -s) are left untouched for the worker's shell.
 # ---------------------------------------------------------------------------
-
-_TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-
 
 def render_template(text: str, ctx: dict[str, object]) -> str:
     """Substitute ``{{name}}`` placeholders from ``ctx``.
@@ -503,6 +595,12 @@ class RunSpec(StrictSpecModel):
     # Values are references only. Plaintext is resolved immediately before
     # dispatch and never written back to this model/persistence journal.
     secret_env: dict[str, str] = Field(default_factory=dict)
+    # Mode-B is deliberately opaque: stdout cannot reveal the exact prompt sent
+    # by an inner CC/Codex harness. This declaration is persisted separately from
+    # the bounded log tail so reproducibility data cannot be evicted by a long run.
+    trajectory_prompt: TrajectoryPromptSpec = Field(
+        default_factory=TrajectoryPromptSpec,
+    )
     cwd: str = "."
     # Missing/None/0 legacy values are normalized to a finite 24-hour default.
     timeout: int = Field(
@@ -961,6 +1059,19 @@ class JobSpec(StrictSpecModel):
         if self.ttl_seconds < self.run.timeout:
             raise ValueError(
                 "ttl_seconds must be greater than or equal to run.timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def trajectory_prompt_fits_initial_fanout(self) -> JobSpec:
+        staged_bytes = (
+            self.run.trajectory_prompt.serialized_bytes()
+            * self.fanout.workers
+        )
+        if staged_bytes > MAX_TRAJECTORY_PROMPT_INITIAL_FANOUT_BYTES:
+            raise ValueError(
+                "run.trajectory_prompt and fanout.workers exceed the "
+                "41943040-byte initial trajectory prompt budget"
             )
         return self
 
