@@ -14,7 +14,6 @@ from elastic_agent.core.release_evidence import (
     canonical_json,
     compute_release_digest,
     compute_task_platform_worker_profile_digest,
-    compute_worker_profile_digest,
     compute_worker_runtime_provenance_digest,
     load_release_manifest,
     validate_deployment_context,
@@ -34,7 +33,9 @@ def _test_only_profile() -> dict:
 
 def _v3_manifest() -> dict:
     legacy = json.loads((ROOT / "deploy/release-manifest.json").read_text(encoding="utf-8"))
-    provenance = deepcopy(legacy["worker_profile"])
+    provenance = deepcopy(
+        legacy.get("worker_runtime_provenance", legacy["worker_profile"])
+    )
     profile = _test_only_profile()
     manifest = {
         **{
@@ -55,15 +56,21 @@ def _v3_manifest() -> dict:
 
 def test_checked_in_manifest_is_canonical_and_stable() -> None:
     manifest = load_release_manifest()
+    provenance = manifest["worker_runtime_provenance"]
     assert manifest["manager_state_schema"] == MANAGER_STATE_SCHEMA
     assert manifest["manager_state_schema"] == "v1"
-    assert manifest["worker_profile_digest"] == compute_worker_profile_digest(manifest["worker_profile"])
+    assert manifest["worker_runtime_provenance_digest"] == compute_worker_runtime_provenance_digest(
+        provenance
+    )
+    assert manifest["worker_profile_digest"] == compute_task_platform_worker_profile_digest(
+        manifest["worker_profile"]
+    )
     assert manifest["release_digest"] == compute_release_digest(manifest)
     assert manifest["worker_profile_digest"].startswith("sha256:")
     assert manifest["release_digest"].startswith("sha256:")
-    assert manifest["worker_profile"]["ami_manifest_digest"].startswith("sha256:")
-    assert manifest["worker_profile"]["ami_constraints_digest"].startswith("sha256:")
-    assert manifest["worker_profile"]["ami_generator_version"] == "build-only-v1"
+    assert provenance["ami_manifest_digest"].startswith("sha256:")
+    assert provenance["ami_constraints_digest"].startswith("sha256:")
+    assert provenance["ami_generator_version"] == "build-only-v1"
     assert canonical_json(manifest) == canonical_json(json.loads(canonical_json(manifest)))
 
 
@@ -127,7 +134,7 @@ def test_generator_requires_external_worker_profile_and_emits_v3(
     import scripts.generate_release_evidence as generator
 
     previous = json.loads((ROOT / "deploy/release-manifest.json").read_text(encoding="utf-8"))
-    previous["worker_profile"]["ami_id"] = _test_only_profile()["ami_id"]
+    previous["worker_runtime_provenance"]["ami_id"] = _test_only_profile()["ami_id"]
     previous_path = tmp_path / "previous-release-manifest.json"
     previous_path.write_text(json.dumps(previous), encoding="utf-8")
     monkeypatch.setattr(generator, "MANIFEST_PATH", previous_path)
@@ -156,7 +163,7 @@ def test_generator_cli_requires_worker_profile_input(
 def test_manifest_tampering_is_rejected() -> None:
     manifest = load_release_manifest()
     manifest["worker_profile"] = dict(manifest["worker_profile"])
-    manifest["worker_profile"]["runtime_source"] = "tampered.py"
+    manifest["worker_profile"]["profile_id"] = "tampered"
     with pytest.raises(ReleaseEvidenceError, match="worker_profile_digest"):
         validate_release_manifest(manifest)
 
@@ -198,11 +205,11 @@ def test_release_tree_tampering_is_rejected(tmp_path: Path) -> None:
 
 def test_deployment_context_accepts_only_canonical_aws_identity() -> None:
     manifest = load_release_manifest()
-    profile = manifest["worker_profile"]
+    provenance = manifest["worker_runtime_provenance"]
     context = {
-        "ami_id": profile["ami_id"],
-        "region": profile["region"],
-        "aws_account_id": profile["aws_account_id"],
+        "ami_id": provenance["ami_id"],
+        "region": provenance["region"],
+        "aws_account_id": provenance["aws_account_id"],
         "release_revision": manifest["release_revision"],
     }
     validate_deployment_context(manifest, context)

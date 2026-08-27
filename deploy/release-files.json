@@ -1895,8 +1895,8 @@
       "path": "tests/unit/test_release_evidence.py",
       "type": "file",
       "mode": "0644",
-      "size": 9042,
-      "sha256": "sha256:5d09641e8c81aadde3513bac1113390a61495e9399587b7f708b0e196bea4182"
+      "size": 9250,
+      "sha256": "sha256:8393ad43c3b30a809854263bb06f4e22b4db437ae16c95dd5ace81a5661226da"
     },
     {
       "path": "tests/unit/test_remove_node.py",
