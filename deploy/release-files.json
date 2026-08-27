@@ -100,6 +100,27 @@
       "sha256": "sha256:20edcbc6b731c7cbfe21915e3fac7ee1af4af7b74ba1d2a9d7f3e3f8a52d3334"
     },
     {
+      "path": "deploy/compatibility/README.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 1193,
+      "sha256": "sha256:726cef7f3869c5da2418806a2361c78cfb0a455a0796422e746f843e5bbb7206"
+    },
+    {
+      "path": "deploy/compatibility/ami-023-evidence.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1546,
+      "sha256": "sha256:2f6166152bd6bb55c3696dbf6cae26eab6e1c21c1b02cdc32ad522caf9a37504"
+    },
+    {
+      "path": "deploy/compatibility/task-platform-worker-profile-ami023.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 954,
+      "sha256": "sha256:110bae28c359c00e4bc271743374992fda1e09883650b681e1dde811344a8abc"
+    },
+    {
       "path": "docs/audiobook-integration/00-overview.md",
       "type": "file",
       "mode": "0644",
@@ -1946,6 +1967,13 @@
       "mode": "0644",
       "size": 12082,
       "sha256": "sha256:e70546f6bcea0332ba04840ada68ebd8afb39cb27f6ffa13cf761bfd6374807d"
+    },
+    {
+      "path": "tests/unit/test_task_platform_ami023_compatibility.py",
+      "type": "file",
+      "mode": "0644",
+      "size": 2339,
+      "sha256": "sha256:78df71d94813ef70d822331b41e761b33baad17925c5484a322f06b5b9c32ee4"
     },
     {
       "path": "tests/unit/test_task_registry.py",

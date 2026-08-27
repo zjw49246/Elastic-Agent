@@ -1,0 +1,27 @@
+{
+  "profile_id": "pilot-build-only-v1",
+  "ami_id": "ami-023251121ceb0d6f3",
+  "instance_profile_name": "TaskPlatformBuildOnlyWorker-pilot",
+  "role_arn": "arn:aws:iam::297645381734:role/task-platform/build-only-workers/TaskPlatformBuildOnlyWorker-pilot",
+  "subnet_ids": [
+    "subnet-0c1db80817d054277"
+  ],
+  "security_group_ids": [
+    "sg-0a72ebfc1a59587c5"
+  ],
+  "allowed_instance_types": [
+    "m6id.32xlarge"
+  ],
+  "environment_profiles": [
+    "ubuntu-agent-docker-v2"
+  ],
+  "input_prefixes": [
+    "s3://task-platform-artifacts-297645381734-apne1/workspaces/7fe226a7-4d0e-486d-8916-372034a8e111/runs/"
+  ],
+  "output_prefixes": [
+    "s3://task-platform-artifacts-297645381734-apne1/workspaces/7fe226a7-4d0e-486d-8916-372034a8e111/runs/"
+  ],
+  "secret_reference_prefixes": [
+    "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:task-platform/7fe226a7-4d0e-486d-8916-372034a8e111/aecbb891-39eb-5d5d-ba3b-7ff2166d2f99/apex/"
+  ]
+}

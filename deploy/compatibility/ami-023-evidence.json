@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "observation_mode": "read-only-ec2-describe-images",
+  "region": "ap-northeast-1",
+  "compatibility": "ami-023251121ceb0d6f3 -> source ami-03c4e1dca88d39005",
+  "target_release_revision": "artifact-sha256:56c2dd8e32cb0a4fc3c429714dce985b17367dc00a436f2c4abdf20010f757fd",
+  "target_release_digest": "sha256:1e5bd0b167f93830fc786968878d7b33961ffbf5537a502a0326a0494e20aafb",
+  "shared_ami_manifest_digest": "sha256:75823a64acc2d38651b857f9ea22e61aff59c3bec8a02929ebda73fa68406df2",
+  "shared_ami_constraints_digest": "sha256:bc81f22a46eee61748cc6d114f7f0d33e0a46e15182726a516e909b82176dce0",
+  "shared_runner_image": "297645381734.dkr.ecr.ap-northeast-1.amazonaws.com/task-platform-pilot-runner@sha256:e0b39edf49d637a86161a397b831610167b2a7d9f6f4203dbae2c232ce45dd19",
+  "shared_platform_revision": "7275b31b0a313e7b1d2ee3de89237a029333bde6",
+  "shared_upstream_revision": "115320154e929bc28800a3273ebb3f56eef10070",
+  "ami_023": {
+    "image_id": "ami-023251121ceb0d6f3",
+    "source_image_id": "ami-03c4e1dca88d39005",
+    "state": "available",
+    "architecture": "x86_64",
+    "virtualization_type": "hvm",
+    "imds_support": "v2.0",
+    "owner_id": "297645381734",
+    "last_launched_time": "2026-08-27T06:28:52Z",
+    "tags_match": ["ManifestDigest", "ConstraintsDigest", "RunnerImage", "PlatformRevision", "UpstreamRevision", "GeneratorVersion", "Environment", "Service", "TaskPlatform"]
+  },
+  "decision": "compatible-binding-only; deployment and campaign creation remain gated",
+  "production_writes": false
+}
