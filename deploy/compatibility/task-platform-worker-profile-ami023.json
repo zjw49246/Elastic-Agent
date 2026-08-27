@@ -1,5 +1,5 @@
 {
-  "profile_id": "pilot-build-only-v1",
+  "profile_id": "pilot-executor-v1",
   "ami_id": "ami-023251121ceb0d6f3",
   "instance_profile_name": "task-platform-pilot-executor-worker",
   "role_arn": "arn:aws:iam::297645381734:role/task-platform-pilot-executor-worker",

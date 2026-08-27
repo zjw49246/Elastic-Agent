@@ -5,6 +5,12 @@ read-only EC2 evidence used to generate the PR#8-compatible release when Task
 Platform Manager is configured to launch `ami-023251121ceb0d6f3`. It does not
 change IAM, Terraform, or any production resource.
 
+The network and IAM identity fields are bound to the Manager's authenticated
+systemd environment observed over SSM: dedicated instance profile/role
+`task-platform-pilot-executor-worker`, subnet `subnet-000a8edefd5306091`, and
+security group `sg-0a72ebfc1a59587c5`. The earlier build-only profile and
+`subnet-0c1db80817d054277` are not interchangeable with this Manager runtime.
+
 The compatibility claim is deliberately narrow: EC2 `DescribeImages` showed
 that AMI-023 is a KMS-refreshed copy whose `SourceImageId` is AMI-03c4 and whose
 `ManifestDigest`, `ConstraintsDigest`, `RunnerImage`, `PlatformRevision`,

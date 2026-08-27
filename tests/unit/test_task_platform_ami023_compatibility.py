@@ -55,7 +55,8 @@ def test_release_and_external_profile_share_the_ami023_binding() -> None:
     assert manifest["worker_profile"] == profile
     assert manifest["worker_profile_digest"] == compute_task_platform_worker_profile_digest(profile)
     assert manifest["worker_runtime_provenance_digest"] == compute_worker_runtime_provenance_digest(provenance)
-    assert profile["instance_profile_name"] == "TaskPlatformBuildOnlyWorker-pilot"
-    assert profile["subnet_ids"] == ["subnet-0c1db80817d054277"]
+    assert profile["instance_profile_name"] == "task-platform-pilot-executor-worker"
+    assert profile["role_arn"] == "arn:aws:iam::297645381734:role/task-platform-pilot-executor-worker"
+    assert profile["subnet_ids"] == ["subnet-000a8edefd5306091"]
     assert profile["security_group_ids"] == ["sg-0a72ebfc1a59587c5"]
     assert profile["environment_profiles"] == ["ubuntu-agent-docker-v2"]
