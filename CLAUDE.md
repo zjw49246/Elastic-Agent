@@ -66,6 +66,16 @@
 - **历史 Job / 配置 / 日志 API 资源边界**：`GET /api/jobs` 的历史部分只用 bounded `scandir`（扫描 10,000、候选 1,000、返回 500、单 journal 32 MiB、总读 64 MiB、历史响应 16 MiB），相关 lease copy 最多 10,000，并返回 `truncated/history_scanned/history_returned`；两线程专用池饱和直接 503。`GET /api/jobs/{job_id}` 用同一有界专用池读取 0600 journal 中不可变的提交时生效 JobSpec，live 内存对象后续变化不能改写历史；current schema 和明确 allowlist 的相邻版本字段先严格投影再脱敏，未知字段/值或损坏 journal fail closed，响应始终 `no-store`。相邻版本兼容只作用于只读详情，当前提交/重提仍严格拒绝，绝不执行未知 schema。`GET /api/jobs/{job_id}/logs` 的归档读取使用四线程专用池和等容量 fail-fast admission，客户端取消必须等真实线程退出后才归还 permit，不能占满共享默认 executor 或堆积已取消扫描。
 - **Accounts / Results 状态刷新**：账号占用只有 `run.cleaned_up`/`accounts_released` 才隐藏；Job/lease 读取故障返回脱敏 503，UI 显示未知而非空闲。Accounts 在可见页每 15 秒 single-flight 刷新并提供手动刷新，CRUD/submit/cancel 强制读取会合并且由版本号拒绝乱序。Results 保留已知非空中间快照，但终态 503/空仍有限退避；只有成功非空的终态读取才停止轮询，避免永久冻结旧快照。
 
+### Platform credential references
+
+The platform credential pool is the sole long-lived Apex secret source.  The
+`POST /api/agent-api/accounts/platform-ref` endpoint accepts only a bounded,
+exact Secrets Manager ARN and projects non-secret metadata into EA.  Version-2
+account directories contain `credential_ref` and never create `api.key`;
+`read_api_key()` resolves the ARN just in time for model/usage/configure calls.
+Legacy local-key accounts remain readable only for migration and must not be
+created by Task Platform production flows.
+
 ## 依赖链（重要）
 
 - 生产依赖只来自 `pyproject.toml`/`uv.lock` 声明；`claude-pty` 不在其中。
