@@ -393,8 +393,9 @@ def _resolve_platform_credential_ref(reference: str) -> str:
     secret_id = _validate_platform_credential_ref(reference)
     try:
         import boto3
+        region = secret_id.split(":", 5)[3]
 
-        response = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
+        response = boto3.client("secretsmanager", region_name=region).get_secret_value(SecretId=secret_id)
         payload = response.get("SecretString")
         if not isinstance(payload, str):
             raise AgentApiStorageError("platform credential secret has no string value")

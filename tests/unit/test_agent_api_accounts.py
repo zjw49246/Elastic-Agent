@@ -3,11 +3,13 @@ import json
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+from elastic_agent.core import agent_api as agent_api_module
 from elastic_agent.core.agent_api import (
     MAX_AGENT_API_MODEL_ID_LENGTH,
     MAX_AGENT_API_MODELS,
@@ -33,6 +35,34 @@ MODELS = {
     "claude": ["claude-opus-4-8", "claude-sonnet-5"],
     "codex": ["gpt-5.4", "o3"],
 }
+
+
+def test_platform_reference_uses_secret_arn_region(monkeypatch):
+    reference = (
+        "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:"
+        "task-platform/workspace/user/apex/123e4567-e89b-42d3-a456-426614174000-AbCd12"
+    )
+    client_calls: list[tuple[str, dict[str, str]]] = []
+
+    class FakeSecretsManager:
+        def get_secret_value(self, **kwargs: str) -> dict[str, str]:
+            assert kwargs == {"SecretId": reference}
+            return {"SecretString": json.dumps({"api_key": "apex-private-value"})}
+
+    class FakeBoto3:
+        @staticmethod
+        def client(service_name: str, **kwargs: str) -> FakeSecretsManager:
+            client_calls.append((service_name, kwargs))
+            return FakeSecretsManager()
+
+    monkeypatch.setitem(sys.modules, "boto3", FakeBoto3)
+
+    assert agent_api_module._resolve_platform_credential_ref(reference) == (
+        "apex-private-value"
+    )
+    assert client_calls == [
+        ("secretsmanager", {"region_name": "ap-northeast-1"})
+    ]
 
 
 def _mode(path: Path) -> int:
@@ -112,7 +142,11 @@ async def test_platform_reference_rejects_unbounded_or_duplicate_refs(tmp_path, 
         "task-platform/workspace/user/apex/123e4567-e89b-42d3-a456-426614174000"
     )
     store = AgentApiAccountStore(tmp_path / "agent-api", credential_resolver=lambda _ref: "secret")
-    monkeypatch.setattr(store.registry.require("apex"), "probe_models", AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}))
+    monkeypatch.setattr(
+        store.registry.require("apex"),
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
 
     with pytest.raises(ValueError, match="platform credential reference"):
         await store.add_reference("apex", "Bad", "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:anything")
