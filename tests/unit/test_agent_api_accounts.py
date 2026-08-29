@@ -66,6 +66,61 @@ async def _add(
     return store, account
 
 
+@pytest.mark.asyncio
+async def test_platform_reference_is_resolved_just_in_time_and_never_persisted(
+    tmp_path, monkeypatch,
+):
+    reference = (
+        "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:"
+        "task-platform/workspace/user/apex/123e4567-e89b-42d3-a456-426614174000-AbCd12"
+    )
+    resolved: list[str] = []
+
+    def resolver(value: str) -> str:
+        resolved.append(value)
+        return "apex-private-value"
+
+    store = AgentApiAccountStore(
+        tmp_path / "agent-api",
+        credential_resolver=resolver,
+    )
+    adapter = store.registry.require("apex")
+    monkeypatch.setattr(adapter, "probe_models", AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}))
+    account = await store.add_reference("apex", "Production Apex", reference)
+
+    account_root = store.root / account.id
+    assert resolved == [reference]
+    assert not (account_root / "api.key").exists()
+    metadata = (account_root / "account.json").read_text()
+    assert reference in metadata
+    assert "apex-private-value" not in metadata
+    assert account.credential_ref == reference
+    assert account.public_dict()["credential_source"] == "platform_ref"
+
+    assert store.read_api_key(account.id) == "apex-private-value"
+    assert resolved == [reference, reference]
+
+    reloaded = AgentApiAccountStore(store.root, credential_resolver=resolver)
+    assert (await reloaded.get(account.id)).credential_ref == reference
+    assert not (account_root / "api.key").exists()
+
+
+@pytest.mark.asyncio
+async def test_platform_reference_rejects_unbounded_or_duplicate_refs(tmp_path, monkeypatch):
+    reference = (
+        "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:"
+        "task-platform/workspace/user/apex/123e4567-e89b-42d3-a456-426614174000"
+    )
+    store = AgentApiAccountStore(tmp_path / "agent-api", credential_resolver=lambda _ref: "secret")
+    monkeypatch.setattr(store.registry.require("apex"), "probe_models", AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}))
+
+    with pytest.raises(ValueError, match="platform credential reference"):
+        await store.add_reference("apex", "Bad", "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:anything")
+    await store.add_reference("apex", "First", reference)
+    with pytest.raises(AgentApiDuplicateKeyError):
+        await store.add_reference("apex", "Second", reference)
+
+
 def test_default_registry_exposes_cloudrouter_then_apex():
     registry = AgentApiProviderRegistry.default()
 
