@@ -20,7 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from elastic_agent.core.secure_store import fsync_directory
 
@@ -35,6 +35,12 @@ MAX_GROUP_LENGTH = 100
 MAX_ACCOUNT_NUMBER = 2_147_483_647
 MAX_TIMESTAMP_SECONDS = 10_000_000_000
 MAX_TIMESTAMP_NS = 9_223_372_036_854_775_807
+PLATFORM_CREDENTIAL_REF_RE = re.compile(
+    r"^arn:aws:secretsmanager:[a-z]{2}(?:-gov)?-[a-z]+-\d:[0-9]{12}:"
+    r"secret:task-platform/[A-Za-z0-9._-]{1,128}/[A-Za-z0-9._-]{1,128}/"
+    r"apex/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    r"(?:-[A-Za-z0-9]{6})?$"
+)
 STORE_STATE_NAME = ".store.json"
 RUNTIME_UNAVAILABLE_NAME = "runtime-unavailable.json"
 MAX_RUNTIME_UNAVAILABLE_BYTES = 16 * 1024
@@ -167,6 +173,7 @@ class AgentApiAccount:
     api_provider: str
     models: dict[str, list[str]]
     key_fingerprint: str
+    credential_ref: str | None
     root: Path
     endpoints: dict[str, str | None]
 
@@ -233,6 +240,7 @@ class AgentApiAccount:
             "supported_agent_types": self.supported_agent_types,
             "has_api_key": self.has_api_key,
             "key_fingerprint": self.key_fingerprint,
+            "credential_source": "platform_ref" if self.credential_ref else "local_legacy",
             "endpoints": dict(self.endpoints),
         }
 
@@ -373,6 +381,34 @@ def _key_fingerprint(api_key: str) -> str:
     return f"sha256:{digest}"
 
 
+def _validate_platform_credential_ref(value: str) -> str:
+    normalized = str(value or "").strip()
+    if PLATFORM_CREDENTIAL_REF_RE.fullmatch(normalized) is None:
+        raise ValueError("Invalid platform credential reference")
+    return normalized
+
+
+def _resolve_platform_credential_ref(reference: str) -> str:
+    """Resolve one exact Task Platform secret ARN without caching its value."""
+    secret_id = _validate_platform_credential_ref(reference)
+    try:
+        import boto3
+
+        response = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
+        payload = response.get("SecretString")
+        if not isinstance(payload, str):
+            raise AgentApiStorageError("platform credential secret has no string value")
+        parsed = json.loads(payload)
+        api_key = parsed.get("api_key") if isinstance(parsed, dict) else None
+        if not isinstance(api_key, str):
+            raise AgentApiStorageError("platform credential secret is invalid")
+        return api_key
+    except AgentApiStorageError:
+        raise
+    except Exception as exc:
+        raise AgentApiStorageError("unable to resolve platform credential") from exc
+
+
 def _valid_timestamp(value: Any) -> bool:
     return bool(
         not isinstance(value, bool)
@@ -491,11 +527,13 @@ class AgentApiAccountStore:
         *,
         registry: AgentApiProviderRegistry | None = None,
         quota_cache_ttl: float = 60.0,
+        credential_resolver: Callable[[str], str] | None = None,
     ) -> None:
         expanded = os.path.expandvars(os.path.expanduser(os.fspath(root)))
         self.root = Path(expanded).absolute()
         self.registry = registry or AgentApiProviderRegistry.default()
         self._quota_cache_ttl = max(0.0, float(quota_cache_ttl))
+        self._credential_resolver = credential_resolver or _resolve_platform_credential_ref
         self._accounts: dict[str, AgentApiAccount] = {}
         self._usage_cache: dict[str, dict[str, Any]] = {}
         self._usage_cached_at: dict[str, float] = {}
@@ -569,7 +607,7 @@ class AgentApiAccountStore:
             "created_at",
             "updated_at",
         }
-        allowed_fields = required_fields | {"admission_pending"}
+        allowed_fields = required_fields | {"admission_pending", "credential_ref"}
         if (
             not required_fields.issubset(metadata)
             or any(field not in allowed_fields for field in metadata)
@@ -584,7 +622,7 @@ class AgentApiAccountStore:
             ) from exc
         if (
             type(metadata.get("version")) is not int
-            or metadata.get("version") != 1
+            or metadata.get("version") not in {1, 2}
             or metadata.get("id") != root.name
             or match.group("provider") != provider
         ):
@@ -625,15 +663,22 @@ class AgentApiAccountStore:
                 "invalid Agent API account metadata"
             ) from exc
 
-        key = self._decode_api_key(
-            _read_private_file(
-                root / "api.key",
-                maximum=MAX_AGENT_API_KEY_BYTES,
-            )
-        )
-        fingerprint = _key_fingerprint(key)
-        if metadata.get("key_fingerprint") != fingerprint:
-            raise AgentApiStorageError("Agent API key fingerprint mismatch")
+        version = int(metadata["version"])
+        credential_ref = metadata.get("credential_ref")
+        if version == 2:
+            if not isinstance(credential_ref, str) or PLATFORM_CREDENTIAL_REF_RE.fullmatch(credential_ref) is None:
+                raise AgentApiStorageError("invalid platform credential reference")
+            if (root / "api.key").exists() or (root / "api.key").is_symlink():
+                raise AgentApiStorageError("platform credential account contains forbidden local key")
+            fingerprint = _key_fingerprint(credential_ref)
+            if metadata.get("key_fingerprint") != fingerprint:
+                raise AgentApiStorageError("platform credential reference fingerprint mismatch")
+        else:
+            credential_ref = None
+            key = self._decode_api_key(_read_private_file(root / "api.key", maximum=MAX_AGENT_API_KEY_BYTES))
+            fingerprint = _key_fingerprint(key)
+            if metadata.get("key_fingerprint") != fingerprint:
+                raise AgentApiStorageError("Agent API key fingerprint mismatch")
         return AgentApiAccount(
             id=root.name,
             name=name,
@@ -643,6 +688,7 @@ class AgentApiAccountStore:
             api_provider=provider,
             models=normalized_models,
             key_fingerprint=fingerprint,
+            credential_ref=credential_ref,
             root=root,
             endpoints=dict(adapter.endpoints),
         )
@@ -1217,11 +1263,12 @@ class AgentApiAccountStore:
         admission_pending: bool,
         models: dict[str, list[str]],
         fingerprint: str,
+        credential_ref: str | None = None,
         created_at: float | None = None,
     ) -> dict[str, Any]:
         now = time.time()
         return {
-            "version": 1,
+            "version": 2 if credential_ref else 1,
             "id": account_id,
             "name": name,
             "group": group,
@@ -1230,6 +1277,7 @@ class AgentApiAccountStore:
             "api_provider": provider,
             "models": models,
             "key_fingerprint": fingerprint,
+            **({"credential_ref": credential_ref} if credential_ref else {}),
             "created_at": created_at or now,
             "updated_at": now,
         }
@@ -1376,6 +1424,60 @@ class AgentApiAccountStore:
             self._reload_sync()
             return self._require_sync(account_id)
 
+    async def add_reference(
+        self,
+        provider: str,
+        name: str,
+        credential_ref: str,
+        group: str = "standard",
+        *,
+        enabled: bool = True,
+        excluded_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> AgentApiAccount:
+        """Register a platform-owned secret reference without persisting its key."""
+        adapter = self.registry.require(provider)
+        clean_name = _validate_text(name, field="Account name", maximum=MAX_ACCOUNT_NAME_LENGTH)
+        clean_group = _validate_text(group, field="Account group", maximum=MAX_GROUP_LENGTH)
+        clean_ref = _validate_platform_credential_ref(credential_ref)
+        clean_key = self._validate_api_key(self._credential_resolver(clean_ref), MAX_AGENT_API_KEY_BYTES)
+        models = await adapter.probe_models(clean_key)
+        if not any(models.get(agent_type) for agent_type in ("claude", "codex")):
+            raise AgentApiUpstreamError("no_supported_models")
+        normalized_models = _validated_models(models)
+        fingerprint = _key_fingerprint(clean_ref)
+        async with self._lock:
+            self._reload_sync()
+            if any(account.credential_ref == clean_ref for account in self._accounts.values()):
+                raise AgentApiDuplicateKeyError("platform credential is already registered")
+            account_id = self._next_id(adapter.provider, excluded_ids=excluded_ids)
+            target = self._account_root(account_id)
+            temporary = Path(tempfile.mkdtemp(prefix=f".{account_id}.", suffix=".tmp", dir=self.root))
+            os.chmod(temporary, 0o700)
+            try:
+                metadata = self._metadata(
+                    account_id=account_id, provider=adapter.provider, name=clean_name,
+                    group=clean_group, enabled=bool(enabled), admission_pending=True,
+                    models=normalized_models, fingerprint=fingerprint, credential_ref=clean_ref,
+                )
+                _atomic_private_write(temporary / "account.json", _metadata_bytes(metadata))
+                fsync_directory(temporary)
+                if target.exists() or target.is_symlink():
+                    raise AgentApiStorageError("Agent API account destination exists")
+                os.rename(temporary, target)
+                fsync_directory(self.root)
+                self._load_account(target)
+            except AgentApiError:
+                raise
+            except OSError as exc:
+                raise AgentApiStorageError("unable to publish platform credential account") from exc
+            finally:
+                if temporary.exists() and not temporary.is_symlink():
+                    for child in temporary.iterdir():
+                        child.unlink()
+                    temporary.rmdir()
+            self._reload_sync()
+            return self._require_sync(account_id)
+
     async def refresh(self, account_id: str) -> AgentApiAccount:
         operation_lock = await self._operation_lock_for_existing(
             account_id,
@@ -1459,14 +1561,12 @@ class AgentApiAccountStore:
         account = self._require_sync(account_id)
         if not account.enabled:
             raise AgentApiError("Agent API account is disabled")
-        key = self._decode_api_key(
-            _read_private_file(
-                account.root / "api.key",
-                maximum=MAX_AGENT_API_KEY_BYTES,
-            )
-        )
-        if _key_fingerprint(key) != account.key_fingerprint:
-            raise AgentApiStorageError("Agent API key fingerprint mismatch")
+        if account.credential_ref:
+            key = self._validate_api_key(self._credential_resolver(account.credential_ref), MAX_AGENT_API_KEY_BYTES)
+        else:
+            key = self._decode_api_key(_read_private_file(account.root / "api.key", maximum=MAX_AGENT_API_KEY_BYTES))
+            if _key_fingerprint(key) != account.key_fingerprint:
+                raise AgentApiStorageError("Agent API key fingerprint mismatch")
         return key
 
     async def fetch_usage(

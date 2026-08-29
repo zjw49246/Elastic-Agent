@@ -349,7 +349,10 @@
       "Sid": "ReadNamedJobSecrets",
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:elastic-agent/*"
+      "Resource": [
+        "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:elastic-agent/*",
+        "arn:aws:secretsmanager:ap-northeast-1:297645381734:secret:task-platform/*"
+      ]
     },
     {
       "Sid": "ReadNamedJobParameters",

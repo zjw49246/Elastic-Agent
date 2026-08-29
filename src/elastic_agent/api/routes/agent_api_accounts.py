@@ -44,6 +44,16 @@ class AgentApiAccountRequest(BaseModel):
     api_key: SecretStr = Field(repr=False)
     group: str = "standard"
 
+
+class PlatformCredentialRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    provider: Literal["cloudrouter", "apex"] = "apex"
+    name: str
+    credential_ref: str = Field(min_length=1, max_length=512)
+    group: str = "model-training"
+    global_concurrency: int = Field(default=1, ge=1, le=1000)
+
     @field_validator("name", "group")
     @classmethod
     def require_printable_text(cls, value: str) -> str:
@@ -180,6 +190,42 @@ async def add_agent_api_account(
         ) from exc
     except (ValueError, AgentApiUnsupportedProviderError) as exc:
         raise HTTPException(422, "invalid Agent API account") from exc
+    except AgentApiStorageError as exc:
+        raise HTTPException(500, "Agent API credential storage failed") from exc
+
+
+@router.post(
+    "/agent-api/accounts/platform-ref",
+    response_model=AccountResponse,
+    status_code=201,
+)
+async def add_platform_credential_account(
+    req: PlatformCredentialRequest,
+) -> AccountResponse:
+    """Project a platform credential into EA without accepting plaintext."""
+    manager = _mgr()
+    try:
+        native_account_ids = {account.id for account in await manager.account_store.list()}
+        bindings, leases = await asyncio.gather(
+            manager.binding_manager.list_bindings(),
+            manager.binding_manager.list_leases(active_only=False),
+        )
+        reserved_account_ids = native_account_ids | {b.account_id for b in bindings} | {l.account_id for l in leases}
+        account = await manager.agent_api_store.add_reference(
+            req.provider,
+            req.name,
+            req.credential_ref,
+            req.group,
+            excluded_ids=reserved_account_ids,
+        )
+        usage = await manager.agent_api_store.fetch_usage(account.id, force=True)
+        return _public_account(account, api_usage=usage)
+    except AgentApiUpstreamError as exc:
+        raise _safe_upstream_error(exc, provider=req.provider) from exc
+    except AgentApiDuplicateKeyError as exc:
+        raise HTTPException(409, "platform credential is already registered") from exc
+    except (ValueError, AgentApiUnsupportedProviderError) as exc:
+        raise HTTPException(422, "invalid platform credential reference") from exc
     except AgentApiStorageError as exc:
         raise HTTPException(500, "Agent API credential storage failed") from exc
 
