@@ -412,6 +412,14 @@ quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
 failures are treated as transient provider errors rather than proof that the
 individual key is exhausted.
 
+For Task Platform integrations, Apex credentials should be registered through
+`POST /api/agent-api/accounts/platform-ref` with an exact
+`task-platform/<workspace>/<owner>/apex/<uuid>` Secrets Manager ARN. EA stores
+the reference and model metadata only; it resolves the current key immediately
+before provider probes or Worker configuration and never writes a Manager-side
+`api.key` for that account. The Manager role must have `GetSecretValue` only on
+the platform credential namespace.
+
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent
 API accounts only with trusted Job code. Ordinary ephemeral Workers are
