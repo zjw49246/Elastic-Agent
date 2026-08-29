@@ -19,8 +19,8 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 62177,
-      "sha256": "sha256:3e3294ca920685ccef107d8463d3c8af02c1f8caa53156f5c04dd60cc59d74eb"
+      "size": 62720,
+      "sha256": "sha256:90727db5ce71e1141b7aafe8c0f864e759502ec5c9d102375924f88c975f296f"
     },
     {
       "path": "PROGRESS.md",
@@ -33,8 +33,8 @@
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 65859,
-      "sha256": "sha256:f3b9af6a65b2f417ce2e75938fd68e1c24991dafd81db8ba67016a8dd1a1ea53"
+      "size": 66348,
+      "sha256": "sha256:1e26f663977227a5cc8d167ba543c5cd105842ec8af290c5cdbfdd13fc0cb3a1"
     },
     {
       "path": "TEST.md",
@@ -54,8 +54,8 @@
       "path": "deploy/aws/elastic-agent-manager-policy.json",
       "type": "file",
       "mode": "0644",
-      "size": 11527,
-      "sha256": "sha256:af9ee6d71d2bd6119cb42703c851e2b064b5e0510ed62de11a7f7e6a69c1e5fd"
+      "size": 11630,
+      "sha256": "sha256:df9225062fa83a516255a62ad45e0cec149236d4f35d573f5e6369570a3baf2f"
     },
     {
       "path": "deploy/aws/elastic-agent-manager.aws.env",
@@ -411,8 +411,8 @@
       "path": "src/elastic_agent/api/routes/agent_api_accounts.py",
       "type": "file",
       "mode": "0644",
-      "size": 10986,
-      "sha256": "sha256:f477f3fe2d4dc2204b7a10daed50a8a147a922d261c24a937958af9cbb917142"
+      "size": 12906,
+      "sha256": "sha256:ac408ca53f5efd75d9f93b8a19bf5fc9d5b47616e4ed845bcb7b97672624c6e3"
     },
     {
       "path": "src/elastic_agent/api/routes/files.py",
@@ -691,8 +691,8 @@
       "path": "src/elastic_agent/core/agent_api.py",
       "type": "file",
       "mode": "0644",
-      "size": 69571,
-      "sha256": "sha256:9e7afe9d7363e16a434e3c4909cc5755e2ae5eb6c504a434b8f6d515c8cac48b"
+      "size": 75249,
+      "sha256": "sha256:f98da8f286f6e23052854c7ceeccc5bdb5f5d2788525b13fe07ed1aa21043c7f"
     },
     {
       "path": "src/elastic_agent/core/agent_type.py",
@@ -1454,8 +1454,8 @@
       "path": "tests/unit/test_agent_api_accounts.py",
       "type": "file",
       "mode": "0644",
-      "size": 48438,
-      "sha256": "sha256:e6cf5f10896440dc68578d2d81fd29c3b94d94cc0c27812eb335f46b1261a673"
+      "size": 50827,
+      "sha256": "sha256:04958d05534aa4ce60c3fc45842987e11c2fb5f095acedfb44d3999d57d8833c"
     },
     {
       "path": "tests/unit/test_agent_type.py",
