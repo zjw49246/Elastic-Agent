@@ -797,7 +797,7 @@ checkpoint 单向累计，最终造成“实际有空间、记账显示已满”
 **生产验证**：修复版 `feat/admin-account-auth-v2@5e56a5a` 于 2026-08-12 07:33 UTC 部署；
 Manager 健康检查通过，重启清除了旧进程内已泄漏的计数，部署后的初次复核未再出现该预算错误。
 
-## 2026-08-31 生产 500 并发容量（commit `ac067ca`）
+## 2026-08-31 生产 500 并发容量（commit `c3c91d6`）
 
 **问题**：平台层即使放开 Campaign 窗口，EA Manager 仍被 AWS provider 100 台的
 启动器校验上限、50 个 Manager-wide active Job 硬上限和 8 个 worker lifecycle 默认
