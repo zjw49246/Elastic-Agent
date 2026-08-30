@@ -279,7 +279,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         ssh_key_path=_absolute_path(source, "ELASTIC_AGENT_AWS_SSH_KEY_PATH"),
         worker_instance_profile=_required(source, "ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE"),
         expected_role_name=expected_role_name,
-        max_instances=_positive_int(source, "ELASTIC_AGENT_AWS_MAX_INSTANCES", maximum=100),
+        max_instances=_positive_int(source, "ELASTIC_AGENT_AWS_MAX_INSTANCES", maximum=500),
         state_dir=_absolute_path(source, "ELASTIC_AGENT_STATE_DIR"),
         manager_url=manager_url,
         public_origin=public_origin,

@@ -30,6 +30,7 @@ import enum
 import functools
 import hmac
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,25 @@ from elastic_agent.harness.base import Harness
 from elastic_agent.harness.generic import build_execute, resolve_harness
 
 logger = logging.getLogger(__name__)
+
+WORKER_LIFECYCLE_CONCURRENCY_MAX = 500
+
+
+def configured_worker_lifecycle_concurrency() -> int:
+    raw = os.environ.get("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "").strip()
+    if not raw:
+        return 8
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be an integer"
+        ) from exc
+    if not 1 <= value <= WORKER_LIFECYCLE_CONCURRENCY_MAX:
+        raise ValueError(
+            "ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be between 1 and 500"
+        )
+    return value
 
 PersistSpecHook = Callable[
     [str, JobSpec, str | None],
@@ -692,7 +712,7 @@ class BatchOrchestrator:
         # the former five-minute ceiling pre-empt its own 30-minute stages.
         final_collect_timeout: float = 7_200.0,
         cleanup_retry_seconds: float = 5.0,
-        worker_concurrency: int = 8,
+        worker_concurrency: int | None = None,
         persist_spec_hook: PersistSpecHook | None = None,
         job_state_hook: JobStateHook | None = None,
         interrupt_intent_hook: InterruptIntentHook | None = None,
@@ -720,6 +740,8 @@ class BatchOrchestrator:
             0.01,
             exit_archive_grace_seconds,
         )
+        if worker_concurrency is None:
+            worker_concurrency = configured_worker_lifecycle_concurrency()
         self._worker_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
         self._jobs: dict[str, BatchJob] = {}
         self._worker_index: dict[str, str] = {}  # worker_id -> job_id

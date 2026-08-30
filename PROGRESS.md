@@ -796,3 +796,17 @@ checkpoint 单向累计，最终造成“实际有空间、记账显示已满”
 
 **生产验证**：修复版 `feat/admin-account-auth-v2@5e56a5a` 于 2026-08-12 07:33 UTC 部署；
 Manager 健康检查通过，重启清除了旧进程内已泄漏的计数，部署后的初次复核未再出现该预算错误。
+
+## 2026-08-31 生产 500 并发容量（commit `ac067ca`）
+
+**问题**：平台层即使放开 Campaign 窗口，EA Manager 仍被 AWS provider 100 台的
+启动器校验上限、50 个 Manager-wide active Job 硬上限和 8 个 worker lifecycle 默认
+并发限制，生产配置更是只允许 30 台。
+
+**解决**：将 provider 和 Manager-wide active Job 的发布硬上限提到 500，增加
+`ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY` 的 1..500 fail-closed 配置，并把生产
+provider、Job Queue、batch worker 总数和 worker lifecycle 并发统一为 500。单个 JobBatch
+仍保留 100 项/10 active Job 的 schema/policy 边界，500 是跨 batch 的 Manager 容量。
+
+**验证**：JobBatch、AWS production launcher 和 BatchOrchestrator 定向测试 **220 passed**；
+Ruff 与 `git diff --check` 通过。

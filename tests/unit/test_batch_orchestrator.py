@@ -12,10 +12,23 @@ from elastic_agent.core.batch_orchestrator import (
     LoginOutcome,
     WorkerAssignment,
     WorkerPhase,
+    configured_worker_lifecycle_concurrency,
 )
 from elastic_agent.core.job_spec import JobSpec, RunSpec
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_worker_lifecycle_concurrency_accepts_500_and_rejects_501(monkeypatch):
+    monkeypatch.setenv("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "500")
+    assert configured_worker_lifecycle_concurrency() == 500
+
+    monkeypatch.setenv("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "501")
+    with pytest.raises(
+        ValueError,
+        match="ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be between 1 and 500",
+    ):
+        configured_worker_lifecycle_concurrency()
 
 
 class FakeDriver:

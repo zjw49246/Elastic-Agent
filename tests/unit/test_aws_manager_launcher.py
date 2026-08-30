@@ -165,14 +165,17 @@ def test_production_allowlist_covers_common_x86_worker_families():
     assert set(iam_types) == actual
 
 
-def test_production_job_batch_global_limit_is_50():
+def test_production_capacity_limits_are_500():
     settings = {
         line.partition("=")[0]: line.partition("=")[2]
         for line in AWS_ENV.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#") and "=" in line
     }
 
-    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "50"
+    assert settings["ELASTIC_AGENT_AWS_MAX_INSTANCES"] == "500"
+    assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "500"
+    assert settings["ELASTIC_AGENT_MAX_JOB_BATCH_TOTAL_WORKERS"] == "500"
+    assert settings["ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY"] == "500"
 
 
 def test_manager_policy_and_cutover_pin_real_key_pair_name():
@@ -346,6 +349,19 @@ def test_load_settings_and_build_config_are_fully_environment_driven(tmp_path):
     assert settings.results_s3_bucket == "elastic-agent-results-example"
     assert settings.results_s3_prefix == "jobs"
     assert settings.results_s3_interval == 60
+
+
+def test_load_settings_accepts_500_instances_and_rejects_501(tmp_path):
+    environment = _environment(tmp_path)
+    environment["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "500"
+    assert load_settings(environment).max_instances == 500
+
+    environment["ELASTIC_AGENT_AWS_MAX_INSTANCES"] = "501"
+    with pytest.raises(
+        LauncherConfigurationError,
+        match="ELASTIC_AGENT_AWS_MAX_INSTANCES must be between 1 and 500",
+    ):
+        load_settings(environment)
 
 
 def test_build_application_requires_enabled_admin_and_pins_public_origin(

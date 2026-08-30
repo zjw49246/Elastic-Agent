@@ -517,6 +517,10 @@ test networks only.
 - JobBatch backend (`tests/unit/test_job_batches.py`): strict schema and body
   limits, side-effect-free all-item preflight, durable acceptance/replay,
   per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
-  restart recovery, and Manager-wide concurrency bounds.
+  restart recovery, and the 500-Job Manager-wide concurrency bound.
+- Production capacity (`tests/unit/test_aws_manager_launcher.py` and
+  `tests/unit/test_batch_orchestrator.py`): the AWS provider, Job Queue, and
+  worker lifecycle settings accept 500 and reject values above the published
+  ceiling.
 - Import graph: `python scripts/build_ui_v2.py --check` validates that every
   ES-module import resolves inside `src/elastic_agent/api/ui_v2/`.

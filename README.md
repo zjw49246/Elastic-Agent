@@ -656,10 +656,12 @@ effect. Ordinary instance publication is fenced against live recovery, and a
 cloud create that times out or is cancelled after acceptance triggers a bounded
 controller/Job-tag scan so an instance that appears later is collected and
 terminated without waiting for a Manager restart. An EIP Job also reserves the whole fanout against provider
-`max_instances` before allocating any EIP. Schema limits are 100 workers, 32
+`max_instances` before allocating any EIP. Schema limits are 100 workers per
+Job, 500 provider instances and 500 Manager-wide active Jobs, 32
 accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for run timeout/Job TTL,
-and an 86,400-second collection interval; provider `max_instances` defaults to
-30. At terminal state, periodic collection stops and final collection is awaited
+and an 86,400-second collection interval. The production profile configures
+provider capacity, Manager-wide active Jobs, and worker lifecycle concurrency
+at 500. At terminal state, periodic collection stops and final collection is awaited
 for up to three attempts/7200 seconds before teardown. The longer bounded
 window permits a large rsync plus separate 30-minute immutable-checkpoint and
 public-result S3 stages. Collection failure marks the Job failed but does not
@@ -1011,6 +1013,9 @@ ELASTIC_AGENT_AWS_SSH_KEY_PATH
 ELASTIC_AGENT_AWS_WORKER_INSTANCE_PROFILE
 ELASTIC_AGENT_AWS_EXPECTED_ROLE_NAME
 ELASTIC_AGENT_AWS_MAX_INSTANCES
+ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS
+ELASTIC_AGENT_MAX_JOB_BATCH_TOTAL_WORKERS
+ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY
 ELASTIC_AGENT_STATE_DIR
 ELASTIC_AGENT_MANAGER_URL
 ELASTIC_AGENT_PUBLIC_ORIGIN
