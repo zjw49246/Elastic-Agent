@@ -832,3 +832,20 @@ BatchOrchestrator 和 JobBatch 定向套件 **427 passed**，Ruff 与 `git diff 
 macOS 全量套件得到 **2896 passed / 48 skipped**，其余失败由 Linux-only
 `/proc/self/fd`、macOS `/var` 软链接安全检查、未安装可选 `claude-pty` 以及本机
 localhost 代理造成；绕过代理和软链接后对应代表测试转绿，相关 427 项无回归。
+
+## 2026-09-01 单批调度上限与生产一致（commit `31a47c4`）
+
+**问题**：生产为了 500 并发曾把 JobBatch `policy.max_active_jobs` 从 10 热修到
+500，但该改动没有进入 Git；直接部署已推送源码会把生产回退到 10。旧控制台和 UI v2
+也仍会在浏览器端拒绝 11 以上的 manifest。
+
+**解决**：将后端逐批 policy 硬上限正式设为 500，并同步旧控制台、UI v2 的提示和
+校验；501 在服务端与两个浏览器入口继续 fail closed。manifest 本身仍受 100 Job schema
+上限，因此提高调度 policy 不扩大单份输入规模。
+
+**以后避免**：任何生产热修在下一次发布前都必须与 Git HEAD 做双向差异审计；发布不能
+只验证新修复存在，还要验证当前生产行为没有被源仓库回退。
+
+**验证**：后端和 UI v2 新测试在旧代码上均失败、修复后转绿；相关 Python 套件
+**507 passed**，UI v2 Node **27 passed**，Ruff（旧单文件 HTML 的既有 E501 除外）和
+`git diff --check` 通过。
