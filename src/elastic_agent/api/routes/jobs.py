@@ -115,8 +115,31 @@ RESULT_SCORE_ABS_MAX = 1_000_000_000_000
 JOB_LOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 JOB_LOG_LINE_MAX_BYTES = 64 * 1024
 JOB_JOURNAL_MAX_BYTES = 32 * 1024 * 1024
-JOB_HISTORY_WORKERS = 2
-JOB_LOG_READ_WORKERS = 4
+READ_WORKERS_MAX = 500
+
+
+def _configured_read_workers(name: str, *, default: int) -> int:
+    """Load a fail-fast read pool size without permitting unbounded threads."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 1 <= value <= READ_WORKERS_MAX:
+        raise ValueError(f"{name} must be between 1 and {READ_WORKERS_MAX}")
+    return value
+
+
+JOB_HISTORY_WORKERS = _configured_read_workers(
+    "ELASTIC_AGENT_JOB_HISTORY_WORKERS",
+    default=2,
+)
+JOB_LOG_READ_WORKERS = _configured_read_workers(
+    "ELASTIC_AGENT_JOB_LOG_READ_WORKERS",
+    default=4,
+)
 JOB_LIST_HISTORY_MAX_SCANNED_ENTRIES = 10_000
 JOB_LIST_HISTORY_MAX_NAME_BYTES = 2 * 1024 * 1024
 JOB_LIST_HISTORY_MAX_CANDIDATES = 1_000
@@ -138,7 +161,10 @@ JOB_CONFIG_NO_STORE_HEADERS = {
 }
 RESULT_ARCHIVE_STREAM_WORKERS = 4
 RESULT_ARCHIVE_BUILD_WORKERS = 2
-RESULT_READ_WORKERS = 4
+RESULT_READ_WORKERS = _configured_read_workers(
+    "ELASTIC_AGENT_RESULT_READ_WORKERS",
+    default=4,
+)
 RESULT_SUMMARY_MAX_JOBS = 1_000
 RESULT_SUMMARY_MAX_OBJECTS = 100_000
 RESULT_SUMMARY_MAX_METADATA_BYTES = 16 * 1024 * 1024

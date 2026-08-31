@@ -23,6 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 from elastic_agent.api.app import create_app
 from elastic_agent.api.auth import reset_api_keys
+from elastic_agent.api.routes import jobs as jobs_routes
 from elastic_agent.core.account_binding import AccountBinding, BindingState
 from elastic_agent.core.config import ElasticAgentConfig
 from elastic_agent.core.credential_pool import AccountDefinition
@@ -30,6 +31,33 @@ from elastic_agent.core.providers.base import CloudProvider, Instance, InstanceC
 from elastic_agent.manager.manager import ElasticAgentManager
 
 API_KEY = "test-api-key-batch"
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("ELASTIC_AGENT_JOB_HISTORY_WORKERS", 2),
+        ("ELASTIC_AGENT_JOB_LOG_READ_WORKERS", 4),
+        ("ELASTIC_AGENT_RESULT_READ_WORKERS", 4),
+    ],
+)
+def test_configured_read_workers_defaults_and_accepts_500(
+    monkeypatch, name, default,
+):
+    monkeypatch.delenv(name, raising=False)
+    assert jobs_routes._configured_read_workers(name, default=default) == default
+
+    monkeypatch.setenv(name, "500")
+    assert jobs_routes._configured_read_workers(name, default=default) == 500
+
+
+@pytest.mark.parametrize("value", ["0", "501", "not-an-integer"])
+def test_configured_read_workers_rejects_invalid_values(monkeypatch, value):
+    name = "ELASTIC_AGENT_RESULT_READ_WORKERS"
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        jobs_routes._configured_read_workers(name, default=4)
 
 
 class InMemoryProvider(CloudProvider):

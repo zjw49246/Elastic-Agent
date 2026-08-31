@@ -176,6 +176,9 @@ def test_production_capacity_limits_are_500():
     assert settings["ELASTIC_AGENT_JOB_BATCH_MAX_ACTIVE_JOBS"] == "500"
     assert settings["ELASTIC_AGENT_MAX_JOB_BATCH_TOTAL_WORKERS"] == "500"
     assert settings["ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY"] == "500"
+    assert settings["ELASTIC_AGENT_JOB_HISTORY_WORKERS"] == "500"
+    assert settings["ELASTIC_AGENT_JOB_LOG_READ_WORKERS"] == "500"
+    assert settings["ELASTIC_AGENT_RESULT_READ_WORKERS"] == "500"
 
 
 def test_manager_policy_and_cutover_pin_real_key_pair_name():

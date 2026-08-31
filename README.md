@@ -660,8 +660,13 @@ terminated without waiting for a Manager restart. An EIP Job also reserves the w
 Job, 500 provider instances and 500 Manager-wide active Jobs, 32
 accounts per unbound worker, 100 rotations, 2048 GiB disk, a 30-day maximum for run timeout/Job TTL,
 and an 86,400-second collection interval. The production profile configures
-provider capacity, Manager-wide active Jobs, and worker lifecycle concurrency
-at 500. At terminal state, periodic collection stops and final collection is awaited
+provider capacity, Manager-wide active Jobs, worker lifecycle concurrency, and
+the dedicated Job-history, Job-log, and result-read pools at 500. The read
+pool variables are `ELASTIC_AGENT_JOB_HISTORY_WORKERS`,
+`ELASTIC_AGENT_JOB_LOG_READ_WORKERS`, and
+`ELASTIC_AGENT_RESULT_READ_WORKERS`; each accepts `1..500`, while omitted
+values retain the conservative `2/4/4` defaults. At terminal state, periodic
+collection stops and final collection is awaited
 for up to three attempts/7200 seconds before teardown. The longer bounded
 window permits a large rsync plus separate 30-minute immutable-checkpoint and
 public-result S3 stages. Collection failure marks the Job failed but does not

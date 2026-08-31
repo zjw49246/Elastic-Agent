@@ -519,8 +519,9 @@ test networks only.
   per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
   restart recovery, and the 500-Job Manager-wide concurrency bound.
 - Production capacity (`tests/unit/test_aws_manager_launcher.py` and
-  `tests/unit/test_batch_orchestrator.py`): the AWS provider, Job Queue, and
-  worker lifecycle settings accept 500 and reject values above the published
-  ceiling.
+  `tests/unit/test_batch_orchestrator.py`): the AWS provider, Job Queue, worker
+  lifecycle, and dedicated Job-history/Job-log/result-read settings accept 500
+  and reject values above the published ceiling; route tests also preserve the
+  conservative `2/4/4` read defaults when those variables are omitted.
 - Import graph: `python scripts/build_ui_v2.py --check` validates that every
   ES-module import resolves inside `src/elastic_agent/api/ui_v2/`.
