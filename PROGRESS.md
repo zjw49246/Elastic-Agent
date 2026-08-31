@@ -810,3 +810,25 @@ provider、Job Queue、batch worker 总数和 worker lifecycle 并发统一为 5
 
 **验证**：JobBatch、AWS production launcher 和 BatchOrchestrator 定向测试 **220 passed**；
 Ruff 与 `git diff --check` 通过。
+
+## 2026-09-01 生产读取容量同步到 500（commit `e342864`）
+
+**问题**：生产虽然已运行 500 台 Worker，但 Job history、Job log 和 result detail
+仍分别固定为 2/4/4 个专用读取线程。fail-fast admission 在小池满载时大量返回 503，
+拖慢平台 reconciler 的状态观察、结果摄取和终态清理。
+
+**解决**：三个专用池改为分别读取
+`ELASTIC_AGENT_JOB_HISTORY_WORKERS`、`ELASTIC_AGENT_JOB_LOG_READ_WORKERS` 和
+`ELASTIC_AGENT_RESULT_READ_WORKERS`，全部严格限制在 `1..500`，未配置时保留
+2/4/4 的保守默认值；生产模板把三个值都设为 500，executor 与 admission 使用同一
+解析结果，避免容量漂移。
+
+**以后避免**：扩展执行面并发时必须同时审计写入、生命周期和读取面的所有独立
+admission/executor，不能只看 EC2 实例数和 Job Queue。生产容量值必须由版本化模板和
+测试共同固定。
+
+**验证**：先新增 6 个失败测试复现不可配置与越界问题；修复后 API、AWS launcher、
+BatchOrchestrator 和 JobBatch 定向套件 **427 passed**，Ruff 与 `git diff --check` 通过。
+macOS 全量套件得到 **2896 passed / 48 skipped**，其余失败由 Linux-only
+`/proc/self/fd`、macOS `/var` 软链接安全检查、未安装可选 `claude-pty` 以及本机
+localhost 代理造成；绕过代理和软链接后对应代表测试转绿，相关 427 项无回归。
