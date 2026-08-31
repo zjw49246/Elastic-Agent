@@ -1,5 +1,28 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-09-01 500 并发结果收集竞态（commit `5f7bae9`）
+
+**问题**：500 并发 Campaign 的 Manager relay 在 rsync 写入私有 staging
+期间每 250ms 扫描配额。rsync 对临时文件的 rename/unlink 会让
+`scandir` 返回的条目在 no-follow `stat` 前消失，旧实现将正常
+`ENOENT` 当成 final collect 失败。同时周期 S3 全树扫描仅有 240 秒
+时限，在数千个历史 Job 下反复超时，无法完成新结果上传。
+
+**解决**：实时 staging 扫描只容忍目录或条目已消失的
+`FileNotFoundError`，保留保守对象计数；权限、symlink、类型、单文件、
+总字节、inode 和磁盘余量错误仍 fail closed，rsync 结束后仍必须
+对静止树完整复扫才能发布。周期 S3 操作时限与 final collect 对齐
+为 1800 秒，取消仍由 `cancel_event` 立即收敛。
+
+**避免复发**：对活动文件树做安全扫描时，必须区分“对象已不存在”
+和“无法证明对象安全”；只有前者可在最终静止复扫存在时容忍。
+并发提升时还要同步审计全局遍历时限，不能只提升 Worker 数。
+
+**验证**：两个回归测试先分别复现 `ENOENT` 致命失败和 240 秒时限，
+修复后收集/上传相关套件 `98 passed / 3 deselected`；3 项是 macOS 无
+`/proc` 的既有 Linux-only 测试，基线同样失败。Fatal Ruff 与
+`git diff --check` 通过。
+
 ## 2026-08-07 ApexRouter 不限额窗口准入（commits `8bbd2df`, `017149e`）
 
 **问题**：ApexRouter 用固定窗口的 `remaining=null`、`limit=null` 表示该共享窗口

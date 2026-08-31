@@ -161,6 +161,10 @@ The focused suite covers:
   intervals, awaited Manager-side upload, explicit S3 failures, and
   force-termination plus Node-record removal (not registry-only draining) after
   ordinary Job completion;
+- live rsync staging scans tolerate only entries that vanish between
+  `scandir` and no-follow `stat`, while settled-tree object/byte/type limits
+  remain mandatory; the periodic S3 uploader also retains a bounded 1800-second
+  default deadline for large 500-concurrency result trees;
 - immutable checkpoint recovery: stable shard-index contracts, per-file
   snapshot race detection, content-addressed blob deduplication, atomic shard
   manifests and all-shard Job sets, incomplete-generation rejection,
