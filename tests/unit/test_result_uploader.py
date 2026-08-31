@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -441,6 +442,32 @@ def test_skips_job_tree_whose_root_is_a_symlink(tmp_path):
     up = S3ResultUploader("bucket", str(root), client=FakeS3())
     assert up.sync_job("j") == 0
     assert up._client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_periodic_default_deadline_covers_large_production_tree(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "collected"
+    root.mkdir()
+    uploader = S3ResultUploader("bucket", str(root), client=FakeS3())
+    observed = threading.Event()
+    remaining: list[float] = []
+
+    def sync_once(*, deadline_monotonic, cancel_event):
+        assert cancel_event is not None
+        remaining.append(deadline_monotonic - time.monotonic())
+        observed.set()
+        return 0
+
+    monkeypatch.setattr(uploader, "sync_once", sync_once)
+    periodic = asyncio.create_task(uploader.run_periodic(interval=3600))
+    assert await asyncio.to_thread(observed.wait, 2)
+    periodic.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await periodic
+
+    assert remaining[0] >= 1_799
 
 
 @pytest.mark.asyncio

@@ -662,7 +662,7 @@ class S3ResultUploader:
     async def run_periodic(
         self,
         interval: float = 300.0,
-        operation_timeout: float = 240.0,
+        operation_timeout: float = 1_800.0,
     ) -> None:
         while True:
             try:

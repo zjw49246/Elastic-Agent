@@ -382,6 +382,48 @@ async def test_collection_tree_enforces_object_file_and_byte_limits(
         )
 
 
+async def test_collection_tree_tolerates_entry_vanishing_during_rsync(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "relay"
+    root.mkdir()
+
+    class VanishedEntry:
+        path = str(root / ".payload.bin.partial")
+
+        @staticmethod
+        def stat(*, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError(VanishedEntry.path)
+
+    class VanishedScan:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return iter((VanishedEntry(),))
+
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.os.scandir",
+        lambda _path: VanishedScan(),
+    )
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=2 * 1024 * 1024 * 1024),
+    )
+    monkeypatch.setattr(
+        "elastic_agent.core.manager_fleet_driver.os.statvfs",
+        lambda _path: SimpleNamespace(f_favail=20_000),
+    )
+
+    assert ManagerFleetDriver._validate_collection_tree(
+        root, max_bytes=10, max_objects=10, max_file_bytes=10,
+    ) == (0, 1)
+
+
 async def test_remote_inventory_rejects_before_manager_rsync(
     tmp_path, monkeypatch,
 ):

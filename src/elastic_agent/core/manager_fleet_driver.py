@@ -1844,6 +1844,13 @@ class ManagerFleetDriver:
             directory = pending.pop()
             try:
                 entries = os.scandir(directory)
+            except FileNotFoundError:
+                # rsync publishes and removes temporary paths while the live
+                # budget monitor walks its private staging attempt.  A path
+                # that no longer exists cannot consume the final snapshot's
+                # object/byte budget; the mandatory post-rsync scan validates
+                # the settled tree before it is published.
+                continue
             except OSError as exc:
                 raise RuntimeError(
                     "cannot inspect Manager collection staging tree"
@@ -1857,6 +1864,12 @@ class ManagerFleetDriver:
                         )
                     try:
                         entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        # The entry was returned by scandir but rsync renamed
+                        # or removed it before lstat.  Keep the conservative
+                        # object count and continue; all non-ENOENT failures
+                        # still fail closed.
+                        continue
                     except OSError as exc:
                         raise RuntimeError(
                             "cannot inspect Manager collection staging entry"
