@@ -590,6 +590,31 @@ class ManagerFleetDriver:
     async def release_capacity(self, reservation_id: str) -> None:
         await self._mgr.release_instance_capacity(reservation_id)
 
+    async def launch_admission_ready(self, spec: JobSpec) -> bool:
+        """Keep credential-bearing launches behind startup recovery.
+
+        Agent API credentials are intentionally unavailable until the Manager
+        proves that workers from its previous process no longer own delegated
+        access.  Apply that same fence before ``scale_out`` so a queued Job does
+        not create a billable worker that is guaranteed to fail at login and
+        add another instance to the recovery set.
+        """
+
+        if getattr(self._mgr, "binding_recovery_ready", True):
+            return True
+        account = spec.account
+        if account.mode == "none":
+            return True
+        if account.binding == "eip" or account.auth_kind == "agent_api":
+            return False
+        if account.auth_kind == "oauth" or not account.ids:
+            return True
+        store = getattr(self._mgr, "agent_api_store", None)
+        if store is None:
+            return True
+        api_ids = {candidate.id for candidate in await store.list()}
+        return not any(account_id in api_ids for account_id in account.ids)
+
     async def scale_out(self, count: int, name_prefix: str = "",
                         instance_type: str = "", region: str = "",
                         disk_gb: int = 0, spot: bool = False,

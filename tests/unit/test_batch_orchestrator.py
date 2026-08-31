@@ -348,6 +348,58 @@ class TestSubmit:
 
 
 class TestLaunch:
+    async def test_launch_admission_waits_before_scale_out(self, monkeypatch):
+        from elastic_agent.core import batch_orchestrator as module
+
+        monkeypatch.setattr(module, "LAUNCH_ADMISSION_POLL_SECONDS", 0.01)
+
+        class GatedDriver(FakeDriver):
+            launch_ready = False
+
+            async def launch_admission_ready(self, spec):
+                return self.launch_ready
+
+        driver = GatedDriver(workers=1)
+        orchestrator = BatchOrchestrator(driver)
+        job = await orchestrator.submit(_spec(
+            fanout={"workers": 1},
+            account={"agent_type": "codex", "auth_kind": "agent_api"},
+        ))
+
+        await asyncio.sleep(0.03)
+        assert job.runs == {}
+        assert not any(event[0] == "scale" for event in driver.events)
+
+        driver.launch_ready = True
+        for _ in range(100):
+            if any(event[0] == "scale" for event in driver.events):
+                break
+            await asyncio.sleep(0.01)
+        assert any(event[0] == "scale" for event in driver.events)
+
+    async def test_cancel_settles_while_launch_admission_is_closed(
+        self, monkeypatch,
+    ):
+        from elastic_agent.core import batch_orchestrator as module
+
+        monkeypatch.setattr(module, "LAUNCH_ADMISSION_POLL_SECONDS", 0.01)
+
+        class GatedDriver(FakeDriver):
+            async def launch_admission_ready(self, spec):
+                return False
+
+        driver = GatedDriver(workers=1)
+        orchestrator = BatchOrchestrator(driver)
+        job = await orchestrator.submit(_spec(
+            fanout={"workers": 1},
+            account={"agent_type": "codex", "auth_kind": "agent_api"},
+        ))
+        await asyncio.sleep(0.02)
+
+        assert await orchestrator.cancel_job(job.job_id) is True
+        assert not any(event[0] == "scale" for event in driver.events)
+        assert job.summary()["done"] is True
+
     async def test_dispatch_captures_rendered_prompt_metadata(self):
         d = FakeDriver(workers=1)
         orch = BatchOrchestrator(d)

@@ -46,6 +46,7 @@ from elastic_agent.harness.generic import build_execute, resolve_harness
 logger = logging.getLogger(__name__)
 
 WORKER_LIFECYCLE_CONCURRENCY_MAX = 500
+LAUNCH_ADMISSION_POLL_SECONDS = 1.0
 
 
 def configured_worker_lifecycle_concurrency() -> int:
@@ -1484,6 +1485,8 @@ class BatchOrchestrator:
                         job.stop_reason
                         or "job stopped after recovery staging"
                     )
+            if not await self._wait_for_launch_admission(job):
+                return
             # ``prepared`` deliberately includes recovery staging: staging is
             # pre-account and pre-cloud, and is safe to rebuild after a crash.
             # Cross the durable launch gate only after it completes and
@@ -1523,6 +1526,31 @@ class BatchOrchestrator:
             # this launch-finally collect/terminate before that sequence runs.
             if not job.stop_requested:
                 await self._maybe_finish(job)
+
+    async def _wait_for_launch_admission(self, job: BatchJob) -> bool:
+        """Wait before the first account reservation or cloud side effect.
+
+        A concrete fleet driver may temporarily close launch admission while
+        recovering resources from an earlier Manager process.  Keeping the Job
+        in its durable ``prepared`` phase prevents a strict Agent API Job from
+        creating a worker that can only fail later at account login, which
+        would otherwise extend the same recovery backlog indefinitely.
+        """
+
+        probe = getattr(self._driver, "launch_admission_ready", None)
+        if not callable(probe):
+            return True
+        while not self._shutting_down and not job.stop_requested:
+            if await probe(job.spec):
+                return True
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=LAUNCH_ADMISSION_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+        return False
 
     async def _bring_up_unbound_all(self, job: BatchJob) -> None:
         """Original fleet path, kept unchanged for ``account.binding=none``."""

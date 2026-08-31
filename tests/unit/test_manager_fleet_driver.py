@@ -194,6 +194,44 @@ def _checkpoint_spec(tmp_path):
     })
 
 
+async def test_launch_admission_blocks_strict_agent_api_during_recovery(
+    tmp_path,
+):
+    manager = FakeManager(tmp_path)
+    manager.binding_recovery_ready = False
+    driver = ManagerFleetDriver(manager)
+
+    assert await driver.launch_admission_ready(JobSpec.model_validate({
+        "name": "strict-agent-api",
+        "run": {"command": "true"},
+        "account": {
+            "agent_type": "codex",
+            "auth_kind": "agent_api",
+            "ids": ["apex-2"],
+        },
+    })) is False
+
+
+async def test_launch_admission_preserves_oauth_and_unmanaged_jobs(tmp_path):
+    manager = FakeManager(tmp_path)
+    manager.binding_recovery_ready = False
+    driver = ManagerFleetDriver(manager)
+
+    oauth = JobSpec.model_validate({
+        "name": "oauth",
+        "run": {"command": "true"},
+        "account": {"auth_kind": "oauth"},
+    })
+    unmanaged = JobSpec.model_validate({
+        "name": "unmanaged",
+        "run": {"command": "true"},
+        "account": {"mode": "none"},
+    })
+
+    assert await driver.launch_admission_ready(oauth) is True
+    assert await driver.launch_admission_ready(unmanaged) is True
+
+
 class FakeCheckpointStore:
     def __init__(self):
         self.restores = []
