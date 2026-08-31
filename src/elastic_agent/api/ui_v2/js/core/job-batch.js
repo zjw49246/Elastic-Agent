@@ -116,8 +116,8 @@ export function validateBatchManifest(manifest) {
         }
       }
       const active = manifest.policy.max_active_jobs;
-      if (active !== undefined && (!Number.isInteger(active) || active < 1 || active > 10)) {
-        errors.push('policy.max_active_jobs 必须是 1–10 的整数。');
+      if (active !== undefined && (!Number.isInteger(active) || active < 1 || active > 500)) {
+        errors.push('policy.max_active_jobs 必须是 1–500 的整数。');
       }
       const failure = manifest.policy.on_job_failure;
       if (failure !== undefined && failure !== 'continue') {

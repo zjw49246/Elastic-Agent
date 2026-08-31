@@ -104,6 +104,15 @@ class TestDashboardEndpoint:
         assert "Submit Job" in resp.text
 
     @pytest.mark.asyncio
+    async def test_legacy_batch_console_uses_500_job_policy_limit(self, ui_client):
+        client, _ = ui_client
+        html = (await client.get("/batch")).text
+
+        assert "max_active_jobs</code>（1–500）" in html
+        assert "manifest.policy.max_active_jobs > 500" in html
+        assert "policy.max_active_jobs 必须是 1–500 的整数" in html
+
+    @pytest.mark.asyncio
     async def test_login_page_uses_account_credentials_without_defaults(
         self, anonymous_ui_client
     ):

@@ -1038,6 +1038,12 @@ ELASTIC_AGENT_MAX_CONCURRENT_REQUEST_BODIES
 ELASTIC_AGENT_MAX_AGGREGATE_REQUEST_BODY_BYTES
 ```
 
+JobBatch `policy.max_active_jobs` accepts `1..500`, matching the published
+Manager-wide ceiling; the manifest still contains at most 100 Jobs. The three
+dedicated read pools use `ELASTIC_AGENT_JOB_HISTORY_WORKERS`,
+`ELASTIC_AGENT_JOB_LOG_READ_WORKERS`, and
+`ELASTIC_AGENT_RESULT_READ_WORKERS`, each bounded to `1..500`.
+
 Keep secrets such as `ELASTIC_AGENT_EXTERNAL_API_KEYS` in
 `/etc/elastic-agent-manager.env`; keep the non-secret AWS deployment settings in
 the separately managed `/etc/elastic-agent-manager.aws.env` (the checked-in

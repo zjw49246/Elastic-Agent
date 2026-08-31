@@ -26,6 +26,17 @@ test('strict parser accepts a valid manifest and rejects null', () => {
   assert.throws(() => parseBatchSource('null'), /顶层必须是 object/);
 });
 
+test('strict parser accepts 500 active jobs and rejects 501', () => {
+  const atLimit = manifest({
+    policy: { max_active_jobs: 500, on_job_failure: 'continue' },
+  });
+  assert.equal(parseBatchSource(JSON.stringify(atLimit)).policy.max_active_jobs, 500);
+  const aboveLimit = manifest({
+    policy: { max_active_jobs: 501, on_job_failure: 'continue' },
+  });
+  assert.throws(() => parseBatchSource(JSON.stringify(aboveLimit)), /1–500/);
+});
+
 test('strict parser rejects semantic duplicate keys before transport', () => {
   const source = '{"schema_version":1,"batch_id":"batch-contract",'
     + '"jobs":[{"client_id":"item-1","spec":{"run":{"command":"true"}}}],'

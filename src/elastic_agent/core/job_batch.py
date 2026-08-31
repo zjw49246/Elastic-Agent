@@ -38,9 +38,10 @@ JOB_BATCH_SCHEMA_VERSION = 1
 JOB_BATCH_JOURNAL_SCHEMA_VERSION = 1
 JOB_BATCH_MAX_BODY_BYTES = 2 * 1024 * 1024
 JOB_BATCH_ABSOLUTE_MAX_ITEMS = 100
-# A single manifest stays deliberately small.  The Manager-wide scheduler may
-# admit several independent manifests up to a separate deployment ceiling.
-JOB_BATCH_POLICY_MAX_ACTIVE_JOBS = 10
+# A manifest remains bounded by its 100-item schema limit.  Production may
+# submit several manifests concurrently, so both per-manifest and Manager-wide
+# scheduling ceilings use the same published upper bound.
+JOB_BATCH_POLICY_MAX_ACTIVE_JOBS = 500
 JOB_BATCH_GLOBAL_MAX_ACTIVE_JOBS = 500
 JOB_BATCH_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
 JOB_BATCH_LIST_DEFAULT_LIMIT = 200

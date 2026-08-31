@@ -517,7 +517,8 @@ test networks only.
 - JobBatch backend (`tests/unit/test_job_batches.py`): strict schema and body
   limits, side-effect-free all-item preflight, durable acceptance/replay,
   per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
-  restart recovery, and the 500-Job Manager-wide concurrency bound.
+  restart recovery, and the 500-Job per-manifest/Manager-wide concurrency
+  bounds. UI v2 parser tests enforce the same `1..500` policy range.
 - Production capacity (`tests/unit/test_aws_manager_launcher.py` and
   `tests/unit/test_batch_orchestrator.py`): the AWS provider, Job Queue, worker
   lifecycle, and dedicated Job-history/Job-log/result-read settings accept 500

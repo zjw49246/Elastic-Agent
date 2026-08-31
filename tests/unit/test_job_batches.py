@@ -273,7 +273,7 @@ async def batch_client(
 
 
 class TestJobBatchValidationAndPlan:
-    def test_global_limit_accepts_500_without_expanding_manifest_policy(
+    def test_global_and_manifest_policy_limits_accept_500(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -281,11 +281,11 @@ class TestJobBatchValidationAndPlan:
         limits = JobBatchLimits()
         assert limits.global_max_active_jobs == 500
         JobBatchManifest.model_validate(
-            _manifest(_spec("policy-ten"), max_active_jobs=10)
+            _manifest(_spec("policy-five-hundred"), max_active_jobs=500)
         )
         with pytest.raises(ValueError, match="max_active_jobs"):
             JobBatchManifest.model_validate(
-                _manifest(_spec("policy-eleven"), max_active_jobs=11)
+                _manifest(_spec("policy-five-oh-one"), max_active_jobs=501)
             )
 
     def test_global_limit_rejects_values_above_500(

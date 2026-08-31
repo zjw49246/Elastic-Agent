@@ -1326,7 +1326,7 @@ export PATH="$HOME/.local/bin:$PATH" && uv python pin 3.13 && uv sync --python 3
     <div class="field-help" id="batchJsonFormatHint">
       严格格式：<code>schema_version: 1</code>、<code>batch_id</code>、可选
       <code>policy</code>，以及 <code>jobs: [{client_id, spec}]</code>。v1 policy 只支持
-      <code>max_active_jobs</code>（1–10）和 <code>on_job_failure: "continue"</code>。
+      <code>max_active_jobs</code>（1–500）和 <code>on_job_failure: "continue"</code>。
       <code>batch_id</code> 是显示标识，<code>client_id</code> 只需在单个批次内唯一；
       每次明确提交会创建新的运行身份，网络中断重试才复用同一个幂等键。
     </div>
@@ -1920,8 +1920,8 @@ function validateBatchManifest(manifest) {
       if (Object.prototype.hasOwnProperty.call(manifest.policy, 'max_active_jobs')
           && (!Number.isInteger(manifest.policy.max_active_jobs)
               || manifest.policy.max_active_jobs < 1
-              || manifest.policy.max_active_jobs > 10)) {
-        validation.errors.push('policy.max_active_jobs 必须是 1–10 的整数。');
+              || manifest.policy.max_active_jobs > 500)) {
+        validation.errors.push('policy.max_active_jobs 必须是 1–500 的整数。');
       }
       if (Object.prototype.hasOwnProperty.call(manifest.policy, 'on_job_failure')
           && manifest.policy.on_job_failure !== 'continue') {
