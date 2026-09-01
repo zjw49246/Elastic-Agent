@@ -3078,9 +3078,60 @@ class TestProvisionHook:
         )
 
         assert await hook("w1", None, spec) is True
+        prepare = next(
+            command for command in commands
+            if command.startswith("if test -e ")
+        )
         copy = next(command for command in commands if "aws s3 cp" in command)
-        assert "mkdir -p '/srv/replay/shard data'" in copy
+        assert "'/srv/replay/shard data'" in prepare
+        assert "sudo -n install -d" in prepare
+        assert "mkdir -p" not in copy
         assert "$(dirname " not in copy
+
+    async def test_s3_dataset_unwritable_destination_fails_before_download(
+        self, tmp_path, monkeypatch,
+    ):
+        import elastic_agent.core.bootstrap as bootstrap_mod
+        from elastic_agent.core.job_spec import JobSpec, RunSpec
+
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []), connected=True)
+        commands = []
+
+        class FakeSSHExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute(self, command, timeout=None, **kwargs):
+                if "ea-task-supervisor.service" in command:
+                    return 0, "", ""
+                commands.append(command)
+                if command.startswith("if test -e "):
+                    return 1, "", "destination is not writable"
+                return 0, "", ""
+
+        monkeypatch.setattr(bootstrap_mod, "SSHExecutor", FakeSSHExecutor)
+
+        async def runner(*args):
+            return True
+
+        spec = JobSpec(
+            name="j",
+            run=RunSpec(command="bench"),
+            account={"mode": "none"},
+            setup={
+                "s3_datasets": [{
+                    "uri": "s3://private-data/package.tar.gz",
+                    "dest": "/opt/elastic-agent/task-package/package.tar.gz",
+                }],
+            },
+        )
+        hook = make_provision_hook(
+            mgr, bootstrap_runner=runner, ws_wait_timeout=1,
+        )
+
+        assert await hook("w1", None, spec) is False
+        assert any("/opt/elastic-agent/task-package" in cmd for cmd in commands)
+        assert not any("aws s3 cp" in cmd for cmd in commands)
 
     async def test_bootstrap_failure(self, tmp_path):
         from elastic_agent.core.job_spec import JobSpec, RunSpec

@@ -1584,17 +1584,47 @@ def make_provision_hook(
                 return False
             for ds in rendered_datasets:
                 uri = ds.uri.strip()
+                destination_dir = (
+                    ds.dest
+                    if uri.endswith("/")
+                    else str(PurePosixPath(ds.dest).parent)
+                )
+                quoted_destination_dir = _shell_quote(destination_dir)
+                prepare_cmd = (
+                    f"if test -e {quoted_destination_dir}; then "
+                    f"test -d {quoted_destination_dir} && "
+                    f"test -w {quoted_destination_dir}; "
+                    "else sudo -n install -d -o \"$(id -u)\" "
+                    f"-g \"$(id -g)\" -m 0750 {quoted_destination_dir}; fi"
+                )
+                rc, _o, _e = await ex.execute(prepare_cmd, timeout=30)
+                if rc != 0:
+                    logger.error(
+                        "s3 dataset destination is not writable on %s: %s (%s)",
+                        worker_id,
+                        destination_dir,
+                        _e[-1000:],
+                    )
+                    return False
                 # trailing '/' → prefix (recursive sync); otherwise a single object.
                 if uri.endswith("/"):
-                    cmd = (f"mkdir -p {_shell_quote(ds.dest)} && "
-                           f"aws s3 sync {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
+                    cmd = (
+                        f"aws s3 sync {_shell_quote(uri)} "
+                        f"{_shell_quote(ds.dest)} --no-progress"
+                    )
                 else:
-                    parent = str(PurePosixPath(ds.dest).parent)
-                    cmd = (f"mkdir -p {_shell_quote(parent)} && "
-                           f"aws s3 cp {_shell_quote(uri)} {_shell_quote(ds.dest)} --no-progress")
+                    cmd = (
+                        f"aws s3 cp {_shell_quote(uri)} "
+                        f"{_shell_quote(ds.dest)} --no-progress"
+                    )
                 rc, _o, _e = await ex.execute(cmd, timeout=3600)
                 if rc != 0:
-                    logger.error("s3 dataset pull failed on %s: %s (%s)", worker_id, uri, _e[:200])
+                    logger.error(
+                        "s3 dataset pull failed on %s: %s (%s)",
+                        worker_id,
+                        uri,
+                        _e[-1000:],
+                    )
                     return False
 
         return await _wait_ws_connected(manager, worker_id, ws_wait_timeout)
