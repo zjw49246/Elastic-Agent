@@ -1943,6 +1943,88 @@ class TestJobsAPI:
         assert manager.batch.started == [first.json()["job_id"]]
 
     @pytest.mark.asyncio
+    async def test_distinct_idempotent_submissions_preflight_concurrently(
+        self, client, monkeypatch,
+    ):
+        original_preflight = jobs_routes._preflight_job
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+        entered = 0
+
+        async def blocking_preflight(manager, spec):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await release.wait()
+            return await original_preflight(manager, spec)
+
+        monkeypatch.setattr(
+            jobs_routes, "_preflight_job", blocking_preflight,
+        )
+        first = asyncio.create_task(client.post(
+            "/api/jobs",
+            json={**self._SPEC, "name": "parallel-submit-a"},
+            headers={"Idempotency-Key": "parallel-submit-a"},
+        ))
+        second = asyncio.create_task(client.post(
+            "/api/jobs",
+            json={**self._SPEC, "name": "parallel-submit-b"},
+            headers={"Idempotency-Key": "parallel-submit-b"},
+        ))
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+        finally:
+            release.set()
+        responses = await asyncio.gather(first, second)
+
+        assert entered == 2
+        assert [response.status_code for response in responses] == [201, 201]
+        assert jobs_routes._submit_identity_locks == {}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_idempotency_key_launches_once(
+        self, client, manager, monkeypatch,
+    ):
+        original_preflight = jobs_routes._preflight_job
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+        entered = 0
+
+        async def blocking_preflight(manager, spec):
+            nonlocal entered
+            entered += 1
+            first_entered.set()
+            await release.wait()
+            return await original_preflight(manager, spec)
+
+        monkeypatch.setattr(
+            jobs_routes, "_preflight_job", blocking_preflight,
+        )
+        headers = {"Idempotency-Key": "simultaneous-submit"}
+        first = asyncio.create_task(
+            client.post("/api/jobs", json=self._SPEC, headers=headers)
+        )
+        await first_entered.wait()
+        second = asyncio.create_task(
+            client.post("/api/jobs", json=self._SPEC, headers=headers)
+        )
+        await asyncio.sleep(0)
+        assert entered == 1
+        release.set()
+        responses = await asyncio.gather(first, second)
+
+        assert entered == 1
+        assert [response.status_code for response in responses] == [201, 201]
+        assert responses[0].json()["job_id"] == responses[1].json()["job_id"]
+        assert sum(
+            response.json().get("idempotent_replay") is True
+            for response in responses
+        ) == 1
+        assert manager.batch.started == [responses[0].json()["job_id"]]
+        assert jobs_routes._submit_identity_locks == {}
+
+    @pytest.mark.asyncio
     async def test_new_fingerprint_replay_preserves_current_semantic_defaults(
         self, client, manager,
     ):

@@ -28,6 +28,7 @@ import time
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -71,7 +72,7 @@ from elastic_agent.core.secure_store import (
 
 router = APIRouter(tags=["jobs"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
-_submit_lock = asyncio.Lock()
+_submit_identity_locks_guard = threading.Lock()
 _job_action_locks_guard = threading.Lock()
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}")
@@ -116,6 +117,51 @@ JOB_LOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 JOB_LOG_LINE_MAX_BYTES = 64 * 1024
 JOB_JOURNAL_MAX_BYTES = 32 * 1024 * 1024
 READ_WORKERS_MAX = 500
+
+
+class _SubmitIdentityLockEntry:
+    """One same-identity submission lock with bounded registry lifetime."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+_submit_identity_locks: dict[str, _SubmitIdentityLockEntry] = {}
+
+
+@asynccontextmanager
+async def _submit_identity_lock(
+    identity: str | None,
+) -> AsyncIterator[None]:
+    """Serialize one idempotency identity without blocking unrelated Jobs."""
+
+    if identity is None:
+        yield
+        return
+
+    with _submit_identity_locks_guard:
+        entry = _submit_identity_locks.get(identity)
+        if entry is None:
+            entry = _SubmitIdentityLockEntry()
+            _submit_identity_locks[identity] = entry
+        entry.users += 1
+
+    acquired = False
+    try:
+        await entry.lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        with _submit_identity_locks_guard:
+            entry.users -= 1
+            if (
+                entry.users == 0
+                and _submit_identity_locks.get(identity) is entry
+            ):
+                del _submit_identity_locks[identity]
 
 
 def _configured_read_workers(name: str, *, default: int) -> int:
@@ -2416,6 +2462,13 @@ async def _submit_job_payload(
 
     mgr = _mgr()
     idempotency_key = _normalize_idempotency_key(idempotency_key)
+    deterministic_id = (
+        "job-" + hashlib.sha256(
+            idempotency_key.encode("utf-8")
+        ).hexdigest()[:32]
+        if idempotency_key
+        else None
+    )
 
     # Unkeyed submissions have no shared identity to serialize. Keep their
     # potentially slow account/model/capacity probes outside the idempotency
@@ -2429,13 +2482,13 @@ async def _submit_job_payload(
         plan = await _preflight_job(mgr, spec)
         spec = _pin_preflight_checkpoint_generation(spec, plan)
 
-    async with _submit_lock:
-        deterministic_id = None
+    # The durable Job id is the transaction identity. Same-key replays must
+    # serialize their journal check and first launch, but a slow preflight for
+    # one Job must not stall hundreds of unrelated keyed JobBatch items.
+    async with _submit_identity_lock(deterministic_id):
         recovered_prepared = False
         if idempotency_key:
-            deterministic_id = "job-" + hashlib.sha256(
-                idempotency_key.encode("utf-8")
-            ).hexdigest()[:32]
+            assert deterministic_id is not None
             persisted = _job_spec_path(mgr, deterministic_id)
             live = mgr.batch.get_job(deterministic_id)
             if persisted.is_file():

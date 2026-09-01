@@ -522,7 +522,10 @@ test networks only.
   limits, side-effect-free all-item preflight, durable acceptance/replay,
   per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
   restart recovery, and the 500-Job per-manifest/Manager-wide concurrency
-  bounds. UI v2 parser tests enforce the same `1..500` policy range.
+  bounds. Route tests additionally hold preflight open to prove different
+  deterministic Job identities enter concurrently, while simultaneous replays
+  of one identity still launch exactly once and release their transient lock.
+  UI v2 parser tests enforce the same `1..500` policy range.
 - Production capacity (`tests/unit/test_aws_manager_launcher.py` and
   `tests/unit/test_batch_orchestrator.py`): the AWS provider, Job Queue, worker
   lifecycle, and dedicated Job-history/Job-log/result-read settings accept 500
