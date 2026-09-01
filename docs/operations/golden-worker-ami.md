@@ -82,6 +82,13 @@ and worker-direct result collection verify `aws` and fail closed if the image
 invariant is broken. Do not unmask these units on an active worker.
 Apply OS security updates by building and promoting a replacement AMI.
 
+Docker bootstrap must preserve the engine family installed by the image. A
+working Docker/buildx pair is reused without APT. If Docker CE is present and
+buildx is missing, install only `docker-buildx-plugin`; installing Ubuntu's
+`docker.io` over Docker CE creates an unsatisfiable package transaction. For a
+non-CE packaged Docker install only `docker-buildx`, and install the complete
+`docker.io docker-buildx` pair only when no Docker command exists.
+
 ## Promotion and rollback
 
 Before promotion, verify that the AMI is owned by this account, available,

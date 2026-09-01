@@ -1121,6 +1121,12 @@ that logical dependency from `apt-get` and verifies `command -v aws` plus
 `aws --version` instead. A missing CLI fails provisioning before the runtime
 starts; bootstrap never substitutes the legacy AWS CLI v1 package.
 
+Docker bootstrap preserves a working engine already supplied by the Worker
+image. When Docker CE is present but buildx is missing, bootstrap installs only
+the matching `docker-buildx-plugin`; it never overlays Ubuntu's conflicting
+`docker.io` package. A non-CE packaged Docker receives only `docker-buildx`,
+while a blank image receives the full `docker.io docker-buildx` dependency set.
+
 On AWS, Manager-initiated SSH traffic (bootstrap, login, logs, code delivery,
 and collection) prefers the Worker's VPC-private address. The Worker's EIP is
 only its stable outbound identity, so port 22 can be restricted to the Manager

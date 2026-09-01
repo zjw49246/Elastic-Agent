@@ -1064,3 +1064,24 @@ fallback 改为验证镜像中的 `aws` 命令及其版本入口。镜像未提�
 **验证**：bootstrap/generic harness、Manager、AWS provider 与 EIP 套件 **192 passed**，
 golden-image verifier **8 passed**；Ruff 与 `git diff --check` 通过。实盘 canary 将在新 release
 部署后重跑。
+
+## 2026-09-02 保留 Worker 镜像预装 Docker CE（commit `c015c88`）
+
+**问题**：AWS CLI 修复发布后，10 个实盘 canary 全部通过 `system-init` 和
+`agent-install`，但在 `docker-install` 以 exit 100 和 `bootstrap failed` 终止；APT 报
+`pkgProblemResolver::Resolve generated breaks`。
+
+**根因**：Task Platform Worker AMI 已预装 Docker CE，而 EA 的 Docker fallback 无条件安装
+Ubuntu `docker.io docker-buildx`。两个 engine 包族互相冲突，因此 APT 无法完成事务；实际
+镜像上的 Docker engine 本不需要替换。
+
+**解决**：Docker 与 buildx 均可用时直接复用。Docker CE 仅缺 buildx 时只安装匹配的
+`docker-buildx-plugin`；其他已有 packaged Docker 只补 `docker-buildx`；只有完全没有 Docker
+的空白镜像才安装 `docker.io docker-buildx`。用户补充组和 Docker service 启用顺序保持不变。
+
+**以后避免**：bootstrap fallback 必须先识别镜像已提供的外部组件及其包族，不能把“确保
+能力存在”实现成“强制替换发行来源”。Golden AMI 的 Docker canary 必须覆盖 engine、buildx、
+socket 权限和真实 sandbox build。
+
+**验证**：bootstrap/generic harness、Manager、AWS provider 与 EIP 套件 **192 passed**；
+Ruff、`git diff --check` 与生成 shell 的 `bash -n` 通过。实盘 canary 将在新 release 部署后重跑。
