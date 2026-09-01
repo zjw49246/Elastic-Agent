@@ -979,3 +979,25 @@ ActiveState、MainPID、cgroup、容器和进程扫描仍全部 fail closed，�
 
 **验证**：API、Manager、fleet driver、AWS launcher 关键套件 **266 passed**（另排除 3 个 macOS
 无 `/proc` 的既有 Linux 专项）；release manifest 生成与 `--check`、Ruff、`git diff --check` 通过。
+
+## 2026-09-02 重启后恢复 prepared JobBatch 项（commit `b5ca47a`）
+
+**问题**：生产 Manager 重启后，JobBatch 中 179 个已 accepted 的项目持续占用活动槽；对应
+Batch Job 显示 queued，但底层 canonical Job journal 停在 `prepared`，EC2 实例数为 0。
+
+**根因**：JobBatch accepted reconciliation 只处理底层 `launching/running` 和终态。标准 Job
+提交路径已经能用确定性 Job id 与原 Idempotency-Key 安全恢复 `prepared` journal，但
+`JobBatchQueue._underlying_job_terminal()` 对 `prepared` 永远返回非终态，因此没有入口再次调用
+canonical submit。
+
+**解决**：startup recovery 证明旧进程的实例和账号所有权已全部收敛后，将底层仍为
+`prepared` 的 accepted item 持久化回 queued；调度器随后用稳定 per-item Idempotency-Key
+重新进入标准提交路径，恢复同一 Job id。`launching/running` 的遗失协程仍保持确定失败语义，
+不重放可能已经发生外部副作用的命令。
+
+**以后避免**：任何 durable lifecycle 增加非终态时，都要逐一审计上层队列在进程重启后的
+分类与推进动作；只验证 direct API 的幂等恢复不足以证明包装它的 durable queue 也能收敛。
+
+**验证**：新增测试先在旧实现上稳定超时，修复后证明 accepted/prepared 项在 Manager 重启后
+以相同 Job id 恢复；JobBatch restart 套件 **4 passed**，JobBatch/API auth 套件 **52 passed**，
+Ruff 与 `git diff --check` 通过。
