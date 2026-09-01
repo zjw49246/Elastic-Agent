@@ -206,12 +206,23 @@ def docker_install_step(run_as: str = "ubuntu", timeout: int = 420) -> Bootstrap
     resolves a service's supplementary groups at start time, so the runtime (and
     its child run command) only gets docker-socket access if ``usermod`` ran
     first. Runs sudo-wrapped (SSHExecutor sudoes non-root users)."""
+    apt_update = "apt-get -o DPkg::Lock::Timeout=600 update -qq"
+    apt_install = "apt-get -o DPkg::Lock::Timeout=600 install -y -qq"
     fallback = (
-        "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
-        # docker-buildx too: Docker 29 builds images with BuildKit, which
-        # needs the buildx component — docker.io alone makes builds fail.
-        "apt-get -o DPkg::Lock::Timeout=600 install -y -qq "
-        "docker.io docker-buildx"
+        "if command -v docker >/dev/null 2>&1; then\n"
+        "  if docker buildx version >/dev/null 2>&1; then\n"
+        "    echo 'worker image Docker dependencies verified'\n"
+        "  elif dpkg-query -W docker-ce-cli >/dev/null 2>&1; then\n"
+        # Task Platform images use Docker CE. Installing Ubuntu's docker.io on
+        # top of it makes APT's resolver fail; add only the matching plugin.
+        f"    {apt_update} && {apt_install} docker-buildx-plugin\n"
+        "  else\n"
+        f"    {apt_update} && {apt_install} docker-buildx\n"
+        "  fi\n"
+        "else\n"
+        # A blank Ubuntu image still gets the complete engine + BuildKit path.
+        f"  {apt_update} && {apt_install} docker.io docker-buildx\n"
+        "fi"
     )
     install_or_verify = _golden_fast_path(
         "docker", [], "golden image Docker dependencies verified", fallback,

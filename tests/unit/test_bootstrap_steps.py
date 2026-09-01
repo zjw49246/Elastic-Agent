@@ -326,6 +326,10 @@ class TestDockerInstallStep:
         assert "golden image Docker dependencies verified" in step.command
         assert "docker.io" in step.command
         assert "docker-buildx" in step.command  # BuildKit builds (--sandbox os)
+        assert "if command -v docker" in step.command
+        assert "dpkg-query -W docker-ce-cli" in step.command
+        assert "install -y -qq docker-buildx-plugin" in step.command
+        assert "install -y -qq docker.io docker-buildx" in step.command
         assert "usermod -aG docker ubuntu" in step.command
         assert "enable --now docker" in step.command
 
