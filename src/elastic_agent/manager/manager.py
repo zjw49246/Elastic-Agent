@@ -68,6 +68,15 @@ EIP_ALLOCATION_RECOVERY_STABLE_SCANS = 30
 BOUND_RECOVERY_STABLE_SCANS = 30
 BOUND_DISCONNECT_GRACE_SECONDS = 30
 
+# Golden-image cleanup removes host identity before capture.  Some Ubuntu AMI
+# copies consequently boot with the OpenSSH unit disabled even though cloud-init
+# restores host keys and authorized_keys.  Manager bootstrap is SSH-based, so
+# make the intended management service explicit on every disposable AWS worker.
+AWS_WORKER_SSH_USER_DATA = """#!/bin/sh
+systemctl unmask ssh.service ssh.socket
+systemctl enable --now ssh.service
+"""
+
 
 class _InstanceLifecycleGate:
     """Let creates overlap while recovery retains exclusive ownership scans.
@@ -3074,6 +3083,7 @@ class ElasticAgentManager:
                 security_group_ids=provider_cfg.aws.security_group_ids,
                 subnet_id=provider_cfg.aws.subnet_id,
                 tags={**(tags or {}), "ManagedBy": "elastic-agent"},
+                user_data=AWS_WORKER_SSH_USER_DATA,
             )
         # Per-job disk/spot overrides; disk_gb falsy → keep InstanceConfig default.
         if disk_gb:

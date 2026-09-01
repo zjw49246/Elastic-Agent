@@ -2292,6 +2292,24 @@ class TestScaleOut:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_aws_scale_out_explicitly_enables_worker_ssh(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        await manager.start()
+
+        await manager.scale_out(count=1)
+
+        assert provider._last_config.user_data.startswith("#!/bin/sh\n")
+        assert "systemctl unmask ssh.service ssh.socket" in (
+            provider._last_config.user_data
+        )
+        assert "systemctl enable --now ssh.service" in (
+            provider._last_config.user_data
+        )
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_scale_out_disk_default_when_unset(self, manager, provider):
         await manager.start()
         await manager.scale_out(count=1)  # no disk_gb → InstanceConfig default (40)
