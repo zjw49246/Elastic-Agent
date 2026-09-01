@@ -923,3 +923,26 @@ preflight、journal、cloud create 和实际 EC2；任何全局事务锁都要�
 
 **验证**：不同键并发测试在旧全局锁上 1 秒超时失败，修复后与同键并发 exactly-once 测试
 一起通过；API/JobBatch 专项 **243 passed**，Ruff 与 `git diff --check` 通过。
+
+## 2026-09-01 恢复扫描与长清理解耦（commit `c797227`）
+
+**问题**：Manager 重启后需要处理数百个遗留 Worker。`_InstanceLifecycleGate` 原本把整次
+recovery pass 都视为独占写事务，controller-tagged 云扫描结束后仍持有 create fence，直到
+每个 Worker 完成最长 7200 秒的 SSH quiesce、final collect 和终止。生产因此有 68 个新 Job
+长期停在 `creating`，当前进程没有发出一次 `RunInstances`。
+
+**解决**：新增独立 `_recovery_pass_lock`，继续保证恢复 pass 单写；lifecycle gate 只覆盖云端
+所有权扫描、精确认领和 durable lease 衔接，建立快照后由所有者任务幂等释放。后续慢清理只
+处理该快照，不再阻塞新 create。恢复上下文的最终释放带 task-owner 校验，避免旧上下文退出时
+误释放后来获得 gate 的恢复任务。Worker quiescence 同时把 `systemctl mask/stop` 的命令返回值
+改为提示性信号，先 runtime-mask、daemon-reload、尝试 stop，再以 UnitFileState、ActiveState、
+MainPID、cgroup、容器和进程扫描作为最终 fail-closed 证明。
+
+**以后避免**：所有权 fence 只应覆盖外部副作用与 durable 发布之间的歧义窗口，不能包住上传、
+SSH 或终止等待等长尾工作。命令行工具的非零退出不能代替最终状态证明；幂等清理应容忍命令
+重放，同时严格验证资源已静止。
+
+**验证**：新增回归证明恢复扫描仍等待已进入 create、阻止插队，但慢 collection 已进入后新
+`scale_out` 可到达 provider。Manager **97 passed**；fleet driver 在排除 3 个 macOS 无
+`/proc` 的既有 Linux 专项后 **67 passed**；目标 quiescence 测试 **2 passed**，Ruff 与
+`git diff --check` 通过。
