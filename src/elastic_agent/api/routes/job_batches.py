@@ -221,11 +221,32 @@ async def _plan(manifest: JobBatchManifest) -> dict[str, Any]:
         all_warnings.extend(warnings)
 
     summary["instance_types"] = sorted(effective_instance_types)
+    # The platform uses the side-effect-free plan call as the capability
+    # handshake before partitioning a campaign.  ``summary.max_active_jobs``
+    # intentionally describes this particular manifest's requested policy,
+    # which may be a one-job probe; it must not be mistaken for the Manager's
+    # published deployment ceiling.  Return the latter explicitly so a small
+    # probe cannot permanently downgrade a larger campaign to serial work.
+    by_pool = summary.get("account_requirements", {}).get("by_pool", [])
+    supported_models = sorted(
+        {
+            str(pool["model"])
+            for pool in by_pool
+            if isinstance(pool, dict)
+            and isinstance(pool.get("model"), str)
+            and pool["model"]
+        }
+    )
     return {
         "valid": valid,
         "side_effects": False,
         "atomic": False,
         "batch_id": manifest.batch_id,
+        "capabilities": {
+            "max_batch_items": manager.job_batch_queue.limits.max_items,
+            "max_active_jobs": manager.job_batch_queue.limits.global_max_active_jobs,
+            "supported_models": supported_models,
+        },
         "summary": summary,
         "items": item_views,
         "errors": aggregate_errors,

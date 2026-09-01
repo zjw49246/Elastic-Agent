@@ -597,6 +597,11 @@ class TestJobBatchValidationAndPlan:
         assert body["summary"]["total_workers"] == 5
         assert body["summary"]["total_worker_hours"] == 7
         assert body["summary"]["max_active_jobs"] == 1
+        assert body["capabilities"] == {
+            "max_batch_items": 20,
+            "max_active_jobs": 3,
+            "supported_models": [],
+        }
         assert private_marker not in response.text
         assert "aws-secretsmanager://prod/job-batch-token#value" not in response.text
         assert batch.started == []
