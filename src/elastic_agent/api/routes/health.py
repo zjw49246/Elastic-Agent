@@ -21,6 +21,30 @@ router = APIRouter(
 )
 
 _start_time = time.monotonic()
+_ROUTES = (
+    "GET /api/health",
+    "POST /api/job-batches/plan",
+    "POST /api/job-batches",
+    "GET /api/job-batches/{id}",
+    "GET /api/jobs/{id}",
+    "GET /api/jobs/{id}/logs",
+    "GET /api/jobs/{id}/results",
+    "POST /api/jobs/{id}/cancel",
+    "POST /api/jobs/{id}/interrupt",
+    "POST /api/jobs/{id}/resume",
+    "POST /api/accounts",
+    "POST /api/agent-api/accounts/platform-ref",
+    "GET /api/accounts",
+    "GET /api/accounts/{id}",
+)
+_IDEMPOTENCY_ROUTES = (
+    "POST /api/accounts",
+    "POST /api/agent-api/accounts/platform-ref",
+    "POST /api/job-batches",
+    "POST /api/jobs/{id}/cancel",
+    "POST /api/jobs/{id}/interrupt",
+    "POST /api/jobs/{id}/resume",
+)
 
 
 @router.get("/api/health")
@@ -53,6 +77,12 @@ async def health() -> dict:
                 "revision": os.environ.get("ELASTIC_AGENT_RELEASE_REVISION", ""),
                 "aws_account_id": os.environ.get("ELASTIC_AGENT_AWS_ACCOUNT_ID", ""),
                 "region": os.environ.get("ELASTIC_AGENT_AWS_REGION", ""),
+                "route_contract": {
+                    "authenticated": True,
+                    "network_scope": "private",
+                    "routes": _ROUTES,
+                    "idempotency_key_routes": _IDEMPOTENCY_ROUTES,
+                },
             }
         )
     return payload

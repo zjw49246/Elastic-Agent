@@ -226,3 +226,52 @@ class TestHealthNoAuth:
     async def test_health_is_public(self, client):
         resp = await client.get("/api/health")
         assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_production_health_requires_auth_and_publishes_exact_route_contract(
+        self, client, manager, monkeypatch
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_RELEASE_MANIFEST", "/release/manifest.json")
+        monkeypatch.setenv("ELASTIC_AGENT_RELEASE_REVISION", "artifact-sha256:" + "a" * 64)
+        monkeypatch.setenv("ELASTIC_AGENT_AWS_ACCOUNT_ID", "297645381734")
+        monkeypatch.setenv("ELASTIC_AGENT_AWS_REGION", "ap-northeast-1")
+        manager.release_evidence = {
+            "manager_state_schema": "v1",
+            "worker_profile_digest": "sha256:" + "b" * 64,
+            "worker_runtime_provenance_digest": "sha256:" + "c" * 64,
+            "release_digest": "sha256:" + "d" * 64,
+        }
+
+        assert (await client.get("/api/health")).status_code == 401
+        response = await client.get(
+            "/api/health",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert response.status_code == 200
+        contract = response.json()["route_contract"]
+        assert contract["authenticated"] is True
+        assert contract["network_scope"] == "private"
+        assert set(contract["routes"]) == {
+            "GET /api/health",
+            "POST /api/job-batches/plan",
+            "POST /api/job-batches",
+            "GET /api/job-batches/{id}",
+            "GET /api/jobs/{id}",
+            "GET /api/jobs/{id}/logs",
+            "GET /api/jobs/{id}/results",
+            "POST /api/jobs/{id}/cancel",
+            "POST /api/jobs/{id}/interrupt",
+            "POST /api/jobs/{id}/resume",
+            "POST /api/accounts",
+            "POST /api/agent-api/accounts/platform-ref",
+            "GET /api/accounts",
+            "GET /api/accounts/{id}",
+        }
+        assert set(contract["idempotency_key_routes"]) == {
+            "POST /api/accounts",
+            "POST /api/agent-api/accounts/platform-ref",
+            "POST /api/job-batches",
+            "POST /api/jobs/{id}/cancel",
+            "POST /api/jobs/{id}/interrupt",
+            "POST /api/jobs/{id}/resume",
+        }

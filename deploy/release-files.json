@@ -397,8 +397,8 @@
       "path": "src/elastic_agent/api/routes/health.py",
       "type": "file",
       "mode": "0644",
-      "size": 2036,
-      "sha256": "sha256:e1b0e332166653a05dfc3c29c67a3e1f2efad4b36d843faf6c6b167ff491cf6c"
+      "size": 2982,
+      "sha256": "sha256:4ba20c560eccea4db4f2dcb2cab2fb11e788353cce90a627aa42cf39515982c4"
     },
     {
       "path": "src/elastic_agent/api/routes/job_batches.py",
@@ -1447,8 +1447,8 @@
       "path": "tests/unit/test_api_auth.py",
       "type": "file",
       "mode": "0644",
-      "size": 6859,
-      "sha256": "sha256:24508739839863011b0c012362691a9e7cf621baace8de11b4f1c441adfd818c"
+      "size": 8959,
+      "sha256": "sha256:85e41980e97bc5c60f1e61d7cddfe31fe83911009e65286e97fcc695209f2d7b"
     },
     {
       "path": "tests/unit/test_api_batch.py",
