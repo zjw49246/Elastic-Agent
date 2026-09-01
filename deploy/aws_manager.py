@@ -36,6 +36,11 @@ from elastic_agent.core.config import (
     WorkerConfig,
 )
 from elastic_agent.core.providers.aws import AWSProvider
+from elastic_agent.core.release_evidence import (
+    ReleaseEvidenceError,
+    load_release_manifest,
+    validate_deployment_context,
+)
 from elastic_agent.manager.manager import ElasticAgentManager
 
 logger = logging.getLogger(__name__)
@@ -104,6 +109,9 @@ class AWSManagerSettings:
     results_s3_prefix: str
     results_s3_interval: float
     allow_canonical_base_ami: bool = False
+    aws_account_id: str = ""
+    release_revision: str = ""
+    release_manifest: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +249,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
     if not _REGION_RE.fullmatch(region):
         raise LauncherConfigurationError("ELASTIC_AGENT_AWS_REGION is invalid")
 
+    aws_account_id = source.get("ELASTIC_AGENT_AWS_ACCOUNT_ID", "").strip()
+    if aws_account_id and not re.fullmatch(r"[0-9]{12}", aws_account_id):
+        raise LauncherConfigurationError("ELASTIC_AGENT_AWS_ACCOUNT_ID is invalid")
+
+    release_revision = source.get("ELASTIC_AGENT_RELEASE_REVISION", "").strip()
+    release_manifest = (
+        _absolute_path(source, "ELASTIC_AGENT_RELEASE_MANIFEST")
+        if source.get("ELASTIC_AGENT_RELEASE_MANIFEST", "").strip()
+        else None
+    )
+
     ami_id = _required(source, "ELASTIC_AGENT_AWS_AMI_ID")
     if not _AWS_ID_RE.fullmatch(ami_id) or not ami_id.startswith("ami-"):
         raise LauncherConfigurationError("ELASTIC_AGENT_AWS_AMI_ID is invalid")
@@ -292,6 +311,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AWSManagerSetting
         results_s3_prefix=_required(source, "ELASTIC_AGENT_RESULTS_S3_PREFIX"),
         results_s3_interval=_positive_float(source, "ELASTIC_AGENT_RESULTS_S3_INTERVAL", maximum=86400),
         allow_canonical_base_ami=_boolean(source, "ELASTIC_AGENT_ALLOW_CANONICAL_BASE_AMI"),
+        aws_account_id=aws_account_id,
+        release_revision=release_revision,
+        release_manifest=release_manifest,
     )
 
 
@@ -467,6 +489,23 @@ def validate_worker_ami(
 
 def build_application(settings: AWSManagerSettings):
     """Validate startup invariants and create the ASGI application."""
+
+    if settings.release_manifest is not None:
+        try:
+            release_manifest = load_release_manifest(settings.release_manifest)
+            validate_deployment_context(
+                release_manifest,
+                {
+                    "ami_id": settings.ami_id,
+                    "region": settings.region,
+                    "aws_account_id": settings.aws_account_id,
+                    "release_revision": settings.release_revision,
+                },
+            )
+        except ReleaseEvidenceError as exc:
+            raise LauncherConfigurationError(
+                "release manifest does not match deployment settings"
+            ) from exc
 
     prepare_local_paths(settings)
     result = validate_worker_ami(settings)
