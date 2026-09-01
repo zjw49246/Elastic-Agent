@@ -1648,6 +1648,44 @@ class TestJobsAPI:
         ]
 
     @pytest.mark.asyncio
+    async def test_aws_worker_detail_includes_platform_identity(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_AWS_ACCOUNT_ID", "297645381734")
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job = manager.batch.get_job(submitted["job_id"])
+        job.spec.fanout.region = "ap-northeast-1"
+        for index, run in enumerate(job.runs.values()):
+            run.worker_id = f"aws:i-{index + 1:017x}"
+
+        workers = (await client.get(f"/api/jobs/{submitted['job_id']}")).json()[
+            "workers_detail"
+        ]
+
+        assert workers[0]["worker_index"] == 0
+        assert workers[0]["cloud_instance_id"] == "i-00000000000000001"
+        assert workers[0]["aws_account_id"] == "297645381734"
+        assert workers[0]["region"] == "ap-northeast-1"
+
+    @pytest.mark.asyncio
+    async def test_worker_detail_does_not_invent_invalid_aws_identity(
+        self, client, manager, monkeypatch,
+    ):
+        monkeypatch.setenv("ELASTIC_AGENT_AWS_ACCOUNT_ID", "not-an-account")
+        submitted = (await client.post("/api/jobs", json=self._SPEC)).json()
+        job = manager.batch.get_job(submitted["job_id"])
+        first = next(iter(job.runs.values()))
+        first.worker_id = "aws:i-00000000000000001"
+
+        worker = (await client.get(f"/api/jobs/{submitted['job_id']}")).json()[
+            "workers_detail"
+        ][0]
+
+        assert "cloud_instance_id" not in worker
+        assert "aws_account_id" not in worker
+        assert "region" not in worker
+
+    @pytest.mark.asyncio
     async def test_non_eip_agent_api_key_can_fill_multiple_worker_slots(
         self, client, manager, monkeypatch,
     ):

@@ -76,6 +76,9 @@ _submit_identity_locks_guard = threading.Lock()
 _job_action_locks_guard = threading.Lock()
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}")
+_AWS_ACCOUNT_ID = re.compile(r"[0-9]{12}")
+_AWS_INSTANCE_ID = re.compile(r"i-[0-9a-f]{8,32}")
+_AWS_REGION = re.compile(r"[a-z]{2}(?:-gov)?-[a-z]+-[0-9]")
 _SAFE_RESUME_GENERATION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
@@ -1167,6 +1170,13 @@ def _persisted_job_view(
         terminal_summary = {}
     summary_error = terminal_summary.get("error")
     errors = collection_errors + ([str(summary_error)] if summary_error else [])
+    raw_spec = payload.get("spec")
+    raw_fanout = raw_spec.get("fanout") if isinstance(raw_spec, dict) else None
+    persisted_region = (
+        str(raw_fanout.get("region") or "")
+        if isinstance(raw_fanout, dict)
+        else ""
+    )
     raw_terminal_workers = terminal_summary.get("terminal_workers")
     if not isinstance(raw_terminal_workers, list):
         raw_terminal_workers = []
@@ -1205,6 +1215,7 @@ def _persisted_job_view(
             "worker_id": worker_id,
             "phase": str(raw.get("phase") or "failed"),
             "shard_index": shard_index,
+            **_aws_worker_identity(worker_id, shard_index, persisted_region),
             "account_id": account_id,
             "account_email": "",
             "active_slot": 0,
@@ -1232,7 +1243,6 @@ def _persisted_job_view(
         state = "recovered"
     else:
         state = submission_state
-    raw_spec = payload.get("spec")
     raw_collect = (
         raw_spec.get("collect")
         if isinstance(raw_spec, dict) else None
@@ -1728,6 +1738,31 @@ def _idempotency_conflict(*, legacy: bool) -> HTTPException:
     )
 
 
+def _aws_worker_identity(
+    worker_id: str,
+    worker_index: int,
+    region: str,
+) -> dict[str, object]:
+    """Expose strict AWS identity fields required for lifecycle reconciliation."""
+
+    if not worker_id.startswith("aws:"):
+        return {}
+    instance_id = worker_id.removeprefix("aws:")
+    account_id = os.environ.get("ELASTIC_AGENT_AWS_ACCOUNT_ID", "").strip()
+    if (
+        _AWS_INSTANCE_ID.fullmatch(instance_id) is None
+        or _AWS_ACCOUNT_ID.fullmatch(account_id) is None
+        or _AWS_REGION.fullmatch(region) is None
+    ):
+        return {}
+    return {
+        "worker_index": worker_index,
+        "cloud_instance_id": instance_id,
+        "aws_account_id": account_id,
+        "region": region,
+    }
+
+
 def _job_detail(
     job,
     *,
@@ -1744,6 +1779,11 @@ def _job_detail(
                 "worker_id": r.worker_id,
                 "phase": r.phase.value,
                 "shard_index": r.ctx.shard_index,
+                **_aws_worker_identity(
+                    r.worker_id,
+                    r.ctx.shard_index,
+                    job.spec.fanout.region,
+                ),
                 "account_id": r.account_id,
                 "account_email": r.account_email,
                 "active_slot": r.active_slot,
