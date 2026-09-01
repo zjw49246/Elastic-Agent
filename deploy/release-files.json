@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 63239,
-      "sha256": "sha256:a227cea24095faea2c129e905a36ce28dd10884438dd46558861322e82f35f74"
+      "size": 63332,
+      "sha256": "sha256:59660a120d0a63e09919550e74685bda20b36aeb3e414e45cd2ed6b11b3800c2"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 125861,
-      "sha256": "sha256:f7a2781684f8688ca15ce7532d3804d83b7469841efe11be2e65a522a6bcf5f5"
+      "size": 127196,
+      "sha256": "sha256:7c0996136bd9bd3a3216e8f9ce244483806ae86da72feba1a4a721db3dc95e6b"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 67050,
-      "sha256": "sha256:ec6b85305681681ececbfbad46c90f7a625c4d6da7ccb766c397761cc924deab"
+      "size": 67426,
+      "sha256": "sha256:4f1945afe5ed614beabeb9f792b58600df4d27468299b68bb4f72b5bc7880085"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31919,
-      "sha256": "sha256:dbce7adfa5dab6064625ad87b1e1d3aa5077af19b0515d11b3e3ba0f05ca891e"
+      "size": 32128,
+      "sha256": "sha256:73894a43eb6169c40d3208798f59982d232e83a8657c82b70aeff58b948908fa"
     },
     {
       "path": "deploy/__init__.py",
@@ -222,8 +222,8 @@
       "path": "docs/operations/golden-worker-ami.md",
       "type": "file",
       "mode": "0644",
-      "size": 7818,
-      "sha256": "sha256:c6e60b9c86ce1679919c06188488d39809c6bd5ea21e29f5cc5d4d0373a5a6b1"
+      "size": 7905,
+      "sha256": "sha256:6ee3f1f0fde0e8d9b7523942e3e41845b8e322611fe854638cae4adbe0983bf5"
     },
     {
       "path": "docs/operations/job-batch-json.md",
@@ -726,8 +726,8 @@
       "path": "src/elastic_agent/core/bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 28491,
-      "sha256": "sha256:227d632c41fe44e9d17fc27285b1d97d9020b077c9adae5346f710bbbf419c06"
+      "size": 29298,
+      "sha256": "sha256:bb7e72c9b0d31fed0ee5a7c7d343dbd2b186c99316b08314e4c68a8740214dc7"
     },
     {
       "path": "src/elastic_agent/core/checkpoint_store.py",
@@ -1524,8 +1524,8 @@
       "path": "tests/unit/test_bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 13904,
-      "sha256": "sha256:2788c908d1c66f74024dbf708855ae99edbad55704ec57c441842b39a7ff6e4e"
+      "size": 14328,
+      "sha256": "sha256:35f4a9d99f53b00548dd74f279ddc81900da37f5b7d7166c4fe288da46cffeef"
     },
     {
       "path": "tests/unit/test_checkpoint_store.py",
@@ -1664,8 +1664,8 @@
       "path": "tests/unit/test_generic_harness.py",
       "type": "file",
       "mode": "0644",
-      "size": 17965,
-      "sha256": "sha256:e40d99547873591907798c28ffd49bfbebb8c7cbf7a8c340fbfe64794c733579"
+      "size": 18123,
+      "sha256": "sha256:d6a8822535edc86b988bd9edbd34151fcd1e1232b1fb980aa2b42aff627c0bca"
     },
     {
       "path": "tests/unit/test_golden_ami_script.py",
