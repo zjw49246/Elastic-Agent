@@ -2414,6 +2414,72 @@ class TestScaleOut:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_concurrent_scale_out_wave_uses_one_capacity_scan(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 20
+        await manager.start()
+        scans = 0
+        entered = 0
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+        real_list = provider.list_instances
+        real_create = provider.create_instance
+
+        async def counted_list(*args, **kwargs):
+            nonlocal scans
+            scans += 1
+            return await real_list(*args, **kwargs)
+
+        async def slow_create(config):
+            nonlocal entered
+            entered += 1
+            if entered == 20:
+                all_entered.set()
+            await release.wait()
+            return await real_create(config)
+
+        provider.list_instances = counted_list
+        provider.create_instance = slow_create
+        creates = [
+            asyncio.create_task(manager.scale_out())
+            for _ in range(20)
+        ]
+        try:
+            await asyncio.wait_for(all_entered.wait(), timeout=0.5)
+            assert scans == 1
+        finally:
+            release.set()
+            await asyncio.gather(*creates)
+
+        assert manager._inflight_instance_creates == 0
+        assert manager._inflight_visible_instance_ids == set()
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_capacity_snapshot_refreshes_after_wave_drains(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 3
+        await manager.start()
+        scans = 0
+        real_list = provider.list_instances
+
+        async def counted_list(*args, **kwargs):
+            nonlocal scans
+            scans += 1
+            return await real_list(*args, **kwargs)
+
+        provider.list_instances = counted_list
+        first = await manager.scale_out()
+        second = await manager.scale_out()
+        assert len(first) == len(second) == 1
+        assert scans == 2
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_recovery_waits_for_parallel_creates_and_blocks_new_create(
         self, manager, provider
     ):

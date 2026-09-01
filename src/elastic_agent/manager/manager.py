@@ -272,6 +272,16 @@ class ElasticAgentManager:
         self._current_unbound_instance_ids: set[str] = set()
         self._job_state_lock = asyncio.Lock()
         self._inflight_instance_creates = 0
+        # One authoritative provider/registry scan seeds each concurrent
+        # admission wave. Every later reservation is represented by the
+        # inflight counter, so repeating the remote scan while that wave is
+        # active only serializes launches and adds no capacity evidence.
+        self._instance_capacity_snapshot_usage: int | None = None
+        # A returned create can become visible before registry publication and
+        # before its inflight reservation is released. Deduplicate that exact
+        # overlap if a failed sibling invalidates the wave snapshot and forces
+        # a fresh fail-closed scan while creates are still settling.
+        self._inflight_visible_instance_ids: set[str] = set()
         self._instance_capacity_holds: dict[str, int] = {}
         self._account_allocator: Any = None
         self._account_login_coordinator: Any = None
@@ -2813,7 +2823,7 @@ class ElasticAgentManager:
             else provider_cfg.aws.max_instances
         )
         async with self._instance_capacity_lock:
-            used = await self._owned_instance_capacity_usage()
+            used = await self._instance_capacity_usage_for_admission()
             projected = used + self._inflight_instance_creates + count
             if projected > limit:
                 raise RuntimeError(
@@ -2874,7 +2884,29 @@ class ElasticAgentManager:
                 owned_ids.add(lease.instance_id)
             else:
                 placeholders += 1
-        return len(owned_ids) + placeholders
+        visible_inflight_overlap = len(
+            owned_ids.intersection(self._inflight_visible_instance_ids)
+        )
+        return len(owned_ids) + placeholders - visible_inflight_overlap
+
+    async def _instance_capacity_usage_for_admission(self) -> int:
+        """Return one fail-closed capacity snapshot for an admission wave.
+
+        The caller holds ``_instance_capacity_lock``. The first reservation
+        performs the remote ownership scan; concurrent reservations use the
+        same baseline plus ``_inflight_instance_creates``. Once the wave
+        drains, the next reservation refreshes provider state before admitting
+        more billable capacity.
+        """
+
+        if (
+            self._instance_capacity_snapshot_usage is None
+            or self._inflight_instance_creates == 0
+        ):
+            self._instance_capacity_snapshot_usage = (
+                await self._owned_instance_capacity_usage()
+            )
+        return self._instance_capacity_snapshot_usage
 
     async def _reserve_instance_capacity(
         self, count: int, tags: dict[str, str] | None
@@ -2890,7 +2922,7 @@ class ElasticAgentManager:
         )
         requested_lease_id = str((tags or {}).get("ElasticAgentLease") or "")
         async with self._instance_capacity_lock:
-            used = await self._owned_instance_capacity_usage()
+            used = await self._instance_capacity_usage_for_admission()
             # A bound lease without an instance is already included as a
             # planned slot. The matching one-instance scale call consumes that
             # durable placeholder rather than reserving a second slot.
@@ -2920,9 +2952,11 @@ class ElasticAgentManager:
         tags: dict[str, str] | None = None,
     ) -> list[NodeRecord]:
         reserved_capacity = await self._reserve_instance_capacity(count, tags)
+        capacity_visible_ids: set[str] = set()
+        completed = False
         try:
             async with self._instance_lifecycle_gate.creation():
-                return await self._scale_out_unchecked(
+                records = await self._scale_out_unchecked(
                     count=count,
                     instance_type=instance_type,
                     region=region,
@@ -2930,13 +2964,29 @@ class ElasticAgentManager:
                     disk_gb=disk_gb,
                     spot=spot,
                     tags=tags,
+                    capacity_visible_ids=(
+                        capacity_visible_ids if reserved_capacity else None
+                    ),
                 )
+            completed = True
+            return records
         finally:
             async with self._instance_capacity_lock:
+                self._inflight_visible_instance_ids.difference_update(
+                    capacity_visible_ids
+                )
                 self._inflight_instance_creates = max(
                     0,
                     self._inflight_instance_creates - reserved_capacity,
                 )
+                if completed:
+                    if self._instance_capacity_snapshot_usage is not None:
+                        self._instance_capacity_snapshot_usage += reserved_capacity
+                else:
+                    # A failed create may have crossed the external side-effect
+                    # boundary before compensation. Force the next admission
+                    # to prove cloud state again.
+                    self._instance_capacity_snapshot_usage = None
 
     async def _scale_out_unchecked(
         self,
@@ -2947,6 +2997,7 @@ class ElasticAgentManager:
         disk_gb: int | None = None,
         spot: bool = False,
         tags: dict[str, str] | None = None,
+        capacity_visible_ids: set[str] | None = None,
     ) -> list[NodeRecord]:
         from elastic_agent.core.auth import generate_worker_token
         from elastic_agent.core.providers.base import InstanceConfig
@@ -3036,6 +3087,16 @@ class ElasticAgentManager:
                     await self._begin_unbound_launch_intent(job_id)
                     unbound_intent_started = True
                 instance = await self.provider.create_instance(instance_cfg)
+                if capacity_visible_ids is not None:
+                    # The inflight reservation already prevents over-admission;
+                    # never hold this lock across the external create. Record
+                    # the returned id afterward only to deduplicate a forced
+                    # failure-path rescan before publication completes.
+                    async with self._instance_capacity_lock:
+                        capacity_visible_ids.add(instance.instance_id)
+                        self._inflight_visible_instance_ids.add(
+                            instance.instance_id
+                        )
                 if (
                     not lease_id
                     and instance_cfg.tags.get("ElasticAgentJob")
