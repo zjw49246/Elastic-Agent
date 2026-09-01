@@ -96,8 +96,8 @@
       "path": "deploy/aws_manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 21659,
-      "sha256": "sha256:56f42537ec2241f5d37c1e029d79f79eba0f0510f9d28e17e40ee4e93217ed03"
+      "size": 22934,
+      "sha256": "sha256:8164a66ad13a5d62f1748fdfef6f28326583c13a5342bca7bf90f8b7c541d7af"
     },
     {
       "path": "docs/audiobook-integration/00-overview.md",
@@ -1475,8 +1475,8 @@
       "path": "tests/unit/test_aws_manager_launcher.py",
       "type": "file",
       "mode": "0644",
-      "size": 24626,
-      "sha256": "sha256:02f5d1bde0fb7c2cfa7b8b64ea8c1db07c8fe7f10b3ec7031f8c8361c5b41c7b"
+      "size": 26344,
+      "sha256": "sha256:bacfca2ef777c312c11c710a10c6856ccccc7d7d5c4c8d9e1d4d86a9b02cd965"
     },
     {
       "path": "tests/unit/test_aws_provider.py",

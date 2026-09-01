@@ -101,6 +101,26 @@ def _golden_image() -> dict:
     }
 
 
+def _task_platform_worker_image() -> dict:
+    image = _golden_image()
+    image["Tags"] = [
+        {"Key": "ManagedBy", "Value": "task-platform-packer"},
+        {"Key": "TaskPlatform", "Value": "worker"},
+        {"Key": "Service", "Value": "task-platform"},
+        {"Key": "Environment", "Value": "pilot"},
+        {"Key": "ManifestDigest", "Value": "sha256:" + "a" * 64},
+        {"Key": "ConstraintsDigest", "Value": "sha256:" + "b" * 64},
+        {"Key": "PlatformRevision", "Value": "c" * 40},
+        {"Key": "UpstreamRevision", "Value": "d" * 40},
+        {"Key": "GeneratorVersion", "Value": "build-only-v1"},
+        {
+            "Key": "RunnerImage",
+            "Value": "example.invalid/runner@sha256:" + "e" * 64,
+        },
+    ]
+    return image
+
+
 def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     source = SERVICE_UNIT.read_text(encoding="utf-8")
 
@@ -556,6 +576,38 @@ def test_self_owned_encrypted_tagged_golden_image_is_accepted():
 
     assert result.provenance == "self-owned-golden"
     assert result.break_glass_used is False
+
+
+def test_self_owned_task_platform_worker_image_is_accepted():
+    result = validate_image_description(
+        _task_platform_worker_image(), caller_account_id=CALLER_ACCOUNT
+    )
+
+    assert result.provenance == "self-owned-task-platform-worker"
+    assert result.break_glass_used is False
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "ManagedBy",
+        "TaskPlatform",
+        "Service",
+        "Environment",
+        "ManifestDigest",
+        "ConstraintsDigest",
+        "PlatformRevision",
+        "UpstreamRevision",
+        "GeneratorVersion",
+        "RunnerImage",
+    ],
+)
+def test_task_platform_worker_image_requires_complete_provenance(missing):
+    image = _task_platform_worker_image()
+    image["Tags"] = [tag for tag in image["Tags"] if tag["Key"] != missing]
+
+    with pytest.raises(LauncherConfigurationError, match="worker provenance"):
+        validate_image_description(image, caller_account_id=CALLER_ACCOUNT)
 
 
 @pytest.mark.parametrize(

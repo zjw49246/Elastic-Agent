@@ -50,6 +50,11 @@ GOLDEN_IMAGE_TAGS = {
     "ManagedBy": "elastic-agent",
     "Role": "worker-golden",
 }
+TASK_PLATFORM_WORKER_TAGS = {
+    "ManagedBy": "task-platform-packer",
+    "TaskPlatform": "worker",
+    "Service": "task-platform",
+}
 
 _AWS_ID_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
@@ -384,6 +389,23 @@ def _root_snapshot_encrypted(image: Mapping[str, Any]) -> bool:
     return False
 
 
+def _task_platform_worker_provenance(tags: Mapping[str, str]) -> bool:
+    if any(tags.get(key) != value for key, value in TASK_PLATFORM_WORKER_TAGS.items()):
+        return False
+    digest_pattern = r"sha256:[0-9a-f]{64}"
+    revision_pattern = r"[0-9a-f]{40}"
+    runner_pattern = r"[^\s]{1,512}@sha256:[0-9a-f]{64}"
+    return bool(
+        tags.get("Environment")
+        and re.fullmatch(digest_pattern, tags.get("ManifestDigest", ""))
+        and re.fullmatch(digest_pattern, tags.get("ConstraintsDigest", ""))
+        and re.fullmatch(revision_pattern, tags.get("PlatformRevision", ""))
+        and re.fullmatch(revision_pattern, tags.get("UpstreamRevision", ""))
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", tags.get("GeneratorVersion", ""))
+        and re.fullmatch(runner_pattern, tags.get("RunnerImage", ""))
+    )
+
+
 def validate_image_description(
     image: Mapping[str, Any],
     *,
@@ -393,10 +415,11 @@ def validate_image_description(
     """Enforce the worker AMI's runtime, encryption, and provenance policy.
 
     Normal production images must be encrypted, owned by the current AWS
-    account, and carry both golden-image tags.  Canonical's official publisher
-    image is an emergency-only exception selected with an explicit environment
-    opt-in.  That exception also permits Canonical's unencrypted public source
-    snapshot; ``AWSProvider`` still requests an encrypted worker root volume.
+    account, and carry either EA golden-image tags or the complete Task
+    Platform worker provenance. Canonical's official publisher image is an
+    emergency-only exception selected with an explicit environment opt-in.
+    That exception also permits Canonical's unencrypted public source snapshot;
+    ``AWSProvider`` still requests an encrypted worker root volume.
     """
 
     image_id = str(image.get("ImageId") or "<unknown>")
@@ -414,17 +437,25 @@ def validate_image_description(
     owner_id = str(image.get("OwnerId") or "")
     if owner_id == caller_account_id:
         tags = _image_tags(image)
-        missing = [f"{key}={value}" for key, value in GOLDEN_IMAGE_TAGS.items() if tags.get(key) != value]
-        if missing:
+        golden = all(
+            tags.get(key) == value for key, value in GOLDEN_IMAGE_TAGS.items()
+        )
+        task_platform = _task_platform_worker_provenance(tags)
+        if not golden and not task_platform:
             raise LauncherConfigurationError(
-                f"worker AMI {image_id}: self-owned image is missing required golden tags: " + ", ".join(missing)
+                f"worker AMI {image_id}: self-owned image is missing required "
+                "EA golden tags or Task Platform worker provenance"
             )
         if not _root_snapshot_encrypted(image):
             raise LauncherConfigurationError(f"worker AMI {image_id}: root snapshot must be encrypted")
         return ImageValidationResult(
             image_id=image_id,
             owner_id=owner_id,
-            provenance="self-owned-golden",
+            provenance=(
+                "self-owned-golden"
+                if golden
+                else "self-owned-task-platform-worker"
+            ),
             break_glass_used=False,
         )
 
