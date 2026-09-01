@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 62440,
-      "sha256": "sha256:33a17fa6f363e2b2ddc54431b782101937701d1122b137ffb49d0c72b7c84b54"
+      "size": 62884,
+      "sha256": "sha256:3627d11801504cd2cfc99f33da6a40a6b545cc79122d8791b3c3d90c0e604f9c"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 123097,
-      "sha256": "sha256:7e77ab03996bc29bb6a7b9307e204842043c04c2534852ca049bd126874871ac"
+      "size": 124499,
+      "sha256": "sha256:1cb986e776f770ff8b1e2beb3e980293095b82a0abb54197d2609f7f41bc0349"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 66312,
-      "sha256": "sha256:2057ba14ab59d09a62c14f252b14fca01d8d4906b77f790dd3658fcec5d8113e"
+      "size": 66672,
+      "sha256": "sha256:6d8319d77221a033299ee3211c893939cd75bdfab5f781dac3ccbbdd5ac6b450"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31534,
-      "sha256": "sha256:f740ac905c7e47b53f85f98afea4172f3d2956c713b6541ad91446e640c2b70e"
+      "size": 31714,
+      "sha256": "sha256:f6beeb2cf7b2e835625578017dfe11c8576e6c60c373ca6fe674b61dbc4fa800"
     },
     {
       "path": "deploy/__init__.py",
@@ -929,8 +929,8 @@
       "path": "src/elastic_agent/core/providers/aws.py",
       "type": "file",
       "mode": "0644",
-      "size": 21747,
-      "sha256": "sha256:aa915aa223c855dbd573d4aa0e6dd1e8e10c9b641a1ab7851022c8af4d18659a"
+      "size": 23174,
+      "sha256": "sha256:b064003e5ca4313934e3d889712d3184c56d87cb6a9171e7073b17d85ae6d62e"
     },
     {
       "path": "src/elastic_agent/core/providers/base.py",
@@ -1482,8 +1482,8 @@
       "path": "tests/unit/test_aws_provider.py",
       "type": "file",
       "mode": "0644",
-      "size": 8763,
-      "sha256": "sha256:dc69576ce72dcae5c7494c5448cd131381b31790ba880c50b7901f84a626fa95"
+      "size": 10710,
+      "sha256": "sha256:c2903dab3d0f936ce4d6fba35c398cd0111958eb2700ee1e8c300c5d55d9e19a"
     },
     {
       "path": "tests/unit/test_batch_hooks.py",
@@ -1825,8 +1825,8 @@
       "path": "tests/unit/test_provider_eip.py",
       "type": "file",
       "mode": "0644",
-      "size": 10071,
-      "sha256": "sha256:0d01f6a9e7601ce2d8842634172406ff7d45c3ef4d58fc13c6e06860425b9361"
+      "size": 10131,
+      "sha256": "sha256:01499e58cd45f69f5f9e198044ac5e111fa61b609b9a98e2f4cbaca119d13d60"
     },
     {
       "path": "tests/unit/test_pty_backend.py",
