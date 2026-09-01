@@ -1608,6 +1608,8 @@ async def test_recovered_worker_quiescence_stops_all_runtime_units(
     assert len(commands) == 1
     assert "systemctl stop \"$unit\"" in commands[0]
     assert "systemctl mask --runtime \"$unit\"" in commands[0]
+    assert "systemctl daemon-reload" in commands[0]
+    assert "unit was not runtime-masked" in commands[0]
     assert "ea-task-supervisor.service" in commands[0]
     assert "elastic-agent-task-supervisor.service" in commands[0]
     assert "ea-runtime.service" in commands[0]

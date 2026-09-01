@@ -83,6 +83,7 @@ class _InstanceLifecycleGate:
         self._condition = asyncio.Condition()
         self._active_creates = 0
         self._recovery_active = False
+        self._recovery_owner: asyncio.Task[Any] | None = None
         self._recovery_waiters = 0
 
     @asynccontextmanager
@@ -104,6 +105,9 @@ class _InstanceLifecycleGate:
     @asynccontextmanager
     async def recovery(self) -> AsyncIterator[None]:
         acquired = False
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("recovery lifecycle gate requires an asyncio task")
         async with self._condition:
             self._recovery_waiters += 1
             try:
@@ -112,6 +116,7 @@ class _InstanceLifecycleGate:
                     and self._active_creates == 0
                 )
                 self._recovery_active = True
+                self._recovery_owner = owner
                 acquired = True
             finally:
                 self._recovery_waiters -= 1
@@ -120,9 +125,21 @@ class _InstanceLifecycleGate:
         try:
             yield
         finally:
-            async with self._condition:
-                self._recovery_active = False
-                self._condition.notify_all()
+            await self.release_recovery()
+
+    async def release_recovery(self) -> None:
+        """Idempotently release recovery ownership from the owning task."""
+
+        owner = asyncio.current_task()
+        async with self._condition:
+            # The recovery context can deliberately release after its cloud
+            # ownership scan, before slow SSH/result cleanup. Its ``finally``
+            # must not release a newer recovery owner that acquired afterward.
+            if self._recovery_owner is not owner:
+                return
+            self._recovery_active = False
+            self._recovery_owner = None
+            self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -262,6 +279,9 @@ class ElasticAgentManager:
         self._shutdown_event = asyncio.Event()
         self._binding_lock_fd: int | None = None
         self._instance_capacity_lock = asyncio.Lock()
+        # Keep recovery passes single-writer even after their short cloud
+        # ownership scan releases the create fence for long-running cleanup.
+        self._recovery_pass_lock = asyncio.Lock()
         # Startup/live recovery and instance publication share this gate.
         # Creates may overlap, but recovery is an exclusive writer so its
         # controller-tag scan cannot observe RunInstances after cloud
@@ -901,10 +921,11 @@ class ElasticAgentManager:
         await self.binding_manager.wait_instance_terminated(instance_id)
 
     async def _recover_bound_resources_once(self) -> None:
-        """Exclude creates from one cloud ownership recovery pass."""
+        """Fence the ownership scan without blocking creates during cleanup."""
 
-        async with self._instance_lifecycle_gate.recovery():
-            await self._recover_bound_resources_once_locked()
+        async with self._recovery_pass_lock:
+            async with self._instance_lifecycle_gate.recovery():
+                await self._recover_bound_resources_once_locked()
 
     async def _current_unbound_instance_is_live(self, instance) -> bool:
         """Prove an unbound cloud row still belongs to this process's live Job."""
@@ -1446,6 +1467,11 @@ class ElasticAgentManager:
                     self._recovery_unbound_launch_scans
                     or self._recovery_unbound_registry_scans
                 )
+
+        # Everything below operates only on exact durable recovery snapshots.
+        # It may spend hours quiescing and collecting old workers, so it must
+        # not retain the create fence after cloud discovery/adoption is done.
+        await self._instance_lifecycle_gate.release_recovery()
 
         async def cleanup_control_plane(lease) -> None:
             worker_id = self._durable_lease_worker_target(

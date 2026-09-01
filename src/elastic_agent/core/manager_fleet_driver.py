@@ -3615,13 +3615,22 @@ unit_exists() {{
 stop_and_mask() {{
   local unit="$1"
   if unit_exists "$unit"; then
-    systemctl mask --runtime "$unit" >/dev/null
-    systemctl stop "$unit"
+    # Mask first so an activation race cannot respawn the unit. systemd can
+    # report a non-zero command status while changing an already loaded unit;
+    # final state, PID, and cgroup verification below remain authoritative.
+    systemctl mask --runtime "$unit" >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl stop "$unit" >/dev/null 2>&1 || true
   fi
 }}
 verify_unit() {{
-  local unit="$1" state pid cgroup file
+  local unit="$1" state unit_file_state pid cgroup file
   unit_exists "$unit" || return 0
+  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")"
+  case "$unit_file_state" in
+    masked|masked-runtime) ;;
+    *) echo "unit was not runtime-masked: $unit ($unit_file_state)" >&2; return 1 ;;
+  esac
   state="$(systemctl show -p ActiveState --value "$unit")"
   case "$state" in
     inactive|failed) ;;

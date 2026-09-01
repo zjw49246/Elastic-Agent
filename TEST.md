@@ -534,7 +534,9 @@ test networks only.
 - Instance lifecycle gate (`tests/unit/test_manager.py`): independent
   one-worker `scale_out` calls must enter the provider concurrently; recovery
   must wait for every entered create transaction, block later creates from
-  overtaking it, and then release those creates after the exclusive scan.
+  overtaking it, and then release those creates after the exclusive scan even
+  while recovered-worker collection remains blocked. Separate recovery passes
+  must stay serialized during that slow cleanup.
   Capacity tests still prove concurrent in-flight creates cannot exceed the
   configured provider maximum.
 - Import graph: `python scripts/build_ui_v2.py --check` validates that every

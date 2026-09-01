@@ -2535,6 +2535,60 @@ class TestScaleOut:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_recovery_cleanup_releases_create_fence(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 3
+        await manager.start()
+        await _wait_for_binding_recovery(manager)
+        previous = await provider.create_instance(InstanceConfig(
+            instance_type="t3.small",
+            image_id="ami-test",
+            key_pair_name="test-key",
+            tags={
+                CloudProvider.MANAGED_TAG_KEY: (
+                    CloudProvider.MANAGED_TAG_VALUE
+                ),
+                "ElasticAgentController": (
+                    manager.account_binding_store.controller_id
+                ),
+                "ElasticAgentJob": "job-previous",
+            },
+        ))
+        collect_entered = asyncio.Event()
+        release_collect = asyncio.Event()
+        create_entered = asyncio.Event()
+
+        async def slow_collect(_instance):
+            collect_entered.set()
+            await release_collect.wait()
+
+        real_create = provider.create_instance
+
+        async def observed_create(config):
+            create_entered.set()
+            return await real_create(config)
+
+        manager._collect_recovered_unbound = slow_collect
+        provider.create_instance = observed_create
+        manager._binding_recovery_scan_pending = True
+        manager._binding_recovery_scans_remaining = 1
+
+        recovery = asyncio.create_task(
+            manager._recover_bound_resources_once()
+        )
+        await asyncio.wait_for(collect_entered.wait(), timeout=0.5)
+        launch = asyncio.create_task(manager.scale_out())
+        await asyncio.wait_for(create_entered.wait(), timeout=0.5)
+
+        release_collect.set()
+        records = await launch
+        await recovery
+        assert records[0].instance_id != previous.instance_id
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_scale_out_merges_bound_lifecycle_tags(self, manager, provider):
         await manager.start()
         await manager.account_binding_store.upsert_binding(
