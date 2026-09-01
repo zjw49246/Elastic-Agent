@@ -1085,3 +1085,26 @@ socket 权限和真实 sandbox build。
 
 **验证**：bootstrap/generic harness、Manager、AWS provider 与 EIP 套件 **192 passed**；
 Ruff、`git diff --check` 与生成 shell 的 `bash -n` 通过。实盘 canary 将在新 release 部署后重跑。
+
+## 2026-09-02 兼容 Worker 的 dpkg Python 模块（commit `b9262dd`）
+
+**问题**：Docker CE 兼容 release 发布后，10 个实盘 canary 全部通过 `system-init`、
+`agent-install` 和 `docker-install`，并记录 `Bootstrap succeeded`，但随后全部在 source runtime
+部署开头以 rc=1 终止，unit 文件尚未写入。
+
+**根因**：AMI 没有有效的 golden-image verifier，source runtime fallback 因而用 pip 安装
+Pydantic 等 Python 依赖。Pydantic 2.13 要求更高版本的 `typing-extensions`，而 Noble 的
+`python3-typing-extensions 4.10.0` 由 dpkg 安装且没有 pip RECORD；pip 尝试卸载它时报
+`Cannot uninstall typing_extensions 4.10.0, RECORD file not found`。
+
+**解决**：仅 source runtime Python dependency fallback 增加 `--ignore-installed`。pip 将完整
+兼容 wheel 集写入 `/usr/local` 并按标准 `sys.path` 覆盖发行版模块，不卸载或修改 dpkg 文件。
+同 AMI/同网络的临时 EC2 探针证明原命令稳定复现 rc=1，而新命令返回 0，五个 runtime 模块
+全部成功导入；探针随后已确认终止。
+
+**以后避免**：Golden AMI 验收必须同时验证 verifier 的存在、Python 依赖 import 和 fallback
+路径；不能只检查包名。任何跨 dpkg/pip 边界的升级都不得依赖 pip 卸载发行版文件。
+
+**验证**：bootstrap/generic harness 套件 **67 passed**，Ruff、`git diff --check` 与生成 shell
+的 `bash -n` 通过。更广 Linux 相关套件 **287 passed**；另有 3 个既有恢复测试因本地 macOS
+没有 `/proc` 而失败，与本修复路径无关。实盘 canary 将在新 release 部署后重跑。

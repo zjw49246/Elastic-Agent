@@ -148,6 +148,9 @@ The focused suite covers:
 - Docker bootstrap that reuses working image-provided Docker/buildx, adds only
   the Docker CE buildx plugin when required, and reserves `docker.io` installs
   for hosts without an existing Docker engine;
+- source-runtime Python fallback that overlays dpkg-owned modules through
+  `/usr/local` without attempting an uninstall of Noble packages lacking a pip
+  RECORD;
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
   the temporary instance/root disk, require an identity-matched `RELEASED`
   lease, clear task/Node/WS status state, retain the EIP, and preserve the Node

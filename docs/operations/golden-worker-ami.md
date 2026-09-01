@@ -89,6 +89,12 @@ buildx is missing, install only `docker-buildx-plugin`; installing Ubuntu's
 non-CE packaged Docker install only `docker-buildx`, and install the complete
 `docker.io docker-buildx` pair only when no Docker command exists.
 
+Runtime Python fallback must coexist with distribution-owned modules. Ubuntu
+Noble's `python3-typing-extensions`, for example, has no pip RECORD, so a normal
+pip upgrade fails while trying to uninstall it. Install the runtime dependency
+set with `--ignore-installed`: compatible wheels land in `/usr/local` and shadow
+the dpkg copy without deleting or modifying files owned by the distribution.
+
 ## Promotion and rollback
 
 Before promotion, verify that the AMI is owned by this account, available,

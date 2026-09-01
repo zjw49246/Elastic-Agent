@@ -1127,6 +1127,12 @@ the matching `docker-buildx-plugin`; it never overlays Ubuntu's conflicting
 `docker.io` package. A non-CE packaged Docker receives only `docker-buildx`,
 while a blank image receives the full `docker.io docker-buildx` dependency set.
 
+The source runtime's Python fallback installs wheels with `--ignore-installed`.
+This lets newer runtime requirements shadow Ubuntu's dpkg-owned modules in
+`/usr/local` without asking pip to uninstall system packages that have no pip
+RECORD, such as Noble's `python3-typing-extensions`. The distribution-owned
+files remain intact.
+
 On AWS, Manager-initiated SSH traffic (bootstrap, login, logs, code delivery,
 and collection) prefers the Worker's VPC-private address. The Worker's EIP is
 only its stable outbound identity, so port 22 can be restricted to the Manager
