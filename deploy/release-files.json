@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 63332,
-      "sha256": "sha256:59660a120d0a63e09919550e74685bda20b36aeb3e414e45cd2ed6b11b3800c2"
+      "size": 63559,
+      "sha256": "sha256:718b5bbde6ad1d83171c3e0a7162155860dfc7cb99df2178b863f1aa7451f188"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 127196,
-      "sha256": "sha256:7c0996136bd9bd3a3216e8f9ce244483806ae86da72feba1a4a721db3dc95e6b"
+      "size": 128583,
+      "sha256": "sha256:ec642faf48c645d77755cc950b77bb55d1f8d0b34e324e65de7b2c07a16c087e"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 67426,
-      "sha256": "sha256:4f1945afe5ed614beabeb9f792b58600df4d27468299b68bb4f72b5bc7880085"
+      "size": 67815,
+      "sha256": "sha256:01a3efdc947e7cd14d8e44452e753e5cafa521a0d2469f32d3e20e19bec209e3"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 32128,
-      "sha256": "sha256:73894a43eb6169c40d3208798f59982d232e83a8657c82b70aeff58b948908fa"
+      "size": 32333,
+      "sha256": "sha256:aae519289def68f56ae55299978e38c9de8fdf99f9df6ea7f15294e29e52e895"
     },
     {
       "path": "deploy/__init__.py",
@@ -222,8 +222,8 @@
       "path": "docs/operations/golden-worker-ami.md",
       "type": "file",
       "mode": "0644",
-      "size": 7905,
-      "sha256": "sha256:6ee3f1f0fde0e8d9b7523942e3e41845b8e322611fe854638cae4adbe0983bf5"
+      "size": 8359,
+      "sha256": "sha256:910bbe8cef0669e8c18b97cff29716e0f7a60150f54c8d7460bc3ee0e0e2fe03"
     },
     {
       "path": "docs/operations/job-batch-json.md",
@@ -726,8 +726,8 @@
       "path": "src/elastic_agent/core/bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 29298,
-      "sha256": "sha256:bb7e72c9b0d31fed0ee5a7c7d343dbd2b186c99316b08314e4c68a8740214dc7"
+      "size": 29877,
+      "sha256": "sha256:089abfba311b0e1c856bae82a711555af75c142fb077339eafc5a7d6c837311b"
     },
     {
       "path": "src/elastic_agent/core/checkpoint_store.py",
@@ -1524,8 +1524,8 @@
       "path": "tests/unit/test_bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 14328,
-      "sha256": "sha256:35f4a9d99f53b00548dd74f279ddc81900da37f5b7d7166c4fe288da46cffeef"
+      "size": 14584,
+      "sha256": "sha256:35ce8a61c673bf302eef2feca8619c2219245edee131a3f3327684d9241ccbbc"
     },
     {
       "path": "tests/unit/test_checkpoint_store.py",
