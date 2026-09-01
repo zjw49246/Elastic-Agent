@@ -2682,7 +2682,10 @@ class ElasticAgentManager:
             make_login_hook,
             make_provision_hook,
         )
-        from elastic_agent.core.batch_orchestrator import BatchOrchestrator
+        from elastic_agent.core.batch_orchestrator import (
+            BatchOrchestrator,
+            configured_worker_lifecycle_concurrency,
+        )
         from elastic_agent.core.manager_fleet_driver import ManagerFleetDriver
         allocator = self.account_allocator
         coordinator = LoginCoordinator(
@@ -2716,6 +2719,13 @@ class ElasticAgentManager:
         self._batch = BatchOrchestrator(
             driver,
             scale_in_on_complete=scale_in_on_complete,
+            worker_concurrency=configured_worker_lifecycle_concurrency(
+                getattr(
+                    getattr(self.config, "batch_runtime", None),
+                    "worker_concurrency",
+                    8,
+                )
+            ),
             persist_spec_hook=self._persist_batch_job_spec,
             job_state_hook=self._update_batch_job_state,
             interrupt_intent_hook=self._update_batch_interrupt_intent,

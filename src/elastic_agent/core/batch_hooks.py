@@ -35,6 +35,7 @@ from elastic_agent.core.batch_orchestrator import (
     BatchOrchestrator,
     LoginOutcome,
     WorkerAssignment,
+    configured_worker_lifecycle_concurrency,
 )
 from elastic_agent.core.credential_pool import AccountDefinition
 from elastic_agent.core.job_spec import JobSpec
@@ -2123,6 +2124,10 @@ def wire_batch(
     login_timeout: float = 3600.0,
 ) -> BatchOrchestrator:
     """Build a fully-wired BatchOrchestrator and route worker events into it."""
+    batch_runtime = getattr(manager.config, "batch_runtime", None)
+    worker_concurrency = configured_worker_lifecycle_concurrency(
+        getattr(batch_runtime, "worker_concurrency", 8)
+    )
     allocator = getattr(manager, "account_allocator", None)
     if allocator is None:
         # Lightweight test/deployment Managers predating the shared property.
@@ -2172,6 +2177,7 @@ def wire_batch(
     orch = BatchOrchestrator(
         driver,
         scale_in_on_complete=scale_in_on_complete,
+        worker_concurrency=worker_concurrency,
         persist_spec_hook=getattr(manager, "_persist_batch_job_spec", None),
         job_state_hook=getattr(manager, "_update_batch_job_state", None),
         interrupt_intent_hook=getattr(

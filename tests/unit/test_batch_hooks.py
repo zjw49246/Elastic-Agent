@@ -3353,6 +3353,19 @@ class TestProvisionHook:
 
 
 class TestWireBatchRouting:
+    async def test_deployment_env_overrides_legacy_runtime_default(
+        self, tmp_path, monkeypatch,
+    ):
+        mgr = FakeManager(tmp_path, await _store(tmp_path, []))
+        mgr.config.__dict__["batch_runtime"] = SimpleNamespace(
+            worker_concurrency=8,
+        )
+        monkeypatch.setenv("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "500")
+
+        orch = wire_batch(mgr)
+
+        assert orch._worker_semaphore._value == 500
+
     async def test_oauth_exhaustion_quarantine_skips_account_for_next_job(
         self, tmp_path,
     ):

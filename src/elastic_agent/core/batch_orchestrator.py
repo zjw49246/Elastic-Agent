@@ -49,16 +49,24 @@ WORKER_LIFECYCLE_CONCURRENCY_MAX = 500
 LAUNCH_ADMISSION_POLL_SECONDS = 1.0
 
 
-def configured_worker_lifecycle_concurrency() -> int:
+def configured_worker_lifecycle_concurrency(default: int = 8) -> int:
+    """Resolve the lifecycle limit, with the deployment env taking priority.
+
+    ``default`` lets Manager runtime configuration provide the fallback while
+    keeping the process-level deployment override authoritative.  This is
+    important for production overlays that still carry the historical
+    ``batch_runtime.worker_concurrency = 8`` default.
+    """
     raw = os.environ.get("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "").strip()
-    if not raw:
-        return 8
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be an integer"
-        ) from exc
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be an integer"
+            ) from exc
+    else:
+        value = int(default)
     if not 1 <= value <= WORKER_LIFECYCLE_CONCURRENCY_MAX:
         raise ValueError(
             "ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY must be between 1 and 500"

@@ -143,6 +143,29 @@ def _rewrite_persisted_account_mode(
     spec_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def test_configure_batch_env_overrides_legacy_runtime_default(
+    manager,
+    monkeypatch,
+):
+    manager.config.__dict__["batch_runtime"] = SimpleNamespace(
+        worker_concurrency=8,
+    )
+    monkeypatch.setenv("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", "500")
+
+    async def provision_hook(*_args, **_kwargs):
+        return True
+
+    async def login_hook(*_args, **_kwargs):
+        return None
+
+    manager.configure_batch(
+        provision_hook=provision_hook,
+        login_hook=login_hook,
+    )
+
+    assert manager.batch._worker_semaphore._value == 500
+
+
 async def _wait_for_binding_recovery(
     manager: ElasticAgentManager,
     *,

@@ -31,6 +31,13 @@ async def test_worker_lifecycle_concurrency_accepts_500_and_rejects_501(monkeypa
         configured_worker_lifecycle_concurrency()
 
 
+async def test_worker_lifecycle_concurrency_uses_runtime_default_without_env(
+    monkeypatch,
+):
+    monkeypatch.delenv("ELASTIC_AGENT_WORKER_LIFECYCLE_CONCURRENCY", raising=False)
+    assert configured_worker_lifecycle_concurrency(37) == 37
+
+
 class FakeDriver:
     """Records calls; each step can be told to fail."""
 
