@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -94,7 +95,8 @@ class AWSProvider(CloudProvider):
     def __init__(self, config: AWSProviderConfig) -> None:
         self._config = config
         self._client = self._create_client()
-        self._root_dev_cache: dict[str, str] = {}
+        self._root_dev_cache: dict[str, tuple[str, int | None]] = {}
+        self._root_dev_lock = threading.Lock()
         self._recent_instances: dict[str, float] = {}
         self._identity: CloudIdentity | None = None
 
@@ -130,23 +132,46 @@ class AWSProvider(CloudProvider):
             raise InstanceNotFoundError(f"Instance not found: {native_id}")
         return reservations[0]["Instances"][0]
 
-    def _root_device_name(self, image_id: str) -> str:
-        """The AMI's real root device name. Ubuntu roots on /dev/sda1, Amazon
-        Linux on /dev/xvda — sizing the wrong name creates a phantom unused
-        volume while the actual root stays at the AMI's baked-in size, so the
-        instance runs out of disk. Cached; falls back to the common Ubuntu name."""
-        if image_id in self._root_dev_cache:
-            return self._root_dev_cache[image_id]
-        name = "/dev/sda1"
-        try:
-            resp = self._client.describe_images(ImageIds=[image_id])
-            images = resp.get("Images", [])
-            if images and images[0].get("RootDeviceName"):
-                name = images[0]["RootDeviceName"]
-        except Exception:  # noqa: BLE001
-            logger.warning("could not resolve root device for %s; using %s", image_id, name)
-        self._root_dev_cache[image_id] = name
-        return name
+    def _root_device_info(self, image_id: str) -> tuple[str, int | None]:
+        """Return the AMI root device and its non-shrinkable volume size."""
+
+        with self._root_dev_lock:
+            cached = self._root_dev_cache.get(image_id)
+            if cached is not None:
+                return cached
+            name = "/dev/sda1"
+            minimum_size: int | None = None
+            try:
+                response = self._client.describe_images(ImageIds=[image_id])
+                images = response.get("Images", [])
+                if images and isinstance(images[0], dict):
+                    image = images[0]
+                    root_name = image.get("RootDeviceName")
+                    if isinstance(root_name, str) and root_name:
+                        name = root_name
+                    for mapping in image.get("BlockDeviceMappings", []):
+                        if (
+                            isinstance(mapping, dict)
+                            and mapping.get("DeviceName") == name
+                            and isinstance(mapping.get("Ebs"), dict)
+                        ):
+                            volume_size = mapping["Ebs"].get("VolumeSize")
+                            if (
+                                isinstance(volume_size, int)
+                                and not isinstance(volume_size, bool)
+                                and volume_size > 0
+                            ):
+                                minimum_size = volume_size
+                            break
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "could not resolve root device metadata for %s; using %s",
+                    image_id,
+                    name,
+                )
+            result = (name, minimum_size)
+            self._root_dev_cache[image_id] = result
+            return result
 
     async def create_instance(self, config: InstanceConfig) -> Instance:
         tags = {**config.tags, self.MANAGED_TAG_KEY: self.MANAGED_TAG_VALUE}
@@ -228,12 +253,25 @@ class AWSProvider(CloudProvider):
             kwargs["UserData"] = config.user_data
 
         image_id = config.image_id or self._config.ami_id
-        root_device = await asyncio.to_thread(self._root_device_name, image_id)
+        root_device, minimum_root_size = await asyncio.to_thread(
+            self._root_device_info,
+            image_id,
+        )
+        root_disk_size = max(
+            config.root_disk_size_gb,
+            minimum_root_size or 0,
+        )
+        if root_disk_size > config.root_disk_size_gb:
+            logger.info(
+                "Raised AWS root volume from %s GiB to AMI minimum %s GiB",
+                config.root_disk_size_gb,
+                root_disk_size,
+            )
         block_devices = [
             {
                 "DeviceName": root_device,
                 "Ebs": {
-                    "VolumeSize": config.root_disk_size_gb,
+                    "VolumeSize": root_disk_size,
                     "VolumeType": "gp3",
                     "DeleteOnTermination": True,
                     "Encrypted": True,

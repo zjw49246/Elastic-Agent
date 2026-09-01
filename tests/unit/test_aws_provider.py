@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -48,6 +49,7 @@ def _provider_with_client(client) -> AWSProvider:
     prov._config = AWSProviderConfig(region="ap-northeast-1")
     prov._client = client
     prov._root_dev_cache = {}
+    prov._root_dev_lock = threading.Lock()
     prov._recent_instances = {}
     return prov
 
@@ -110,6 +112,73 @@ async def test_create_instance_sizes_the_amis_real_root_device():
         "HttpTokens": "required",
         "HttpPutResponseHopLimit": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_create_instance_never_shrinks_below_ami_root_volume():
+    client = MagicMock()
+    client.describe_images.return_value = {
+        "Images": [
+            {
+                "RootDeviceName": "/dev/sda1",
+                "BlockDeviceMappings": [
+                    {
+                        "DeviceName": "/dev/sda1",
+                        "Ebs": {"VolumeSize": 80},
+                    }
+                ],
+            }
+        ]
+    }
+    client.run_instances.return_value = {
+        "Instances": [{"InstanceId": "i-x", "State": {"Name": "pending"}}]
+    }
+    prov = _provider_with_client(client)
+
+    await prov.create_instance(
+        InstanceConfig(
+            instance_type="t3.large",
+            image_id="ami-x",
+            key_pair_name="k",
+            root_disk_size_gb=40,
+        )
+    )
+
+    bdm = client.run_instances.call_args.kwargs["BlockDeviceMappings"]
+    assert bdm[0]["Ebs"]["VolumeSize"] == 80
+
+
+@pytest.mark.asyncio
+async def test_create_instance_caches_ami_root_volume_metadata():
+    client = MagicMock()
+    client.describe_images.return_value = {
+        "Images": [
+            {
+                "RootDeviceName": "/dev/sda1",
+                "BlockDeviceMappings": [
+                    {
+                        "DeviceName": "/dev/sda1",
+                        "Ebs": {"VolumeSize": 80},
+                    }
+                ],
+            }
+        ]
+    }
+    client.run_instances.return_value = {
+        "Instances": [{"InstanceId": "i-x", "State": {"Name": "pending"}}]
+    }
+    prov = _provider_with_client(client)
+    config = InstanceConfig(
+        instance_type="t3.large",
+        image_id="ami-x",
+        key_pair_name="k",
+        root_disk_size_gb=40,
+    )
+
+    await prov.create_instance(config)
+    await prov.create_instance(config)
+
+    assert client.describe_images.call_count == 1
 
 
 @pytest.mark.asyncio

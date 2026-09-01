@@ -1103,6 +1103,12 @@ must update the exact IAM image pin and environment together, run Access
 Analyzer/full-policy simulation, and complete a launch/upload/terminate canary.
 Restore a tagged golden image and its narrow IAM pin immediately.
 
+AWS root-volume overrides never shrink below the selected AMI's root block
+device size. If a Job requests a smaller `fanout.disk_gb`, the provider uses
+the AMI minimum reported by `DescribeImages`; larger requests still expand the
+encrypted gp3 volume. Root metadata is cached per AMI so a large launch wave
+does not repeat the image lookup for every Worker.
+
 On AWS, Manager-initiated SSH traffic (bootstrap, login, logs, code delivery,
 and collection) prefers the Worker's VPC-private address. The Worker's EIP is
 only its stable outbound identity, so port 22 can be restricted to the Manager

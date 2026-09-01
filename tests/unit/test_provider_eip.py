@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,6 +22,7 @@ def _aws(client) -> AWSProvider:
     prov._config = AWSProviderConfig(region="ap-northeast-1")
     prov._client = client
     prov._root_dev_cache = {}
+    prov._root_dev_lock = threading.Lock()
     prov._recent_instances = {}
     return prov
 
