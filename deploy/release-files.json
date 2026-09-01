@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 62187,
-      "sha256": "sha256:ea749067efc9666d382e7f36efde7f4d11d96bfc3faea4530d66079d340fb14b"
+      "size": 62440,
+      "sha256": "sha256:33a17fa6f363e2b2ddc54431b782101937701d1122b137ffb49d0c72b7c84b54"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 121581,
-      "sha256": "sha256:0b56a30a6ea42a36f590ece7898cac9cba395ec6032be7eee3ed5aabad46958b"
+      "size": 123097,
+      "sha256": "sha256:7e77ab03996bc29bb6a7b9307e204842043c04c2534852ca049bd126874871ac"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 66053,
-      "sha256": "sha256:a4b70ab3dfe3bf661f53bbb84c9c20ce7c7522355173a4ea4b28a0081e914a42"
+      "size": 66312,
+      "sha256": "sha256:2057ba14ab59d09a62c14f252b14fca01d8d4906b77f790dd3658fcec5d8113e"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31446,
-      "sha256": "sha256:1f29bfa509e751cd8a882afa0f65203ae9e61bd7b2ce96ffa559e242f1cff0ab"
+      "size": 31534,
+      "sha256": "sha256:f740ac905c7e47b53f85f98afea4172f3d2956c713b6541ad91446e640c2b70e"
     },
     {
       "path": "deploy/__init__.py",
@@ -824,8 +824,8 @@
       "path": "src/elastic_agent/core/job_batch.py",
       "type": "file",
       "mode": "0644",
-      "size": 44432,
-      "sha256": "sha256:1458436d4d383697f1bbdb6fecd59c1420b42466803da5a66c0ced1b897b222b"
+      "size": 45434,
+      "sha256": "sha256:1470d9048b1b76924df6c9be55fccb68c44f6f806775963e5d2006aef28e3630"
     },
     {
       "path": "src/elastic_agent/core/job_log_store.py",
@@ -1699,8 +1699,8 @@
       "path": "tests/unit/test_job_batches.py",
       "type": "file",
       "mode": "0644",
-      "size": 44206,
-      "sha256": "sha256:8d5f36f8643c8ede962de7a6a47a09e7387a69ab87ebf2beb628fd2253003765"
+      "size": 47208,
+      "sha256": "sha256:ce118003f39a6cdf5500542aa25760fd060ff050e137d9f42daeb263b7faa045"
     },
     {
       "path": "tests/unit/test_job_log_store.py",
