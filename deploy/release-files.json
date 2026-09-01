@@ -26,8 +26,8 @@
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 120210,
-      "sha256": "sha256:d4958ed94ddc6a48c5cdd34e83e1a384e3c71a59d76f36cbca21dd0a22f05cbc"
+      "size": 121581,
+      "sha256": "sha256:0b56a30a6ea42a36f590ece7898cac9cba395ec6032be7eee3ed5aabad46958b"
     },
     {
       "path": "README.md",
@@ -68,8 +68,8 @@
       "path": "deploy/aws/elastic-agent-manager.service",
       "type": "file",
       "mode": "0644",
-      "size": 2132,
-      "sha256": "sha256:3ddbca950d529ff78e728689a10926714a3234df4b45d91491fd353b1f299281"
+      "size": 2393,
+      "sha256": "sha256:871b5ea3db4229b19b8e55f48394194749653e8c9e758f0ef1c60d4b92e1a779"
     },
     {
       "path": "deploy/aws/elastic-agent-results-bucket-policy.json",
@@ -1475,8 +1475,8 @@
       "path": "tests/unit/test_aws_manager_launcher.py",
       "type": "file",
       "mode": "0644",
-      "size": 24577,
-      "sha256": "sha256:4b0fbacea7c801792386340327934706e95554341b1514dbfdb77281919a87cd"
+      "size": 24626,
+      "sha256": "sha256:02f5d1bde0fb7c2cfa7b8b64ea8c1db07c8fe7f10b3ec7031f8c8361c5b41c7b"
     },
     {
       "path": "tests/unit/test_aws_provider.py",

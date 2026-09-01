@@ -24,6 +24,10 @@ Restart=always
 RestartSec=5
 TimeoutStartSec=1900
 TimeoutStopSec=32400
+# systemd's default hard limit is high, but its inherited soft limit is 1024.
+# A 500-worker launch wave needs concurrent SSH, HTTP, registry, and result
+# upload descriptors, so pin both values instead of relying on the host default.
+LimitNOFILE=524288:524288
 UMask=0077
 
 # The Manager needs network access and one state directory, but it does not

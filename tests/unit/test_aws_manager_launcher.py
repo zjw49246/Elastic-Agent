@@ -108,6 +108,7 @@ def test_systemd_unit_enforces_state_readiness_and_imds_boundary():
     assert "ReadWritePaths=/home/ubuntu/.elastic-agent-demo" in source
     assert "ExecStartPost=" in source and "/api/health" in source
     assert "TimeoutStopSec=32400" in source
+    assert "LimitNOFILE=524288:524288" in source
     for setting in (
         "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
         "AWS_CONFIG_FILE=/dev/null",
