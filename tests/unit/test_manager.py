@@ -2380,6 +2380,95 @@ class TestScaleOut:
         await manager.stop()
 
     @pytest.mark.asyncio
+    async def test_independent_scale_out_calls_create_in_parallel(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 2
+        await manager.start()
+        entered = 0
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+        real_create = provider.create_instance
+
+        async def slow_create(config):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await release.wait()
+            return await real_create(config)
+
+        provider.create_instance = slow_create
+        creates = [
+            asyncio.create_task(manager.scale_out()),
+            asyncio.create_task(manager.scale_out()),
+        ]
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=0.2)
+        finally:
+            release.set()
+            await asyncio.gather(*creates)
+
+        assert entered == 2
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_recovery_waits_for_parallel_creates_and_blocks_new_create(
+        self, manager, provider
+    ):
+        manager.config.provider.type = "aws"
+        manager.config.provider.aws.max_instances = 3
+        await manager.start()
+        entered = 0
+        first_two_entered = asyncio.Event()
+        third_entered = asyncio.Event()
+        release_creates = asyncio.Event()
+        recovery_entered = asyncio.Event()
+        release_recovery = asyncio.Event()
+        real_create = provider.create_instance
+
+        async def slow_create(config):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                first_two_entered.set()
+            if entered == 3:
+                third_entered.set()
+            await release_creates.wait()
+            return await real_create(config)
+
+        async def controlled_recovery():
+            recovery_entered.set()
+            await release_recovery.wait()
+
+        provider.create_instance = slow_create
+        manager._recover_bound_resources_once_locked = controlled_recovery
+        first_wave = [
+            asyncio.create_task(manager.scale_out()),
+            asyncio.create_task(manager.scale_out()),
+        ]
+        await asyncio.wait_for(first_two_entered.wait(), timeout=0.2)
+        recovery = asyncio.create_task(manager._recover_bound_resources_once())
+        await asyncio.sleep(0)
+        late_create = asyncio.create_task(manager.scale_out())
+        await asyncio.sleep(0.05)
+        assert recovery_entered.is_set() is False
+        assert third_entered.is_set() is False
+
+        release_creates.set()
+        await asyncio.gather(*first_wave)
+        await asyncio.wait_for(recovery_entered.wait(), timeout=0.2)
+        await asyncio.sleep(0.05)
+        assert third_entered.is_set() is False
+
+        release_recovery.set()
+        await recovery
+        await asyncio.wait_for(third_entered.wait(), timeout=0.2)
+        await late_create
+        await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_scale_out_merges_bound_lifecycle_tags(self, manager, provider):
         await manager.start()
         await manager.account_binding_store.upsert_binding(

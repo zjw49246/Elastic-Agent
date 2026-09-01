@@ -652,8 +652,11 @@ after releasing its EIP.
 Manager-wired `submit()` and `launch()` (including REST) atomically persist the
 JobSpec in a mode-`0600` recovery journal before registration, account/EIP
 reservation, or cloud creation; a journal failure produces no launch side
-effect. Ordinary instance publication is fenced against live recovery, and a
-cloud create that times out or is cancelled after acceptance triggers a bounded
+effect. Ordinary instance publication is fenced against live recovery.
+Independent create transactions enter the provider concurrently, while a
+writer-priority recovery pass waits for all entered creates and blocks later
+creates from overtaking its ownership scan. A cloud create that times out or
+is cancelled after acceptance triggers a bounded
 controller/Job-tag scan so an instance that appears later is collected and
 terminated without waiting for a Manager restart. An EIP Job also reserves the whole fanout against provider
 `max_instances` before allocating any EIP. Schema limits are 100 workers per

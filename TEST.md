@@ -528,5 +528,11 @@ test networks only.
   lifecycle, and dedicated Job-history/Job-log/result-read settings accept 500
   and reject values above the published ceiling; route tests also preserve the
   conservative `2/4/4` read defaults when those variables are omitted.
+- Instance lifecycle gate (`tests/unit/test_manager.py`): independent
+  one-worker `scale_out` calls must enter the provider concurrently; recovery
+  must wait for every entered create transaction, block later creates from
+  overtaking it, and then release those creates after the exclusive scan.
+  Capacity tests still prove concurrent in-flight creates cannot exceed the
+  configured provider maximum.
 - Import graph: `python scripts/build_ui_v2.py --check` validates that every
   ES-module import resolves inside `src/elastic_agent/api/ui_v2/`.

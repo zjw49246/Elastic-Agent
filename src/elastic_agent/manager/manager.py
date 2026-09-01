@@ -10,6 +10,8 @@ import asyncio
 import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -60,6 +62,67 @@ EIP_ALLOCATION_RECOVERY_STABLE_SCANS = 30
 # quarantine EIP work for up to five minutes before declaring it launch-free.
 BOUND_RECOVERY_STABLE_SCANS = 30
 BOUND_DISCONNECT_GRACE_SECONDS = 30
+
+
+class _InstanceLifecycleGate:
+    """Let creates overlap while recovery retains exclusive ownership scans.
+
+    A plain mutex made every one-worker ``scale_out`` wait for the previous
+    cloud create, so a configured lifecycle concurrency of hundreds still
+    reached the provider one request at a time.  Creation transactions may
+    safely overlap because capacity, durable intents, registries, and binding
+    stores have their own atomic boundaries.  Recovery must remain exclusive:
+    it scans controller-tagged cloud rows and cannot observe a create between
+    RunInstances acceptance and durable registry/event publication.
+
+    Writers receive priority so a continuous launch wave cannot starve a
+    recovery pass after it has requested the fence.
+    """
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._active_creates = 0
+        self._recovery_active = False
+        self._recovery_waiters = 0
+
+    @asynccontextmanager
+    async def creation(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._recovery_active
+                and self._recovery_waiters == 0
+            )
+            self._active_creates += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._active_creates -= 1
+                if self._active_creates == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def recovery(self) -> AsyncIterator[None]:
+        acquired = False
+        async with self._condition:
+            self._recovery_waiters += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: not self._recovery_active
+                    and self._active_creates == 0
+                )
+                self._recovery_active = True
+                acquired = True
+            finally:
+                self._recovery_waiters -= 1
+                if not acquired:
+                    self._condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._recovery_active = False
+                self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -199,11 +262,11 @@ class ElasticAgentManager:
         self._shutdown_event = asyncio.Event()
         self._binding_lock_fd: int | None = None
         self._instance_capacity_lock = asyncio.Lock()
-        # Startup/live recovery and instance publication share this fence.
-        # Otherwise a controller-tag scan can observe RunInstances after the
-        # cloud accepted it but before the ordinary Job's registry row exists,
-        # and mistake the current worker for a previous-process orphan.
-        self._instance_lifecycle_lock = asyncio.Lock()
+        # Startup/live recovery and instance publication share this gate.
+        # Creates may overlap, but recovery is an exclusive writer so its
+        # controller-tag scan cannot observe RunInstances after cloud
+        # acceptance and before durable registry/event publication.
+        self._instance_lifecycle_gate = _InstanceLifecycleGate()
         # This is deliberately process-local.  Durable registry metadata alone
         # must never suppress startup cleanup after a Manager restart.
         self._current_unbound_instance_ids: set[str] = set()
@@ -828,9 +891,9 @@ class ElasticAgentManager:
         await self.binding_manager.wait_instance_terminated(instance_id)
 
     async def _recover_bound_resources_once(self) -> None:
-        """Serialize one recovery pass with cloud create -> registry publication."""
+        """Exclude creates from one cloud ownership recovery pass."""
 
-        async with self._instance_lifecycle_lock:
+        async with self._instance_lifecycle_gate.recovery():
             await self._recover_bound_resources_once_locked()
 
     async def _current_unbound_instance_is_live(self, instance) -> bool:
@@ -2858,7 +2921,7 @@ class ElasticAgentManager:
     ) -> list[NodeRecord]:
         reserved_capacity = await self._reserve_instance_capacity(count, tags)
         try:
-            async with self._instance_lifecycle_lock:
+            async with self._instance_lifecycle_gate.creation():
                 return await self._scale_out_unchecked(
                     count=count,
                     instance_type=instance_type,
