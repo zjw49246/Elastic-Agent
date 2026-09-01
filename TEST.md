@@ -139,6 +139,9 @@ The focused suite covers:
 - AWS root-volume sizing that preserves the AMI's real root device and never
   requests less than its snapshot size, with one cached image lookup across
   repeated Worker creates;
+- AWS Manager scale-out user-data that explicitly unmasks and enables
+  `ssh.service`, so copied golden images remain reachable for bootstrap even
+  when their OpenSSH unit enable state was not preserved;
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
   the temporary instance/root disk, require an identity-matched `RELEASED`
   lease, clear task/Node/WS status state, retain the EIP, and preserve the Node

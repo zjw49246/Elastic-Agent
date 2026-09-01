@@ -1021,3 +1021,26 @@ provider launch contract；所有 per-Job disk override 都必须与不可缩小
 
 **验证**：现场条件红测在旧实现上得到 40 而失败，修复后得到 80；AWS provider 与 EIP 套件
 **27 passed**，并验证重复创建只查询一次 AMI metadata；Ruff 与 `git diff --check` 通过。
+
+## 2026-09-02 显式启动 AWS Worker SSH（commit `9075656`）
+
+**问题**：AMI 根盘修复后，500 个 retry 已能创建 `m6id.large`，但大量实例在
+Manager 的 240 秒窗口内始终无法 SSH，Job 以 `bootstrap failed` 终止。
+
+**根因**：EC2 控制台日志证明系统在 27 秒内完成 cloud-init，host keys 和
+`ubuntu` authorized key 均已生成，但启动序列中没有 `ssh.service/ssh.socket`。
+Manager 到 115 台正在创建的实例中，108 台的私网 22 端口直接返回
+`connection refused`，证明不是安全组丢包，而是拷贝后 AMI 未保留 OpenSSH unit
+enable 状态。
+
+**解决**：AWS Worker `InstanceConfig` 统一注入最小 user-data，在 cloud-init final 阶段
+`unmask ssh.service ssh.socket` 并 `enable --now ssh.service`。不改变其他 Provider，不放宽
+Worker 安全组。
+
+**以后避免**：Golden AMI 验收不能只看 cloud-init 和 authorized keys；必须从 Manager
+所在网络完成真实 22 端口与 SSH 命令握手，并把 OpenSSH unit enable/active 状态纳入
+启动合同。
+
+**验证**：同 AMI/SG/subnet 的实盘探针实例加入该 user-data 后，Manager 观测
+22 端口 open，`ssh.service` 为 `enabled/active`，真实 SSH 命令返回 `ready`；探针随后已终止。
+Manager/AWS provider 套件 **109 passed**，Ruff 与 `git diff --check` 通过。
