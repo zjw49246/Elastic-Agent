@@ -77,6 +77,7 @@ _SAFE_JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_CHECKPOINT_GENERATION_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+_LEGACY_PYTHON_RUNNER_RE = re.compile(r"(?<![A-Za-z0-9_./-])python(?=\s+runner\.py(?:\s|$))")
 _TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _TRAJECTORY_PROMPT_TEMPLATE_VARIABLES = frozenset({
     "shard_id",
@@ -1321,6 +1322,11 @@ class JobSpec(StrictSpecModel):
         mode) or shlex-splits into a bare argv.
         """
         rendered = render_template(self.run.command, ctx.as_dict())
+        # Ubuntu images guarantee ``python3`` but do not guarantee the legacy
+        # ``python`` alias.  Older published templates still use
+        # ``python runner.py``; normalize that exact runner entry point at the
+        # immutable EA boundary without rewriting arbitrary user commands.
+        rendered = _LEGACY_PYTHON_RUNNER_RE.sub("python3", rendered)
         if self.run.shell:
             return ["bash", "-lc", rendered]
         return shlex.split(rendered)
@@ -1332,6 +1338,7 @@ class JobSpec(StrictSpecModel):
         re-running completed work.
         """
         base = render_template(self.run.command, ctx.as_dict())
+        base = _LEGACY_PYTHON_RUNNER_RE.sub("python3", base)
         extra = render_template(self.rotation.resume_args, ctx.as_dict()).strip()
         rendered = f"{base} {extra}".strip() if extra else base
         if self.run.shell:
@@ -1349,6 +1356,7 @@ class JobSpec(StrictSpecModel):
             self.run.resume_command,
             ctx.as_dict(),
         )
+        rendered = _LEGACY_PYTHON_RUNNER_RE.sub("python3", rendered)
         if self.run.shell:
             return ["bash", "-lc", rendered]
         return shlex.split(rendered)

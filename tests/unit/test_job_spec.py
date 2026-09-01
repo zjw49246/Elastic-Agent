@@ -36,6 +36,18 @@ class TestRenderTemplate:
         out = render_template("results/$(hostname -s)_{{shard_index}}", {"shard_index": 2})
         assert out == "results/$(hostname -s)_2"
 
+    def test_legacy_python_runner_command_uses_guaranteed_python3(self):
+        spec = JobSpec(
+            name="legacy-runner",
+            run={
+                "command": "python runner.py --shard {{shard_index}}",
+                "resume_command": "python runner.py --resume",
+            },
+        )
+        context = WorkerContext(shard_index=7)
+        assert spec.render_command(context) == ["bash", "-lc", "python3 runner.py --shard 7"]
+        assert spec.render_recovery_command(context) == ["bash", "-lc", "python3 runner.py --resume"]
+
     def test_multiple_occurrences(self):
         out = render_template("{{n}}-{{n}}", {"n": "a"})
         assert out == "a-a"
