@@ -90,12 +90,21 @@ def _is_codex_model(model: str) -> bool:
 
 
 def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("models"),
-        list,
-    ):
+    if not isinstance(payload, dict):
         raise AgentApiUpstreamError("invalid_models_response")
-    items = payload["models"]
+    native_items = payload.get("models")
+    openai_items = payload.get("data")
+    native_schema = isinstance(native_items, list)
+    openai_schema = isinstance(openai_items, list)
+    if native_schema == openai_schema:
+        raise AgentApiUpstreamError("invalid_models_response")
+    if openai_schema:
+        if payload.get("object") != "list" or payload.get("success") is not True:
+            raise AgentApiUpstreamError("invalid_models_response")
+        items = openai_items
+    else:
+        items = native_items
+    assert isinstance(items, list)
     if len(items) > MAX_AGENT_API_MODELS:
         raise AgentApiUpstreamError("invalid_models_response")
 
@@ -103,12 +112,12 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        if (
+        if native_schema and (
             item.get("supported_in_api") is False
             or item.get("visibility") == "hide"
         ):
             continue
-        model = item.get("slug")
+        model = item.get("slug" if native_schema else "id")
         if not isinstance(model, str):
             continue
         try:

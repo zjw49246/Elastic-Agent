@@ -141,6 +141,58 @@ async def test_apex_native_model_probe_is_versioned_filtered_and_codex_only(
 
 
 @pytest.mark.asyncio
+async def test_apex_openai_model_probe_is_filtered_and_codex_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter()
+    request = AsyncMock(return_value={
+        "object": "list",
+        "success": True,
+        "data": [
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"id": "codex-auto-review", "object": "model"},
+            {"id": "claude-opus-5", "object": "model"},
+            {"id": "gemini-3.7-flash", "object": "model"},
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"not_an_id": "gpt-ignored"},
+        ],
+    })
+    monkeypatch.setattr(adapter, "_request_json", request)
+
+    models = await adapter.probe_models("lck-private")
+
+    assert models == {
+        "claude": [],
+        "codex": ["codex-auto-review", "gpt-5.6-sol"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"object": "list", "success": False, "data": [{"id": "gpt-5.6-sol"}]},
+        {"object": "error", "success": True, "data": [{"id": "gpt-5.6-sol"}]},
+        {
+            "object": "list",
+            "success": True,
+            "data": [{"id": "gpt-5.6-sol"}],
+            "models": [{"slug": "gpt-5.6-sol"}],
+        },
+    ],
+)
+async def test_apex_model_probe_rejects_ambiguous_or_failed_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+) -> None:
+    adapter = ApexRouterAdapter()
+    monkeypatch.setattr(adapter, "_request_json", AsyncMock(return_value=payload))
+
+    with pytest.raises(AgentApiUpstreamError, match="invalid_models_response"):
+        await adapter.probe_models("lck-private")
+
+
+@pytest.mark.asyncio
 async def test_apex_usage_keeps_key_usage_separate_from_shared_group_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
