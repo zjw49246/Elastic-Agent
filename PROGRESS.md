@@ -872,3 +872,29 @@ localhost 代理造成；绕过代理和软链接后对应代表测试转绿，�
 **验证**：后端和 UI v2 新测试在旧代码上均失败、修复后转绿；相关 Python 套件
 **507 passed**，UI v2 Node **27 passed**，Ruff（旧单文件 HTML 的既有 E501 除外）和
 `git diff --check` 通过。
+
+## 2026-09-01 Worker 云创建并行化（commit `de0e53d`）
+
+**问题**：生产已经把 JobBatch、Manager-wide Job、provider capacity 和 worker lifecycle
+并发都配置为 500，但一个 Manager 仍只以约每分钟 3–5 台的速度创建 Worker。现场看到
+数百个 accepted/queued Job，却只有约 200 台属于该 Controller 的 EC2；持续排队使实际
+并发远低于配置值。
+
+**根因**：`scale_out()` 在进入 provider 前仍持有进程级 `_instance_lifecycle_lock`。
+这个锁本来用于阻止 recovery 在 `RunInstances` 已接受、registry/event 尚未发布的窗口误收
+当前实例，却也把所有互不相关的一 Worker 创建事务完全串行化；把 orchestrator 的 lifecycle
+并发调到 500 并不能穿透该 mutex。
+
+**解决**：用写者优先的 `_InstanceLifecycleGate` 替代单一 mutex。多个创建事务走并行读侧，
+容量预留、durable launch intent、registry/event 和失败补偿继续使用原有原子边界；启动/在线
+recovery 走独占写侧，等待所有已进入创建完成，并阻止新创建插队，保留原来的所有权安全保证。
+
+**以后避免**：容量配置审计不仅要验证 semaphore/queue 上限，还要追踪请求直至实际云 API，
+确认路径上没有更窄的隐式串行锁。为“保护恢复窗口”增加互斥时，应明确区分可并行的同类事务
+与必须独占的恢复事务，并为实际同时进入 provider 建立回归测试。
+
+**验证**：两个新测试先在旧 mutex 下稳定超时失败；修复后证明独立 `scale_out` 可同时进入
+provider、recovery 等待所有已进入创建且阻止后续创建越过写者。Manager 全套 **94 passed**；
+Manager、JobBatch、BatchOrchestrator 与 AWS launcher 关键回归 **318 passed**；Ruff 与
+`git diff --check` 通过。Manager fleet driver 的三项 Linux `/proc` 专项在 macOS 上仍按既有
+环境限制失败，与本改动无关。
