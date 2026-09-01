@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 64224,
-      "sha256": "sha256:d3ddf858a0b4158f33515acf967589063a21cb3029640e02e0719c333288f478"
+      "size": 64644,
+      "sha256": "sha256:4ae392cb544a0c212075e23ae918585f639924b942e8d549b13a7747a8712aa2"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 132061,
-      "sha256": "sha256:b3cbd9672807d7c4c04e80b7e5e508330caa243d7d140c694440318d7a334c0f"
+      "size": 133973,
+      "sha256": "sha256:753cca799a7771c4aa2fff0925bbd9a733879301e31b2f903ab5047234a04917"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 68146,
-      "sha256": "sha256:c3177b2d24d9fdd0d88bea9756fca3a2728a67b12e4e3df7de51a409469a26f9"
+      "size": 68610,
+      "sha256": "sha256:3cf36019c51a2195ce7aeb7515ca4be22cd3ddfafdccffd4ccf2e9249e85c4cf"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 32496,
-      "sha256": "sha256:47528b7bf0a4cd2709457233944ac2027a3ce36249bac83161d246324a808add"
+      "size": 32766,
+      "sha256": "sha256:3b2dcd8e1465c432f65d66a1253aa5e8e9a986774d6dd108973f1e8a228e8ee1"
     },
     {
       "path": "deploy/__init__.py",
@@ -411,8 +411,8 @@
       "path": "src/elastic_agent/api/routes/jobs.py",
       "type": "file",
       "mode": "0644",
-      "size": 204911,
-      "sha256": "sha256:2057c552ace56aab0de8437c8ac874162bfc91e7529ce0a6e35edcc0bfc75af1"
+      "size": 206268,
+      "sha256": "sha256:d54e39f3466106bd5638e48e958ef40af7f338dbec28195df42300444d410d6e"
     },
     {
       "path": "src/elastic_agent/api/routes/management_auth.py",
@@ -663,8 +663,8 @@
       "path": "src/elastic_agent/core/agent_api.py",
       "type": "file",
       "mode": "0644",
-      "size": 75249,
-      "sha256": "sha256:f98da8f286f6e23052854c7ceeccc5bdb5f5d2788525b13fe07ed1aa21043c7f"
+      "size": 75313,
+      "sha256": "sha256:9cc9fddf6dbee9ce3d0bfe8002aefe4426a3e2f5abfe73da9ffba707a486af74"
     },
     {
       "path": "src/elastic_agent/core/agent_type.py",
@@ -1419,8 +1419,8 @@
       "path": "tests/unit/test_agent_api_accounts.py",
       "type": "file",
       "mode": "0644",
-      "size": 50827,
-      "sha256": "sha256:04958d05534aa4ce60c3fc45842987e11c2fb5f095acedfb44d3999d57d8833c"
+      "size": 51954,
+      "sha256": "sha256:72fa1fad392fb5767e1a34ee2529dfa53d19e42ba831151aefc370e1ac934592"
     },
     {
       "path": "tests/unit/test_agent_type.py",
@@ -1454,8 +1454,8 @@
       "path": "tests/unit/test_api_batch.py",
       "type": "file",
       "mode": "0644",
-      "size": 263291,
-      "sha256": "sha256:47b66e1e0da1a01454683d6db1ebe5791085a026797ad06d5312aac64a3d3826"
+      "size": 264875,
+      "sha256": "sha256:032dabe1295876fcf0bcb544109c044fa6391f625f74a382c9b98a24535fb8e0"
     },
     {
       "path": "tests/unit/test_audit_worker_regressions.py",
