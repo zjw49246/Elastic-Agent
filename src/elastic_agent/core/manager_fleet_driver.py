@@ -3624,13 +3624,16 @@ stop_and_mask() {{
   fi
 }}
 verify_unit() {{
-  local unit="$1" state unit_file_state pid cgroup file
+  local unit="$1" load_state state pid cgroup file
   unit_exists "$unit" || return 0
-  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")"
-  case "$unit_file_state" in
-    masked|masked-runtime) ;;
-    *) echo "unit was not runtime-masked: $unit ($unit_file_state)" >&2; return 1 ;;
-  esac
+  # UnitFileState describes the installed template and can remain ``static``
+  # when one concrete template instance is runtime-masked. LoadState is the
+  # authoritative runtime view after daemon-reload.
+  load_state="$(systemctl show -p LoadState --value "$unit")"
+  [ "$load_state" = "masked" ] || {{
+    echo "unit was not runtime-masked: $unit ($load_state)" >&2
+    return 1
+  }}
   state="$(systemctl show -p ActiveState --value "$unit")"
   case "$state" in
     inactive|failed) ;;
