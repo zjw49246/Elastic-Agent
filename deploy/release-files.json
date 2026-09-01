@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 62884,
-      "sha256": "sha256:3627d11801504cd2cfc99f33da6a40a6b545cc79122d8791b3c3d90c0e604f9c"
+      "size": 63239,
+      "sha256": "sha256:a227cea24095faea2c129e905a36ce28dd10884438dd46558861322e82f35f74"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 124499,
-      "sha256": "sha256:1cb986e776f770ff8b1e2beb3e980293095b82a0abb54197d2609f7f41bc0349"
+      "size": 125861,
+      "sha256": "sha256:f7a2781684f8688ca15ce7532d3804d83b7469841efe11be2e65a522a6bcf5f5"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 66672,
-      "sha256": "sha256:6d8319d77221a033299ee3211c893939cd75bdfab5f781dac3ccbbdd5ac6b450"
+      "size": 67050,
+      "sha256": "sha256:ec6b85305681681ececbfbad46c90f7a625c4d6da7ccb766c397761cc924deab"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 31714,
-      "sha256": "sha256:f6beeb2cf7b2e835625578017dfe11c8576e6c60c373ca6fe674b61dbc4fa800"
+      "size": 31919,
+      "sha256": "sha256:dbce7adfa5dab6064625ad87b1e1d3aa5077af19b0515d11b3e3ba0f05ca891e"
     },
     {
       "path": "deploy/__init__.py",
@@ -1083,8 +1083,8 @@
       "path": "src/elastic_agent/manager/manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 186110,
-      "sha256": "sha256:b9cd0363001b6f40f2fb0dc90701b53758425322e8bd1453fa1959e5e2cbbb10"
+      "size": 186599,
+      "sha256": "sha256:4d232130900f120e0db60da35d762941c163e6b6bd4fb491262f3b46c5945330"
     },
     {
       "path": "src/elastic_agent/testing/__init__.py",
@@ -1762,8 +1762,8 @@
       "path": "tests/unit/test_manager.py",
       "type": "file",
       "mode": "0644",
-      "size": 159026,
-      "sha256": "sha256:1b4b4d2270047ee4041d662365bbbe2d1dbab0902ba87531b90d67c5dbfc2b4d"
+      "size": 159602,
+      "sha256": "sha256:62a58da05ca59dbddd9a80f934718a6f13054107414426b003269fc3137c1a47"
     },
     {
       "path": "tests/unit/test_manager_fleet_driver.py",
