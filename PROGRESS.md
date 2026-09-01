@@ -1108,3 +1108,27 @@ Pydantic 等 Python 依赖。Pydantic 2.13 要求更高版本的 `typing-extensi
 **验证**：bootstrap/generic harness 套件 **67 passed**，Ruff、`git diff --check` 与生成 shell
 的 `bash -n` 通过。更广 Linux 相关套件 **287 passed**；另有 3 个既有恢复测试因本地 macOS
 没有 `/proc` 而失败，与本修复路径无关。实盘 canary 将在新 release 部署后重跑。
+
+## 2026-09-02 为 S3 Task Package 准备 Job-owned 目标目录（commit `7373caf`）
+
+**问题**：Python runtime dependency 修复发布后，10 个实盘 canary 均完成全部 bootstrap、
+source runtime 部署并连接 Manager，但随后全部以 `s3 dataset pull failed` 终止，未进入 dispatch。
+
+**根因**：Task Platform 把单对象 URI 的 `dest` 写成目录
+`/opt/elastic-agent/task-package`，而 EA 的单对象合同把 `dest` 当完整文件路径。Runner 又读取
+`/opt/elastic-agent/task-package/package.tar.gz`。此外 `/opt/elastic-agent` 是 root 所有，
+Job 用户不能在其下创建目标。日志只保留 stderr 前 200 字节，SSH host-key warning 还截掉了
+真正的 `Permission denied`。
+
+**解决**：Platform 将单对象 `dest` 改为完整的 `.../package.tar.gz`。EA 在下载前以 Job 用户
+检查对应目录；目录不存在时只用最小 sudo 创建该精确目录并赋给当前 UID/GID，已有但不可写的
+目录继续 fail closed，绝不 chown 已有系统目录。下载失败改为保留 stderr 尾部 1000 字节。
+
+**以后避免**：单对象 S3 输入必须在模板、EA JobSpec 和 Runner 参数三处使用同一完整文件路径；
+任何写入 `/opt` 的 Job 数据都要在 bootstrap 边界显式建立最小 Job-owned 目录，不能依赖普通用户
+在 root-owned 父目录下隐式 `mkdir -p`。
+
+**验证**：同 AMI、同 instance profile、同 KMS/S3 对象的临时 EC2 探针证明 IAM 下载成功；
+旧目标稳定返回 `[Errno 13] Permission denied`，新目录+完整文件路径下载成功且 SHA-256 与 S3
+metadata 完全一致，探针随后已确认终止。EA dataset/bootstrap/job-spec 套件 **295 passed**，
+Platform template/resources/API 套件 **213 passed**，Ruff（EA）与两仓库 `git diff --check` 通过。
