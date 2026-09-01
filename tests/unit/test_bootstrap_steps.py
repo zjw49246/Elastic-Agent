@@ -34,6 +34,14 @@ class TestSystemInitStep:
         assert "nodejs npm" in step.command
         assert "awscli" not in step.command
 
+    def test_aws_cli_is_verified_without_using_the_noble_apt_package(self) -> None:
+        step = system_init_step(packages=["curl", "awscli"])
+
+        assert "elastic-agent-image-verify system curl awscli" in step.command
+        assert "install -y -qq curl awscli" not in step.command
+        assert "install -y -qq curl && command -v aws" in step.command
+        assert "aws --version >/dev/null 2>&1" in step.command
+
     def test_custom_timeout(self) -> None:
         step = system_init_step(timeout=600)
         assert step.timeout == 600

@@ -232,7 +232,7 @@ class TestBootstrapSteps:
         assert "harness-code" in names
         assert any(name.startswith("job-setup-") for name in names)
 
-    def test_s3_cli_is_installed_only_when_requested_before_runtime(self):
+    def test_s3_cli_is_verified_only_when_requested_before_runtime(self):
         without_s3 = compile_bootstrap_steps(
             _spec(), manager_url="u", auth_token="t", worker_id="w",
         )
@@ -245,6 +245,8 @@ class TestBootstrapSteps:
         s3_init = next(s for s in with_s3 if s.name == "system-init")
         assert "awscli" not in plain_init.command
         assert "awscli" in s3_init.command
+        assert "command -v aws" in s3_init.command
+        assert "install -y -qq python3 python3-pip git curl rsync nodejs npm awscli" not in s3_init.command
         assert [s.name for s in with_s3].index(
             "system-init"
         ) < [s.name for s in with_s3].index("host-update-hardening")

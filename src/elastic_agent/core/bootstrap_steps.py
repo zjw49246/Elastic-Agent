@@ -22,6 +22,12 @@ BACKGROUND_UPDATE_UNITS = (
     "apt-daily-upgrade.service",
     "unattended-upgrades.service",
 )
+PREINSTALLED_SYSTEM_COMMANDS = {
+    # Ubuntu Noble has no awscli APT candidate. Worker images install the
+    # pinned AWS CLI v2 bundle, so bootstrap verifies that immutable image
+    # dependency instead of trying to replace it with the legacy v1 package.
+    "awscli": "aws",
+}
 
 
 def _golden_verify_command(component: str, args: list[str] | None = None) -> str:
@@ -90,11 +96,24 @@ def system_init_step(
     package_names = list(packages or [
         "python3", "python3-pip", "git", "curl", "rsync", "nodejs", "npm",
     ])
-    pkg_list = shlex.join(package_names)
-    fallback = (
-        "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
-        f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
+    apt_packages = [
+        package for package in package_names
+        if package not in PREINSTALLED_SYSTEM_COMMANDS
+    ]
+    fallback_commands: list[str] = []
+    if apt_packages:
+        pkg_list = shlex.join(apt_packages)
+        fallback_commands.append(
+            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+            f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
+        )
+    fallback_commands.extend(
+        f"command -v {shlex.quote(command)} >/dev/null && "
+        f"{shlex.quote(command)} --version >/dev/null 2>&1"
+        for package, command in PREINSTALLED_SYSTEM_COMMANDS.items()
+        if package in package_names
     )
+    fallback = " && ".join(fallback_commands)
     return BootstrapStep(
         name="system-init",
         command=(
