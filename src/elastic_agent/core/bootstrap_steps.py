@@ -318,7 +318,10 @@ def runtime_deploy_from_src_step(
         "python",
         dependency_names,
         "golden image runtime Python dependencies verified",
-        f"pip3 install -q --break-system-packages {deps}",
+        # Noble's python3-typing-extensions has no pip RECORD. Pydantic may
+        # require a newer wheel, so avoid asking pip to uninstall the dpkg copy;
+        # the /usr/local wheel safely shadows it on Python's normal sys.path.
+        f"pip3 install -q --ignore-installed --break-system-packages {deps}",
     )
     home = "/root" if run_as == "root" else f"/home/{run_as}"
     task_socket = "/run/elastic-agent-task-supervisor/control.sock"

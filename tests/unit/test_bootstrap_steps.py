@@ -201,6 +201,7 @@ class TestRuntimeDeployFromSrc:
         assert "elastic-agent-image-verify python" in c
         assert "golden image runtime Python dependencies verified" in c
         assert "pip3 install" in c  # complete fallback remains available
+        assert "pip3 install -q --ignore-installed --break-system-packages" in c
         assert c.startswith("set -e\n")
         assert (
             "(systemctl disable --now elastic-agent-runtime.service "
