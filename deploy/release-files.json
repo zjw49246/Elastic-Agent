@@ -19,15 +19,15 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 63757,
-      "sha256": "sha256:de9d1832f309c4ffb992ebbc4afbe835a04737317d7762a13ce6354d73b61e8e"
+      "size": 64224,
+      "sha256": "sha256:d3ddf858a0b4158f33515acf967589063a21cb3029640e02e0719c333288f478"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 130231,
-      "sha256": "sha256:7709229fa14aa1396a52cb16f4ab465a9990c95612e53ba3867ccf5788ba47be"
+      "size": 132061,
+      "sha256": "sha256:b3cbd9672807d7c4c04e80b7e5e508330caa243d7d140c694440318d7a334c0f"
     },
     {
       "path": "README.md",
@@ -691,8 +691,8 @@
       "path": "src/elastic_agent/core/batch_hooks.py",
       "type": "file",
       "mode": "0644",
-      "size": 97974,
-      "sha256": "sha256:b2e4f7cc7d66b1aa02746752ec6e3aeef1f4e21f5d0395ab3c256d6aaffbb558"
+      "size": 99054,
+      "sha256": "sha256:ed3bec8af16a62d3af9d2626e64dc12c69b9eadca31253d9535af6e48a6c8b15"
     },
     {
       "path": "src/elastic_agent/core/batch_orchestrator.py",
@@ -1489,8 +1489,8 @@
       "path": "tests/unit/test_batch_hooks.py",
       "type": "file",
       "mode": "0644",
-      "size": 127543,
-      "sha256": "sha256:6194446844c5003363553f9fa514f41c29baaac6266c3b3df187c6ae75440757"
+      "size": 129367,
+      "sha256": "sha256:47d405f768de5c69a69ae4e49808af7497d382b65ac1abeb66d8b066b93da5cd"
     },
     {
       "path": "tests/unit/test_batch_orchestrator.py",
