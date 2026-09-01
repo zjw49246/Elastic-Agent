@@ -898,3 +898,28 @@ provider、recovery 等待所有已进入创建且阻止后续创建越过写者
 Manager、JobBatch、BatchOrchestrator 与 AWS launcher 关键回归 **318 passed**；Ruff 与
 `git diff --check` 通过。Manager fleet driver 的三项 Linux `/proc` 专项在 macOS 上仍按既有
 环境限制失败，与本改动无关。
+
+## 2026-09-01 JobBatch 独立提交并行化（commit `1c95869`）
+
+**问题**：生产 500 个单 Job manifest 已全部进入 EA，但约 15 分钟后仍有 344 个 batch
+保持 queued；Manager 只有约 150 个 batch running、126 台本 Controller 的 EC2。AWS 日志
+没有 RunInstances throttle、配额或容量错误，说明队列尚未把多数 Job 推到云创建边界。
+
+**根因**：JobBatch 为每项派生稳定 Idempotency-Key，canonical submit 因而全部进入
+`_submit_job_payload()` 的进程级 `_submit_lock`。该锁覆盖 durable replay 检查、完整
+preflight、prepared journal fsync 和首次调度；一个提交的文件或账号读取延迟会把另外
+499 个互不相关的确定性 Job 全部串行化。配置 500 个 queue/lifecycle slot 无法穿透此锁。
+
+**解决**：用确定性 Job id 作为提交事务身份，只让同一身份的并发请求共享一个
+`asyncio.Lock`；不同身份并行 preflight/持久化/调度。同一 Idempotency-Key 仍严格完成
+live/durable replay 检查后才允许后继请求继续，因此 exactly-once fleet 语义不变。锁表以
+同步 guard 维护 waiter/user 引用计数，取消或完成时归还，最后一个调用者退出即删除 entry，
+避免长寿命 Manager 被任意幂等键撑出无界内存。
+
+**以后避免**：并发容量验收必须从外部 batch queued 状态一路测到 canonical submit、
+preflight、journal、cloud create 和实际 EC2；任何全局事务锁都要证明它保护的是全局不变量，
+不能只因请求带幂等键就串行化不同身份。幂等锁回归必须同时覆盖“不同键并行”和“同键只启动
+一次”，并验证取消/完成后的锁生命周期有界。
+
+**验证**：不同键并发测试在旧全局锁上 1 秒超时失败，修复后与同键并发 exactly-once 测试
+一起通过；API/JobBatch 专项 **243 passed**，Ruff 与 `git diff --check` 通过。
