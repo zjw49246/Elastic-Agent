@@ -935,7 +935,7 @@ recovery pass 都视为独占写事务，controller-tagged 云扫描结束后仍
 所有权扫描、精确认领和 durable lease 衔接，建立快照后由所有者任务幂等释放。后续慢清理只
 处理该快照，不再阻塞新 create。恢复上下文的最终释放带 task-owner 校验，避免旧上下文退出时
 误释放后来获得 gate 的恢复任务。Worker quiescence 同时把 `systemctl mask/stop` 的命令返回值
-改为提示性信号，先 runtime-mask、daemon-reload、尝试 stop，再以 UnitFileState、ActiveState、
+改为提示性信号，先 runtime-mask、daemon-reload、尝试 stop，再以运行态 LoadState、ActiveState、
 MainPID、cgroup、容器和进程扫描作为最终 fail-closed 证明。
 
 **以后避免**：所有权 fence 只应覆盖外部副作用与 durable 发布之间的歧义窗口，不能包住上传、
@@ -946,3 +946,19 @@ SSH 或终止等待等长尾工作。命令行工具的非零退出不能代替�
 `scale_out` 可到达 provider。Manager **97 passed**；fleet driver 在排除 3 个 macOS 无
 `/proc` 的既有 Linux 专项后 **67 passed**；目标 quiescence 测试 **2 passed**，Ruff 与
 `git diff --check` 通过。
+
+## 2026-09-01 修正 systemd 模板实例 runtime-mask 验证（commit `d96a68e`）
+
+**问题**：生产恢复过程对 `ea-task@<id>.service` 等 systemd 模板实例执行
+`systemctl mask --runtime` 后，仍用 `UnitFileState` 验证结果。该属性描述安装态模板，具体实例
+已被 runtime-mask 时仍可能返回 `static`，导致实际已静止的遗留 Worker 被误判为未隔离，阻塞
+Manager 启动恢复和新版切换。
+
+**解决**：在 `daemon-reload` 后改用运行态权威属性 `LoadState=masked` 验证具体 unit；
+ActiveState、MainPID、cgroup、容器和进程扫描仍全部 fail closed，不放宽真正的 quiescence 边界。
+
+**以后避免**：systemd 模板 unit 的安装态与具体实例运行态必须分开验证；runtime mask 的验收
+只能读取具体实例的 `LoadState`，不能用模板级 `UnitFileState` 推断。
+
+**验证**：Manager **97 passed**；fleet driver 排除 3 个 macOS 无 `/proc` 的既有 Linux 专项后
+**67 passed**；目标 quiescence 测试 **2 passed**，Ruff 与 `git diff --check` 通过。
