@@ -1001,3 +1001,23 @@ canonical submit。
 **验证**：新增测试先在旧实现上稳定超时，修复后证明 accepted/prepared 项在 Manager 重启后
 以相同 Job id 恢复；JobBatch restart 套件 **4 passed**，JobBatch/API auth 套件 **52 passed**，
 Ruff 与 `git diff --check` 通过。
+
+## 2026-09-02 保留 AMI 根卷最小容量（commit `54358b0`）
+
+**问题**：prepared 重启恢复发布后，Campaign 追加的 500 个 retry 已开始进入 EA，但首批 298
+个 Job 在创建实例前快速失败，EC2 活跃数仍为 0。AWS 返回
+`InvalidBlockDeviceMapping: Volume of size 40GB is smaller than snapshot ... expect size >= 80GB`。
+
+**根因**：Job manifest 显式请求 `fanout.disk_gb=40`，而 Golden AMI 根快照已经是 80 GiB。
+AWS provider 只从 `DescribeImages` 读取真实 root device name，却仍把请求值 40 原样写入
+`RunInstances.BlockDeviceMappings`；EBS snapshot volume 不允许缩小。
+
+**解决**：同一次 AMI metadata 查询同时读取 root mapping 的 `VolumeSize`，传给 RunInstances
+的根盘取 `max(requested, AMI minimum)`。metadata 以线程锁保护的 per-AMI cache 发布，500 个
+并发创建只做一次 DescribeImages；扩大根盘仍按 Job 请求，绝不低于快照下限。
+
+**以后避免**：Golden AMI 更新不仅要验证 image provenance，还要把 root snapshot size 纳入
+provider launch contract；所有 per-Job disk override 都必须与不可缩小的镜像下限做合并。
+
+**验证**：现场条件红测在旧实现上得到 40 而失败，修复后得到 80；AWS provider 与 EIP 套件
+**27 passed**，并验证重复创建只查询一次 AMI metadata；Ruff 与 `git diff --check` 通过。
