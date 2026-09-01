@@ -418,7 +418,14 @@ For Task Platform integrations, Apex credentials should be registered through
 the reference and model metadata only; it resolves the current key immediately
 before provider probes or Worker configuration and never writes a Manager-side
 `api.key` for that account. The Manager role must have `GetSecretValue` only on
-the platform credential namespace.
+the platform credential namespace. Secret resolution always selects the AWS
+Region encoded in the ARN, so it does not depend on `AWS_REGION` being present
+in the Manager process environment.
+
+For AWS Jobs, `GET /api/jobs/{job_id}` and persisted Job history include the
+validated `worker_index`, `cloud_instance_id`, `aws_account_id`, and `region`
+for each live or unreleased Worker. Lifecycle clients should use this tuple for
+identity matching and cleanup evidence rather than parsing `worker_id`.
 
 An Agent API key is delegated to the Job's Unix user. Arbitrary Job code running
 as that user can invoke the helper or read the private key file, so use Agent

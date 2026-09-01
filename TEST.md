@@ -117,6 +117,10 @@ uv run pytest -q \
 
 The focused suite covers:
 
+- platform credential references selecting Secrets Manager from the Region
+  encoded in the ARN, without persisting the resolved key;
+- AWS live and persisted Job detail publishing the exact Worker index,
+  instance, account, and Region tuple required by Task Platform;
 - atomic mode-`0600` `account_id → EIP` mappings and exclusive Job leases;
 - EIP allocation/association/disassociation calls, including the AWS
   `AllowReassociation=False` safety guard;

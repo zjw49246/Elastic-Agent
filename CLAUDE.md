@@ -73,9 +73,16 @@ The platform credential pool is the sole long-lived Apex secret source.  The
 `POST /api/agent-api/accounts/platform-ref` endpoint accepts only a bounded,
 exact Secrets Manager ARN and projects non-secret metadata into EA.  Version-2
 account directories contain `credential_ref` and never create `api.key`;
-`read_api_key()` resolves the ARN just in time for model/usage/configure calls.
+`read_api_key()` resolves the ARN just in time for model/usage/configure calls,
+using the region encoded in the ARN instead of ambient AWS SDK configuration.
 Legacy local-key accounts remain readable only for migration and must not be
 created by Task Platform production flows.
+
+AWS Job detail and persisted-history responses expose a validated
+`worker_index/cloud_instance_id/aws_account_id/region` tuple for every live or
+unreleased `aws:i-*` Worker. Task Platform uses that tuple as execution identity
+and cleanup evidence; malformed Manager identity inputs fail closed rather than
+publishing partial cloud identity.
 
 ## 依赖链（重要）
 

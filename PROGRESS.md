@@ -1132,3 +1132,38 @@ Job 用户不能在其下创建目标。日志只保留 stderr 前 200 字节，
 旧目标稳定返回 `[Errno 13] Permission denied`，新目录+完整文件路径下载成功且 SHA-256 与 S3
 metadata 完全一致，探针随后已确认终止。EA dataset/bootstrap/job-spec 套件 **295 passed**，
 Platform template/resources/API 套件 **213 passed**，Ruff（EA）与两仓库 `git diff --check` 通过。
+
+## 2026-09-02 按凭证 ARN 选择 Secrets Manager Region（commit `64f00af`）
+
+**问题**：Task Platform 已把 Apex Key 收敛到平台凭证池，EA 的 `apex-2` 仅保存
+Secrets Manager ARN；但显式刷新返回 `Agent API credential storage failed`，账号始终是
+`invalid_local_credentials`。
+
+**根因**：线上 `_resolve_platform_credential_ref()` 创建 Secrets Manager client 时依赖
+ambient AWS SDK Region。Manager 只有 `ELASTIC_AGENT_AWS_REGION`，没有 `AWS_REGION`，因此 boto3 在
+请求 secret 之前就抛出 `NoRegionError`。
+
+**解决**：从已通过严格校验的 Secrets Manager ARN 中取出 Region，显式传给
+`boto3.client("secretsmanager", region_name=...)`。凭证仍是 just-in-time 解析，不缓存、
+不写本地 `api.key`。
+
+**以后避免**：任何持久资源 ARN 的 SDK 访问都应使用 ARN 自带的 Region，不得把服务
+是否能读取凭证隐式绑定到进程环境变量。
+
+**验证**：现场脱敏 traceback 证明原因是 `NoRegionError`；新单测精确断言
+Secrets Manager service 和 `ap-northeast-1` client 参数。
+
+## 2026-09-02 发布 AWS Worker 身份四元组（commit `f1f859d`）
+
+**问题**：EA Job 详情只返回 `worker_id="aws:i-*"`；Task Platform 不会从字符串推断云身份，
+因此 active Job 被标记为 `JOB_DETAIL_IDENTITY_MISMATCH`，无法形成可验证的执行与清理证据。
+
+**解决**：live Job 和持久化历史的 `workers_detail` 对经校验的 AWS Worker 同时发布
+`worker_index/cloud_instance_id/aws_account_id/region`。非 AWS Worker 或任一身份字段非法时
+fail closed，不发布不完整四元组。
+
+**以后避免**：执行器与平台之间的 Worker identity 必须是结构化 API 合同，不能让消费方
+解析内部 `worker_id` 编码。
+
+**验证**：Agent API 账号与 Job API 定向套件 **270 passed**；Ruff 与
+`git diff --check` 通过。
