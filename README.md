@@ -913,9 +913,12 @@ values may be run again. Until a definitive receipt arrives, the tab retains
 only the source digest and non-secret key in `sessionStorage`; retrying the
 same source after a network failure or reload safely reuses that key. The page
 then polls `GET /api/job-batches/{job_batch_id}` until every item is terminal
-or errored. The schema permits at most 100 Jobs, while the deployment default
-is 20 Jobs/100 Workers/1440 Worker-hours and the actual admission limits are
-reported by preflight. Browser operators use the management administrator
+or errored. After a Manager restart, an accepted item whose canonical Job was
+only durably `prepared` is replayed with the same per-item idempotency key once
+startup resource recovery completes, so it resumes the same Job identity
+without occupying a queue slot forever. The schema permits at most 100 Jobs,
+while the deployment default is 20 Jobs/100 Workers/1440 Worker-hours and the
+actual admission limits are reported by preflight. Browser operators use the management administrator
 login; the opaque session stays in a Secure/HttpOnly cookie and the CSRF token
 is held only in page memory. Service API keys remain available for automation.
 

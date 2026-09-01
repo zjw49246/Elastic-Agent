@@ -848,10 +848,19 @@ class JobBatchQueue:
                 item = journal["items"][self._item_index(journal, client_id)]
                 if item["state"] != "accepted":
                     continue
-                item["state"] = "terminal"
                 item["job_state"] = job_state
-                item["error"] = error
-                item["completed_at"] = _now()
+                if job_state == "prepared":
+                    # The canonical Job journal proves that submission never
+                    # crossed its account/cloud launch gate. Persistently put
+                    # the item back on the queue; its stable idempotency key
+                    # then resumes this exact Job instead of creating another.
+                    item["state"] = "queued"
+                    item["error"] = None
+                    item["completed_at"] = None
+                else:
+                    item["state"] = "terminal"
+                    item["error"] = error
+                    item["completed_at"] = _now()
                 self._refresh_batch_state(journal)
                 dirty.add(job_batch_id)
             for job_batch_id in dirty:
@@ -912,6 +921,14 @@ class JobBatchQueue:
             logger.exception("Cannot reconcile accepted Job %s", job_id)
             return None, None
         state = payload.get("submission_state")
+        if state == "prepared":
+            # A prepared journal has no account/cloud side effects and the
+            # canonical submit path can safely replay it with the same stable
+            # idempotency identity. Wait for startup recovery first so the
+            # replay cannot race prior-process ownership or admission gates.
+            if getattr(self._manager, "binding_recovery_ready", False):
+                return "prepared", None
+            return None, None
         if state in {"launching", "running"}:
             # A nonterminal durable Job that is absent from this process's
             # orchestrator was owned by an earlier Manager process.  Startup

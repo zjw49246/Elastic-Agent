@@ -521,8 +521,9 @@ test networks only.
 - JobBatch backend (`tests/unit/test_job_batches.py`): strict schema and body
   limits, side-effect-free all-item preflight, durable acceptance/replay,
   per-item idempotency, FIFO/capacity scheduling, terminal reconciliation,
-  restart recovery, and the 500-Job per-manifest/Manager-wide concurrency
-  bounds. Route tests additionally hold preflight open to prove different
+  restart recovery (including replay of accepted items whose underlying Job
+  journal remained `prepared`), and the 500-Job per-manifest/Manager-wide
+  concurrency bounds. Route tests additionally hold preflight open to prove different
   deterministic Job identities enter concurrently, while simultaneous replays
   of one identity still launch exactly once and release their transient lock.
   UI v2 parser tests enforce the same `1..500` policy range.
