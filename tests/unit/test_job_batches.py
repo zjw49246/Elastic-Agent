@@ -1038,6 +1038,84 @@ class TestJobBatchDurability:
         await second_manager.stop()
 
     @pytest.mark.asyncio
+    async def test_restart_releases_recovered_ghost_active_item(
+        self,
+        tmp_path: Path,
+    ):
+        from elastic_agent.core.job_spec_store import update_job_state
+
+        manifest = _manifest(
+            _spec("restart-interrupted"),
+            _spec("restart-after-interrupted"),
+            max_active_jobs=1,
+        )
+
+        first_manager, _first_provider = _new_manager(tmp_path)
+        first_batch = RecordingBatch(first_manager._persist_batch_job_spec)
+        first_manager._batch = first_batch
+        first_manager.job_batch_queue._poll_interval_seconds = 0.05
+        first_manager.job_batch_queue._submitter = first_batch.submit_payload
+        await first_manager.start()
+        first_app = create_app(first_manager)
+        async with AsyncClient(
+            transport=ASGITransport(app=first_app),
+            base_url="http://testserver",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        ) as first_client:
+            submitted = await first_client.post(
+                "/api/job-batches",
+                json=manifest,
+                headers={"Idempotency-Key": "restart-interrupted-batch"},
+            )
+            assert submitted.status_code == 201
+            job_batch_id = submitted.json()["job_batch_id"]
+            await _wait_for(
+                lambda: first_batch.started_names == ["restart-interrupted"]
+            )
+            before = (
+                await first_client.get(f"/api/job-batches/{job_batch_id}")
+            ).json()
+            interrupted_job_id = before["items"][0]["job_id"]
+            update_job_state(
+                first_manager.config.registry.path,
+                interrupted_job_id,
+                "launching",
+            )
+
+        await _stop_job_batch_queue(first_manager)
+        await first_manager.stop()
+
+        second_manager, second_provider = _new_manager(tmp_path)
+        second_batch = RecordingBatch(second_manager._persist_batch_job_spec)
+        second_manager._batch = second_batch
+        second_manager.job_batch_queue._poll_interval_seconds = 0.05
+        second_manager.job_batch_queue._submitter = second_batch.submit_payload
+        await second_manager.start()
+        second_app = create_app(second_manager)
+        async with AsyncClient(
+            transport=ASGITransport(app=second_app),
+            base_url="http://testserver",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        ) as second_client:
+            await _wait_for(
+                lambda: second_batch.started_names
+                == ["restart-after-interrupted"]
+            )
+            recovered = (
+                await second_client.get(f"/api/job-batches/{job_batch_id}")
+            ).json()
+
+        assert [item["state"] for item in recovered["items"]] == [
+            "terminal",
+            "accepted",
+        ]
+        assert recovered["items"][0]["job_state"] == "failed"
+        assert "Manager restarted" in recovered["items"][0]["error"]
+        assert second_provider.create_calls == 0
+        await _stop_job_batch_queue(second_manager)
+        await second_manager.stop()
+
+    @pytest.mark.asyncio
     async def test_detail_and_client_mapping_survive_manager_restart(
         self,
         tmp_path: Path,

@@ -912,6 +912,22 @@ class JobBatchQueue:
             logger.exception("Cannot reconcile accepted Job %s", job_id)
             return None, None
         state = payload.get("submission_state")
+        if state in {"launching", "running"}:
+            # A nonterminal durable Job that is absent from this process's
+            # orchestrator was owned by an earlier Manager process.  Startup
+            # recovery is the authority for its cloud/account side effects;
+            # do not release the JobBatch slot until that recovery proves all
+            # prior-process ownership settled.  Once it does, the lost
+            # coroutine cannot resume, so retaining the item as ``accepted``
+            # forever would create a ghost active Job and permanently reduce
+            # queue/fleet concurrency after every Manager restart.
+            if getattr(self._manager, "binding_recovery_ready", False):
+                return (
+                    "failed",
+                    "Manager restarted during execution; startup recovery "
+                    "settled the previous worker ownership",
+                )
+            return None, None
         if state not in _TERMINAL_JOB_STATES:
             return None, None
         summary = payload.get("terminal_summary")
