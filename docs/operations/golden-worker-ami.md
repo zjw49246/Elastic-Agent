@@ -75,10 +75,11 @@ normal bootstrap write
 `/etc/apt/apt.conf.d/99elastic-agent-no-background-upgrades`, mask
 `apt-daily*` and `unattended-upgrades.service`, and configure `needrestart` in
 list-only mode. Elastic runtime/task units are additionally excluded from
-`needrestart` selection. Framework-owned APT dependencies—including
-`awscli`—must finish before `ea-runtime` starts; S3 dataset staging and
-worker-direct result collection only verify `aws` and fail closed if the
-bootstrap invariant is broken. Do not unmask these units on an active worker.
+`needrestart` selection. Framework-owned APT dependencies must finish before
+`ea-runtime` starts. Ubuntu Noble has no `awscli` APT candidate, so the image
+must install the pinned AWS CLI v2 bundle; system bootstrap, S3 dataset staging,
+and worker-direct result collection verify `aws` and fail closed if the image
+invariant is broken. Do not unmask these units on an active worker.
 Apply OS security updates by building and promoting a replacement AMI.
 
 ## Promotion and rollback

@@ -1044,3 +1044,23 @@ Worker 安全组。
 **验证**：同 AMI/SG/subnet 的实盘探针实例加入该 user-data 后，Manager 观测
 22 端口 open，`ssh.service` 为 `enabled/active`，真实 SSH 命令返回 `ready`；探针随后已终止。
 Manager/AWS provider 套件 **109 passed**，Ruff 与 `git diff --check` 通过。
+
+## 2026-09-02 验证 Worker 镜像预装 AWS CLI v2（commit `9b3fdf1`）
+
+**问题**：SSH 修复发布后，10 个实盘 canary 均成功创建 Worker 并进入
+`Bootstrap step 1/5: system-init`，但随后以 exit 100 和 `bootstrap failed` 终止。
+
+**根因**：Job 的 S3 dataset 要求逻辑依赖 `awscli`。Task Platform Worker AMI 已按锁定版本
+预装 AWS CLI v2，但 EA fallback 仍把 `awscli` 当成 Debian 包传给 `apt-get`；Ubuntu Noble
+没有该 candidate，因此每台 Worker 都报 `Package 'awscli' has no installation candidate`。
+
+**解决**：system bootstrap 保留 `awscli` 作为发布清单中的逻辑组件，但从 APT 包列表剥离，
+fallback 改为验证镜像中的 `aws` 命令及其版本入口。镜像未提供 CLI 时继续 fail closed，绝不
+静默安装旧 AWS CLI v1，也不把包管理操作推迟到 runtime 之后。
+
+**以后避免**：Job 逻辑依赖名不能直接等同于当前发行版的包名；由 Golden AMI 安装的外部
+组件必须明确区分“镜像验证”和“系统包安装”，并在目标 Ubuntu 版本做实盘 canary。
+
+**验证**：bootstrap/generic harness、Manager、AWS provider 与 EIP 套件 **192 passed**，
+golden-image verifier **8 passed**；Ruff 与 `git diff --check` 通过。实盘 canary 将在新 release
+部署后重跑。

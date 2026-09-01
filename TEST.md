@@ -142,6 +142,9 @@ The focused suite covers:
 - AWS Manager scale-out user-data that explicitly unmasks and enables
   `ssh.service`, so copied golden images remain reachable for bootstrap even
   when their OpenSSH unit enable state was not preserved;
+- S3 bootstrap on Ubuntu Noble that excludes the unavailable `awscli` APT
+  package, verifies the image-provided AWS CLI v2 command before runtime, and
+  fails closed when that immutable dependency is absent;
 - cleanup ordering and idempotent retry: final collect, detach EIP, terminate
   the temporary instance/root disk, require an identity-matched `RELEASED`
   lease, clear task/Node/WS status state, retain the EIP, and preserve the Node
