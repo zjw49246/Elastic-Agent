@@ -962,3 +962,20 @@ ActiveState、MainPID、cgroup、容器和进程扫描仍全部 fail closed，�
 
 **验证**：Manager **97 passed**；fleet driver 排除 3 个 macOS 无 `/proc` 的既有 Linux 专项后
 **67 passed**；目标 quiescence 测试 **2 passed**，Ruff 与 `git diff --check` 通过。
+
+## 2026-09-01 发布保留 immutable release evidence（commit `14dcd18`）
+
+**问题**：第一次基于 `4691…` 的恢复门修复发布时，从旧源码覆盖生产目录，遗漏了生产目录中尚未
+进入当前分支的 `release_evidence` 启动门。Manager 虽然完成恢复并记录 `ElasticAgentManager started`，
+但 health 因 `release_evidence` 缺失持续返回 503，导致切换无法完成。
+
+**解决**：将 release-evidence 校验器、生成器、manifest/index 和 Manager/launcher/health 生命周期
+正式纳入源码；发布构建以已验证的 `fe59…` 目录为合并基线，只应用 Git 中的并行恢复与 runtime-mask
+差异，禁止整文件覆盖生产基线。健康检查在生产 manifest 配置下保持鉴权和 fail-closed，开发/单测
+无 manifest 时保留旧探针行为。生产 systemd readiness 窗口扩为 30 分钟，并通过 stdin 注入鉴权头。
+
+**以后避免**：immutable release 必须从版本化完整基线构建；任何生产目录中的热修都必须先回收到 Git，
+发布前用 manifest/index 校验完整树，不能只验证单个 Manager 源文件。
+
+**验证**：API、Manager、fleet driver、AWS launcher 关键套件 **266 passed**（另排除 3 个 macOS
+无 `/proc` 的既有 Linux 专项）；release manifest 生成与 `--check`、Ruff、`git diff --check` 通过。
