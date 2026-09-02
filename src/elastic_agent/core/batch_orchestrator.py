@@ -2481,8 +2481,25 @@ class BatchOrchestrator:
                 # Local pool spent: login must run off the WebSocket read pump so
                 # LoginCoordinator can receive its correlated result/OTP frames.
                 new_dir = self._extra_dir(job, run)
+                requested_account_id = ""
+                if spec.account.ids:
+                    # Explicit Agent API identities are intentionally reusable
+                    # across rotations when they are unbound.  Preserve the
+                    # same deterministic worker/slot mapping used during
+                    # bring-up; omitting this argument would silently fall
+                    # back to the requested account group (often ``standard``)
+                    # and fail even though the explicit identity is available.
+                    slot_count = max(1, spec.account.per_worker)
+                    requested_account_id = self._explicit_account_for_slot(
+                        run,
+                        spec,
+                        run.active_slot % slot_count,
+                    )
                 outcome = await self._driver.login(
-                    run.worker_id, spec, new_dir
+                    run.worker_id,
+                    spec,
+                    new_dir,
+                    account_id=requested_account_id,
                 )
                 if not outcome.success:
                     self._fail(run, outcome.error or "rotation login failed")

@@ -286,6 +286,8 @@ The focused suite covers:
   promotion from exit 0, durable runtime hard-quota benching with successful
   re-probe recovery, API-first OAuth fallback, explicit-ID mapping, and
   projection-external sibling slots for dynamic API→OAuth rotation,
+  explicit Agent API identity reuse across exhaustion rotation without
+  falling back to the account-group selector,
   claim release only after ordinary Worker teardown, and startup-recovery
   admission fencing before any API key read or Worker send while OAuth remains
   available; runtime auth feedback is pinned to an immutable

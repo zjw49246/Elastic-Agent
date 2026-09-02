@@ -1305,6 +1305,38 @@ class TestRotation:
         # a fresh account was logged in
         assert len(d.login_calls) == 2
 
+    async def test_explicit_agent_api_rotation_reuses_requested_identity(self):
+        d = FakeDriver()
+        orch = BatchOrchestrator(d)
+        job = await orch.launch(_spec(
+            fanout={"workers": 1},
+            account={
+                "ids": ["apex-2"],
+                "group": "standard",
+                "auth_kind": "agent_api",
+            },
+            rotation={
+                "strategy": "on_exhaust_restart_resume",
+                "resume_args": "--resume out",
+                "max_rotations": 1,
+            },
+        ))
+        run = next(iter(job.runs.values()))
+        initial_login_events = [
+            event for event in d.events if event[0] == "login"
+        ]
+        assert [event[2] for event in initial_login_events] == ["apex-2"]
+
+        assert await orch.on_worker_exhausted(
+            job.job_id,
+            run.worker_id,
+            task_id=run.task_id,
+        ) is True
+
+        login_events = [event for event in d.events if event[0] == "login"]
+        assert [event[2] for event in login_events] == ["apex-2", "apex-2"]
+        assert run.account_ids == ["apex-2", "apex-2"]
+
     async def test_no_rotation_policy_fails(self):
         d = FakeDriver()
         orch = BatchOrchestrator(d)
