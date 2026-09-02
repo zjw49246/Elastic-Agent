@@ -691,8 +691,8 @@
       "path": "src/elastic_agent/core/batch_hooks.py",
       "type": "file",
       "mode": "0644",
-      "size": 99054,
-      "sha256": "sha256:ed3bec8af16a62d3af9d2626e64dc12c69b9eadca31253d9535af6e48a6c8b15"
+      "size": 99195,
+      "sha256": "sha256:c19b3ca90e34d188d661c7f96bdd4d109444e02ca32cb07d51ede2203ff5c82f"
     },
     {
       "path": "src/elastic_agent/core/batch_orchestrator.py",
@@ -726,8 +726,8 @@
       "path": "src/elastic_agent/core/bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 30131,
-      "sha256": "sha256:8c1b7afa9fc71b68a8d88a704cff3edd6619066d9c19742bef3b292af8d42be4"
+      "size": 31458,
+      "sha256": "sha256:037285313a6f853b89bdc98ace24a89b0291c2f9e56f8f53dd69e7c75071ecc0"
     },
     {
       "path": "src/elastic_agent/core/checkpoint_store.py",
@@ -1216,8 +1216,8 @@
       "path": "src/elastic_agent/worker/runtime.py",
       "type": "file",
       "mode": "0644",
-      "size": 151709,
-      "sha256": "sha256:a8daeabf71eb3d5583dde9eb27e67dc5d4573adcdc5a1675ea189785d6de622a"
+      "size": 152115,
+      "sha256": "sha256:6e5d55a218c68c8b13b2858cc4bdf4523119146a486c8933f830ac5dcfca9004"
     },
     {
       "path": "src/elastic_agent/worker/runtime_main.py",
@@ -1524,8 +1524,8 @@
       "path": "tests/unit/test_bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 14665,
-      "sha256": "sha256:7399d69341c770607ad671409fdc5e9f1f1767f03536f1aff5b986b2ab310566"
+      "size": 14981,
+      "sha256": "sha256:ae137df302e7464f9dced60b8cc98650149d125628bc988e6c30a6844ff8f757"
     },
     {
       "path": "tests/unit/test_checkpoint_store.py",
@@ -2035,8 +2035,8 @@
       "path": "tests/unit/test_worker_runtime.py",
       "type": "file",
       "mode": "0644",
-      "size": 87780,
-      "sha256": "sha256:908bbb19715bc35e7e48c07477193a7ae00c76a66ac4e85eba4e34260da5969d"
+      "size": 89008,
+      "sha256": "sha256:c5f2a894343fa950b30fa77b578b116edef9343a3a491efed5f56a0b81f1087e"
     },
     {
       "path": "uv.lock",
