@@ -30,6 +30,35 @@ PREINSTALLED_SYSTEM_COMMANDS = {
 }
 
 
+def _apt_lock_wait_command(timeout_seconds: int) -> str:
+    """Wait for boot-time APT work without killing an in-flight transaction."""
+    wait_seconds = max(30, int(timeout_seconds))
+    units = "apt-daily.service apt-daily-upgrade.service unattended-upgrades.service"
+    locks = (
+        "/var/lib/apt/lists/lock /var/cache/apt/archives/lock "
+        "/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock"
+    )
+    return (
+        "systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+        ">/dev/null 2>&1 || true\n"
+        f"apt_lock_deadline=$((SECONDS + {wait_seconds}))\n"
+        "while true; do\n"
+        "  apt_busy=0\n"
+        f"  for unit in {units}; do\n"
+        "    if systemctl is-active --quiet \"$unit\"; then apt_busy=1; fi\n"
+        "  done\n"
+        "  if command -v fuser >/dev/null 2>&1 && "
+        f"fuser {locks} >/dev/null 2>&1; then apt_busy=1; fi\n"
+        "  if test \"$apt_busy\" = 0; then break; fi\n"
+        "  if test \"$SECONDS\" -ge \"$apt_lock_deadline\"; then\n"
+        "    echo 'timed out waiting for boot-time APT locks' >&2\n"
+        "    exit 75\n"
+        "  fi\n"
+        "  sleep 2\n"
+        "done"
+    )
+
+
 def _golden_verify_command(component: str, args: list[str] | None = None) -> str:
     """Return a shell-safe, fail-closed golden-image verifier invocation."""
     return shlex.join([GOLDEN_IMAGE_VERIFY_PATH, component, *(args or [])])
@@ -109,7 +138,8 @@ def system_init_step(
     if apt_packages:
         pkg_list = shlex.join(apt_packages)
         fallback_commands.append(
-            "apt-get -o DPkg::Lock::Timeout=600 update -qq && "
+            _apt_lock_wait_command(max(30, timeout - 60))
+            + "\napt-get -o DPkg::Lock::Timeout=600 update -qq && "
             f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
         )
     fallback_commands.extend(

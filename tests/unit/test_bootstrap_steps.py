@@ -27,6 +27,17 @@ class TestSystemInitStep:
         assert "awscli" not in step.command
         assert "cloud-init status --wait" in step.command   # fresh-boot apt lock
         assert "DPkg::Lock::Timeout" in step.command
+        assert "systemctl stop apt-daily.timer apt-daily-upgrade.timer" in step.command
+        assert "apt-daily.service apt-daily-upgrade.service" in step.command
+        assert "unattended-upgrades.service" in step.command
+        for lock in (
+            "/var/lib/apt/lists/lock",
+            "/var/cache/apt/archives/lock",
+            "/var/lib/dpkg/lock-frontend",
+            "/var/lib/dpkg/lock",
+        ):
+            assert lock in step.command
+        assert "timed out waiting for boot-time APT locks" in step.command
         assert step.retry_count == 2
 
     def test_custom_packages(self) -> None:
