@@ -1167,3 +1167,22 @@ fail closed，不发布不完整四元组。
 
 **验证**：Agent API 账号与 Job API 定向套件 **270 passed**；Ruff 与
 `git diff --check` 通过。
+
+## 2026-09-02 兼容 Apex OpenAI-style 模型目录（commit `9317133`）
+
+**问题**：Secrets Manager Region 修复上线后，`apex-2` refresh 已能解析平台凭证，但改为
+422 `ApexRouter returned an invalid model list`。
+
+**根因**：Apex `/v1/models` 从旧 native `models[].slug` 切换为
+`object=list,success=true,data[].id`。现场脱敏目录共 26 项，模型 ID 均合法，EA 因顶层
+字段不匹配在读取 slug 前即 fail closed。
+
+**解决**：模型目录 parser 严格支持两种明确 schema：旧 native 继续应用
+`supported_in_api/visibility`过滤；新 schema 必须同时证明 `object=list` 和 `success=true`，
+并从 `data[].id` 投影 Codex 模型。两个列表同时出现、失败标志或不合法 ID 仍拒绝。
+
+**以后避免**：上游 wire schema 演进要以可枚举的版本分支兼容，不得用模糊字段 fallback
+或放宽字符约束来“修复”生产目录。
+
+**验证**：Apex/Agent API/Job API 定向套件 **289 passed**；Ruff 与
+`git diff --check` 通过。

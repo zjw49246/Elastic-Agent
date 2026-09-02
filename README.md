@@ -412,6 +412,11 @@ quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
 failures are treated as transient provider errors rather than proof that the
 individual key is exhausted.
 
+Apex model discovery accepts exactly one of the legacy native
+`models[].slug` response or the current OpenAI-style
+`object=list, success=true, data[].id` response. Mixed, failed, oversized, or
+malformed catalogs remain unavailable rather than weakening model admission.
+
 For Task Platform integrations, Apex credentials should be registered through
 `POST /api/agent-api/accounts/platform-ref` with an exact
 `task-platform/<workspace>/<owner>/apex/<uuid>` Secrets Manager ARN. EA stores
