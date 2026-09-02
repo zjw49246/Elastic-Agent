@@ -3,9 +3,9 @@
   "product": "elastic-agent",
   "upstream_source_commit": "e06ac35dedf4e876ab42ef2cf83161948c09cf87",
   "upstream_archive_sha256": "3d8dd17e3e355dccf63b7830b31809c435944a5cc7aa70222fbba8f7b588740d",
-  "release_revision": "artifact-sha256:b9c3a7964c16b38c9a35ca4b83f9eaab734b19f9c1e87b889cbf318524da7fdb",
+  "release_revision": "artifact-sha256:cc12d5cd988c915b67c3671d75a226be7fac1de77d27316ff8f09fcb0b362f26",
   "release_index": "deploy/release-files.json",
-  "release_artifact_digest": "sha256:b9c3a7964c16b38c9a35ca4b83f9eaab734b19f9c1e87b889cbf318524da7fdb",
+  "release_artifact_digest": "sha256:cc12d5cd988c915b67c3671d75a226be7fac1de77d27316ff8f09fcb0b362f26",
   "manager_state_schema": "v1",
   "worker_runtime_provenance": {
     "ami_id": "ami-023251121ceb0d6f3",
@@ -37,11 +37,11 @@
     "ami_platform_revision": "7275b31b0a313e7b1d2ee3de89237a029333bde6",
     "ami_upstream_revision": "115320154e929bc28800a3273ebb3f56eef10070",
     "ami_generator_version": "build-only-v1",
-    "release_revision": "artifact-sha256:b9c3a7964c16b38c9a35ca4b83f9eaab734b19f9c1e87b889cbf318524da7fdb",
+    "release_revision": "artifact-sha256:cc12d5cd988c915b67c3671d75a226be7fac1de77d27316ff8f09fcb0b362f26",
     "runtime_source": "src/elastic_agent/worker/runtime.py",
     "schema_version": 1
   },
-  "worker_runtime_provenance_digest": "sha256:a65f967123a9f55dda8ca7a2a7adeb5a4cef42bfa063c8ba791bc82a3cdf1ff6",
+  "worker_runtime_provenance_digest": "sha256:37746702ff590b3eef5596622b1ec5b53cc1673ccbad5c1abe1864a403a108b5",
   "worker_profile": {
     "profile_id": "pilot-executor-v1",
     "ami_id": "ami-023251121ceb0d6f3",
@@ -71,5 +71,5 @@
     ]
   },
   "worker_profile_digest": "sha256:421e2b681e823096a59836eb091b672b9e40d8027174343b9b99a8276dafb2d7",
-  "release_digest": "sha256:ff1685988906c437882790113db4289cc1a9e9429ebd1ad3a01ab55f5b12d142"
+  "release_digest": "sha256:8106dd89b12694267c45ab09ffa66560232c02cde6d2d3379d01286dcf9970d0"
 }
