@@ -69,6 +69,37 @@ class TestWorkerRuntimeInit:
         )
         assert rt._log_dir == custom
 
+    def test_credential_discovery_uses_runtime_users_home(self, runtime, tmp_path):
+        runtime_home = tmp_path / "runtime-home"
+        slot = runtime_home / ".claude-prod"
+        slot.mkdir(parents=True)
+        with (
+            patch.object(Path, "home", return_value=runtime_home),
+            patch(
+                "elastic_agent.core.claude_oauth.read_credentials",
+                return_value={"accessToken": "token"},
+            ) as read_credentials,
+        ):
+            slots = runtime._discover_credential_slots()
+
+        assert slots == [
+            {"account_id": ".claude-prod", "config_dir": str(slot)}
+        ]
+        read_credentials.assert_called_once_with(str(slot))
+
+    def test_credential_discovery_skips_inaccessible_slot(self, runtime, tmp_path):
+        runtime_home = tmp_path / "runtime-home"
+        slot = runtime_home / ".claude-prod"
+        slot.mkdir(parents=True)
+        with (
+            patch.object(Path, "home", return_value=runtime_home),
+            patch(
+                "elastic_agent.core.claude_oauth.read_credentials",
+                side_effect=PermissionError("denied"),
+            ),
+        ):
+            assert runtime._discover_credential_slots() == []
+
     @pytest.mark.asyncio
     async def test_reliable_exit_event_survives_restart_until_ack(self, tmp_path):
         from elastic_agent.core.protocols.messages import EventAckMessage, ProcessExitMessage

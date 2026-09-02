@@ -2665,22 +2665,34 @@ class WorkerRuntime:
         from elastic_agent.core.claude_oauth import read_credentials
 
         slots: list[dict[str, str]] = []
+        home = Path.home()
         candidate_dirs = [
-            "/root/.claude-prod",
-            *[f"/root/.claude-edit-{i}" for i in range(1, 10)],
+            home / ".claude-prod",
+            *[home / f".claude-edit-{i}" for i in range(1, 10)],
         ]
-        for config_dir in candidate_dirs:
-            if not Path(config_dir).is_dir():
-                continue
-            creds = read_credentials(config_dir)
-            if creds and creds.get("accessToken"):
-                account_id_file = Path(config_dir) / ".account_id"
-                if account_id_file.exists():
-                    account_id = account_id_file.read_text().strip()
-                else:
-                    account_id = Path(config_dir).name
-                slots.append({"account_id": account_id, "config_dir": config_dir})
-                logger.info("QuotaChecker: discovered slot %s at %s", account_id, config_dir)
+        for config_path in candidate_dirs:
+            try:
+                if not config_path.is_dir():
+                    continue
+                config_dir = str(config_path)
+                creds = read_credentials(config_dir)
+                if creds and creds.get("accessToken"):
+                    account_id_file = config_path / ".account_id"
+                    if account_id_file.exists():
+                        account_id = account_id_file.read_text().strip()
+                    else:
+                        account_id = config_path.name
+                    slots.append({"account_id": account_id, "config_dir": config_dir})
+                    logger.info(
+                        "QuotaChecker: discovered slot %s at %s",
+                        account_id,
+                        config_dir,
+                    )
+            except OSError:
+                logger.warning(
+                    "QuotaChecker: skipping inaccessible credential slot %s",
+                    config_path,
+                )
         return slots
 
     async def _on_quota_status(self, status: dict) -> None:

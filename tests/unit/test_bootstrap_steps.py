@@ -41,6 +41,8 @@ class TestSystemInitStep:
         assert "install -y -qq curl awscli" not in step.command
         assert "install -y -qq curl && command -v aws" in step.command
         assert "aws --version >/dev/null 2>&1" in step.command
+        assert "awscli==1.42.52" in step.command
+        assert "python3-pip" in step.command
 
     def test_custom_timeout(self) -> None:
         step = system_init_step(timeout=600)
@@ -202,6 +204,12 @@ class TestRuntimeDeployFromSrc:
         assert "golden image runtime Python dependencies verified" in c
         assert "pip3 install" in c  # complete fallback remains available
         assert "pip3 install -q --ignore-installed --break-system-packages" in c
+        assert "python3 -m pip --version" in c
+        assert "install -y -qq python3-pip" in c
+        assert (
+            "install -d -o ubuntu -g ubuntu -m 0755 "
+            "/opt/elastic-agent/task-package"
+        ) in c
         assert c.startswith("set -e\n")
         assert (
             "(systemctl disable --now elastic-agent-runtime.service "

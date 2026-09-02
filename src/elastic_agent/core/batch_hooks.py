@@ -1521,7 +1521,11 @@ def make_provision_hook(
             ex = SSHExecutor(host, user=ssh_user, key_path=ssh_key)
             rc, _out, _err = await ex.execute(step.command, timeout=step.timeout)
             if rc != 0:
-                logger.error("framework runtime deploy (from src) failed on %s (rc=%s)", worker_id, rc)
+                logger.error(
+                    "framework runtime deploy (from src) failed on %s (rc=%s); "
+                    "stdout_tail=%r stderr_tail=%r",
+                    worker_id, rc, _out[-2000:], _err[-2000:],
+                )
                 return False
             if protocol_pinned:
                 # The service command has completed, but a baked/stale runtime

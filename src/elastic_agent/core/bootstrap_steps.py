@@ -100,6 +100,11 @@ def system_init_step(
         package for package in package_names
         if package not in PREINSTALLED_SYSTEM_COMMANDS
     ]
+    # Ubuntu Noble has no apt candidate for awscli. Keep the golden-image fast
+    # path, but make a non-golden host self-healing by installing the pinned
+    # CLI through pip (and its pip package if the caller did not request it).
+    if "awscli" in package_names and "python3-pip" not in package_names:
+        apt_packages.append("python3-pip")
     fallback_commands: list[str] = []
     if apt_packages:
         pkg_list = shlex.join(apt_packages)
@@ -108,8 +113,17 @@ def system_init_step(
             f"apt-get -o DPkg::Lock::Timeout=600 install -y -qq {pkg_list}"
         )
     fallback_commands.extend(
-        f"command -v {shlex.quote(command)} >/dev/null && "
-        f"{shlex.quote(command)} --version >/dev/null 2>&1"
+        (
+            "(command -v aws >/dev/null 2>&1 || "
+            "python3 -m pip install -q --break-system-packages "
+            "awscli==1.42.52) && "
+            "command -v aws >/dev/null && aws --version >/dev/null 2>&1"
+            if package == "awscli"
+            else (
+                f"command -v {shlex.quote(command)} >/dev/null && "
+                f"{shlex.quote(command)} --version >/dev/null 2>&1"
+            )
+        )
         for package, command in PREINSTALLED_SYSTEM_COMMANDS.items()
         if package in package_names
     )
@@ -323,6 +337,13 @@ def runtime_deploy_from_src_step(
         # the /usr/local wheel safely shadows it on Python's normal sys.path.
         f"pip3 install -q --ignore-installed --break-system-packages {deps}",
     )
+    ensure_pip = (
+        "if ! python3 -m pip --version >/dev/null 2>&1; then\n"
+        "  export DEBIAN_FRONTEND=noninteractive\n"
+        "  apt-get -o DPkg::Lock::Timeout=600 update -qq\n"
+        "  apt-get -o DPkg::Lock::Timeout=600 install -y -qq python3-pip\n"
+        "fi"
+    )
     home = "/root" if run_as == "root" else f"/home/{run_as}"
     task_socket = "/run/elastic-agent-task-supervisor/control.sock"
     task_wrapper = (
@@ -393,6 +414,7 @@ def runtime_deploy_from_src_step(
         # treat an earlier pip/file-write failure as success and restart a
         # stale runtime.
         "set -e\n"
+        f"{ensure_pip}\n"
         f"{dependency_install}\n"
         # This step runs sudo-wrapped (root), so a bare mkdir makes ea-logs
         # root-owned — but the runtime runs as ``run_as``. It would then fail to
@@ -403,6 +425,11 @@ def runtime_deploy_from_src_step(
         f"mkdir -p {home}/ea-tasks\n"
         f"chown {run_as} {home}/ea-logs {home}/ea-tasks\n"
         f"chmod 700 {home}/ea-logs {home}/ea-tasks\n"
+        # Task Platform downloads immutable task packages as the runtime user.
+        # The parent /opt directory is root-owned on a fresh worker, so create
+        # only the dedicated package directory before the non-root S3 phase.
+        f"install -d -o {run_as} -g {run_as} -m 0755 "
+        "/opt/elastic-agent/task-package\n"
         "cat > /usr/local/bin/ea-task-supervisor.sh << 'TASKWRAP'\n"
         f"{task_wrapper}"
         "TASKWRAP\n"
