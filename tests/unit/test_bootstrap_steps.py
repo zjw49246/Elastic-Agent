@@ -39,7 +39,7 @@ class TestSystemInitStep:
 
         assert "elastic-agent-image-verify system curl awscli" in step.command
         assert "install -y -qq curl awscli" not in step.command
-        assert "install -y -qq curl && command -v aws" in step.command
+        assert "install -y -qq curl python3-pip" in step.command
         assert "aws --version >/dev/null 2>&1" in step.command
         assert "awscli==1.42.52" in step.command
         assert "python3-pip" in step.command
