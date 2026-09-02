@@ -19,29 +19,29 @@
       "path": "CLAUDE.md",
       "type": "file",
       "mode": "0644",
-      "size": 64975,
-      "sha256": "sha256:6b5af141251615ff03a0aa3bad16eb1849a27875d47950b811f85f9e24077555"
+      "size": 65272,
+      "sha256": "sha256:cb40a9e21b0f3cc0ff76032948321daee65bf705a726bed9be0aaffcaf01446c"
     },
     {
       "path": "PROGRESS.md",
       "type": "file",
       "mode": "0644",
-      "size": 135014,
-      "sha256": "sha256:dcc99c5375cc258b3def7db4aa4742e9682bff5460e03a8d9181add8389c8d28"
+      "size": 136429,
+      "sha256": "sha256:4a50f550b3e9fa97338b78a0f90230df056602c891641d747f0a1ecd78f007b5"
     },
     {
       "path": "README.md",
       "type": "file",
       "mode": "0644",
-      "size": 68881,
-      "sha256": "sha256:3dd91e77e7ffbcbbfa814791fe8de62325b53ee7d7128f3ea6515b252dbbd6b4"
+      "size": 69238,
+      "sha256": "sha256:0e9c9821283c58b590871cfe9e47ed7650f2fe30f4dbc2da64b5670fb9ea996a"
     },
     {
       "path": "TEST.md",
       "type": "file",
       "mode": "0644",
-      "size": 32900,
-      "sha256": "sha256:4615b1d0bb98f9da9278931063d2e4e7f6ceefecaf1f0522d101d841d9a8c3d1"
+      "size": 33076,
+      "sha256": "sha256:72c20897da0d41c9d780e9faf498cc5395b3c5256c5b859ea1cc2833b49091e2"
     },
     {
       "path": "deploy/__init__.py",
@@ -677,8 +677,8 @@
       "path": "src/elastic_agent/core/apexrouter.py",
       "type": "file",
       "mode": "0644",
-      "size": 9924,
-      "sha256": "sha256:f27e8090d903c0e4beb6175d6c47f58e667a5672ac78009b7e3e4ddbcba02751"
+      "size": 11183,
+      "sha256": "sha256:28fa6acecc1df6bcfb5b11629ea89163e5a03b11397c4b1765fe63e90ad08d23"
     },
     {
       "path": "src/elastic_agent/core/auth.py",
@@ -1433,8 +1433,8 @@
       "path": "tests/unit/test_apexrouter.py",
       "type": "file",
       "mode": "0644",
-      "size": 13384,
-      "sha256": "sha256:54c8ef4bbcbf842aa14af7197ba088029857590e63395c6b23b02e74495aa527"
+      "size": 15501,
+      "sha256": "sha256:0717da288bd08e427aa334c0487bb88615b63b8b292bf4569d60ecebfc386254"
     },
     {
       "path": "tests/unit/test_api.py",
