@@ -726,8 +726,8 @@
       "path": "src/elastic_agent/core/bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 31458,
-      "sha256": "sha256:037285313a6f853b89bdc98ace24a89b0291c2f9e56f8f53dd69e7c75071ecc0"
+      "size": 32692,
+      "sha256": "sha256:a54767b614a3b828f5474f31e7d627041c0a0fb1ea655815978a34af61b3e953"
     },
     {
       "path": "src/elastic_agent/core/checkpoint_store.py",
@@ -1524,8 +1524,8 @@
       "path": "tests/unit/test_bootstrap_steps.py",
       "type": "file",
       "mode": "0644",
-      "size": 14981,
-      "sha256": "sha256:ae137df302e7464f9dced60b8cc98650149d125628bc988e6c30a6844ff8f757"
+      "size": 15515,
+      "sha256": "sha256:7822759b080d84abbd555b5ae212f7129b2a89030bf67f56651063ddf4febb06"
     },
     {
       "path": "tests/unit/test_checkpoint_store.py",
