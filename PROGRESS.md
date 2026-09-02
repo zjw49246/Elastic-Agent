@@ -1186,3 +1186,25 @@ fail closed，不发布不完整四元组。
 
 **验证**：Apex/Agent API/Job API 定向套件 **289 passed**；Ruff 与
 `git diff --check` 通过。
+
+## 2026-09-02 恢复 Apex usage 404 运行时守卫（commit `48f97e6`）
+
+**问题**：Apex 模型目录 parser 修复上线后，`apex-2` 已能成功刷新并持久化
+Codex 模型，但 refresh 响应仍为 `invalid_models_response`，runtime tombstone 始终不清除。
+
+**根因**：公网 Apex Gateway 没有 `/v1/usage` 路由，稳定返回
+`upstream_rejected/404`。当前 Codex-only adapter 在基线合并时丢失了已审核的
+runtime-guarded 策略；Agent API store 正确要求模型和 usage 同时成功才清理
+deterministic tombstone，因此这个 404 使身份永久停用。
+
+**解决**：恢复 `ELASTIC_AGENT_APEX_USAGE_POLICY=runtime|strict`。默认 `runtime` 仅将固定
+Apex usage URL 的精确 `upstream_rejected/404` 投影为已知可用的
+`runtime_guarded` snapshot，由 Worker 真实 Responses 请求继续证明认证与额度。
+`strict` 以及 401/403/429/5xx、非法 200 usage schema 仍原样 fail closed。
+
+**以后避免**：对已知缺少的 provider 能力，要保留显式、可测试、可改严的
+策略分支，不得在 provider 能力收窄或基线归档时删除。模型准入、usage 准入和
+Worker 运行时反馈必须作为一个端到端合同一起验证。
+
+**验证**：线上脱敏直连探针证实 `/v1/usage` 为 404，而模型目录已成功。
+Apex/Agent API/调度定向套件 **130 passed**；Ruff 与 `git diff --check` 通过。
