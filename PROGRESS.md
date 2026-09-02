@@ -1,5 +1,22 @@
 # PROGRESS — 经验教训沉淀
 
+## 2026-09-02 Claude 隐式异步 Agent 生命周期级联（commit `64737fe`）
+
+**问题**：Claude 即使没有在 Agent 工具输入中设置 `run_in_background`，也可能在
+结构化回执中返回 `isAsync=true`、`status=async_launched`。旧 PTY 只看请求参数，
+会把启动确认误判为同步完成，使 Manager 过早清零活跃子 Agent 且丢失 transcript 报告。
+
+**解决**：将 elastic-agent 的 claude-pty lock、worker bootstrap 与 golden-image pin
+统一升级到 `4d7c819`，继承结构化 async 回执和 `agentId` 跟踪；启动确认保持 pending，
+直到匹配的 completion notification 才收口。
+
+**避免复发**：Agent 生命周期应以 provider 的结构化执行回执为权威，不能只从请求意图
+推断同步/异步；下游 lock、bootstrap 和 golden pin 必须作为同一个发布单元更新。
+
+**验证**：PTY/bootstrap/golden-image 聚焦回归 `175 passed`，完整套件
+`3152 passed / 12 skipped / 0 failed`，结构化隐式 async smoke 与
+`git diff --check` 通过。
+
 ## 2026-09-01 500 并发结果收集竞态（commit `5f7bae9`）
 
 **问题**：500 并发 Campaign 的 Manager relay 在 rsync 写入私有 staging
