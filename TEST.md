@@ -121,6 +121,9 @@ The focused suite covers:
   encoded in the ARN, without persisting the resolved key;
 - legacy-native and current OpenAI-style Apex model catalog normalization,
   including rejection of mixed or failed response schemas;
+- Apex's expected usage-route 404 becoming runtime-guarded only under the
+  reviewed runtime policy, while strict mode and all auth/rate-limit/server
+  errors remain rejected;
 - AWS live and persisted Job detail publishing the exact Worker index,
   instance, account, and Region tuple required by Task Platform;
 - atomic mode-`0600` `account_id → EIP` mappings and exclusive Job leases;

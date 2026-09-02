@@ -193,6 +193,77 @@ async def test_apex_model_probe_rejects_ambiguous_or_failed_schema(
 
 
 @pytest.mark.asyncio
+async def test_apex_missing_usage_route_uses_runtime_guard_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter(usage_policy="runtime")
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(side_effect=AgentApiUpstreamError("upstream_rejected", 404)),
+    )
+
+    snapshot = await adapter.fetch_usage("apex-1", "lck-private")
+
+    assert snapshot == {
+        "account_id": "apex-1",
+        "fetched_at": snapshot["fetched_at"],
+        "stale": False,
+        "state": "active",
+        "status": "active",
+        "mode": "runtime_guarded",
+        "quota": None,
+        "windows": [],
+        "usage": {},
+        "available": True,
+        "known": True,
+        "reason": "provider_usage_endpoint_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403, 429, 500])
+async def test_apex_runtime_policy_does_not_mask_other_upstream_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    adapter = ApexRouterAdapter(usage_policy="runtime")
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(
+            side_effect=AgentApiUpstreamError(
+                "upstream_rejected",
+                status_code,
+            )
+        ),
+    )
+
+    with pytest.raises(AgentApiUpstreamError, match="upstream_rejected"):
+        await adapter.fetch_usage("apex-1", "lck-private")
+
+
+@pytest.mark.asyncio
+async def test_apex_strict_usage_policy_rejects_missing_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ApexRouterAdapter(usage_policy="strict")
+    monkeypatch.setattr(
+        adapter,
+        "_request_json",
+        AsyncMock(side_effect=AgentApiUpstreamError("upstream_rejected", 404)),
+    )
+
+    with pytest.raises(AgentApiUpstreamError, match="upstream_rejected"):
+        await adapter.fetch_usage("apex-1", "lck-private")
+
+
+def test_apex_usage_policy_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="must be runtime or strict"):
+        ApexRouterAdapter(usage_policy="unknown")
+
+
+@pytest.mark.asyncio
 async def test_apex_usage_keeps_key_usage_separate_from_shared_group_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

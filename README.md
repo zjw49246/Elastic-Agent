@@ -406,11 +406,16 @@ ApexRouter `/usage` reports per-key `used` values but shared-group
 and excludes the key when any shared limit is exhausted. An explicit `null`
 pair for one window's `remaining` and `limit` means that shared window is
 unlimited; limited and unlimited windows may coexist, while missing,
-asymmetric-null, or invalid values fail closed. ApexRouter does not currently
-supply an expiry time. At runtime, Apex authentication failures and explicit
-quota exhaustion rotate credentials, while ordinary HTTP `429` and `500`/`502`
-failures are treated as transient provider errors rather than proof that the
-individual key is exhausted.
+asymmetric-null, or invalid values fail closed. The public gateway may return
+its expected `404` because it exposes no usage route. The default
+`ELASTIC_AGENT_APEX_USAGE_POLICY=runtime` treats only that exact response as an
+active `runtime_guarded` identity after model authentication; the Worker's real
+Responses request remains the authentication and quota guard. Set the policy to
+`strict` to reject the missing route. ApexRouter does not currently supply an
+expiry time. Authentication failures and explicit quota exhaustion rotate
+credentials, while ordinary HTTP `429` and `500`/`502` failures are treated as
+transient provider errors rather than proof that the individual key is
+exhausted.
 
 Apex model discovery accepts exactly one of the legacy native
 `models[].slug` response or the current OpenAI-style

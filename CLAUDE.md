@@ -4,7 +4,7 @@
 
 ## 架构要点
 
-- **Apex 模型目录 schema**：pinned Codex client 请求的 `/v1/models` 严格支持旧 native `models[].slug` 或当前 `object=list,success=true,data[].id` 二选一；旧 schema 继续应用 `supported_in_api/visibility`，新 schema 只投影经验证的 Codex ID。混合、失败、超限或非法 catalog fail closed。
+- **Apex 模型目录与 usage 策略**：pinned Codex client 请求的 `/v1/models` 严格支持旧 native `models[].slug` 或当前 `object=list,success=true,data[].id` 二选一；旧 schema 继续应用 `supported_in_api/visibility`，新 schema 只投影经验证的 Codex ID。混合、失败、超限或非法 catalog fail closed。Apex 公网 `/v1/usage` 的预期 `upstream_rejected/404` 在默认 `ELASTIC_AGENT_APEX_USAGE_POLICY=runtime` 下投影为 `runtime_guarded` active，由 Worker 实际 Responses 请求继续拦截 auth/quota；`strict` 策略、401/403/429/5xx 和非法 200 usage 响应仍 fail closed。
 - **任务执行两条路径**（worker/runtime.py `_handle_execute`）：
   - subprocess（默认）：Manager 经 AgentType 构造 `claude -p ... --output-format stream-json` 命令行，worker spawn 后逐行转发 stdout
   - **PTY 模式**（可选）：`ExecuteMessage.agent_params` 非空且 worker 装了 [claude-pty](https://github.com/zjw49246/Claude-Code-PTY) 时，worker 用 `ElasticPTYBackend`（worker/pty_backend.py，继承 claude_pty 的 BasePTYBackend）把 Claude Code 宿主在持久 PTY 会话里；`command` 始终随消息下发作为 fallback

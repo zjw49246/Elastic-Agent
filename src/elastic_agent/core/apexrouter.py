@@ -9,6 +9,7 @@ remaining-limit pair marks one shared window as unlimited.
 
 from __future__ import annotations
 
+import os
 import time
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
@@ -142,6 +143,25 @@ def _normalise_apex_models(payload: Any) -> dict[str, list[str]]:
     return {"claude": [], "codex": sorted(selected)}
 
 
+def _runtime_guarded_usage(account_id: str) -> dict[str, Any]:
+    """Represent a valid key when Apex exposes no public usage endpoint."""
+
+    return {
+        "account_id": account_id,
+        "fetched_at": time.time(),
+        "stale": False,
+        "state": "active",
+        "status": "active",
+        "mode": "runtime_guarded",
+        "quota": None,
+        "windows": [],
+        "usage": {},
+        "available": True,
+        "known": True,
+        "reason": "provider_usage_endpoint_unavailable",
+    }
+
+
 def _normalise_apex_usage(
     account_id: str,
     payload: Any,
@@ -269,6 +289,18 @@ class ApexRouterAdapter(CloudRouterAdapter):
 
     provider = "apex"
 
+    def __init__(self, *, usage_policy: str | None = None) -> None:
+        super().__init__()
+        policy = usage_policy or os.environ.get(
+            "ELASTIC_AGENT_APEX_USAGE_POLICY",
+            "runtime",
+        )
+        if policy not in {"runtime", "strict"}:
+            raise ValueError(
+                "ELASTIC_AGENT_APEX_USAGE_POLICY must be runtime or strict"
+            )
+        self.usage_policy = policy
+
     @property
     def endpoints(self) -> Mapping[str, str | None]:
         return APEX_ENDPOINTS
@@ -289,10 +321,17 @@ class ApexRouterAdapter(CloudRouterAdapter):
         account_id: str,
         api_key: str,
     ) -> dict[str, Any]:
-        return _normalise_apex_usage(
-            account_id,
-            await self._request_json(APEX_USAGE_URL, api_key),
-        )
+        try:
+            payload = await self._request_json(APEX_USAGE_URL, api_key)
+        except AgentApiUpstreamError as exc:
+            if (
+                self.usage_policy == "runtime"
+                and exc.status_code == 404
+                and exc.code == "upstream_rejected"
+            ):
+                return _runtime_guarded_usage(account_id)
+            raise
+        return _normalise_apex_usage(account_id, payload)
 
 
 __all__ = [
