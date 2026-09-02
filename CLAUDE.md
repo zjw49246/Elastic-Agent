@@ -97,7 +97,7 @@ Claude-Code-PTY (claude-pty)  ←  elastic-agent[pty]  ←  下游 harness（aud
 - **本仓库更新后**，提醒/级联下游 harness：`uv lock --upgrade-package elastic-agent && uv sync`
 - **任务生命周期补充**：领取任务时（步骤 1）先检查上游是否有新版本（`uv lock --upgrade-package claude-pty --dry-run` 或对比 PTY main HEAD 与 lock 中 pin 的 rev）；若本次改动涉及 PTY 接口适配，必须同步 bump lock
 - worker 侧 claude-pty 由 bootstrap `pty_install_step` 安装——下游应传入与其 lock 一致的 pinned URL（`pty_package="git+https://github.com/zjw49246/Claude-Code-PTY@<rev>"`）
-- 当前 lock/golden worker pin：`7d5a0e5b2192e248e36fc840a5418b773a4560ec`（Session start publication/cancel cleanup 事务化）
+- 当前 lock/golden worker pin：`4d7c8198d516a94b6ac48bb661b9bd209e3b3c40`（隐式 async Claude Agent 生命周期与结构化 agentId 跟踪）
 
 ## Git 信息
 

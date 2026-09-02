@@ -63,8 +63,9 @@ session, the prompt is injected into the warm session as a new turn — no
 process respawn, no cold `--resume` (verified: ~3x faster turnaround).
 A STOP tears the session down; the next resume is cold.
 
-The lock currently pins claude-pty commit `7d5a0e5` (cross-host inject
-isolation plus cancellation-safe Session publication and cleanup).
+The lock currently pins claude-pty commit `4d7c819` (including structured
+tracking for Claude Agents that launch asynchronously even when the tool input
+does not explicitly request background execution).
 
 Credential rotation: account swaps are in-place (new tokens written into the
 same config_dir). On CREDENTIAL_LOGIN the Worker recycles every PTY session
