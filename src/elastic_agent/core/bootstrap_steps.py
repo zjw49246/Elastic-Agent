@@ -33,7 +33,9 @@ PREINSTALLED_SYSTEM_COMMANDS = {
 def _apt_lock_wait_command(timeout_seconds: int) -> str:
     """Wait for boot-time APT work without killing an in-flight transaction."""
     wait_seconds = max(30, int(timeout_seconds))
-    units = "apt-daily.service apt-daily-upgrade.service unattended-upgrades.service"
+    # This service can stay active solely because its shutdown helper waits for
+    # a signal. The lock owners below prove an actual unattended transaction.
+    units = "apt-daily.service apt-daily-upgrade.service"
     locks = (
         "/var/lib/apt/lists/lock /var/cache/apt/archives/lock "
         "/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock"

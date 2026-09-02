@@ -29,7 +29,7 @@ class TestSystemInitStep:
         assert "DPkg::Lock::Timeout" in step.command
         assert "systemctl stop apt-daily.timer apt-daily-upgrade.timer" in step.command
         assert "apt-daily.service apt-daily-upgrade.service" in step.command
-        assert "unattended-upgrades.service" in step.command
+        assert "unattended-upgrades.service" not in step.command
         for lock in (
             "/var/lib/apt/lists/lock",
             "/var/cache/apt/archives/lock",
