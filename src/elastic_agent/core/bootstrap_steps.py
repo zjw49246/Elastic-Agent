@@ -619,7 +619,13 @@ def credential_login_deps_step(
     for dep in (login_dependencies or []):
         if dep not in pip_pkgs and dep not in ("chrome", "google-chrome", "xvfb", "xdotool"):
             pip_pkgs.append(dep)
-    pip = f"pip3 install -q --break-system-packages {shlex.join(pip_pkgs)}"
+    # Fresh Ubuntu images may provide packages such as typing_extensions via
+    # dpkg without pip RECORD metadata. Avoid trying to uninstall that
+    # distro-owned copy; a complete wheel set safely shadows it instead.
+    pip = (
+        "pip3 install -q --break-system-packages --ignore-installed "
+        f"{shlex.join(pip_pkgs)}"
+    )
     install_or_verify = _golden_fast_path(
         "login",
         pip_pkgs,

@@ -320,6 +320,7 @@ class TestCredentialLoginDepsStep:
         assert "xdotool" in step.command
         assert "xvfb" in step.command
         assert "httpx" in step.command and "websockets" in step.command
+        assert "--ignore-installed" in step.command
         assert step.timeout == 600
         assert step.retry_count == 1
 
